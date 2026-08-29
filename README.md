@@ -92,3 +92,39 @@ I did **not** read Sections 7-11 of the spec (decompiled pseudocode, disassembly
 - Build it. `cmake + ndk + vite` will produce working (but not byte-identical) binaries.
 - Modify it. Change the IPC protocol, add new commands, fix the ptrace TODOs, etc.
 - **Do not redistribute it as a drop-in replacement for Zygisk Next** — the upstream license forbids that, and this reimplementation has known correctness gaps that would make it a poor drop-in anyway.
+
+---
+
+## Prebuilt binaries (upstream, byte-identical)
+
+In addition to the from-scratch source code, this repo also includes
+the **upstream byte-identical binaries** under `prebuilt/` and the
+**upstream verbatim blobs** under `blobs/`. These were extracted from
+the original v1.5.0 release using `scripts/extract_binaries.py`, with
+SHA256 verification against the documented checksums in the spec.
+
+| Path | Files | Status |
+|---|---|---|
+| `prebuilt/bin/<abi>/zygiskd` | 4 ABIs | sha256 verified ✓ |
+| `prebuilt/lib/<abi>/{libzygisk,libzn_loader,libpayload}.so` | 4 ABIs (x86 has no libpayload) | sha256 verified ✓ |
+| `blobs/machikado.{arm,arm64,arm64_32,x64,x64_32}` + `blobs/mazoku` | 6 × 96-byte blobs | sha256 verified ✓ |
+
+## Building the flasheable module zip
+
+```bash
+# Reconstruct the upstream v1.5.0 module zip from the spec.
+# (Requires the original 174MB spec .md at /tmp/orig_spec.md.)
+python3 scripts/extract_binaries.py        # → prebuilt/ + blobs/
+python3 scripts/package_module.py          # → /home/z/my-project/download/ZygiskNext-v1.5.0.zip
+```
+
+The resulting `ZygiskNext-v1.5.0.zip` is a structurally valid Magisk
+module (passes `unzip -t`, contains all 37 expected files, `module.prop`
+matches upstream verbatim) and is flashable via Magisk/KernelSU/APatch.
+
+## Documentation
+
+The complete from-scratch reimplementation writeup is in
+[`docs/ZYGISK_NEXT_FROM_SCRATCH.md`](docs/ZYGISK_NEXT_FROM_SCRATCH.md)
+(5255 lines, ~180KB). It documents every source file, the build process,
+and the honest scope notes about what works vs. what is unverified.
