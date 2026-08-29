@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>Zygisk Next</title>
+        <!-- KSU/APatch window-inset CSS (provided at runtime by the manager app) -->
+        <link rel="stylesheet" type="text/css" href="/internal/insets.css" />
+        <style>
+            .root_layout { padding-top: var(--window-inset-top); }
+            .n-layout-scroll-container {
+                padding-bottom: var(--window-inset-bottom);
+            }
+            @media (prefers-color-scheme: dark) {
+                body { background-color: black; }
+            }
+        </style>
+    </head>
+    <body>
+        <div id="app"></div>
+        <script type="module" src="/src/main.ts"></script>
+        <script>
+            // APatch compatibility: apatch users get window.apatch
+            // but no window.ksu. Mirror the original WebUI's
+            // compatibility shim so both bridges work the same.
+            if (window.apatch !== undefined && window.apatch.ksu === undefined) {
+                window.ksu = window.apatch;
+            }
+        </script>
+    </body>
+</html>

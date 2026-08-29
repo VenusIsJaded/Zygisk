@@ -1,0 +1,6 @@
+id=zygisksu
+name=Zygisk Next
+version=1.5.0-reimpl.1
+versionCode=843
+author=ZygiskNext reimpl (personal use)
+description=Standalone Zygisk implementation (from-scratch reimplementation — not the upstream binary).

@@ -1,0 +1,6 @@
+LIBZYGISK_1.0 {
+    global:
+        zygisk_entry;
+    local:
+        *;
+};

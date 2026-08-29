@@ -1,0 +1,23 @@
+# sepolicy rules — allow zygiskd (in the magisk/zygisksu context)
+# to ptrace the zygote, sendmsg/recvmsg on its abstract socket,
+# and read /proc/<pid>/maps and /proc/<pid>/root for ELF parsing.
+#
+# These are the minimum rules needed for ptrace-based injection.
+
+allow zygote zygote:process { ptrace ptrace_getregset ptrace_setregset ptrace_cont ptrace_attach ptrace_detach };
+allow zygote zygote:process { setcurrent signal;
+                              signal };
+allow zygiskd zygote:dir { search read open getattr };
+allow zygiskd zygote:file { read open getattr };
+allow zygiskd zygote:lnk_file { read open getattr };
+
+# Allow zygiskd to read the zygote's /proc/<pid>/maps
+allow zygiskd proc:file { read open getattr };
+
+# Allow zygiskd to access its own /data/adb/zygisksu/ directory.
+allow zygiskd zygisksu_data_file:dir { search read write add_name remove_name open getattr };
+allow zygiskd zygisksu_data_file:file { create read write open getattr unlink };
+
+# Allow zygiskd to access /data/adb/modules/
+allow zygiskd adb_modules_file:dir { search read open getattr };
+allow zygiskd adb_modules_file:file { read open getattr };

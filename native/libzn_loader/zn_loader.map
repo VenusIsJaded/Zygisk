@@ -1,0 +1,7 @@
+LIBZN_LOADER_1.0 {
+    global:
+        zn_entry;
+        zn_post_specialize;
+    local:
+        *;
+};

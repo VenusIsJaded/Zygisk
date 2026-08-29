@@ -1,0 +1,7 @@
+#Updater-script for Magisk modules (we just say "OK" and bail out)
+#This file is required by Magisk's update-binary but is not actually
+#used for anything — Magisk modules are installed by the bootstrap
+#in update-binary, not by this script.
+
+show_progress 0.000000 0
+show_progress 1.000000 0

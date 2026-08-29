@@ -1,0 +1,10 @@
+# Export only the 4 documented public symbols. Everything else is hidden.
+LIBPAYLOAD_1.0 {
+    global:
+        my_execve;
+        my_execveat;
+        my_wait4;
+        daemon_addr;
+    local:
+        *;
+};

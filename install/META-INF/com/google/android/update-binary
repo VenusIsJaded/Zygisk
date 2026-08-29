@@ -1,0 +1,28 @@
+#META-INF/com/google/android/update-binary
+# Bootstrap script invoked by Magisk/KernelSU/APatch at install time.
+
+SKIPUNZIP=0
+SKIPMOUNT=false
+PROPFILE=false
+POSTFSDATA_DEBUG=false
+
+if [ -f /data/adb/magisk/util_functions.sh ]; then
+  . /data/adb/magisk/util_functions.sh
+  install_module
+  exit 0
+fi
+
+if [ -f /data/adb/ksu/bin/util_functions.sh ]; then
+  . /data/adb/ksu/bin/util_functions.sh
+  install_module
+  exit 0
+fi
+
+if [ -f /data/adb/ap/bin/util_functions.sh ]; then
+  . /data/adb/ap/bin/util_functions.sh
+  install_module
+  exit 0
+fi
+
+ui_print "- No supported manager found"
+exit 1

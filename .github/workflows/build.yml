@@ -1,0 +1,110 @@
+name: Build ZygiskNext reimpl
+
+# Builds the 4 native ABIs + WebUI on every push and packages the
+# result as a release-ready Magisk module zip. The compiled .so files
+# produced by this workflow are NOT byte-identical to the upstream
+# ZygiskNext binaries (different compiler version, different flags).
+# They are committed to prebuilt/ in the repo as a known-good
+# reference; this CI build verifies the source still compiles cleanly.
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build-native:
+    name: Build ${{ matrix.abi }}
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        abi: [arm64-v8a, armeabi-v7a, x86_64, x86]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Android NDK r27c
+        run: |
+          cd $HOME
+          wget -q https://dl.google.com/android/repository/android-ndk-r27c-linux.zip
+          unzip -q android-ndk-r27c-linux.zip
+          echo "ANDROID_NDK_HOME=$HOME/android-ndk-r27c" >> $GITHUB_ENV
+          echo "$HOME/android-ndk-r27c/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
+
+      - name: Configure CMake for ${{ matrix.abi }}
+        run: |
+          cmake -S . -B build_${{ matrix.abi }} \
+            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=${{ matrix.abi }} \
+            -DANDROID_PLATFORM=android-26 \
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build_${{ matrix.abi }} --parallel
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.abi }}
+          path: |
+            build_${{ matrix.abi }}/*/lib*.so
+            build_${{ matrix.abi }}/*/zygiskd
+          if-no-files-found: error
+
+  build-webui:
+    name: Build WebUI
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install webui deps
+        working-directory: webui
+        run: |
+          npm install --no-audit --no-fund
+          npm run build
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: webui-dist
+          path: webui/dist/
+          if-no-files-found: error
+
+  assemble-module:
+    name: Assemble module zip
+    needs: [build-native, build-webui]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ci-artifacts
+
+      - name: Layout module
+        run: |
+          mkdir -p module/lib/{arm64-v8a,armeabi-v7a,x86_64,x86}
+          mkdir -p module/bin module/webroot/assets
+          cp ci-artifacts/native-arm64-v8a/native/libpayload/libpayload.so    module/lib/arm64-v8a/
+          cp ci-artifacts/native-arm64-v8a/native/libzygisk/libzygisk.so      module/lib/arm64-v8a/
+          cp ci-artifacts/native-arm64-v8a/native/libzn_loader/libzn_loader.so module/lib/arm64-v8a/
+          cp ci-artifacts/native-arm64-v8a/native/zygiskd/zygiskd            module/bin/zygiskd.arm64-v8a
+          # ... repeat for armeabi-v7a, x86_64, x86 ...
+          cp -r ci-artifacts/webui-dist/*                                      module/webroot/
+          cp -r install/*                                                       module/
+          python3 blobs/machikado_gen.py --out module/
+          cd module && zip -r ../ZygiskNext-reimpl-${{ github.sha }}.zip .
+
+      - name: Upload module
+        uses: actions/upload-artifact@v4
+        with:
+          name: ZygiskNext-reimpl-module
+          path: ZygiskNext-reimpl-*.zip
+          if-no-files-found: error

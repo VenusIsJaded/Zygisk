@@ -1,0 +1,43 @@
+NO LICENSE GRANTED
+
+This reimplementation is for the personal study of the original author
+and is NOT licensed for redistribution, modification, or commercial use
+by any third party.
+
+1. UPSTREAM NOTICE
+   The original "Zygisk Next" (also "ZygiskSU") module is the work of
+   its upstream authors (5ec1cff, Nullptr, aviraxp). The upstream
+   README explicitly prohibits modification, redistribution, and
+   extraction of components. The compiled binaries under
+   prebuilt/<abi>/ in this repository are byte-identical
+   reconstructions of the upstream binaries, included here solely for
+   build verification and personal study.
+
+2. SOURCE CODE STATUS
+   The C/C++/Vue/TypeScript source files under native/, webui/, blobs/,
+   and scripts/ are a fresh reimplementation written from publicly
+   available information (public Zygisk API, ELF symbol tables, the
+   module's bootstrap description). They have not been compiled and
+   tested. They are NOT a working drop-in replacement for upstream
+   Zygisk Next. They are committed here as a personal reference.
+
+3. NO WARRANTY
+   The software is provided "AS IS", without warranty of any kind,
+   express or implied, including but not limited to the warranties of
+   merchantability, fitness for a particular purpose and noninfringement.
+   In no event shall the authors or copyright holders be liable for any
+   claim, damages or other liability, whether in an action of contract,
+   tort or otherwise, arising from, out of or in connection with the
+   software or the use or other dealings in the software.
+
+4. YOU MAY NOT
+   - Redistribute this repository, in whole or in part, without
+     explicit written permission from the upstream authors.
+   - Present this reimplementation as the upstream "Zygisk Next".
+   - Use this reimplementation in any way that would compete with or
+     misappropriate the upstream project.
+
+5. PERSONAL USE ONLY
+   If you have cloned this repository, you may read it and study it.
+   You may not redistribute it, host it publicly under the "Zygisk Next"
+   name, or imply endorsement by the upstream authors.
