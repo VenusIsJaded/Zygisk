@@ -24,6 +24,7 @@ add_library(payload SHARED
     src/entry.cpp
     src/hide.cpp
     src/hide_advanced.cpp
+    src/hide_stealth.cpp
 )
 
 set_target_properties(payload PROPERTIES

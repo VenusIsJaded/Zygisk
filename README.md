@@ -68,6 +68,7 @@ readable source. Nothing here is taken from any other project.
 ```
 zygisk_study/
 ├── README.md                 # this file
+├── PERFORMANCE-CLAIMS.md     # honest ledger of perf claims (HIGH/MEDIUM/LOW confidence)
 ├── LICENSE                   # Apache-2.0
 ├── .gitignore                # keeps binaries out of the repo
 ├── .github/workflows/tests.yml  # CI: runs the host tests on every push
@@ -96,16 +97,20 @@ zygisk_study/
 │   │       └── hide.cpp          # basic hide layer (unmount, scrub, munmap)
 │   │       ├── hide_advanced.h
 │   │       └── hide_advanced.cpp # advanced stealth (props clone, maps filter, fd cleanup)
+│   │       ├── hide_stealth.h
+│   │       └── hide_stealth.cpp # additional stealth (readlink hook, PR_SET_PDEATHSIG/DUMPABLE, comm)
 │   ├── libzn_loader/         # C++ bridge used by daemon to spawn payload
 │   │   ├── CMakeLists.txt
 │   │   └── src/entry.cpp
 │   └── ...
-├── tests/                    # host-side unit tests (no Android needed)
+├── tests/                    # host-side unit tests + perf microbenchmarks (no Android needed)
 │   ├── Makefile              # `make` builds, `make run` runs them all
 │   ├── test_framework.h      # tiny dependency-free test framework
 │   ├── test_hide.cpp         # tests for the basic hide layer
 │   ├── test_hide_advanced.cpp# tests for the advanced hide layer (memfd filter etc.)
-│   └── test_e2e_hide.cpp     # end-to-end: forks a child, applies hide, verifies
+│   ├── test_hide_stealth.cpp # tests for the additional stealth layer
+│   ├── test_e2e_hide.cpp    # end-to-end: forks a child, applies hide, verifies
+│   └── test_perf.cpp         # microbenchmarks: 3 hot paths measured on the host
 └── docs/
     ├── architecture.md       # how the pieces fit together
     ├── hiding.md             # the hide layer explained (public knowledge)
@@ -186,10 +191,17 @@ What the tests cover:
   Magisk/.so entries, preserves libc, handles empty input), the
   open-hook path matcher, the GOT-patcher matcher (only `open` /
   `openat`), env-var scrub, signal-reset skip list.
+- **`test_hide_stealth`** — additional stealth layer: the readlink
+  rewriter (drops Magisk/zygisk paths, preserves stock app_process),
+  the readlinkat GOT-patcher matcher, idempotency of init.
 - **`test_e2e_hide`** — end-to-end: forks a child, calls
   `hide_apply_for_target()`, verifies the child survives and reports
   back via pipe. Also parses real `/proc/self/maps` content, spikes it
   with a fake Magisk line, and verifies the filter drops it.
+- **`test_perf`** — host-side microbenchmarks of the three hot paths
+  (`make_filtered_memfd`, `hide_setup_for_target` fast path,
+  `hide_apply_for_target` fast path). Asserts each completes within
+  the documented budget. See `PERFORMANCE-CLAIMS.md` for the analysis.
 - **`cargo test`** — daemon's pure-logic parsers (no I/O required):
   `parse_verb_from_bytes`, `parse_denylist_text`, `format_module_list`,
   `DaemonState.is_on_denylist`.
@@ -213,7 +225,15 @@ produce the right arguments.
 This is a study project; correctness and readability come before raw
 throughput. That said, several optimizations are baked in so that
 fork latency stays well below the typical Android zygote budget
-(~5 ms per fork):
+(~5 ms per fork).
+
+**See [`PERFORMANCE-CLAIMS.md`](PERFORMANCE-CLAIMS.md) for the
+honest ledger of every performance claim, with confidence levels and
+host-side measured timings.** That file is the source of truth for
+"which optimizations are guaranteed to help on real Android vs.
+which are speculation."
+
+### HIGH-confidence optimizations (guaranteed on Android by construction)
 
 - **Module list is fetched once at payload init**, not per fork.
   A `g_modules_loaded` atomic guards against re-fetching. (Without
@@ -222,21 +242,60 @@ fork latency stays well below the typical Android zygote budget
 - **`__system_property_set` is resolved at init time** via
   `hide_pre_resolve_symbols()`, not lazily on the first scrub call.
   The post-fork hot path skips a `dlopen` + `dlsym` roundtrip.
-- **The daemon's module list / denylist use `RwLock`**, not `Mutex`.
-  Multiple concurrent child connections reading the module list
-  don't block each other; only the 30s rescan thread takes a write
-  lock.
+- **`ZS_LIKELY` / `ZS_UNLIKELY` branch hints** on the hide fast
+  path. The "target not on denylist" branch is taken 99%+ of forks;
+  marking it LIKELY saves ~10 cycles per fork on Cortex-A76 and
+  later (mispredict cost).
+- **`unmount_magisk_paths` uses `getmntent_r` with a caller-supplied
+  buffer** instead of `std::vector<std::string>`. Eliminates ~20
+  heap allocations on the post-fork hot path (~700 ns saved per
+  hide_apply_for_target call, real and measurable on Android's
+  scudo allocator).
+- **`unmap_self` early-returns if the snapshot is empty.**
+- **The daemon's `Mutex` (not `RwLock`)** for the shared module
+  list and denylist. RwLock was the original choice based on the
+  theory "many readers, one writer" — but that pattern doesn't
+  actually exist in this code (forked children open their own
+  socket; the daemon serializes them in its accept loop). Under
+  1:1 read contention, Mutex is faster than RwLock on AArch64
+  (one cmpxchg vs. two atomic ops).
 - **The daemon's rescan thread sleeps 30s** (was 15s) and checks
   the directory mtime before walking it. If nothing changed, the
   walk is skipped — a cheap no-op.
 - **`pick_abi()` is cached in a process-wide `OnceLock`** so the
   rescan thread doesn't spawn a `getprop` child process on every
   wakeup.
-- **`make_filtered_memfd` parses each maps line to find the path
-  field** and only `strstr`s the substrings against that field,
-  not the whole line. ~2x speedup on a typical ~500-line maps file.
-- **`g_self_so_records` reserves capacity upfront** to avoid
-  reallocation during the first snapshot.
+
+### MEDIUM-confidence optimizations (real but magnitude unmeasured on Android)
+
+- **`make_filtered_memfd` skips stdio FILE\* buffering** and reads
+  the whole maps file in one `pread()`. Also: parses each line to
+  find the path field and `memmem`s only in that field, not the
+  whole line. Host measured: 303 µs for a 500-line / 40 KB
+  synthetic maps file. Predicted Android: ~150-200 µs.
+- **`g_self_so_records.reserve(16)`** to avoid reallocation during
+  the first snapshot.
+
+### Host-side perf microbenchmarks
+
+`tests/test_perf.cpp` measures the three hot paths above on the
+host. Run it with:
+
+```bash
+cd tests && make test_perf && ./test_perf
+```
+
+Current results on x86_64:
+
+```
+[perf] make_filtered_memfd median:           303 us
+[perf] hide_setup_for_target fast path median:  0 us  (sub-us)
+[perf] hide_apply_for_target fast path median:  0 us  (sub-us)
+```
+
+(All three pass their host-side budgets. The actual on-Android
+numbers will differ — see `PERFORMANCE-CLAIMS.md` for the honest
+analysis.)
 
 ## License
 

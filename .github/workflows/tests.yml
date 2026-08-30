@@ -6,9 +6,9 @@
 #
 # What this workflow verifies:
 #
-#   - The three C++ test binaries (test_hide, test_hide_advanced,
-#     test_e2e_hide) build cleanly with g++ -Wall -Wextra and pass
-#     their assertions.
+#   - The five C++ test binaries (test_hide, test_hide_advanced,
+#     test_hide_stealth, test_e2e_hide, test_perf) build cleanly
+#     with g++ -Wall -Wextra and pass their assertions.
 #
 #   - The Rust daemon's #[cfg(test)] unit tests build and pass.
 #     (Skipped on the host because the daemon depends on getprop

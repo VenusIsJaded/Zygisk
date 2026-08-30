@@ -28,6 +28,7 @@
 
 #include "hide.h"
 #include "hide_advanced.h"
+#include "hide_stealth.h"
 #include "log.h"
 
 #include <dlfcn.h>
@@ -326,6 +327,8 @@ extern "C" pid_t zygisk_study_payload_fork_hook(void) {
 
         if (zygisk_study::hide_setup_for_target(pkg)) {
             zygisk_study::hide_apply_for_target(pkg);
+            zygisk_study::hide_advanced_apply_post_fork(pkg);
+            zygisk_study::hide_stealth_apply_post_fork(pkg);
         }
 
         // Dispatch into every loaded module's pre/post specialize.
@@ -364,6 +367,11 @@ void zygisk_study_payload_init() {
     // hooks so /proc/self/maps and /proc/self/mounts reads get
     // filtered versions).
     hide_advanced_init();
+
+    // Initialize the additional stealth layer (installs readlink/
+    // readlinkat hooks so /proc/self/exe reads return the stock
+    // app_process path).
+    hide_stealth_init();
 
     // Resolve the *real* fork libc symbol so we can call through to
     // it from our hook. We use dlsym(RTLD_NEXT, "fork") which
@@ -414,6 +422,9 @@ void zygisk_study_payload_post_fork(const char* package_name,
         // Apply the advanced hide layer AFTER the basic one — see
         // hide_advanced.cpp for the ordering rationale.
         hide_advanced_apply_post_fork(package_name);
+        // Apply the additional stealth layer AFTER the advanced one
+        // — see hide_stealth.cpp for the ordering rationale.
+        hide_stealth_apply_post_fork(package_name);
     }
 
     // Modules' post-specialize callbacks.

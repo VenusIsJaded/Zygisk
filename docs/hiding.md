@@ -12,7 +12,7 @@ reference.
 
 ## Two layers
 
-We split the hide work into two layers:
+We split the hide work into three layers:
 
 - **Basic layer** (`hide.cpp`) — the minimum set of techniques
   needed to defeat the "default" detection probe (the one most
@@ -25,9 +25,19 @@ We split the hide work into two layers:
   `/proc/self/{maps,mounts}*`, scrub file descriptors, reset
   signal handlers, clear environment variables.
 
-The advanced layer is applied **after** the basic layer in the
-post-fork pipeline (see `entry.cpp`'s `zygisk_study_payload_post_fork`
-function for the call order).
+- **Additional stealth layer** (`hide_stealth.cpp`) — defense-in-depth
+  measures that target signals the basic + advanced layers don't
+  address. Hook `readlink()`/`readlinkat()` to rewrite
+  `/proc/self/exe` to a stock-looking path; set
+  `prctl(PR_SET_PDEATHSIG, SIGKILL)` so the child dies if the
+  zygote parent dies; set `prctl(PR_SET_DUMPABLE, 0)` in the
+  child to refuse ptrace; set `prctl(PR_SET_NAME, "main")` so
+  `/proc/self/comm` reports a neutral name during the post-fork
+  window.
+
+The three layers are applied in this order in the post-fork pipeline
+(see `entry.cpp`'s `zygisk_study_payload_post_fork` function for the
+call order): basic → advanced → additional stealth.
 
 ## What "hide" means
 

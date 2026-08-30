@@ -21,7 +21,9 @@ target/
 # Test binaries (host-side unit tests)
 tests/test_hide
 tests/test_hide_advanced
+tests/test_hide_stealth
 tests/test_e2e_hide
+tests/test_perf
 tests/*.dSYM/
 tests/*.pdb
 
