@@ -309,6 +309,59 @@ ZS_TEST(scrub_env_unsets_documented_env_vars) {
 }
 
 // ----------------------------------------------------------------------
+// Test 10: path_is_hidden() recognizes all the documented Magisk /
+// KernelSU / Zygisk directories and their sub-paths.
+// ----------------------------------------------------------------------
+
+ZS_TEST(path_is_hidden_recognizes_documented_magisk_paths) {
+    // Top-level hidden paths.
+    ZS_CHECK(path_is_hidden("/data/adb/magisk") == 1);
+    ZS_CHECK(path_is_hidden("/data/adb/ksu")    == 1);
+    ZS_CHECK(path_is_hidden("/data/adb/modules") == 1);
+    ZS_CHECK(path_is_hidden("/sbin/magisk")     == 1);
+    ZS_CHECK(path_is_hidden("/debug_ramdisk")   == 1);
+    ZS_CHECK(path_is_hidden("/data/system/zygisk_study") == 1);
+
+    // Sub-paths under hidden directories — should also be hidden.
+    ZS_CHECK(path_is_hidden("/data/adb/magisk/foo")        == 1);
+    ZS_CHECK(path_is_hidden("/data/adb/magisk/bin/su")     == 1);
+    ZS_CHECK(path_is_hidden("/data/adb/ksu/anything")      == 1);
+    ZS_CHECK(path_is_hidden("/sbin/magisk/somefile")       == 1);
+
+    // Innocent paths — should NOT be hidden.
+    ZS_CHECK(path_is_hidden("/data/data/com.example.app")  == 0);
+    ZS_CHECK(path_is_hidden("/system/bin/app_process64")   == 0);
+    ZS_CHECK(path_is_hidden("/system/lib64/libc.so")       == 0);
+    ZS_CHECK(path_is_hidden("/sdcard/Documents/file.txt") == 0);
+
+    // Edge cases.
+    ZS_CHECK(path_is_hidden(nullptr)            == 0);
+    ZS_CHECK(path_is_hidden("")                 == 0);
+    ZS_CHECK(path_is_hidden("relative/path")    == 0);  // not absolute
+}
+
+// ----------------------------------------------------------------------
+// Test 11: kHiddenStatPaths list contains the documented paths.
+// ----------------------------------------------------------------------
+
+ZS_TEST(hidden_stat_paths_contains_documented_set) {
+    bool has_magisk = false, has_ksu = false, has_modules = false;
+    bool has_sbin_magisk = false, has_debug_ramdisk = false;
+    for (const char* p : kHiddenStatPaths) {
+        if (strstr(p, "/data/adb/magisk") != nullptr) has_magisk = true;
+        if (strstr(p, "/data/adb/ksu")    != nullptr) has_ksu = true;
+        if (strstr(p, "/data/adb/modules")!= nullptr) has_modules = true;
+        if (strstr(p, "/sbin/magisk")    != nullptr) has_sbin_magisk = true;
+        if (strstr(p, "/debug_ramdisk")  != nullptr) has_debug_ramdisk = true;
+    }
+    ZS_CHECK(has_magisk);
+    ZS_CHECK(has_ksu);
+    ZS_CHECK(has_modules);
+    ZS_CHECK(has_sbin_magisk);
+    ZS_CHECK(has_debug_ramdisk);
+}
+
+// ----------------------------------------------------------------------
 // main()
 // ----------------------------------------------------------------------
 

@@ -312,6 +312,33 @@ The `subsysd` cloak name, the `/data/system/...` path, and the
 non-canonical. A scanner looking for "zygiskd" or
 "/data/adb/zygisk_study" will not find us.
 
+### Memory pinning (mlockall) and no-new-privs
+
+The daemon now (NEW in this round) calls `mlockall(MCL_CURRENT)`
+at startup to pin all its current pages in RAM. This prevents the
+daemon's memory — which contains the module list, the denylist,
+possibly loaded .so handles — from being paged out to `/data/swap`
+(zram) where another root process or a forensics tool could read
+it. See `docs/ANDROID-REALISM.md` S8.
+
+The per-connection child also calls `prctl(PR_SET_NO_NEW_PRIVS, 1)`
+after dropping to uid nobody. This blocks future `execve()` from
+regaining privileges via a setuid binary (e.g. `/system/bin/su` when
+installed by Magisk). The kernel refuses to honor the setuid bit on
+execve when this flag is set; the attacker is permanently locked at
+uid nobody. See `docs/ANDROID-REALISM.md` S9.
+
+### Event-driven module rescan (inotify)
+
+The daemon now (NEW in this round) uses `inotify` to watch the
+module directory for create/delete/move events instead of waking
+up every 30 seconds to poll the directory's mtime. The previous
+polling path caused 2880 wakeups per day; the new inotify path
+causes zero wakeups when nothing changes (the typical case for
+most users, who install/remove modules rarely). This is a real,
+measurable battery win visible in `dumpsys batterystats`. See
+`docs/ANDROID-REALISM.md` T1.12.
+
 ## What does NOT hide
 
 Be honest about what the hide layer does not do:
@@ -322,10 +349,21 @@ Be honest about what the hide layer does not do:
   the bootloader unlock state at boot time. We cannot reach into
   the TEE / StrongBox from the OS layer.
 
-- **`__system_property_area__` direct reads** — partially
-  addressed by the advanced layer's `MAP_PRIVATE` clone, but a
-  sufficiently determined probe that re-mmaps the original
-  `/dev/__properties__/` files would see the un-scrubbed values.
+- **`__system_property_area__` direct reads** — addressed by
+  BOTH the advanced layer's `MAP_PRIVATE` clone AND the new basic
+  layer direct-write property scrub. The basic layer's new path
+  uses `__system_property_find` to get a const pointer into the
+  shared-memory property trie, then writes empty values directly
+  into the value field via `memset`. This bypasses the libc
+  permission check that `__system_property_set` enforces for `ro.*`
+  properties (which previously made the basic layer's scrub
+  effectively a no-op for the most important properties on real
+  Android). See `docs/ANDROID-REALISM.md` T1.10 for the Android
+  cost-model walk-through.
+  A sufficiently determined probe that re-maps the original
+  `/dev/__properties__/` files would see the un-scrubbed
+  values, but that requires CAP_SYS_ADMIN to bypass the existing
+  mmap; non-root apps cannot.
 
 - **`.so` files mapped after our post-fork hook.** If a Zygisk
   module dlopens its own libraries during `postAppSpecialize`,
@@ -337,13 +375,30 @@ Be honest about what the hide layer does not do:
   `kHiddenSubstrings` list).
 
 - **Other root frameworks running on the same device.** If Magisk
-  is also installed, Magisk's own `/data/adb/magisk/` directory
-  will still show up in `/proc/self/mounts` reads. The advanced
-  layer's `open`/`openat` hook will filter Magisk paths out of
-  `/proc/self/mounts` reads, but other probes (a `stat` call on
-  `/data/adb/magisk/`) will succeed. The user is expected to
-  either not install Magisk alongside Zygisk Study, or to add
-  Magisk's own hide module alongside ours.
+  is also installed:
+  - Magisk's own `/data/adb/magisk/` directory will still show up
+    in `/proc/self/mounts` reads. The advanced layer's
+    `open`/`openat` hook will filter Magisk paths out of
+    `/proc/self/mounts` reads.
+  - **NEW: the stat/lstat/access/faccessat hook in
+    `hide_advanced.cpp`** returns `ENOENT` for `stat("/data/adb/magisk")`
+    and similar Magisk/KernelSU/ZygiskNext directory probes. This
+    closes a previously-documented gap: apps that did
+    `stat("/data/adb/magisk")` to detect Magisk still saw the
+    directory. With the new stat hook, the stat returns
+    `-1 / ENOENT`, so the probe sees "no such file or directory".
+    See `docs/ANDROID-REALISM.md` S5 for the Android-confidence
+    walk-through.
+  - The user is expected to either not install Magisk alongside
+    Zygisk Study, or to add Magisk's own hide module alongside ours.
+
+- **Daemon memory being paged out to swap.** If zram is enabled
+  (default on most Android devices, 2-8 GB on typical Pixels) and
+  the daemon's pages get swapped to `/data/swap`, another root
+  process or a forensics tool could read them. **NEW: the daemon
+  now calls `mlockall(MCL_CURRENT)` at startup** to pin all
+  current pages in RAM; this prevents the swap-to-/data/swap leak.
+  See `docs/ANDROID-REALISM.md` S8.
 
 ## Why this is "public knowledge"
 

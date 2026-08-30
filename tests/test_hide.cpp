@@ -302,6 +302,107 @@ ZS_TEST(unmount_magisk_paths_parser_recognizes_data_adb_and_sbin) {
 }
 
 // ----------------------------------------------------------------------
+// Test 12: scrub_prop_in_memory() correctly zeros the value field
+// of a fake prop_info struct, simulating what bionic's trie entry
+// looks like in shared memory.
+//
+// We construct a 128-byte struct on the heap with:
+//   offset 0:  uint32_t serial = 2 (no pending bit)
+//   offset 4:  char value[92] = "some_secret_value"
+//   offset 96: char name[32]  = "ro.boot.test"
+// We call scrub_prop_in_memory on it and verify:
+//   - The serial field is unchanged.
+//   - The value field is all zeros.
+//   - The name field is unchanged.
+//
+// This exercises the in-memory write path that will run on real
+// Android to scrub ro.* properties (which __system_property_set
+// silently fails on with EACCES).
+// ----------------------------------------------------------------------
+
+ZS_TEST(scrub_prop_in_memory_zeros_value_field_correctly) {
+    // Allocate a 128-byte struct, page-aligned, so we can simulate
+    // the shared-memory property trie entry. (On real Android, the
+    // struct lives in a MAP_SHARED mmap of /dev/__properties__/u:...)
+    constexpr size_t kStructSize = 128;
+    void* raw = mmap(nullptr, kStructSize, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ZS_CHECK(raw != MAP_FAILED);
+    memset(raw, 0, kStructSize);
+
+    // Layout the fields per the bionic prop_info ABI.
+    uint32_t* serial  = reinterpret_cast<uint32_t*>(raw);
+    char*     value   = reinterpret_cast<char*>(raw) + 4;
+    char*     name    = reinterpret_cast<char*>(raw) + 96;
+
+    *serial = 2;  // serial count = 1, no pending bit (bit 0 = 0)
+    strcpy(value, "some_secret_value");
+    strcpy(name,  "ro.boot.test");
+
+    // Sanity: the value is non-empty before scrub.
+    ZS_CHECK_EQ(strcmp(value, "some_secret_value"), 0);
+
+    // Call the function under test.
+    scrub_prop_in_memory(raw);
+
+    // After scrub: serial unchanged (we don't bump it for ro.* props
+    // — see the comment in the function body for why this is safe).
+    ZS_CHECK_EQ(*serial, 2u);
+
+    // After scrub: value field is all zeros.
+    for (size_t i = 0; i < 92; ++i) {
+        if (value[i] != 0) {
+            throw ::zstest::CheckFailed{
+                std::string(__FILE__) + ":" + std::to_string(__LINE__) +
+                "  value[" + std::to_string(i) + "] is non-zero after scrub"};
+        }
+    }
+
+    // After scrub: name field is unchanged.
+    ZS_CHECK_EQ(strcmp(name, "ro.boot.test"), 0);
+
+    munmap(raw, kStructSize);
+}
+
+// ----------------------------------------------------------------------
+// Test 13: scrub_prop_in_memory() is a no-op when the pending bit
+// is set (i.e. another writer is mid-write). This is the safety
+// rail against racing with init's property_service.
+// ----------------------------------------------------------------------
+
+ZS_TEST(scrub_prop_in_memory_skips_when_pending_bit_set) {
+    constexpr size_t kStructSize = 128;
+    void* raw = mmap(nullptr, kStructSize, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ZS_CHECK(raw != MAP_FAILED);
+    memset(raw, 0, kStructSize);
+
+    uint32_t* serial = reinterpret_cast<uint32_t*>(raw);
+    char*     value  = reinterpret_cast<char*>(raw) + 4;
+
+    // Set the pending bit (bit 0) — simulate a concurrent writer.
+    *serial = 0x1;  // pending bit set, serial count = 0
+    strcpy(value, "ORIGINAL");
+
+    scrub_prop_in_memory(raw);
+
+    // Function should have skipped the write — value unchanged.
+    ZS_CHECK_EQ(strcmp(value, "ORIGINAL"), 0);
+
+    munmap(raw, kStructSize);
+}
+
+// ----------------------------------------------------------------------
+// Test 14: scrub_prop_in_memory() handles nullptr safely.
+// ----------------------------------------------------------------------
+
+ZS_TEST(scrub_prop_in_memory_handles_null_safely) {
+    // Should not crash.
+    scrub_prop_in_memory(nullptr);
+    ZS_CHECK(true);  // reached here = pass
+}
+
+// ----------------------------------------------------------------------
 // main(): run all tests.
 // ----------------------------------------------------------------------
 

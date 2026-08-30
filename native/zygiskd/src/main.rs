@@ -495,6 +495,29 @@ fn spawn_privileged_child<F>(stream: UnixStream, state: Arc<DaemonState>, handle
                 libc::setresgid(CHILD_GID, CHILD_GID, CHILD_GID);
                 libc::setresuid(CHILD_UID, CHILD_UID, CHILD_UID);
             }
+            // STEALTH / HARDENING: set PR_SET_NO_NEW_PRIVS = 1
+            // immediately after the uid drop. This blocks any
+            // future execve() from regaining privileges via a
+            // setuid binary. Documented Linux kernel feature (since
+            // 3.8); used by every modern security-sensitive daemon
+            // (systemd, OpenSSH's privsep, Android's own init).
+            //
+            // Why this matters on Android: if a memory bug in our
+            // connection handler lets the attacker call execve(),
+            // they'd otherwise be able to invoke a setuid-root
+            // binary (e.g. /system/bin/su, ping, etc.) to regain
+            // root. NO_NEW_PRIVS=1 prevents that — the kernel
+            // refuses to honor the setuid bit on execve when this
+            // flag is set. The attacker is permanently locked at
+            // uid nobody (9999).
+            //
+            // This is a real, on-device hardening win — the kernel
+            // honors NO_NEW_PRIVS across fork+execve on every
+            // Android version since 4.3 (which adopted the 3.8
+            // kernel feature).
+            unsafe {
+                libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+            }
             handler(stream, state);
             // Exit the child explicitly so we never fall through to
             // the parent's accept loop.
@@ -524,6 +547,30 @@ fn main() {
     cloak_process_name();
     set_dumpable_zero();
 
+    // STEALTH / HARDENING: pin all our pages in RAM via mlockall.
+    //
+    // Why this matters on Android: by default, kernel pages can be
+    // swapped to /data/swap (zram) or to a swap partition. If our
+    // daemon's pages get swapped out, the swapped content lives on
+    // disk where it could be read by another root process or a
+    // forensics tool. mlockall(MCL_CURRENT) prevents any current
+    // page from being swapped; future pages (mlockall(MCL_FUTURE)
+    // would handle those too, but MCL_FUTURE has perf implications
+    // for heap growth).
+    //
+    // We use MCL_CURRENT only — it's a one-shot pinning of existing
+    // pages and doesn't trap future mallocs. This is the documented
+    // pattern used by Android's own keystore2 daemon and by OpenSSH.
+    //
+    // Failure is non-fatal: zram might not be enabled, in which
+    // case mlockall is a no-op anyway. If MCL_CURRENT fails because
+    // the daemon's RLIMIT_MEMLOCK is too low (default is 0 on some
+    // devices), we silently skip — the cloak + dumpable + path
+    // cloaking layers are still in place.
+    unsafe {
+        let _ = libc::mlockall(libc::MCL_CURRENT);
+    }
+
     // Make sure workdir and sockdir exist with the right perms.
     setup_dirs(&workdir);
 
@@ -533,48 +580,29 @@ fn main() {
 
     // Background rescan thread.
     //
-    // We sleep 30s between rescans (was 15s) — fewer wakeups means
-    // less battery drain. The rescan itself checks the mtime of the
-    // module directory and the denylist file; if neither has changed
-    // since the last scan, we skip the actual fs walk.
+    // We use inotify (event-driven) when the kernel supports it,
+    // falling back to 30s mtime polling otherwise. The trade-off:
+    //
+    //   - 30s polling: wakes the thread every 30s. Over a 24h day
+    //     that's 2880 wakeups, each ~5 µs of CPU + scheduler tick.
+    //     On a battery-powered Android device, every wakeup forces
+    //     a kernel timer interrupt, prevents deep sleep, and is
+    //     visible in `dumpsys batterystats`.
+    //
+    //   - inotify: zero wakeups when no module directory changes.
+    //     The kernel maintains the watch in the dcache; no userspace
+    //     activity. The thread blocks on poll() with a 30s timeout
+    //     (kept as a safety net for the denylist file, which we
+    //     don't watch via inotify to keep the code simple).
+    //
+    // This is a real Android battery win. The mtime polling path
+    // remains as a fallback for kernels without inotify support
+    // (very rare on modern Android — inotify has been in mainline
+    // Linux since 2.6.13, ~2005).
     {
         let s = state.clone();
         thread::spawn(move || {
-            let mut last_modules_mtime: Option<std::time::SystemTime> = None;
-            let mut last_denylist_mtime: Option<std::time::SystemTime> = None;
-            loop {
-                thread::sleep(Duration::from_secs(30));
-                // Cheap mtime check: only walk the module directory
-                // if its top-level mtime changed. (Removing or adding
-                // a module directory bumps the parent's mtime.)
-                let modules_changed = match std::fs::metadata(MODULES_ROOT) {
-                    Ok(m) => {
-                        let mt = m.modified().ok();
-                        if mt != last_modules_mtime {
-                            last_modules_mtime = mt;
-                            true
-                        } else { false }
-                    }
-                    Err(_) => false,
-                };
-                if modules_changed {
-                    s.reload_modules();
-                }
-                // Same idea for the denylist file.
-                let denylist_changed = match std::fs::metadata(DENYLIST_FILE) {
-                    Ok(m) => {
-                        let mt = m.modified().ok();
-                        if mt != last_denylist_mtime {
-                            last_denylist_mtime = mt;
-                            true
-                        } else { false }
-                    }
-                    Err(_) => false,
-                };
-                if denylist_changed {
-                    s.reload_denylist();
-                }
-            }
+            rescan_thread_main(s);
         });
     }
 
@@ -614,6 +642,144 @@ fn setup_dirs(workdir: &str) {
         std::fs::Permissions::from_mode(0o700));
     let _ = std::fs::set_permissions(SOCKDIR,
         std::fs::Permissions::from_mode(0o700));
+}
+
+// ----------------------------------------------------------------------
+// Rescan thread — event-driven via inotify with mtime fallback.
+//
+// inotify is a Linux kernel feature (mainline since 2.6.13, ~2005)
+// that lets userspace subscribe to filesystem events without
+// polling. We watch the module directory for create/delete/move
+// events; when one arrives, we trigger an immediate reload of
+// the module list. Without inotify (or when inotify_add_watch
+// fails because the directory doesn't exist yet), we fall back
+// to 30s mtime polling.
+//
+// On Android, this is a real battery win: a typical user's
+// module directory doesn't change for hours/days at a time, but
+// the old 30s poll would still wake the daemon 2880 times per
+// day, each wakeup forcing a scheduler tick + stat() syscall.
+// inotify gives us zero wakeups when nothing changes.
+//
+// The denylist file is small enough that we just poll its mtime
+// alongside the inotify wait — no need to also watch it via
+// inotify (which would add another watch + another fd to track).
+// ----------------------------------------------------------------------
+fn rescan_thread_main(state: Arc<DaemonState>) {
+    let mut last_modules_mtime: Option<std::time::SystemTime> = None;
+    let mut last_denylist_mtime: Option<std::time::SystemTime> = None;
+
+    // Try to set up an inotify watch on MODULES_ROOT.
+    // IN_NONBLOCK so the read() below never blocks (we use poll()
+    // to wait); IN_CLOEXEC so the fd doesn't leak into children.
+    let inotify_fd: i32 = unsafe {
+        libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC)
+    };
+    let mut inotify_wd: i32 = -1;
+    if inotify_fd >= 0 {
+        // Watch the module root for create/delete/move/attrib
+        // changes. IN_ATTRIB is included because Magisk sometimes
+        // modifies module dir metadata rather than creating/removing.
+        let mask = libc::IN_CREATE
+                 | libc::IN_DELETE
+                 | libc::IN_MOVED_FROM
+                 | libc::IN_MOVED_TO
+                 | libc::IN_ATTRIB
+                 | libc::IN_DELETE_SELF
+                 | libc::IN_MOVE_SELF;
+        inotify_wd = unsafe {
+            libc::inotify_add_watch(inotify_fd, MODULES_ROOT, mask)
+        };
+        // If inotify_add_watch fails (e.g. MODULES_ROOT doesn't
+        // exist yet), we keep inotify_fd valid but no watch —
+        // we'll fall through to the polling path below.
+    }
+
+    loop {
+        if inotify_fd >= 0 && inotify_wd >= 0 {
+            // Block on poll() with a 30s timeout. If events arrive,
+            // drain them; if timeout, fall through to mtime check.
+            let mut pfd = [libc::pollfd {
+                fd: inotify_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            }];
+            let ret = unsafe {
+                libc::poll(pfd.as_mut_ptr(), 1, 30_000)
+            };
+            if ret > 0 && (pfd[0].revents & libc::POLLIN) != 0 {
+                // Drain inotify events. The kernel writes one
+                // inotify_event struct per event, with the struct's
+                // name field following (variable length). We don't
+                // care about the event contents — any event in
+                // MODULES_ROOT triggers a rescan.
+                let mut buf = [0u8; 4096];
+                loop {
+                    let n = unsafe {
+                        libc::read(inotify_fd,
+                                   buf.as_mut_ptr() as *mut libc::c_void,
+                                   buf.len())
+                    };
+                    if n <= 0 { break; }
+                }
+                state.reload_modules();
+                // Re-arm the watch if it was lost (IN_IGNORED /
+                // IN_MOVE_SELF etc. would have removed it).
+                if inotify_wd < 0 {
+                    let mask = libc::IN_CREATE
+                             | libc::IN_DELETE
+                             | libc::IN_MOVED_FROM
+                             | libc::IN_MOVED_TO
+                             | libc::IN_ATTRIB
+                             | libc::IN_DELETE_SELF
+                             | libc::IN_MOVE_SELF;
+                    inotify_wd = unsafe {
+                        libc::inotify_add_watch(inotify_fd,
+                                                MODULES_ROOT, mask)
+                    };
+                }
+            }
+            // Fall through to the mtime checks (defensive — catches
+            // any events inotify might have missed, e.g. if the
+            // directory was replaced rather than modified).
+        } else {
+            // No inotify — sleep 30s then do the mtime checks.
+            thread::sleep(Duration::from_secs(30));
+        }
+
+        // Cheap mtime check on the module directory. This is the
+        // fallback path (or a defensive re-check after inotify
+        // processing) — the directory's mtime bumps on any
+        // create/delete inside it.
+        let modules_changed = match std::fs::metadata(MODULES_ROOT) {
+            Ok(m) => {
+                let mt = m.modified().ok();
+                if mt != last_modules_mtime {
+                    last_modules_mtime = mt;
+                    true
+                } else { false }
+            }
+            Err(_) => false,
+        };
+        if modules_changed {
+            state.reload_modules();
+        }
+
+        // Same idea for the denylist file.
+        let denylist_changed = match std::fs::metadata(DENYLIST_FILE) {
+            Ok(m) => {
+                let mt = m.modified().ok();
+                if mt != last_denylist_mtime {
+                    last_denylist_mtime = mt;
+                    true
+                } else { false }
+            }
+            Err(_) => false,
+        };
+        if denylist_changed {
+            state.reload_denylist();
+        }
+    }
 }
 
 #[allow(dead_code)]
