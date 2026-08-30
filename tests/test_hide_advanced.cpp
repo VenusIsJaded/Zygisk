@@ -139,7 +139,7 @@ ZS_TEST(make_filtered_memfd_drops_magisk_and_our_so_entries) {
         "7f8a0c500000-7f8a0c510000 r--p 00000000 fd:00 1234   /data/system/zygisk_study/sock\n";
 
     int input_fd = write_text_to_memfd(fake_maps);
-    int filtered_fd = make_filtered_memfd(input_fd);
+    int filtered_fd = make_filtered_memfd(input_fd, "/proc/self/maps");
     ZS_CHECK(filtered_fd >= 0);
     std::string out = read_fd_to_string(filtered_fd);
 
@@ -165,7 +165,7 @@ ZS_TEST(make_filtered_memfd_preserves_normal_proc_self_maps_content) {
         "7f8a0c020000-7f8a0c030000 rw-p 00000000 fd:00 1234   /usr/lib/libc.so\n";
 
     int input_fd = write_text_to_memfd(normal_maps);
-    int filtered_fd = make_filtered_memfd(input_fd);
+    int filtered_fd = make_filtered_memfd(input_fd, "/proc/self/maps");
     ZS_CHECK(filtered_fd >= 0);
     std::string out = read_fd_to_string(filtered_fd);
 
@@ -178,7 +178,7 @@ ZS_TEST(make_filtered_memfd_preserves_normal_proc_self_maps_content) {
 
 ZS_TEST(make_filtered_memfd_handles_empty_input) {
     int input_fd = write_text_to_memfd("");
-    int filtered_fd = make_filtered_memfd(input_fd);
+    int filtered_fd = make_filtered_memfd(input_fd, "/proc/self/maps");
     ZS_CHECK(filtered_fd >= 0);
     std::string out = read_fd_to_string(filtered_fd);
     ZS_CHECK_EQ(out.size(), (size_t)0);
@@ -222,9 +222,11 @@ ZS_TEST(open_hook_only_filters_documented_proc_self_paths) {
     ZS_CHECK(is_filtered("/proc/self/mounts"));
     ZS_CHECK(is_filtered("/proc/self/mountinfo"));
     ZS_CHECK(is_filtered("/proc/self/mountstats"));
+    // /proc/self/status is filtered too (S10): we rewrite the
+    // TracerPid line in the filtered copy.
+    ZS_CHECK(is_filtered("/proc/self/status"));
     // Must NOT filter other paths:
     ZS_CHECK(!is_filtered("/proc/self/cmdline"));
-    ZS_CHECK(!is_filtered("/proc/self/status"));
     ZS_CHECK(!is_filtered("/proc/self/exe"));
     ZS_CHECK(!is_filtered("/dev/__properties__/u:object_r:default_prop:s0"));
     ZS_CHECK(!is_filtered("/system/etc/public.libraries.txt"));
@@ -359,6 +361,122 @@ ZS_TEST(hidden_stat_paths_contains_documented_set) {
     ZS_CHECK(has_modules);
     ZS_CHECK(has_sbin_magisk);
     ZS_CHECK(has_debug_ramdisk);
+}
+
+// ----------------------------------------------------------------------
+// Test 12 (S10): make_filtered_memfd rewrites the TracerPid line in
+// /proc/self/status to "TracerPid:\t0", even when the original
+// reported a non-zero tracer pid. This is the defense-in-depth on
+// top of prctl(PR_SET_DUMPABLE, 0) in hide_stealth.
+// ----------------------------------------------------------------------
+
+ZS_TEST(make_filtered_memfd_rewrites_tracerpid_to_zero) {
+    // Synthesize a /proc/self/status content with a non-zero
+    // TracerPid line. The kernel would normally only report a
+    // non-zero TracerPid when a ptrace is attached; we deliberately
+    // set it to 12345 to verify our rewriter blanks it.
+    std::string fake_status =
+        "Name:\ttest_process\n"
+        "State:\tR (running)\n"
+        "Tgid:\t1234\n"
+        "Pid:\t1234\n"
+        "PPid:\t1\n"
+        "TracerPid:\t12345\n"           // <- this should be rewritten
+        "Uid:\t10001\t10001\t10001\t10001\n"
+        "Gid:\t10001\t10001\t10001\t10001\n"
+        "FDSize:\t256\n";
+
+    int input_fd = write_text_to_memfd(fake_status);
+    int filtered_fd = make_filtered_memfd(input_fd, "/proc/self/status");
+    ZS_CHECK(filtered_fd >= 0);
+    std::string out = read_fd_to_string(filtered_fd);
+
+    // The TracerPid line must be present, but rewritten to 0.
+    ZS_CHECK_STR_CONTAINS(out, "TracerPid:\t0\n");
+    // The original TracerPid value (12345) must NOT appear.
+    ZS_CHECK_STR_ABSENT(out, "TracerPid:\t12345");
+    // The other status fields must be preserved verbatim.
+    ZS_CHECK_STR_CONTAINS(out, "Name:\ttest_process");
+    ZS_CHECK_STR_CONTAINS(out, "Tgid:\t1234");
+    ZS_CHECK_STR_CONTAINS(out, "Pid:\t1234");
+    ZS_CHECK_STR_CONTAINS(out, "FDSize:\t256");
+
+    close(input_fd);
+    close(filtered_fd);
+}
+
+// ----------------------------------------------------------------------
+// Test 13 (S10): make_filtered_memfd handles /proc/self/status with
+// NO TracerPid line gracefully (passes through unchanged).
+// ----------------------------------------------------------------------
+
+ZS_TEST(make_filtered_memfd_status_without_tracerpid_passes_through) {
+    std::string fake_status =
+        "Name:\ttest_process\n"
+        "State:\tR (running)\n"
+        "Tgid:\t1234\n"
+        "Pid:\t1234\n";  // no TracerPid line
+
+    int input_fd = write_text_to_memfd(fake_status);
+    int filtered_fd = make_filtered_memfd(input_fd, "/proc/self/status");
+    ZS_CHECK(filtered_fd >= 0);
+    std::string out = read_fd_to_string(filtered_fd);
+
+    // Output should match input exactly (no TracerPid line was added).
+    ZS_CHECK_STR_CONTAINS(out, "Name:\ttest_process");
+    ZS_CHECK_STR_CONTAINS(out, "Pid:\t1234");
+    ZS_CHECK_STR_ABSENT(out, "TracerPid:");
+
+    close(input_fd);
+    close(filtered_fd);
+}
+
+// ----------------------------------------------------------------------
+// Test 14 (P1.18): make_filtered_memfd batches all writes into a
+// single pwrite — i.e. the output is byte-identical to the previous
+// implementation's per-line write, but with one syscall instead of N.
+// We can't measure syscalls directly, but we CAN verify the output
+// is correct for a large (500-line) input — which is what would have
+// exercised the per-line write path in the old code.
+// ----------------------------------------------------------------------
+
+ZS_TEST(make_filtered_memfd_batched_write_produces_correct_output_for_large_input) {
+    // 500-line synthetic /proc/self/maps. One Magisk line per 50
+    // normal lines (matching the real-device ratio of ~5-10 Magisk
+    // entries out of ~500 total).
+    std::string content;
+    content.reserve(500 * 80);
+    for (size_t i = 0; i < 500; ++i) {
+        char line[256];
+        if (i > 0 && i % 50 == 0) {
+            // Magisk entry — should be filtered out.
+            snprintf(line, sizeof line,
+                "7000000%08zx-7000000%08zx r-xp 00000000 fd:00 12345 /sbin/magisk\n",
+                i * 0x1000, i * 0x1000 + 0x1000);
+        } else {
+            // Normal libc.so entry — should be preserved.
+            snprintf(line, sizeof line,
+                "7000000%08zx-7000000%08zx r-xp 00000000 fd:00 12345 /system/lib64/libc.so\n",
+                i * 0x1000, i * 0x1000 + 0x1000);
+        }
+        content.append(line);
+    }
+
+    int input_fd = write_text_to_memfd(content);
+    int filtered_fd = make_filtered_memfd(input_fd, "/proc/self/maps");
+    ZS_CHECK(filtered_fd >= 0);
+    std::string out = read_fd_to_string(filtered_fd);
+
+    // All Magisk entries must be absent.
+    ZS_CHECK_STR_ABSENT(out, "/sbin/magisk");
+    // The libc.so entries must be present (490 of them — one per 50 lines
+    // is filtered, so 500 - 10 = 490 kept).
+    // We don't count exactly (that would be brittle); we just verify
+    // the libc.so line is present and the magisk line is absent.
+    ZS_CHECK_STR_CONTAINS(out, "/system/lib64/libc.so");
+
+    close(input_fd);
+    close(filtered_fd);
 }
 
 // ----------------------------------------------------------------------

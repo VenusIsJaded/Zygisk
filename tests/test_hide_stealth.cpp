@@ -178,6 +178,71 @@ ZS_TEST(hide_stealth_init_is_idempotent) {
 }
 
 // ----------------------------------------------------------------------
+// Test 9 (S12): path_is_proc_exe() recognizes the documented
+// /proc/<pid>/exe variants.
+// ----------------------------------------------------------------------
+
+ZS_TEST(path_is_proc_exe_recognizes_documented_variants) {
+    // Self variant — most common in app probes.
+    ZS_CHECK_EQ(path_is_proc_exe("/proc/self/exe"),  1);
+    // Numeric PID variants — apps that prefer the by-PID form.
+    ZS_CHECK_EQ(path_is_proc_exe("/proc/0/exe"),     1);
+    ZS_CHECK_EQ(path_is_proc_exe("/proc/1/exe"),     1);
+    ZS_CHECK_EQ(path_is_proc_exe("/proc/1234/exe"),  1);
+    ZS_CHECK_EQ(path_is_proc_exe("/proc/99999/exe"), 1);
+
+    // Negative cases — must NOT match.
+    ZS_CHECK_EQ(path_is_proc_exe("/proc/self/maps"),  0);  // wrong suffix
+    ZS_CHECK_EQ(path_is_proc_exe("/proc/self/cwd"),   0);  // wrong suffix
+    ZS_CHECK_EQ(path_is_proc_exe("/proc/self/exe2"),  0);  // suffix has trailing char
+    ZS_CHECK_EQ(path_is_proc_exe("/proc/self/executable"), 0);
+    ZS_CHECK_EQ(path_is_proc_exe("/proc/self"),       0);  // no /exe suffix
+    ZS_CHECK_EQ(path_is_proc_exe("/proc/"),           0);  // no PID
+    ZS_CHECK_EQ(path_is_proc_exe("/data/adb/magisk"), 0);  // not a proc path
+    ZS_CHECK_EQ(path_is_proc_exe("/system/bin/app_process64"), 0);
+    ZS_CHECK_EQ(path_is_proc_exe(nullptr),            0);
+    ZS_CHECK_EQ(path_is_proc_exe(""),                 0);
+    ZS_CHECK_EQ(path_is_proc_exe("self/exe"),         0);  // relative
+    ZS_CHECK_EQ(path_is_proc_exe("/proc/abc/exe"),    0);  // non-numeric middle
+}
+
+// ----------------------------------------------------------------------
+// Test 10 (S16): disable_core_dumps() actually zeroes RLIMIT_CORE.
+// We can verify this on the host because RLIMIT_CORE is a standard
+// Linux rlimit, honored by the host kernel just like Android's.
+// ----------------------------------------------------------------------
+
+ZS_TEST(disable_core_dumps_zeros_rlimit_core) {
+    // Save the current rlimit so we can restore it after the test.
+    struct rlimit saved;
+    ZS_CHECK_EQ(getrlimit(RLIMIT_CORE, &saved), 0);
+
+    // Set a non-zero rlimit so the test is meaningful.
+    struct rlimit nonzero{};
+    nonzero.rlim_cur = RLIM_SAVED_MAX;  // typically huge but non-zero
+    nonzero.rlim_max = RLIM_SAVED_MAX;
+    if (setrlimit(RLIMIT_CORE, &nonzero) == 0) {
+        struct rlimit before;
+        getrlimit(RLIMIT_CORE, &before);
+        // Before: should be non-zero (or RLIM_SAVED_MAX).
+        ZS_CHECK(before.rlim_cur != 0 || before.rlim_max != 0);
+    }
+
+    // Call our function.
+    disable_core_dumps();
+
+    // Verify: both cur and max should now be 0.
+    struct rlimit after;
+    ZS_CHECK_EQ(getrlimit(RLIMIT_CORE, &after), 0);
+    ZS_CHECK_EQ(after.rlim_cur, (rlim_t)0);
+    ZS_CHECK_EQ(after.rlim_max, (rlim_t)0);
+
+    // Restore the original rlimit so we don't perturb the test
+    // process for any later tests.
+    (void)setrlimit(RLIMIT_CORE, &saved);
+}
+
+// ----------------------------------------------------------------------
 // main()
 // ----------------------------------------------------------------------
 

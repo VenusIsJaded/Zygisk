@@ -39,6 +39,7 @@
 #include <sys/auxv.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
@@ -70,6 +71,18 @@ namespace zygisk_study {
 //
 // We only rewrite if the original resolved path contains one of
 // our kHiddenSubstrings; otherwise we pass through unchanged.
+//
+// STEALTH EXTENSION (S12): the previous implementation only matched
+// the literal path "/proc/self/exe". Apps can also probe via:
+//   - readlink("/proc/<own_pid>/exe")  — the same symlink, by PID
+//   - readlinkat(AT_FDCWD, "/proc/<pid>/exe", ...)
+//   - readlinkat(dirfd_to_proc, "self/exe", ...)
+// All of these resolve to the same kernel symlink. We broaden the
+// matcher to recognize any path that:
+//   1. Starts with "/proc/"
+//   2. Has a numeric or "self" middle component
+//   3. Ends with "/exe"
+// This catches all the variants with one cheap pattern check.
 
 using ReadlinkFn   = ssize_t (*)(const char*, char*, size_t);
 using ReadlinkAtFn = ssize_t (*)(int, const char*, char*, size_t);
@@ -82,14 +95,6 @@ extern "C" ssize_t zygisk_study_hook_readlinkat(int dirfd,
                                                 const char* path,
                                                 char* buf, size_t bufsiz);
 
-// The set of paths we rewrite to a stock-looking value. If the
-// real readlink returns a path that contains any of these, we
-// overwrite the buffer with the stock path.
-static constexpr const char* kRewriteToStock[] = {
-    "/proc/self/exe",
-    "/proc/%/exe",  // not actually used; placeholder
-};
-
 // Substrings that, if present in the resolved path, trigger a rewrite.
 static constexpr const char* kRewriteSubstrings[] = {
     "magisk",
@@ -100,6 +105,45 @@ static constexpr const char* kRewriteSubstrings[] = {
 };
 
 static const char* kStockExePath = "/system/bin/app_process64";
+
+// Returns 1 if `path` looks like a /proc/<pid>/exe path (with <pid>
+// being either the literal "self" or a decimal number).
+//
+// Examples that match:
+//   /proc/self/exe
+//   /proc/1234/exe
+//   /proc/0/exe
+//
+// Examples that don't:
+//   /proc/self/maps
+//   /proc/self/cwd
+//   /data/adb/magisk
+//   /system/bin/app_process64
+static int path_is_proc_exe(const char* path) {
+    if (!path) return 0;
+    // Must start with "/proc/".
+    static const char kProc[] = "/proc/";
+    constexpr size_t kProcLen = sizeof(kProc) - 1;
+    if (strncmp(path, kProc, kProcLen) != 0) return 0;
+
+    // After /proc/, expect either "self" or a decimal number.
+    const char* p = path + kProcLen;
+    if (strncmp(p, "self", 4) == 0) {
+        p += 4;
+    } else {
+        // Must start with a digit.
+        if (*p < '0' || *p > '9') return 0;
+        while (*p >= '0' && *p <= '9') ++p;
+    }
+
+    // Must end with "/exe".
+    static const char kSuffix[] = "/exe";
+    constexpr size_t kSuffixLen = sizeof(kSuffix) - 1;
+    if (strncmp(p, kSuffix, kSuffixLen) != 0) return 0;
+    // And the byte after /exe must be NUL (so we don't match
+    // /proc/self/exe2 or /proc/self/executable).
+    return p[kSuffixLen] == '\0' ? 1 : 0;
+}
 
 static ssize_t rewrite_if_suspicious(char* buf, size_t bufsiz,
                                        ssize_t real_n) {
@@ -134,8 +178,9 @@ extern "C" ssize_t zygisk_study_hook_readlink(const char* path,
         ? g_real_readlink(path, buf, bufsiz)
         : (ssize_t)syscall(SYS_readlink, path, buf, bufsiz);
     if (n < 0) return n;
-    // Only rewrite for /proc/self/exe — anything else passes through.
-    if (strcmp(path, "/proc/self/exe") != 0) return n;
+    // Broaden: rewrite for any /proc/<pid>/exe path, not just
+    // /proc/self/exe. Apps can probe via the numeric PID variant.
+    if (!path_is_proc_exe(path)) return n;
     return rewrite_if_suspicious(buf, bufsiz, n);
 }
 
@@ -146,8 +191,13 @@ extern "C" ssize_t zygisk_study_hook_readlinkat(int dirfd,
         ? g_real_readlinkat(dirfd, path, buf, bufsiz)
         : (ssize_t)syscall(SYS_readlinkat, dirfd, path, buf, bufsiz);
     if (n < 0) return n;
-    // Only rewrite for /proc/self/exe — anything else passes through.
-    if (strcmp(path, "/proc/self/exe") != 0) return n;
+    // Broaden: same logic as readlink. We only rewrite absolute
+    // paths that look like /proc/<pid>/exe — for relative paths
+    // (readlinkat(dirfd, "exe", ...)) we don't have enough context
+    // to know whether dirfd is a /proc/<pid> directory, so we pass
+    // through unchanged.
+    if (!path || path[0] != '/') return n;
+    if (!path_is_proc_exe(path)) return n;
     return rewrite_if_suspicious(buf, bufsiz, n);
 }
 
@@ -234,7 +284,34 @@ static void set_neutral_comm_name() {
 }
 
 // ----------------------------------------------------------------------------
-// 13. GOT-patching for readlink / readlinkat
+// 13. RLIMIT_CORE = 0 in the forked child (S16)
+// ----------------------------------------------------------------------------
+//
+// prctl(PR_SET_DUMPABLE, 0) prevents the kernel from honoring any
+// future ptrace attach. But if a kernel bug or a third-party kernel
+// module bypasses that check, a core dump from the forked child
+// could contain our hide layer's in-memory state (including the
+// module list, denylist, and any other sensitive data we've touched).
+//
+// setrlimit(RLIMIT_CORE, 0) is a documented Linux hardening
+// technique that disables core dumps at the resource limit level.
+// The kernel checks rlimit before writing a core file, so even if
+// dumpable is somehow re-enabled (e.g. by a setuid binary we
+// mistakenly exec), core dumps are still suppressed.
+//
+// This is a real, on-device defense-in-depth win — Linux has
+// honored RLIMIT_CORE since 1.0, and Android's kernel is no
+// exception. The cost is one prlimit/setrlimit syscall (~1 µs on
+// AArch64), paid once per fork on the slow path.
+static void disable_core_dumps() {
+    struct rlimit rl;
+    rl.rlim_cur = 0;
+    rl.rlim_max = 0;
+    (void)setrlimit(RLIMIT_CORE, &rl);
+}
+
+// ----------------------------------------------------------------------------
+// 14. GOT-patching for readlink / readlinkat
 // ----------------------------------------------------------------------------
 //
 // Same pattern as hide_advanced's GOT-patching for open / openat.
@@ -381,6 +458,9 @@ void hide_stealth_apply_post_fork(const char* /*package_name*/) {
     set_pdeathsig_if_safe();
     set_dumpable_zero();
     set_neutral_comm_name();
+    // Defense-in-depth on top of dumpable=0: also disable core
+    // dumps via RLIMIT_CORE. See S16 above.
+    disable_core_dumps();
 }
 
 } // namespace zygisk_study

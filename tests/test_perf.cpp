@@ -84,7 +84,7 @@ ZS_TEST(make_filtered_memfd_filters_500_lines_under_200us) {
     ZS_CHECK(warmup_fd >= 0);
     write(warmup_fd, content.data(), content.size());
     lseek(warmup_fd, 0, SEEK_SET);
-    int warmup_out = make_filtered_memfd(warmup_fd);
+    int warmup_out = make_filtered_memfd(warmup_fd, "/proc/self/maps");
     ZS_CHECK(warmup_out >= 0);
     close(warmup_fd); close(warmup_out);
 
@@ -97,7 +97,7 @@ ZS_TEST(make_filtered_memfd_filters_500_lines_under_200us) {
         write(fd, content.data(), content.size());
         lseek(fd, 0, SEEK_SET);
         auto t0 = clk::now();
-        int out = make_filtered_memfd(fd);
+        int out = make_filtered_memfd(fd, "/proc/self/maps");
         auto t1 = clk::now();
         durations_us[i] = std::chrono::duration_cast<
             std::chrono::microseconds>(t1 - t0).count();

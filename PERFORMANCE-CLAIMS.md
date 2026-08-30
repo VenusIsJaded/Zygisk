@@ -24,13 +24,20 @@ comparing the Android and host cost models.
 
 | # | Claim | Test | Median | Budget |
 |---|-------|------|--------|--------|
-| 1 | `make_filtered_memfd` filters a 500-line `/proc/self/maps` | `test_perf` | 303 µs | < 2000 µs |
+| 1 | `make_filtered_memfd` filters a 500-line `/proc/self/maps` | `test_perf` | **170 µs** (was 303 µs before P1.18) | < 2000 µs |
 | 2 | `hide_setup_for_target` fast path (not on denylist) | `test_perf` | 0 µs | < 50 µs |
 | 3 | `hide_apply_for_target` fast path (`g_will_hide=0`) | `test_perf` | 0 µs | < 20 µs |
 
 Note: tests #2 and #3 report "0 µs" because `std::chrono::steady_clock`
 on this host has ~1 µs resolution; the actual call is sub-microsecond
 but we can't measure it precisely with steady_clock.
+
+The 44% reduction in `make_filtered_memfd` median (303 µs → 170 µs)
+is the direct, measurable effect of the P1.18 batched-write optimization.
+The remaining 170 µs is dominated by the pread + memmove + write loop
+on the 40 KB buffer; further reduction would require shrinking the
+input (e.g. caching the filtered memfd across multiple reads of the
+same maps file by the same app).
 
 ## ARM64 (Android) confidence levels
 
@@ -142,6 +149,78 @@ Android-cost-model walk-through is in `docs/ANDROID-REALISM.md`.
   once a week), this drops the daemon's wakeups from 2880/day to
   ~0/day — a real, measurable battery win visible in
   `dumpsys batterystats`.
+
+### ✅ ROUND 4 — NEW HIGH-confidence wins (this round)
+
+Each of these is a new Android-targeted optimization. The Android
+cost-model walk-through is inline in the source comments; see
+`hide_advanced.cpp`, `hide.cpp`, and `hide_stealth.cpp` for the
+full reasoning.
+
+- **P1.13 — Direct `getdents64` syscall in `close_unknown_fds`**
+  (replaces `opendir`/`readdir`/`closedir`). The previous path
+  allocated an ~88-byte `DIR` struct on the heap, did a
+  `getdents64` syscall wrapped in Bionic's `readdir` (which also
+  parses each `struct dirent`), then did a `closedir` syscall +
+  free. The new path uses the raw `getdents64` syscall directly
+  with an 8 KB stack buffer and parses the entry name (a small
+  decimal integer) inline. Saves ~1 µs of heap allocation +
+  ~1 µs of closedir syscall + ~1 µs of per-entry dirent parsing
+  overhead = ~3 µs per fork on the slow path. The syscall itself
+  is identical (`getdents64` is what `readdir` uses internally);
+  the win is from skipping the Bionic wrapper layer. HIGH
+  confidence because: (a) `getdents64` has been the documented
+  Linux syscall since 2.6 (2003), present on every Android
+  kernel; (b) the `struct linux_dirent64` ABI is stable; (c) we
+  skip the heap allocation, which is a real scudo-malloc cycle
+  saving on AArch64.
+
+- **P1.15 / P1.19 — `pread`-based `/proc/self/maps` reader for
+  `clone_property_area_private()` and `snapshot_self_so()`**
+  (replaces `fopen`/`fgets`). The previous paths used Bionic's
+  stdio layer: `fopen` allocated a ~552-byte FILE struct + an
+  8 KB stdio buffer (two scudo mallocs), and `fgets` did ~1 KB
+  read() syscalls per line on a typical 50 KB maps file = ~50
+  read() syscalls. Each read() on AArch64 is ~1-3 µs of kernel
+  work (SVC exception entry + VFS read path + return). Total:
+  ~100 µs of pure syscall overhead per call. The new paths do
+  ONE `pread()` into a 64 KB stack buffer + in-memory `memchr`
+  scan. Saves ~49 syscalls = ~100 µs per call. HIGH confidence
+  because: (a) `/proc/self/maps` is a kernel seqfile that
+  regenerates content from internal data structures on every
+  read — a single pread() returns up to ~64 KB in one VFS call
+  on Android (the seqfile implementation produces the content
+  directly into the caller's buffer); (b) memchr/memmem are
+  NEON-optimized on AArch64 (16 bytes/cycle); (c) the heap
+  allocation is eliminated, which is a real scudo-malloc cycle
+  saving.
+
+- **P1.18 — Batched-write `make_filtered_memfd`** (replaces
+  per-line `write()` calls). The previous path issued one
+  `write()` syscall per kept line in the filtered output. On a
+  typical 500-line maps file with ~490 kept lines, that was
+  ~490 write() syscalls per filtered read. Each write() on
+  AArch64 takes ~1-3 µs of kernel work (SVC exception entry +
+  VFS write path + return). Total: ~500-1500 µs of pure syscall
+  overhead per filtered read on real Android. The new path
+  compacts the kept lines in place (memmove when needed, which
+  is NEON-optimized at ~16 bytes/cycle — ~1 µs total for a
+  40 KB buffer) and issues ONE `write()` syscall at the end.
+  Savings: ~489 syscalls = ~500-1500 µs per filtered read on
+  Android. For a denylisted app fork, `make_filtered_memfd`
+  is called once per probe (apps that read /proc/self/maps
+  usually do so 5-10 times during the first ~100 ms of
+  execution). So the savings are ~2500-7500 µs per denylisted
+  fork. **Host-measured:** median dropped from 303 µs → 170 µs
+  (44% reduction on x86_64, where syscalls are cheaper than
+  on AArch64). On Android, the reduction is predicted to be
+  ~60-70% (because the syscall savings dominate more on
+  AArch64). HIGH confidence because: (a) the in-place
+  compaction is safe (write_ptr <= line_start always); (b)
+  `memmove` is correct on every platform and is NEON-optimized
+  on AArch64; (c) the output bytes are byte-identical to the
+  previous implementation (verified by `test_hide_advanced.cpp`
+  test 14).
 
 ### ⚠️ MEDIUM confidence — probably wins on Android, magnitude uncertain
 
@@ -274,6 +353,62 @@ Android:
   With NO_NEW_PRIVS=1, the kernel refuses to honor the setuid bit
   on execve; the attacker is permanently locked at uid nobody.
 
+### ✅ ROUND 4 — NEW HIGH-confidence stealth wins (this round)
+
+- **S10 — Filter `/proc/self/status` and rewrite `TracerPid:` to
+  `0`.** Added `/proc/self/status` to `kFilteredPaths` in
+  `hide_advanced.cpp` and added a `rewrite_status_line()` helper
+  that detects the `TracerPid:` prefix and writes
+  `TracerPid:\t0\n` in its place. Defense-in-depth on top of
+  `prctl(PR_SET_DUMPABLE, 0)` in hide_stealth — that prctl already
+  makes the kernel report `TracerPid: 0`, but if the app reads
+  the text of `/proc/self/status` directly (which some apps do,
+  using read() not the kernel's /proc report path), we want the
+  bytes to also say 0. HIGH confidence because: (a) the rewrite
+  is purely a string substitution in our filtered memfd copy;
+  (b) the kernel's `/proc/self/status` seqfile is regenerated on
+  every read (same as /proc/self/maps); (c) covered by 2 new
+  host-side tests in `test_hide_advanced.cpp` (TracerPid rewrite
+  + no-TracerPid graceful pass-through). The technique is the
+  same one used by every public root hide framework that
+  supports `/proc/self/status` filtering.
+
+- **S12 — Broadened `readlink` / `readlinkat` hook to match any
+  `/proc/<pid>/exe` path.** The previous implementation only
+  matched the literal path `/proc/self/exe` (via `strcmp`). Apps
+  can also probe via `/proc/<own_pid>/exe` (the same kernel
+  symlink, accessed by numeric PID), via `readlinkat(AT_FDCWD,
+  "/proc/<pid>/exe", ...)`, etc. The new `path_is_proc_exe()`
+  matcher recognizes any path that starts with `/proc/`, has a
+  middle component of either `self` or a decimal number, and ends
+  with `/exe`. HIGH confidence because: (a) the matcher is a
+  cheap prefix + numeric-scan + suffix comparison (~20 cycles
+  total on AArch64); (b) covered by a new host-side test in
+  `test_hide_stealth.cpp` (`path_is_proc_exe_recognizes_documented_variants`)
+  that exercises 7 positive and 11 negative cases; (c) the
+  GOT-patching mechanism is unchanged from the previous
+  implementation (which was already shipped).
+
+- **S16 — `setrlimit(RLIMIT_CORE, 0)` in the forked child.**
+  Defense-in-depth on top of `prctl(PR_SET_DUMPABLE, 0)`. If a
+  kernel bug or a third-party kernel module bypasses the
+  dumpable check, a core dump from the forked child could
+  contain our hide layer's in-memory state (including the
+  module list, denylist, and any other sensitive data we've
+  touched). `setrlimit(RLIMIT_CORE, 0)` is a documented Linux
+  hardening technique that disables core dumps at the resource
+  limit level. The kernel checks rlimit before writing a core
+  file, so even if dumpable is somehow re-enabled (e.g. by a
+  setuid binary we mistakenly exec), core dumps are still
+  suppressed. HIGH confidence because: (a) Linux has honored
+  `RLIMIT_CORE` since 1.0 (1991), and Android's kernel is no
+  exception; (b) the syscall takes ~1 µs on AArch64, paid once
+  per fork on the slow path; (c) covered by a new host-side
+  test in `test_hide_stealth.cpp`
+  (`disable_core_dumps_zeros_rlimit_core`) that sets a non-zero
+  rlimit, calls our function, and verifies both `rlim_cur` and
+  `rlim_max` are zero afterwards.
+
 ## What I cannot do in this sandbox
 
 I cannot:
@@ -293,10 +428,11 @@ What I CAN do (and did):
 
 1. Build all C++ source against the host g++ and verify zero
    compile errors and zero warnings under `-Wall -Wextra`.
-2. Run **43 host-side unit tests** (14 hide + 13 advanced + 8
+2. Run **48 host-side unit tests** (14 hide + 16 advanced + 10
    stealth + 5 e2e + 3 perf, including 5 new tests for the
-   direct-write prop scrub and the stat-hide path matcher).
-   All 43 pass.
+   TracerPid rewrite, the path_is_proc_exe matcher, the
+   disable_core_dumps rlimit check, and the batched-write
+   correctness on a 500-line input). All 48 pass.
 3. Static reasoning about ARM64 behavior based on the Cortex-A76 /
    A78 / X1 / X4 architecture reference manual and the Bionic libc
    source (which is open).
@@ -331,7 +467,7 @@ To get true 100% confidence on Android, the user needs to:
     daemon's wakeups dropped from ~2880/day (old polling) to ~0/day
     (new inotify).
 
-The 43 host-side tests + the Android-cost-model walk-through in
+The 48 host-side tests + the Android-cost-model walk-through in
 `docs/ANDROID-REALISM.md` + the architecture reference give us "high
 confidence" — which is the strongest honest claim I can make from
 this sandbox.

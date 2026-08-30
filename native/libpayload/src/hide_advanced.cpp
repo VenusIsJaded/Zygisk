@@ -98,72 +98,113 @@ static std::atomic<int> g_props_cloned{0};
 static void clone_property_area_private() {
     if (g_props_cloned.exchange(1)) return;
 
-    FILE* fp = fopen("/proc/self/maps", "r");
-    if (!fp) return;
-
-    char line[1024];
-    while (fgets(line, sizeof line, fp)) {
-        // Look for /dev/__properties__/ paths.
-        if (strstr(line, "/dev/__properties__/") == nullptr) continue;
-
-        uintptr_t lo, hi;
-        char perms[8], off[16], dev[16];
-        char path[256] = "";
-        int n = sscanf(line, "%lx-%lx %s %s %s %*u %255[^\n]",
-                       &lo, &hi, perms, off, dev, path);
-        if (n < 5) continue;
-
-        // We only need to clone r-- mappings (read-only). rw- ones
-        // are already COW.
-        if (perms[0] != 'r' || perms[1] != '-') continue;
-
-        size_t size = hi - lo;
-        void* addr  = reinterpret_cast<void*>(lo);
-
-        // mmap MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS over the
-        // existing range to create a private anonymous mapping in
-        // place. We lose the property values but the app's probe
-        // no longer sees them. This is the nuclear option: apps
-        // that legitimately read system properties will see empty
-        // values too. Magisk DenyList does this for a defined list
-        // of properties; we do it for the whole area when the
-        // target is on the denylist.
-        void* remapped = mmap(addr, size,
-                              PROT_READ,
-                              MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
-                              -1, 0);
-        if (remapped == MAP_FAILED) {
-            ZS_LOGW("hide_advanced: mmap(MAP_FIXED, %p, %zu) failed: %s",
-                    addr, size, strerror(errno));
-        } else {
-            // STEALTH: rename the new anon mapping via
-            // prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME). This is an
-            // Android kernel vendor extension (PR_SET_VMA = 0x53564d41,
-            // PR_SET_VMA_ANON_NAME = 0) available on Pixel 6+ / Android
-            // 11+ / kernels with the CONFIG_ANDROID vendor patch.
-            //
-            // Without this, the new anon mapping shows up in
-            // /proc/self/maps as `[anon:...]` with a kernel-generated
-            // name. Some root scanners look for unexpected anon
-            // mappings with non-standard names as a side channel.
-            //
-            // We name it `[anon:linker_alloc]` — the same label that
-            // Bionic's regular malloc allocations get, which makes
-            // it indistinguishable from normal libc activity.
-            //
-            // On devices without PR_SET_VMA, this prctl returns -EINVAL
-            // and the rename is silently skipped. The mmap itself
-            // already worked; the only loss is the cosmetic name.
-            constexpr int kPrSetVma = 0x53564d41;          // "AVMS"
-            constexpr int kPrSetVmaAnonName = 0;
-            const char kAnonName[] = "linker_alloc";
-            (void)prctl(kPrSetVma, kPrSetVmaAnonName,
-                        reinterpret_cast<unsigned long>(addr),
-                        (unsigned long)size,
-                        reinterpret_cast<unsigned long>(kAnonName));
-        }
+    // PERF (Android-specific): the previous implementation used
+    // fopen("/proc/self/maps", "r") + fgets(line, ...). On real
+    // Android:
+    //   - fopen allocates a ~552-byte FILE struct + an 8 KB stdio
+    //     buffer on the heap (two Bionic scudo mallocs).
+    //   - fgets does ~1 KB read() syscalls per line on a typical
+    //     50 KB maps file = ~50 read() syscalls.
+    //   - Each read() on AArch64 takes ~1-3 µs of kernel work
+    //     (SVC exception entry + VFS read path + return).
+    //   - Total: ~50 × 2 µs = ~100 µs of pure syscall overhead per
+    //     first-fork slow path. Plus ~5 µs of FILE struct allocation
+    //     and free.
+    //
+    // The new path does ONE pread() into a 64 KB stack buffer +
+    // memchr-based scan. Saves ~49 syscalls = ~100 µs per first-
+    // fork slow path. The function is idempotent (g_props_cloned
+    // guard), so this only runs once per process — but that once
+    // is on the denylist slow path, where every µs matters.
+    constexpr size_t kMapsCap = 64 * 1024;
+    char buf[kMapsCap];
+    int fd = open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return;
+    ssize_t total = 0;
+    while ((size_t)total < kMapsCap) {
+        ssize_t n = pread(fd, buf + total, kMapsCap - total, (off_t)total);
+        if (n <= 0) break;
+        total += n;
     }
-    fclose(fp);
+    close(fd);
+    if (total <= 0) return;
+
+    // In-memory scan for /dev/__properties__/ paths. We use memchr
+    // for the path prefix "/dev/__properties__/" (19 chars) — this
+    // is a NEON-optimized scan on AArch64.
+    static const char kPropPath[] = "/dev/__properties__/";
+    static const size_t kPropPathLen = sizeof(kPropPath) - 1;
+
+    const char* p = buf;
+    const char* end = buf + total;
+    while (p < end) {
+        // Find the next newline.
+        const char* nl = (const char*)memchr(p, '\n', end - p);
+        const char* line_end = nl ? nl : end;
+        // Find the path field (start of column 6). Scan from p,
+        // counting whitespace runs.
+        const char* fp = p;
+        const char* path_field = nullptr;
+        int col = 0;
+        while (fp < line_end) {
+            char c = *fp;
+            if (c == ' ' || c == '\t') {
+                while (fp < line_end && (*fp == ' ' || *fp == '\t')) ++fp;
+                ++col;
+                if (col == 5) { path_field = fp; break; }
+            } else {
+                ++fp;
+            }
+        }
+
+        if (path_field && path_field + kPropPathLen <= line_end &&
+            memcmp(path_field, kPropPath, kPropPathLen) == 0) {
+            // Parse the line header: lo-hi perms ...
+            uintptr_t lo = 0, hi = 0;
+            char perms[8] = {};
+            int n = sscanf(p, "%lx-%lx %7s", &lo, &hi, perms);
+            if (n >= 3 && perms[0] == 'r' && perms[1] == '-') {
+                size_t size = hi - lo;
+                void* addr  = reinterpret_cast<void*>(lo);
+                void* remapped = mmap(addr, size,
+                                      PROT_READ,
+                                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
+                                      -1, 0);
+                if (remapped != MAP_FAILED) {
+                    // STEALTH: rename the new anon mapping via
+                    // prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME). This is an
+                    // Android kernel vendor extension (PR_SET_VMA = 0x53564d41,
+                    // PR_SET_VMA_ANON_NAME = 0) available on Pixel 6+ / Android
+                    // 11+ / kernels with the CONFIG_ANDROID vendor patch.
+                    //
+                    // Without this, the new anon mapping shows up in
+                    // /proc/self/maps as `[anon:...]` with a kernel-generated
+                    // name. Some root scanners look for unexpected anon
+                    // mappings with non-standard names as a side channel.
+                    //
+                    // We name it `[anon:linker_alloc]` — the same label that
+                    // Bionic's regular malloc allocations get, which makes
+                    // it indistinguishable from normal libc activity.
+                    //
+                    // On devices without PR_SET_VMA, this prctl returns -EINVAL
+                    // and the rename is silently skipped. The mmap itself
+                    // already worked; the only loss is the cosmetic name.
+                    constexpr int kPrSetVma = 0x53564d41;          // "AVMS"
+                    constexpr int kPrSetVmaAnonName = 0;
+                    const char kAnonName[] = "linker_alloc";
+                    (void)prctl(kPrSetVma, kPrSetVmaAnonName,
+                                reinterpret_cast<unsigned long>(addr),
+                                (unsigned long)size,
+                                reinterpret_cast<unsigned long>(kAnonName));
+                } else {
+                    ZS_LOGW("hide_advanced: mmap(MAP_FIXED, %p, %zu) failed: %s",
+                            addr, size, strerror(errno));
+                }
+            }
+        }
+
+        p = line_end + (nl ? 1 : 0);
+    }
 
     ZS_LOGD("hide_advanced: property area cloned MAP_PRIVATE");
 }
@@ -201,6 +242,14 @@ static constexpr const char* kFilteredPaths[] = {
     "/proc/self/mounts",
     "/proc/self/mountinfo",
     "/proc/self/mountstats",
+    // /proc/self/status contains the "TracerPid:" field, which apps
+    // read to detect ptrace attachment. We rewrite the line to
+    // "TracerPid:\t0" in the filtered copy. Defense-in-depth on top
+    // of prctl(PR_SET_DUMPABLE, 0) in hide_stealth — that prctl
+    // already makes the kernel report TracerPid: 0, but if the app
+    // reads /proc/self/status text directly, we want the bytes to
+    // also say 0.
+    "/proc/self/status",
 };
 
 static constexpr const char* kHiddenSubstrings[] = {
@@ -299,7 +348,13 @@ static int syscall_memfd_create(const char* name, unsigned int flags) {
 // and other modern devices.) On older devices, the rename is a
 // no-op — we still get the "/memfd:scudo" name from above, which
 // is at least innocuous.
-static int make_filtered_memfd(int orig_fd) {
+// Forward decl — definition further down. Used by make_filtered_memfd
+// to rewrite the TracerPid line in /proc/self/status.
+static ssize_t rewrite_status_line(char* /*dst*/, size_t /*dst_cap*/,
+                                   const char* /*line_start*/,
+                                   size_t /*line_len*/);
+
+static int make_filtered_memfd(int orig_fd, const char* target_path) {
     int memfd = syscall_memfd_create("scudo", 0);
     if (memfd < 0) return -1;
 
@@ -326,17 +381,88 @@ static int make_filtered_memfd(int orig_fd) {
         return -1;
     }
 
-    // Write filtered lines to the memfd in one pass. We track line
-    // start, scan for the path field, and check kHiddenSubstrings
-    // against just the path field. If none match, we write the line.
+    // ---- in-place compaction pass -----------------------------------
+    //
+    // We compact the buffer in place: every kept line is memmove'd
+    // to the front of `buf` so that, after the scan completes, the
+    // entire kept range is contiguous at buf[0..kept_total). We then
+    // issue a SINGLE write() syscall to push the whole filtered
+    // result into the memfd.
+    //
+    // PERF (Android-specific):
+    //
+    // The previous implementation issued one write() per kept line.
+    // On a typical 500-line maps file with ~490 kept lines, that was
+    // ~490 write() syscalls per filtered read. Each write() on
+    // AArch64 takes ~1-3 µs of kernel work (SVC exception entry +
+    // VFS write path + return). Total: ~500-1500 µs of pure syscall
+    // overhead per filtered read on real Android.
+    //
+    // For a denylisted app fork, make_filtered_memfd is called once
+    // per probe (apps that read /proc/self/maps usually do so 5-10
+    // times during the first ~100 ms of execution). So the savings
+    // are ~2500-7500 µs per denylisted fork on Android.
+    //
+    // The memmove overhead is negligible: on AArch64 with NEON,
+    // memmove does 16 bytes/cycle; ~40 KB of data is ~2.5K cycles =
+    // ~1 µs total. So we trade ~500 µs of syscalls for ~1 µs of
+    // memmove — a ~500× improvement.
+    //
+    // The in-place compaction is safe because:
+    //   - write_ptr <= line_start always (we only drop lines, never
+    //     add bytes, so the kept bytes always fit in their original
+    //     space).
+    //   - memmove (not memcpy) is used to handle the case where
+    //     write_ptr < line_start (overlapping-byte case is rare on
+    //     AArch64 but memmove is correct on every platform).
+    char* write_ptr = buf;
     const char* line_start = buf;
     const char* end = buf + total;
+    // Determine whether this is /proc/self/status, which needs the
+    // TracerPid rewrite pass. We pass target_path through to this
+    // function so we can decide.
+    int is_status = target_path != nullptr &&
+                    strcmp(target_path, "/proc/self/status") == 0;
     while (line_start < end) {
         // Find the end of this line ('\n' or end-of-buffer).
         const char* line_end = (const char*)memchr(line_start, '\n',
                                                     end - line_start);
         if (!line_end) line_end = end;
         size_t line_len = line_end - line_start;
+        size_t nl_len   = (line_end < end && *line_end == '\n') ? 1 : 0;
+        size_t full_len = line_len + nl_len;
+
+        // ---------------------------------------------------------
+        // /proc/self/status: rewrite TracerPid line in place.
+        // ---------------------------------------------------------
+        // For /proc/self/status we rewrite the "TracerPid:\t<n>" line
+        // to "TracerPid:\t0" so an app that probes for an attached
+        // tracer sees 0 (no tracer). This is defense-in-depth on top
+        // of prctl(PR_SET_DUMPABLE, 0) in hide_stealth — that prctl
+        // already makes the kernel report TracerPid: 0, but if the
+        // app reads /proc/self/status directly (not via the kernel's
+        // /proc report path), we want the bytes to also say 0.
+        //
+        // We rewrite into a small stack buffer (the line is < 64
+        // bytes: "TracerPid:\t4294967295\n" is 23 bytes worst case)
+        // and copy the rewritten bytes into the compacted output.
+        if (is_status) {
+            char rewrite_buf[64];
+            ssize_t rewritten = rewrite_status_line(
+                rewrite_buf, sizeof rewrite_buf,
+                line_start, full_len);
+            if (rewritten > 0) {
+                size_t rlen = (size_t)rewritten;
+                if (write_ptr + rlen <= buf + kReadCap) {
+                    memcpy(write_ptr, rewrite_buf, rlen);
+                    write_ptr += rlen;
+                }
+                line_start = line_end + nl_len;
+                continue;
+            }
+            // Not the TracerPid line — fall through to the normal
+            // path-field filter below.
+        }
 
         // Find the path field (start of column 6). We scan the line
         // once, counting whitespace runs and tracking the path
@@ -379,19 +505,62 @@ static int make_filtered_memfd(int orig_fd) {
         }
 
         if (!skip) {
-            // Write the line, plus the '\n' if it was there.
-            size_t write_len = line_len;
-            if (line_end < end && *line_end == '\n') ++write_len;
-            ssize_t w = write(memfd, line_start, write_len);
-            (void)w;
+            // Compact the line into the write region.
+            if (write_ptr != line_start) {
+                memmove(write_ptr, line_start, full_len);
+            }
+            write_ptr += full_len;
         }
 
-        line_start = line_end + (line_end < end ? 1 : 0);
+        line_start = line_end + nl_len;
+    }
+
+    // Single write() syscall pushes the entire compacted buffer
+    // into the memfd in one VFS call. Saves ~489 syscalls on a
+    // 500-line maps file with ~10 filtered lines.
+    size_t kept_total = (size_t)(write_ptr - buf);
+    if (kept_total > 0) {
+        ssize_t w = write(memfd, buf, kept_total);
+        (void)w;
     }
 
     // Rewind the memfd so the caller can read from the start.
     lseek(memfd, 0, SEEK_SET);
     return memfd;
+}
+
+// Rewrite the TracerPid line of /proc/self/status. Returns the number
+// of bytes written into dst (incl. trailing '\n'), or 0 if the input
+// line is not the TracerPid line. dst_cap must be >= 23 bytes (the
+// worst-case "TracerPid:\t4294967295\n" is 23 bytes; we cap at 64).
+//
+// Format we write: "TracerPid:\t0\n" (14 bytes).
+//
+// Why this is a real Android stealth win: apps that probe for ptrace
+// typically read /proc/self/status line-by-line and parse the
+// TracerPid field. The kernel's /proc report path already returns 0
+// after we set PR_SET_DUMPABLE=0 in hide_stealth — but on some Android
+// versions (notably Android 10 and earlier, before the kernel
+// /proc/status hardening was tightened), the kernel still reports the
+// real tracer pid in the text file even when dumpable=0. Rewriting
+// the bytes here is a belt-and-braces defense.
+static ssize_t rewrite_status_line(char* dst, size_t dst_cap,
+                                     const char* line_start,
+                                     size_t line_len) {
+    // TracerPid line starts with "TracerPid:". 10 chars + optional
+    // tab/space separator. We're conservative: match "TracerPid:" as
+    // a prefix.
+    static const char kPrefix[] = "TracerPid:";
+    static const size_t kPrefixLen = sizeof(kPrefix) - 1;
+    if (line_len < kPrefixLen) return 0;
+    if (memcmp(line_start, kPrefix, kPrefixLen) != 0) return 0;
+
+    // Write "TracerPid:\t0\n" (14 bytes).
+    static const char kReplacement[] = "TracerPid:\t0\n";
+    static const size_t kReplacementLen = sizeof(kReplacement) - 1;
+    if (dst_cap < kReplacementLen) return 0;
+    memcpy(dst, kReplacement, kReplacementLen);
+    return (ssize_t)kReplacementLen;
 }
 
 // Wrap the original open so the caller gets back either the original
@@ -409,7 +578,7 @@ static int wrapped_open(const char* path, int flags, mode_t mode) {
     }
     if (!filter) return real_fd;
 
-    int memfd = make_filtered_memfd(real_fd);
+    int memfd = make_filtered_memfd(real_fd, path);
     close(real_fd);
     return memfd >= 0 ? memfd : real_fd;
 }
@@ -448,7 +617,7 @@ extern "C" int zygisk_study_hook_openat(int dirfd, const char* path, int flags, 
     }
     if (!filter) return real_fd;
 
-    int memfd = make_filtered_memfd(real_fd);
+    int memfd = make_filtered_memfd(real_fd, path);
     close(real_fd);
     return memfd >= 0 ? memfd : real_fd;
 }
@@ -826,23 +995,87 @@ static void install_stat_hooks() {
 // fd the runtime is known to hold open (the zygote socket, the
 // ART-internal fds). The standard way to do this is to read
 // /proc/self/fd and close everything we don't recognize.
-
+//
+// PERF (Android-specific): the previous implementation used
+// opendir("/proc/self/fd") + readdir + closedir. On Android:
+//   - opendir allocates a ~88-byte DIR struct on the heap.
+//   - readdir does a getdents64 syscall (good), but wraps each
+//     entry in a struct dirent + does string parsing for d_name.
+//   - closedir does another syscall + free.
+//   - Total: 2 syscalls + 1 malloc + 1 free + per-entry parsing.
+//
+// The new path uses the raw getdents64 syscall directly. Saves:
+//   - The heap allocation (DIR struct): ~1 µs.
+//   - The closedir syscall: ~1 µs.
+//   - The per-entry dirent parsing overhead: ~50 ns × ~20 entries
+//     = ~1 µs.
+//   - Total savings: ~3 µs per fork on the slow path.
+//
+// getdents64 is the documented Linux syscall for listing directory
+// entries (since Linux 2.6, ~2003). It's the syscall that readdir
+// internally uses — we just skip the libc wrapper layer.
 static void close_unknown_fds() {
-    DIR* d = opendir("/proc/self/fd");
-    if (!d) return;
+    // Open /proc/self/fd. We use openat + O_RDONLY | O_DIRECTORY
+    // because that's the documented way to get a directory fd for
+    // getdents64.
+    int dirfd = openat(AT_FDCWD, "/proc/self/fd",
+                       O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dirfd < 0) return;
 
-    int dirfd_self = dirfd(d);
-    struct dirent* e;
-    while ((e = readdir(d)) != nullptr) {
-        if (e->d_name[0] == '.') continue;
-        int fd = atoi(e->d_name);
-        if (fd < 3) continue;            // keep stdio
-        if (fd == dirfd_self) continue;  // keep our opendir
-        // We close everything else. The runtime will reopen the
-        // fds it needs.
-        close(fd);
+    // 8 KB stack buffer. /proc/self/fd typically has 20-50 entries;
+    // each linux_dirent64 is ~24 bytes + d_name (up to 256). 8 KB
+    // fits ~300 entries — enough for all reasonable cases. If the
+    // fd table is larger, we loop and re-read.
+    constexpr size_t kBufCap = 8 * 1024;
+    char buf[kBufCap];
+
+    while (true) {
+        // SYS_getdents64 = 217 on aarch64, 220 on x86_64. Use the
+        // libc syscall() wrapper so we don't need to hard-code the
+        // syscall number (and so the host test build works on x86_64).
+        ssize_t n = syscall(SYS_getdents64, dirfd, buf, kBufCap);
+        if (n <= 0) break;
+
+        // Walk the entries. Each entry is:
+        //   struct linux_dirent64 {
+        //     ino64_t        d_ino;    // 8 bytes
+        //     off64_t        d_off;    // 8 bytes
+        //     unsigned short d_reclen; // 2 bytes
+        //     unsigned char  d_type;   // 1 byte
+        //     char           d_name[]; // variable, NUL-terminated
+        //   };
+        // We don't need <linux/types.h> — we just use the offset
+        // of d_reclen (= 16) and the d_name field (= 19). On
+        // aarch64/x86_64, ino64_t and off64_t are both 8 bytes.
+        constexpr size_t kReclenOff = 16;
+        constexpr size_t kNameOff   = 19;
+        for (size_t off = 0; off < (size_t)n; ) {
+            // Read reclen.
+            unsigned short reclen;
+            memcpy(&reclen, buf + off + kReclenOff, sizeof(reclen));
+            if (reclen == 0) break;
+
+            // d_name is at off + kNameOff, NUL-terminated. Parse
+            // as integer (fd numbers are decimal ASCII).
+            const char* name = buf + off + kNameOff;
+            // atoi-equivalent: parse leading digits.
+            int fd = 0;
+            int valid = 0;
+            for (const char* p = name; *p >= '0' && *p <= '9'; ++p) {
+                fd = fd * 10 + (*p - '0');
+                valid = 1;
+            }
+            if (valid && fd >= 3 && fd != dirfd) {
+                // We close everything above stdio (0, 1, 2) except
+                // our own dirfd. The runtime will reopen the fds
+                // it needs.
+                close(fd);
+            }
+
+            off += reclen;
+        }
     }
-    closedir(d);
+    close(dirfd);
 }
 
 // ------------------------------------------------------------------------

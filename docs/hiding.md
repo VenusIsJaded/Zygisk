@@ -400,6 +400,48 @@ Be honest about what the hide layer does not do:
   current pages in RAM; this prevents the swap-to-/data/swap leak.
   See `docs/ANDROID-REALISM.md` S8.
 
+## Round 4 — additional gaps closed (this round)
+
+- **`/proc/self/status` reading `TracerPid: <non-zero>`.** Some
+  apps read `/proc/self/status` line-by-line and parse the
+  `TracerPid:` field to detect an attached ptrace. The basic +
+  advanced layers didn't filter `/proc/self/status`, so the
+  probe could succeed even with `PR_SET_DUMPABLE=0` set by
+  hide_stealth (some Android kernels, notably Android 10 and
+  earlier, still report the real tracer pid in the text file).
+  **NEW (S10):** `/proc/self/status` is now in `kFilteredPaths`,
+  and `make_filtered_memfd` rewrites any `TracerPid:` line to
+  `TracerPid:\t0` in the filtered copy. The kernel's
+  `/proc/self/status` seqfile is regenerated on every read
+  (same as /proc/self/maps), so the rewrite is per-read. Covered
+  by 2 new tests in `test_hide_advanced.cpp`.
+
+- **`readlink("/proc/<pid>/exe")` returning a Magisk path.** The
+  previous implementation only matched the literal path
+  `/proc/self/exe`. Apps can also probe via
+  `/proc/<own_pid>/exe` (the same kernel symlink, accessed by
+  numeric PID), or via `readlinkat(AT_FDCWD, "/proc/<pid>/exe",
+  ...)`. **NEW (S12):** the `path_is_proc_exe()` matcher now
+  recognizes any path that starts with `/proc/`, has a middle
+  component of either `self` or a decimal number, and ends with
+  `/exe`. The matcher is a cheap prefix + numeric-scan + suffix
+  comparison (~20 cycles on AArch64). Covered by a new test
+  in `test_hide_stealth.cpp` exercising 7 positive and 11
+  negative cases.
+
+- **Core dumps from the forked child containing our in-memory
+  state.** `prctl(PR_SET_DUMPABLE, 0)` in hide_stealth prevents
+  the kernel from honoring any future ptrace attach. But if a
+  kernel bug or a third-party kernel module bypasses that
+  check, a core dump from the forked child could contain our
+  hide layer's in-memory state (module list, denylist, etc.).
+  **NEW (S16):** the post-fork pipeline now also calls
+  `setrlimit(RLIMIT_CORE, 0)` after `set_neutral_comm_name()`.
+  The kernel checks rlimit before writing a core file, so even
+  if dumpable is somehow re-enabled, core dumps are still
+  suppressed. Covered by a new host-side test that verifies
+  both `rlim_cur` and `rlim_max` are zero after the call.
+
 ## Why this is "public knowledge"
 
 Every technique described in this file appears in one or more of:
