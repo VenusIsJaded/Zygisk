@@ -6,32 +6,28 @@
 # The original author of this code did not have GitHub credentials in
 # the build sandbox. The repo is fully prepared locally (commits are
 # in place, .gitignore is set up, CI workflow is in place). All that
-# remains is for the user to:
-#
-#   1. Create an empty GitHub repo (via the web UI, `gh repo create`,
-#      or the API).
-#   2. Set up authentication (PAT or SSH key).
-#   3. Run this script to push.
+# remains is for the user to push to the existing Zygisk repo at
+# https://github.com/VenusIsJaded/Zygisk.
 #
 # USAGE:
 #   ./publish.sh                           # use HTTPS + your PAT
 #   ./publish.sh --ssh                     # use SSH
-#   ./publish.sh --repo user/zygisk_study  # specify the repo
+#   ./publish.sh --repo VenusIsJaded/Zygisk  # specify the repo
 #   ./publish.sh --remote my-fork          # use an existing remote
 #
 # STEP-BY-STEP (first time):
 #
-# 1. Create the GitHub repo:
-#    - Web: https://github.com/new — name it `zygisk_study`, leave
-#      it EMPTY (no README, no LICENSE, no .gitignore; we already
-#      have all three). Public or private, your call.
-#    - CLI: `gh repo create zygisk_study --public --source=.`
+# 1. The GitHub repo already exists:
+#    https://github.com/VenusIsJaded/Zygisk
+#    It is a public repo, default branch `main`. If you are running
+#    this script from a fresh clone, you don't need to do anything
+#    here; the `origin` remote is already configured.
 #
 # 2. Authenticate:
 #    - PAT: create a Personal Access Token at
 #      https://github.com/settings/tokens (classic, `repo` scope).
 #      Store it in your environment:
-#        export GH_TOKEN=ghp_xxxxxxxxxxxxxxxxxxxx
+#        export GH_TOKEN=<your_PAT>
 #      Or: paste it when git prompts you for a password.
 #    - SSH: add your public key at
 #      https://github.com/settings/keys
@@ -51,7 +47,7 @@ cd "$REPO_ROOT"
 
 # Defaults.
 PROTOCOL="https"           # https or ssh
-REPO=""                    # e.g. user/zygisk_study
+REPO=""                    # e.g. VenusIsJaded/Zygisk
 REMOTE_NAME="origin"       # name of the git remote to use/push to
 BRANCH="main"              # the branch to push
 
@@ -76,7 +72,7 @@ done
 
 # Sanity: are we in a git repo?
 if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    echo "publish.sh: not in a git repo. Run from the zygisk_study/ root." >&2
+    echo "publish.sh: not in a git repo. Run from the project root." >&2
     exit 1
 fi
 
@@ -94,7 +90,7 @@ if [[ -z "$REMOTE_URL" ]]; then
         # Try to guess from `git config user.email` if --repo not given.
         GUESS_USER="$(git config user.email | cut -d@ -f1)"
         echo "publish.sh: no remote named '$REMOTE_NAME'." >&2
-        echo "publish.sh: pass --repo USER/REPO (e.g. --repo $GUESS_USER/zygisk_study)." >&2
+        echo "publish.sh: pass --repo USER/REPO (e.g. --repo $GUESS_USER/Zygisk)." >&2
         exit 1
     fi
     if [[ "$PROTOCOL" == "ssh" ]]; then
