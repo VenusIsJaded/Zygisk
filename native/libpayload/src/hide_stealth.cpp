@@ -145,6 +145,44 @@ static int path_is_proc_exe(const char* path) {
     return p[kSuffixLen] == '\0' ? 1 : 0;
 }
 
+// S61 (Round 6): returns 1 if `path` looks like a
+// /proc/<pid>/fd/<n> path — the per-fd symlink whose readlink target
+// reveals the open file behind descriptor <n>.
+//
+// Examples that match:
+//   /proc/self/fd/21
+//   /proc/1234/fd/3
+//
+// Examples that don't:
+//   /proc/self/fd          (a directory, not a symlink)
+//   /proc/self/fdinfo/21   (different file, shows offsets not paths)
+//   /proc/self/exe
+static int path_is_proc_fd(const char* path) {
+    if (!path) return 0;
+    static const char kProc[] = "/proc/";
+    constexpr size_t kProcLen = sizeof(kProc) - 1;
+    if (strncmp(path, kProc, kProcLen) != 0) return 0;
+
+    const char* p = path + kProcLen;
+    if (strncmp(p, "self", 4) == 0) {
+        p += 4;
+    } else {
+        if (*p < '0' || *p > '9') return 0;
+        while (*p >= '0' && *p <= '9') ++p;
+    }
+
+    // Must have "/fd/" next.
+    static const char kFd[] = "/fd/";
+    constexpr size_t kFdLen = sizeof(kFd) - 1;
+    if (strncmp(p, kFd, kFdLen) != 0) return 0;
+    p += kFdLen;
+
+    // Must end with a non-empty run of decimal digits.
+    if (*p < '0' || *p > '9') return 0;
+    while (*p >= '0' && *p <= '9') ++p;
+    return *p == '\0' ? 1 : 0;
+}
+
 static ssize_t rewrite_if_suspicious(char* buf, size_t bufsiz,
                                        ssize_t real_n) {
     if (real_n < 0) return real_n;
@@ -180,8 +218,19 @@ extern "C" ssize_t zygisk_study_hook_readlink(const char* path,
     if (n < 0) return n;
     // Broaden: rewrite for any /proc/<pid>/exe path, not just
     // /proc/self/exe. Apps can probe via the numeric PID variant.
-    if (!path_is_proc_exe(path)) return n;
-    return rewrite_if_suspicious(buf, bufsiz, n);
+    if (path_is_proc_exe(path)) {
+        return rewrite_if_suspicious(buf, bufsiz, n);
+    }
+    // S61 (Round 6): also rewrite /proc/<pid>/fd/<n> targets that
+    // resolve to a Magisk / Zygisk / KernelSU path. This catches
+    // probes that iterate the fd table and readlink each entry —
+    // e.g. an app that survived a race with hide_advanced's
+    // close_unknown_fds() would otherwise see the daemon socket's
+    // /data/system/zygisk_study/... path here.
+    if (path_is_proc_fd(path)) {
+        return rewrite_if_suspicious(buf, bufsiz, n);
+    }
+    return n;
 }
 
 extern "C" ssize_t zygisk_study_hook_readlinkat(int dirfd,
@@ -192,13 +241,15 @@ extern "C" ssize_t zygisk_study_hook_readlinkat(int dirfd,
         : (ssize_t)syscall(SYS_readlinkat, dirfd, path, buf, bufsiz);
     if (n < 0) return n;
     // Broaden: same logic as readlink. We only rewrite absolute
-    // paths that look like /proc/<pid>/exe — for relative paths
-    // (readlinkat(dirfd, "exe", ...)) we don't have enough context
-    // to know whether dirfd is a /proc/<pid> directory, so we pass
-    // through unchanged.
+    // paths that look like /proc/<pid>/{exe,fd/<n>} — for relative
+    // paths (readlinkat(dirfd, "exe", ...)) we don't have enough
+    // context to know whether dirfd is a /proc/<pid> directory, so
+    // we pass through unchanged.
     if (!path || path[0] != '/') return n;
-    if (!path_is_proc_exe(path)) return n;
-    return rewrite_if_suspicious(buf, bufsiz, n);
+    if (path_is_proc_exe(path) || path_is_proc_fd(path)) {
+        return rewrite_if_suspicious(buf, bufsiz, n);
+    }
+    return n;
 }
 
 // ----------------------------------------------------------------------------
@@ -308,6 +359,61 @@ static void disable_core_dumps() {
     rl.rlim_cur = 0;
     rl.rlim_max = 0;
     (void)setrlimit(RLIMIT_CORE, &rl);
+}
+
+// ----------------------------------------------------------------------------
+// 15. PR_SET_NO_NEW_PRIVS in the forked child (S63)
+// ----------------------------------------------------------------------------
+//
+// prctl(PR_SET_NO_NEW_PRIVS, 1) is a documented Linux kernel feature
+// (since 3.5) that guarantees execve() will never grant the process
+// more privileges than it currently has: setuid/setgid bits and file
+// capabilities on the exec'd binary are ignored.
+//
+// For the forked app child this is a hardening win on two axes:
+//
+//   - The child can never regain capabilities by exec'ing a setuid
+//     helper, so any privilege boundary we established via the hide
+//     layer cannot be escalated back over.
+//   - LSMs (SELinux) treat no_new_privs processes as confined, which
+//     removes a class of "the sandbox escaped and re-acquired privs"
+//     detections.
+//
+// This matches what Android's own zygote does for app processes —
+// app_process children are already launched with no_new_privs=1 by
+// the runtime on Android 12+. Setting it again here is idempotent
+// (the flag is one-way; a second set is a no-op) and covers devices
+// / configurations where the runtime did not set it.
+static void set_no_new_privs() {
+    // PR_SET_NO_NEW_PRIVS = 38. Failure is silent — pre-3.5 kernels
+    // reject it, and we just don't get the guarantee there.
+    (void)prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+}
+
+// ----------------------------------------------------------------------------
+// 16. cwd fixup after the hide unmounts (S65)
+// ----------------------------------------------------------------------------
+//
+// The basic hide layer (hide.cpp) unmounts every Magisk/KernelSU
+// mount inside our private namespace. If the forked child's current
+// working directory happened to sit on one of those mounts, the
+// kernel now reports the cwd as disconnected: getcwd() fails with
+// ENOENT and /proc/self/cwd readlinks to "<path> (deleted)".
+//
+// Both are a tell. A stock app process always has cwd == "/"
+// (the zygote chdirs to / at boot and nothing changes it), so:
+//   - getcwd() failing at all is anomalous, and
+//   - a "(deleted)" suffix in /proc/self/cwd is anomalous.
+//
+// The fix is one cheap syscall: chdir("/"). On the common path the
+// cwd is already "/" and this is a no-op (~1 µs); on the anomalous
+// path it re-pins the cwd to the root mount, making both probes
+// return the stock answer. chdir is one of the cheapest syscalls on
+// Linux (no I/O, just an inode pin swap).
+static void ensure_cwd_is_root() {
+    if (chdir("/") != 0) {
+        ZS_LOGW("hide_stealth: chdir(/) failed: %s", strerror(errno));
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -461,6 +567,13 @@ void hide_stealth_apply_post_fork(const char* /*package_name*/) {
     // Defense-in-depth on top of dumpable=0: also disable core
     // dumps via RLIMIT_CORE. See S16 above.
     disable_core_dumps();
+    // S63 (Round 6): one-way privilege cap — execve() can never
+    // grant this child more privileges than it has now.
+    set_no_new_privs();
+    // S65 (Round 6): re-pin cwd to "/" so getcwd()//proc/self/cwd
+    // return the stock answer even if the hide layer's unmounts
+    // disconnected the old cwd.
+    ensure_cwd_is_root();
 }
 
 } // namespace zygisk_study

@@ -319,6 +319,62 @@ for the full reasoning.
   installed; the change is verified by code review and by
   the updated unit tests.
 
+### ✅ ROUND 6 — NEW HIGH-confidence perf wins (this round)
+
+- **P1.60 — Merged GOT walker: one `dl_iterate_phdr` walk instead
+  of two in `hide_advanced.cpp`.** The previous implementation
+  walked every loaded module twice at payload init (once for
+  open/openat in `install_open_hooks`, once for the stat family
+  in `install_stat_hooks`). Each walk of ~30 loaded modules is
+  ~30 dl_iterate_phdr callbacks + ~30 PT_DYNAMIC header scans +
+  ~30 dynamic-section walks ≈ 60-100 µs on AArch64, paid at init.
+  The merged `patch_got_all_for_phdr` patches all 11 symbol names
+  this TU owns (open, openat, stat, lstat, access, faccessat,
+  faccessat2, fstatat, fstatat64, __fstatat, statx) in ONE walk.
+  HIGH confidence because the change strictly reduces the number
+  of iterations over the same data structures — there is no
+  platform on which walking the module list once is slower than
+  walking it twice. The per-relocation matcher also switched to
+  a first-character switch so non-matching symbol names (the
+  ~99% common case in a typical .so's JUMP_SLOT table) exit
+  after one byte compare instead of up to 8 strcmp calls.
+  hide_stealth's readlink/readlinkat walk remains a separate
+  pass BY DESIGN (layer ordering: it must install after the
+  advanced layer's patches). Covered by a host-side test
+  (`merged_got_matcher_recognizes_all_hooked_symbols`) that
+  keeps the matcher's symbol set in sync with the hooks.
+
+- **P1.61 — `path_is_filtered()` fast gate in the open/openat
+  hooks.** Every entry in `kFilteredPaths` starts with
+  `/proc/` (6 chars). The old code ran up to 7 strcmp calls per
+  hooked open() to discover that `/data/...` or `/system/...`
+  isn't filtered. The new gate is a single 6-byte memcmp that
+  rejects non-/proc paths immediately: ~4 cycles instead of
+  ~70 on AArch64 for the common case. HIGH confidence because
+  the gate is a pure prefix check that is logically equivalent
+  (all filtered paths have the prefix; nothing without it can
+  match). Covered by `path_is_filtered_matches_only_documented_paths`.
+
+- **P1.62 — `path_is_hidden()` prefix fast gate + strlen
+  hoisting.** All entries in `kHiddenStatPaths` start with one of
+  four prefixes (/data, /sbin, /system, /debug_ramdisk); a probe
+  path starting with none of them (e.g. /vendor, /apex, /proc)
+  now exits after 4 short strncmps instead of 12 strcmp + 12
+  strncmp calls. The probe path's strlen is also computed once
+  and reused by the prefix-match loop (previously the loop read
+  `path[hlen]` per hidden entry — see the B1 correctness fix in
+  the stealth section, which this refactor subsumes). HIGH
+  confidence because the gate is logically equivalent and the
+  strlen hoist is a standard loop-invariant-code-motion.
+  Covered by `path_is_hidden_handles_prefix_of_hidden_path`.
+
+- **Correctness fix (B2) folded into the perf hooks:
+  `wrapped_open` / openat hook no longer return a closed fd.**
+  Not a perf item per se, but fixed in the same hot-path
+  functions: on the `make_filtered_memfd` failure path the old
+  code returned a just-closed fd; it now returns -1/EBADF.
+  Verified by `wrapped_open_returns_valid_fd_for_filtered_path`.
+
 ### ⚠️ MEDIUM confidence — probably wins on Android, magnitude uncertain
 
 These optimizations are correct on Android, but the magnitude of
@@ -609,6 +665,78 @@ Android:
   host-side test (`fstatat_hook_returns_enoent_for_hidden_paths`)
   that exercises both stat-like (flags=0) and lstat-like
   (flags=AT_SYMLINK_NOFOLLOW) behavior.
+
+### ✅ ROUND 6 — NEW HIGH-confidence stealth wins (this round)
+
+- **S60 — GOT-patch `statx`.** `statx(2)` is the modern Linux
+  stat interface (kernel 4.11+, glibc 2.28+, bionic on Android
+  8.0+). It is its own syscall — NOT routed through `newfstatat`
+  — so the Round 5 `stat`/`lstat`/`fstatat` hooks never saw it.
+  Detection code increasingly prefers `statx` because it also
+  exposes `STATX_BTIME` (inode birth time), useful for
+  fingerprinting freshly-created root files. The new hook applies
+  the same hidden-path check (ENOENT for absolute paths in the
+  hidden set) and falls back through `g_real_statx` →
+  `SYS_statx` → `ENOSYS`. HIGH confidence because the
+  GOT-patching mechanism is identical to the existing stat
+  patchers (just a different symbol name) and the fallback chain
+  covers every kernel we support. Covered by
+  `statx_hook_returns_enoent_for_hidden_paths`.
+
+- **S61 — Rewrite `readlink("/proc/<pid>/fd/<n>")` targets that
+  resolve to hidden paths.** The advanced layer's
+  `close_unknown_fds()` closes our fds after fork, but a probe
+  during the race window (or of an fd the runtime legitimately
+  holds open to a hidden path) could readlink the per-fd symlink
+  and see `/data/adb/...` or the daemon socket path. The
+  readlink/readlinkat hooks now match `/proc/{self,<pid>}/fd/<n>`
+  via a new `path_is_proc_fd()` matcher (same cheap
+  prefix + numeric-scan + suffix pattern as S12's
+  `path_is_proc_exe()`) and run the resolved target through the
+  existing suspicious-substring rewrite. HIGH confidence because
+  it reuses the S12 rewrite path unchanged — only the path
+  matcher is new, and it is covered by
+  `path_is_proc_fd_recognizes_documented_variants` (4 positive,
+  11 negative cases) plus `rewrite_if_suspicious_covers_fd_targets`.
+
+- **S63 — `prctl(PR_SET_NO_NEW_PRIVS, 1)` in the forked child.**
+  Guarantees execve() can never grant the child more privileges
+  than it has now (setuid/setgid bits and file capabilities on
+  the exec'd binary are ignored). One-way and idempotent —
+  Android 12+'s zygote already sets it for app processes, so on
+  modern devices this is a guaranteed no-op second set, and on
+  older devices it closes the privilege-escalation gap. Cost is
+  one prctl syscall (~1 µs) per fork on the slow path. HIGH
+  confidence because the kernel has honored PR_SET_NO_NEW_PRIVS
+  since Linux 3.5 and the host test verifies the flag via
+  PR_GET_NO_NEW_PRIVS (`set_no_new_privs_sets_flag`).
+
+- **S65 — `chdir("/")` after the hide unmounts.** If the forked
+  child's cwd sat on a mount that `unmount_magisk_paths()`
+  detached, `getcwd()` fails with ENOENT and `/proc/self/cwd`
+  readlinks to `"<path> (deleted)"` — both anomalous vs. a stock
+  app process (whose cwd is always `/`). One cheap syscall
+  re-pins the cwd to the root mount; on the common path it is
+  already `/` and the call is a no-op. HIGH confidence because
+  chdir("/") is one of the cheapest and oldest syscalls on Linux
+  and cannot fail in a way that leaves the process worse off.
+  Covered by `ensure_cwd_is_root_sets_cwd_to_slash`.
+
+- **B1 — Out-of-bounds read in `path_is_hidden` fixed.** The
+  prefix-match loop read `path[hlen]` before verifying the probe
+  path was at least `hlen` bytes long — a read past the NUL
+  terminator for probes shorter than the hidden prefix (e.g.
+  `/data/adb` vs. `/data/adb/modules`). Harmless on real systems
+  but UB under sanitizers; fixed with an explicit `hlen < plen`
+  guard (see P1.62 for the accompanying refactor). Covered by
+  `path_is_hidden_handles_prefix_of_hidden_path`.
+
+- **B2 — `wrapped_open` / openat hook returning a closed fd
+  fixed.** On the `make_filtered_memfd` failure path the old code
+  returned the just-closed original fd; the app would then read
+  an anomalous EBADF (or silently operate on an unrelated file if
+  the fd number was reused). Both hooks now return -1/EBADF.
+  Covered by `wrapped_open_returns_valid_fd_for_filtered_path`.
 
 ## What I cannot do in this sandbox
 

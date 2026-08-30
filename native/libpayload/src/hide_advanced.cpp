@@ -631,6 +631,22 @@ static ssize_t rewrite_status_line(char* dst, size_t dst_cap,
     return (ssize_t)kReplacementLen;
 }
 
+// P1.61 (Round 6): is `path` one of the /proc/self/* files we filter?
+// Every entry in kFilteredPaths starts with "/proc/" (6 chars), so a
+// single prefix memcmp rejects the overwhelming majority of opens an
+// app makes (which are for /data, /system, /apex, /vendor paths)
+// before any of the 7 strcmp calls run. On the hook hot path this
+// turns ~7 strcmp calls (~70 cycles) into 1 memcmp (~4 cycles) for
+// the common case.
+static int path_is_filtered(const char* path) {
+    if (ZS_UNLIKELY(!path)) return 0;
+    if (memcmp(path, "/proc/", 6) != 0) return 0;
+    for (const char* p : kFilteredPaths) {
+        if (strcmp(path, p) == 0) return 1;
+    }
+    return 0;
+}
+
 // Wrap the original open so the caller gets back either the original
 // fd (for non-filtered paths) or a filtered memfd (for filtered paths).
 static int wrapped_open(const char* path, int flags, mode_t mode) {
@@ -639,16 +655,19 @@ static int wrapped_open(const char* path, int flags, mode_t mode) {
         : (int)syscall(SYS_openat, AT_FDCWD, path, flags, mode);
     if (real_fd < 0) return real_fd;
 
-    // Is this a path we want to filter?
-    int filter = 0;
-    for (const char* p : kFilteredPaths) {
-        if (strcmp(path, p) == 0) { filter = 1; break; }
-    }
-    if (!filter) return real_fd;
+    if (!path_is_filtered(path)) return real_fd;
 
     int memfd = make_filtered_memfd(real_fd, path);
     close(real_fd);
-    return memfd >= 0 ? memfd : real_fd;
+    if (memfd >= 0) return memfd;
+    // B2 fix (Round 6): the original fd is already closed here, so
+    // returning it would hand the app a CLOSED descriptor (the old
+    // `return memfd >= 0 ? memfd : real_fd` did exactly that). Fail
+    // like a normal failed open instead. This path is only reachable
+    // if memfd_create or the pread of the original fails, which is
+    // already an anomaly.
+    errno = EBADF;
+    return -1;
 }
 
 extern "C" int zygisk_study_hook_open(const char* path, int flags, ...) {
@@ -679,164 +698,21 @@ extern "C" int zygisk_study_hook_openat(int dirfd, const char* path, int flags, 
         : (int)syscall(SYS_openat, dirfd, path, flags, mode);
     if (real_fd < 0) return real_fd;
 
-    int filter = 0;
-    for (const char* p : kFilteredPaths) {
-        if (strcmp(path, p) == 0) { filter = 1; break; }
-    }
-    if (!filter) return real_fd;
+    if (!path_is_filtered(path)) return real_fd;
 
     int memfd = make_filtered_memfd(real_fd, path);
     close(real_fd);
-    return memfd >= 0 ? memfd : real_fd;
+    if (memfd >= 0) return memfd;
+    // B2 fix (Round 6): see wrapped_open — never return the closed fd.
+    errno = EBADF;
+    return -1;
 }
 
-// Make a page containing the given address writable. Returns the
-// previous protection so the caller can restore it. Returns -1 on
-// failure. The "page" here is the page that contains `addr`.
-static int make_page_writable(void* addr) {
-    long pagesize = sysconf(_SC_PAGESIZE);
-    uintptr_t page = reinterpret_cast<uintptr_t>(addr) & ~(pagesize - 1);
-    void*    pageptr = reinterpret_cast<void*>(page);
-    size_t   pagelen = pagesize;
-
-    int old_prot;
-    // Try to query the current protection via /proc/self/maps. If
-    // that fails (it shouldn't), we default to PROT_READ.
-    // We can't use mprotect without saving the old protection
-    // because some hardening frameworks check for unexpected
-    // protection changes — restoring the old value is safer.
-    // For simplicity here we set RWX temporarily and restore to
-    // R-X. This isn't perfectly safe but it's the standard
-    // technique used by every Zygisk implementation in the
-    // public space.
-    if (mprotect(pageptr, pagelen,
-                 PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
-        return -1;
-    }
-    old_prot = PROT_READ | PROT_EXEC; // best-effort restore
-    return old_prot;
-}
-
-static void restore_page_protection(void* addr, int /*old_prot*/) {
-    long pagesize = sysconf(_SC_PAGESIZE);
-    uintptr_t page = reinterpret_cast<uintptr_t>(addr) & ~(pagesize - 1);
-    void*    pageptr = reinterpret_cast<void*>(page);
-    mprotect(pageptr, pagesize, PROT_READ | PROT_EXEC);
-}
-
-// Overwrite one GOT slot. The slot is a `void**` whose current
-// value is the address of the real function (in libc.so). We
-// replace it with the address of our hook. The caller is
-// responsible for having made the slot's page writable first.
-static void patch_got_slot(void** slot, void* hook_addr) {
-    *slot = hook_addr;
-}
-
-// Walk the dynamic section of one ELF object and patch the GOT slots
-// for `open` and `openat` so that they point to our hooks instead of
-// libc's. We skip our own .so files (we need to be able to call the
-// real libc functions from inside our own code).
-//
-// This is the standard "PLT/GOT patching" technique used by every
-// Android Zygisk implementation. The implementation here is
-// deliberately verbose — anyone reading the resulting .so should
-// be able to follow what we're doing.
-static int patch_got_for_phdr(struct dl_phdr_info* info,
-                              size_t /*size*/, void* /*data*/) {
-    if (!info || !info->dlpi_name || info->dlpi_name[0] == '\0') return 0;
-
-    // Skip our own .so files.
-    if (strstr(info->dlpi_name, "libpayload.so")   != nullptr ||
-        strstr(info->dlpi_name, "libzygisk.so")    != nullptr ||
-        strstr(info->dlpi_name, "libzn_loader.so") != nullptr) {
-        return 0;
-    }
-
-    // Find PT_DYNAMIC. The dynamic section is at info->dlpi_addr +
-    // p_vaddr for the PT_DYNAMIC program header.
-    const ElfW(Dyn)* dyn = nullptr;
-    for (int i = 0; i < info->dlpi_phnum; i++) {
-        const ElfW(Phdr)& ph = info->dlpi_phdr[i];
-        if (ph.p_type == PT_DYNAMIC) {
-            dyn = reinterpret_cast<const ElfW(Dyn)*>(
-                reinterpret_cast<const char*>(info->dlpi_addr) + ph.p_vaddr);
-            break;
-        }
-    }
-    if (!dyn) return 0;
-
-    // Pull out the four pointers we need from the dynamic section:
-    //   DT_SYMTAB   — the symbol table
-    //   DT_STRTAB   — the string table
-    //   DT_JMPREL   — the JUMP_SLOT relocation table
-    //   DT_PLTRELSZ — the byte size of DT_JMPREL
-    const ElfW(Sym)*  symtab  = nullptr;
-    const char*       strtab  = nullptr;
-    const ElfW(Rela)* jmprel  = nullptr;  // aarch64 uses Rela
-    size_t            pltrelsz = 0;
-
-    for (const ElfW(Dyn)* d = dyn; d->d_tag != DT_NULL; d++) {
-        switch (d->d_tag) {
-            case DT_SYMTAB:   symtab   = reinterpret_cast<const ElfW(Sym)*>(d->d_un.d_ptr); break;
-            case DT_STRTAB:   strtab   = reinterpret_cast<const char*>(d->d_un.d_ptr);      break;
-            case DT_JMPREL:   jmprel   = reinterpret_cast<const ElfW(Rela)*>(d->d_un.d_ptr); break;
-            case DT_PLTRELSZ: pltrelsz = d->d_un.d_val;                                    break;
-            default: break;
-        }
-    }
-    if (!symtab || !strtab || !jmprel || pltrelsz == 0) return 0;
-
-    // Walk the JUMP_SLOT relocations. For each one, the r_info field
-    // encodes the symbol index. We look up the symbol in symtab, get
-    // its name from strtab, and if the name is "open" or "openat",
-    // we overwrite the GOT slot at dlpi_addr + r_offset with the
-    // address of our hook.
-    size_t n = pltrelsz / sizeof(ElfW(Rela));
-    void*  hook_open   = reinterpret_cast<void*>(&zygisk_study_hook_open);
-    void*  hook_openat = reinterpret_cast<void*>(&zygisk_study_hook_openat);
-
-    for (size_t i = 0; i < n; i++) {
-        const ElfW(Rela)& r = jmprel[i];
-        // The ELF64 r_info layout is: symbol index in upper 32 bits,
-        // relocation type in lower 32 bits. R_SYM pulls the upper
-        // 32 bits.
-        size_t sym_idx = ELF64_R_SYM(r.r_info);
-        const ElfW(Sym)& sym = symtab[sym_idx];
-        const char* name = strtab + sym.st_name;
-        void** slot = reinterpret_cast<void**>(
-            reinterpret_cast<char*>(info->dlpi_addr) + r.r_offset);
-
-        if (strcmp(name, "open") == 0) {
-            int old = make_page_writable(slot);
-            if (old >= 0) {
-                patch_got_slot(slot, hook_open);
-                restore_page_protection(slot, old);
-            }
-        } else if (strcmp(name, "openat") == 0) {
-            int old = make_page_writable(slot);
-            if (old >= 0) {
-                patch_got_slot(slot, hook_openat);
-                restore_page_protection(slot, old);
-            }
-        }
-    }
-
-    return 0;
-}
-
-static void install_open_hooks() {
-    // Resolve the real libc open / openat so our hooks can
-    // delegate to them.
-    g_real_open   = (OpenFn)dlsym(RTLD_NEXT, "open");
-    g_real_openat = (OpenAtFn)dlsym(RTLD_NEXT, "openat");
-    if (!g_real_open || !g_real_openat) {
-        ZS_LOGW("hide_advanced: dlsym(RTLD_NEXT, open/openat) failed");
-    }
-
-    // Walk every loaded .so and patch its GOT.
-    dl_iterate_phdr(patch_got_for_phdr, nullptr);
-    ZS_LOGD("hide_advanced: open/openat hooks installed");
-}
+// P1.60 (Round 6): the old standalone open/openat walker
+// (patch_got_for_phdr + install_open_hooks) used to live here. It was
+// merged into patch_got_all_for_phdr + install_all_got_hooks below,
+// which patches every symbol this translation unit owns in ONE
+// dl_iterate_phdr walk. See the P1.60 comment block there.
 
 // ------------------------------------------------------------------------
 // 5b. stat / lstat / access hook — hide Magisk directories.
@@ -900,6 +776,18 @@ static FAccessAtFn  g_real_faccessat   = nullptr;
 static FAccessAt2Fn g_real_faccessat2  = nullptr;
 static FStatAtFn    g_real_fstatat      = nullptr;
 
+// S60 (Round 6): statx hook. See the S60 comment block above
+// zygisk_study_hook_statx for why the existing stat/lstat/fstatat
+// hooks don't cover this.
+//
+// `struct statx` comes from <sys/stat.h> (glibc 2.28+, bionic on
+// every NDK we target). The hook body treats the buffer as opaque —
+// we never read its fields — so the definition is only needed for
+// the pointer type.
+using StatxFn = int (*)(int, const char*, int, unsigned int,
+                        struct statx*);
+static StatxFn g_real_statx = nullptr;
+
 extern "C" int zygisk_study_hook_stat(const char* path, struct stat* st);
 extern "C" int zygisk_study_hook_lstat(const char* path, struct stat* st);
 extern "C" int zygisk_study_hook_access(const char* path, int mode);
@@ -910,6 +798,10 @@ extern "C" int zygisk_study_hook_faccessat2(int dirfd, const char* path,
                                              int mode, int flags);
 extern "C" int zygisk_study_hook_fstatat(int dirfd, const char* path,
                                           struct stat* st, int flags);
+// S60: statx hook entry point.
+extern "C" int zygisk_study_hook_statx(int dirfd, const char* path,
+                                        int flags, unsigned int mask,
+                                        struct statx* stx);
 
 // Paths whose existence would reveal Magisk / KernelSU / ZygiskNext.
 // We return ENOENT ("no such file or directory") for these.
@@ -931,18 +823,40 @@ static constexpr const char* kHiddenStatPaths[] = {
 
 static int path_is_hidden(const char* path) {
     if (!path || path[0] != '/') return 0;
+    // P1.62 (Round 6): all entries in kHiddenStatPaths start with
+    // one of three prefixes: /data (5), /sbin (5), /system (7),
+    // /debug_ramdisk (14). A path that starts with none of them
+    // (e.g. /sdcard, /vendor, /apex, /proc) cannot match any entry,
+    // so bail out before the two loops. This is a fast gate for the
+    // common case on the stat/access hook hot path.
+    if (strncmp(path, "/data",          5) != 0 &&
+        strncmp(path, "/sbin",          5) != 0 &&
+        strncmp(path, "/system",        7) != 0 &&
+        strncmp(path, "/debug_ramdisk", 14) != 0) {
+        return 0;
+    }
     for (const char* h : kHiddenStatPaths) {
         if (strcmp(path, h) == 0) return 1;
     }
     // Also match any path that starts with a hidden prefix + '/' —
     // e.g. /data/adb/magisk/anything or /sbin/magisk/foo. This catches
     // apps that probe for a specific known file inside the directory.
+    size_t plen = strlen(path);
     for (const char* h : kHiddenStatPaths) {
         size_t hlen = __builtin_strlen(h);
         // Skip the trailing '/' variants in the list above; we want
         // to match the prefix without it.
         if (hlen > 0 && h[hlen-1] == '/') hlen--;
-        if (path[hlen] == '/' && strncmp(path, h, hlen) == 0) return 1;
+        // B1 fix (Round 6): guard the path[hlen] read. The original
+        // `path[hlen] == '/' && strncmp(...)` read path[hlen] BEFORE
+        // checking hlen <= plen, which is an out-of-bounds read when
+        // the probe path is shorter than the hidden prefix (e.g.
+        // path "/data/adb" vs. hidden "/data/adb/modules"). Harmless
+        // on real systems (the NUL page is mapped) but UB under
+        // sanitizers; the explicit length check is also one branch
+        // the compiler can fold into the comparison.
+        if (hlen < plen && path[hlen] == '/' &&
+            strncmp(path, h, hlen) == 0) return 1;
     }
     return 0;
 }
@@ -1071,11 +985,71 @@ extern "C" int zygisk_study_hook_fstatat(int dirfd, const char* path,
 #endif
 }
 
-// GOT-patching walker for stat/lstat/access/faccessat. Same pattern
-// as the open/openat patcher above — we just look up different symbol
-// names in each .so's GOT.
-static int patch_got_stat_for_phdr(struct dl_phdr_info* info,
-                                    size_t /*size*/, void* /*data*/) {
+// S60 (Round 6): statx hook.
+//
+// statx(2) is the modern Linux stat interface (kernel 4.11+,
+// glibc 2.28+, bionic on Android 8.0+). Unlike stat/lstat/fstatat,
+// it is NOT routed through the newfstatat syscall — it is its own
+// syscall (SYS_statx = 291 on aarch64). Apps that probe Magisk
+// paths via statx bypass every hook we installed above:
+//
+//   struct statx stx;
+//   if (statx(AT_FDCWD, "/data/adb/magisk", 0, STATX_TYPE, &stx) == 0) {
+//       // Magisk is installed — and stat/lstat/fstatat hooks never saw it.
+//   }
+//
+// statx is increasingly common in detection code because it also
+// exposes STATX_BTIME (inode birth time) — useful for fingerprinting
+// freshly-created root files. We hook the libc `statx` symbol and
+// return ENOENT for hidden paths, matching the other stat-family
+// hooks.
+extern "C" int zygisk_study_hook_statx(int dirfd, const char* path,
+                                        int flags, unsigned int mask,
+                                        struct statx* stx) {
+    if (path && path[0] == '/' && path_is_hidden(path)) {
+        errno = ENOENT;
+        return -1;
+    }
+    if (g_real_statx) {
+        return g_real_statx(dirfd, path, flags, mask, stx);
+    }
+#ifdef SYS_statx
+    return (int)syscall(SYS_statx, dirfd, path, flags, mask, stx);
+#else
+    // Kernel/libc without statx — fail the same way libc would.
+    errno = ENOSYS;
+    return -1;
+#endif
+}
+
+// ------------------------------------------------------------------------
+// GOT-patching — merged walker (P1.60)
+// ------------------------------------------------------------------------
+//
+// PERF (Android-specific, P1.60): previously we walked
+// dl_iterate_phdr twice from this translation unit (once for
+// open/openat, once for stat/lstat/access/faccessat/faccessat2/
+// fstatat) and hide_stealth.cpp walked it a third time for
+// readlink/readlinkat. Each walk of ~30 loaded modules means ~30
+// dl_iterate_phdr callbacks, ~30 PT_DYNAMIC header scans, and ~30
+// dynamic-section walks — roughly 60-100 µs on AArch64 per extra
+// walk, paid at payload init.
+//
+// The merged walker below patches every symbol this TU owns in ONE
+// dl_iterate_phdr walk: open/openat plus the entire stat family
+// (including the S54 faccessat2, S55 fstatat, and S60 statx hooks).
+// hide_stealth's readlink/readlinkat walk remains separate by design
+// (layer ordering: it installs after ours), but eliminating one of
+// the three walks still saves ~60-100 µs at init.
+//
+// The per-relocation matcher uses a first-character switch so the
+// common case (symbol name isn't ours) exits after one byte compare
+// instead of up to 8 strcmp calls. strcmp of a non-matching name
+// against "open" is cheap but not free; over ~300 JUMP_SLOT
+// relocations in a typical .so the switch saves a few µs per module.
+
+static int patch_got_all_for_phdr(struct dl_phdr_info* info,
+                                  size_t /*size*/, void* /*data*/) {
     if (!info || !info->dlpi_name || info->dlpi_name[0] == '\0') return 0;
 
     // Skip our own .so files.
@@ -1085,6 +1059,8 @@ static int patch_got_stat_for_phdr(struct dl_phdr_info* info,
         return 0;
     }
 
+    // Find PT_DYNAMIC. The dynamic section is at info->dlpi_addr +
+    // p_vaddr for the PT_DYNAMIC program header.
     const ElfW(Dyn)* dyn = nullptr;
     for (int i = 0; i < info->dlpi_phnum; i++) {
         const ElfW(Phdr)& ph = info->dlpi_phdr[i];
@@ -1113,41 +1089,67 @@ static int patch_got_stat_for_phdr(struct dl_phdr_info* info,
     if (!symtab || !strtab || !jmprel || pltrelsz == 0) return 0;
 
     size_t n = pltrelsz / sizeof(ElfW(Rela));
-    void*  hook_stat        = reinterpret_cast<void*>(&zygisk_study_hook_stat);
-    void*  hook_lstat       = reinterpret_cast<void*>(&zygisk_study_hook_lstat);
-    void*  hook_access      = reinterpret_cast<void*>(&zygisk_study_hook_access);
-    void*  hook_faccessat   = reinterpret_cast<void*>(&zygisk_study_hook_faccessat);
-    // S54 / S55: new hooks for faccessat2 and fstatat.
-    void*  hook_faccessat2  = reinterpret_cast<void*>(&zygisk_study_hook_faccessat2);
-    void*  hook_fstatat     = reinterpret_cast<void*>(&zygisk_study_hook_fstatat);
+    void* hook_open        = reinterpret_cast<void*>(&zygisk_study_hook_open);
+    void* hook_openat      = reinterpret_cast<void*>(&zygisk_study_hook_openat);
+    void* hook_stat        = reinterpret_cast<void*>(&zygisk_study_hook_stat);
+    void* hook_lstat       = reinterpret_cast<void*>(&zygisk_study_hook_lstat);
+    void* hook_access      = reinterpret_cast<void*>(&zygisk_study_hook_access);
+    void* hook_faccessat   = reinterpret_cast<void*>(&zygisk_study_hook_faccessat);
+    // S54 / S55 / S60: faccessat2, fstatat, statx.
+    void* hook_faccessat2  = reinterpret_cast<void*>(&zygisk_study_hook_faccessat2);
+    void* hook_fstatat     = reinterpret_cast<void*>(&zygisk_study_hook_fstatat);
+    void* hook_statx       = reinterpret_cast<void*>(&zygisk_study_hook_statx);
 
     long pagesize = sysconf(_SC_PAGESIZE);
     for (size_t i = 0; i < n; i++) {
         const ElfW(Rela)& r = jmprel[i];
+        // The ELF64 r_info layout is: symbol index in upper 32 bits,
+        // relocation type in lower 32 bits. R_SYM pulls the upper
+        // 32 bits.
         size_t sym_idx = ELF64_R_SYM(r.r_info);
         const ElfW(Sym)& sym = symtab[sym_idx];
         const char* name = strtab + sym.st_name;
-        void** slot = reinterpret_cast<void**>(
-            reinterpret_cast<char*>(info->dlpi_addr) + r.r_offset);
 
+        // First-character switch: reject ~25/26 of symbols with one
+        // byte compare before any strcmp runs. Our hooked names all
+        // start with 'o', 's', 'l', 'a', 'f', or '_'.
         void* hook = nullptr;
-        if      (strcmp(name, "stat")       == 0) hook = hook_stat;
-        else if (strcmp(name, "lstat")      == 0) hook = hook_lstat;
-        else if (strcmp(name, "access")     == 0) hook = hook_access;
-        else if (strcmp(name, "faccessat")  == 0) hook = hook_faccessat;
-        // S54 / S55: new symbol name matches.
-        else if (strcmp(name, "faccessat2") == 0) hook = hook_faccessat2;
-        else if (strcmp(name, "fstatat")    == 0) hook = hook_fstatat;
-        // Also catch the alternative names that some Bionic
-        // versions and some glibc builds export. `__fstatat` is
-        // the internal Bionic name; `fstatat64` is the LFS alias.
-        // Catching these is a defensive measure — most apps use
-        // `fstatat` directly, but some third-party NDK-built libs
-        // may use the alternative names.
-        else if (strcmp(name, "__fstatat")  == 0) hook = hook_fstatat;
-        else if (strcmp(name, "fstatat64")  == 0) hook = hook_fstatat;
+        switch (name[0]) {
+        case 'o':
+            if      (strcmp(name, "open")   == 0) hook = hook_open;
+            else if (strcmp(name, "openat") == 0) hook = hook_openat;
+            break;
+        case 's':
+            if      (strcmp(name, "stat")  == 0) hook = hook_stat;
+            // S60: statx.
+            else if (strcmp(name, "statx") == 0) hook = hook_statx;
+            break;
+        case 'l':
+            if (strcmp(name, "lstat") == 0) hook = hook_lstat;
+            break;
+        case 'a':
+            if (strcmp(name, "access") == 0) hook = hook_access;
+            break;
+        case 'f':
+            if      (strcmp(name, "faccessat")  == 0) hook = hook_faccessat;
+            // S54 / S55: faccessat2 and fstatat.
+            else if (strcmp(name, "faccessat2") == 0) hook = hook_faccessat2;
+            else if (strcmp(name, "fstatat")    == 0) hook = hook_fstatat;
+            // Also catch the LFS alias that some third-party
+            // NDK-built libs use.
+            else if (strcmp(name, "fstatat64")  == 0) hook = hook_fstatat;
+            break;
+        case '_':
+            // `__fstatat` is the internal Bionic name — defensive.
+            if (strcmp(name, "__fstatat") == 0) hook = hook_fstatat;
+            break;
+        default:
+            break;
+        }
         if (!hook) continue;
 
+        void** slot = reinterpret_cast<void**>(
+            reinterpret_cast<char*>(info->dlpi_addr) + r.r_offset);
         uintptr_t page = reinterpret_cast<uintptr_t>(slot) & ~(pagesize - 1);
         void* pageptr = reinterpret_cast<void*>(page);
         if (mprotect(pageptr, pagesize,
@@ -1159,17 +1161,30 @@ static int patch_got_stat_for_phdr(struct dl_phdr_info* info,
     return 0;
 }
 
-static void install_stat_hooks() {
+// P1.60 (Round 6): one-shot installer that resolves every real libc
+// symbol this TU's hooks delegate to, then performs the single merged
+// GOT walk. Replaces the old install_open_hooks() + install_stat_hooks()
+// pair (which did two dl_iterate_phdr walks).
+static void install_all_got_hooks() {
+    g_real_open   = (OpenFn)dlsym(RTLD_NEXT, "open");
+    g_real_openat = (OpenAtFn)dlsym(RTLD_NEXT, "openat");
+    if (!g_real_open || !g_real_openat) {
+        ZS_LOGW("hide_advanced: dlsym(RTLD_NEXT, open/openat) failed");
+    }
+
     g_real_stat       = (StatFn)dlsym(RTLD_NEXT, "stat");
     g_real_lstat      = (LstatFn)dlsym(RTLD_NEXT, "lstat");
     g_real_access     = (AccessFn)dlsym(RTLD_NEXT, "access");
     g_real_faccessat  = (FAccessAtFn)dlsym(RTLD_NEXT, "faccessat");
-    // S54 / S55: resolve the new libc symbols. On older Bionic
-    // (pre-Android 11), `faccessat2` may not be exported — that's
-    // fine, our hook falls back to `faccessat`. `fstatat` is
-    // exported on all Android versions we support.
+    // S54 / S55 / S60: resolve the newer libc symbols. On older
+    // Bionic (pre-Android 11), `faccessat2` may not be exported —
+    // that's fine, our hook falls back to `faccessat`. `statx` is
+    // exported on all bionic versions that have the syscall; where
+    // absent, the hook falls back to the raw SYS_statx syscall.
     g_real_faccessat2 = (FAccessAt2Fn)dlsym(RTLD_NEXT, "faccessat2");
     g_real_fstatat    = (FStatAtFn)dlsym(RTLD_NEXT, "fstatat");
+    g_real_statx      = (StatxFn)dlsym(RTLD_NEXT, "statx");
+
     // stat/lstat/access not being available via dlsym is a warning,
     // not an error — our hooks fall back to direct syscalls.
     if (!g_real_stat || !g_real_lstat || !g_real_access || !g_real_faccessat) {
@@ -1185,9 +1200,14 @@ static void install_stat_hooks() {
         ZS_LOGW("hide_advanced: dlsym fstatat failed "
                 "(hook will fall back to syscall)");
     }
-    dl_iterate_phdr(patch_got_stat_for_phdr, nullptr);
-    ZS_LOGD("hide_advanced: stat/lstat/access/faccessat/faccessat2/"
-            "fstatat hooks installed");
+    if (!g_real_statx) {
+        ZS_LOGD("hide_advanced: statx not in libc "
+                "(hook will fall back to SYS_statx)");
+    }
+
+    dl_iterate_phdr(patch_got_all_for_phdr, nullptr);
+    ZS_LOGD("hide_advanced: open/openat + stat/lstat/access/faccessat/"
+            "faccessat2/fstatat/statx hooks installed (single GOT walk)");
 }
 
 // ------------------------------------------------------------------------
@@ -1343,13 +1363,12 @@ void hide_advanced_init() {
     if (!g_advanced_initialized.compare_exchange_strong(expected, 1)) {
         return;
     }
-    // Install our open/openat hooks at init time so they're in place
-    // before any fork. The hooks themselves check the path argument
-    // and only filter /proc/self/{maps,mounts}*.
-    install_open_hooks();
-    // Also install the stat/lstat/access/faccessat hooks so apps
-    // that probe for /data/adb/magisk etc. via stat() see ENOENT.
-    install_stat_hooks();
+    // P1.60: install ALL of this layer's GOT hooks (open/openat,
+    // stat family, faccessat2/fstatat/statx) in a single
+    // dl_iterate_phdr walk. The hooks themselves check the path
+    // argument and only filter /proc/self/{maps,mounts}* or the
+    // documented Magisk/KernelSU directories.
+    install_all_got_hooks();
 }
 
 void hide_advanced_apply_pre_fork() {

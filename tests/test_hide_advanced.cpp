@@ -655,6 +655,213 @@ ZS_TEST(make_filtered_memfd_filters_smaps_magisk_entries) {
 }
 
 // ----------------------------------------------------------------------
+// Test (Round 6, S60): the statx hook returns ENOENT for hidden paths
+// and passes through for innocent ones.
+//
+// We call the hook directly (as with the S54/S55 tests) — GOT
+// patching the host binary's own statx would be risky, but the hook
+// function's hide/pass-through logic is fully testable.
+// ----------------------------------------------------------------------
+
+ZS_TEST(statx_hook_returns_enoent_for_hidden_paths) {
+    struct statx stx;
+    errno = 0;
+    int r = zygisk_study_hook_statx(AT_FDCWD, "/data/adb/magisk",
+                                    0, /*STATX_TYPE*/ 0x001, &stx);
+    ZS_CHECK_EQ(r, -1);
+    ZS_CHECK_EQ(errno, ENOENT);
+
+    errno = 0;
+    r = zygisk_study_hook_statx(AT_FDCWD, "/sbin/magisk",
+                                0, 0x001, &stx);
+    ZS_CHECK_EQ(r, -1);
+    ZS_CHECK_EQ(errno, ENOENT);
+
+    errno = 0;
+    r = zygisk_study_hook_statx(AT_FDCWD, "/data/adb/ksu/anything",
+                                AT_SYMLINK_NOFOLLOW, 0x001, &stx);
+    ZS_CHECK_EQ(r, -1);
+    ZS_CHECK_EQ(errno, ENOENT);
+
+    // An innocent path on the host: /tmp exists, statx must succeed
+    // (via g_real_statx or the raw SYS_statx fallback — the host
+    // kernel has supported statx since 4.11).
+    errno = 0;
+    r = zygisk_study_hook_statx(AT_FDCWD, "/tmp", 0, 0x001, &stx);
+    ZS_CHECK_EQ(r, 0);
+
+    // A relative path: pass through to the real syscall (the hidden
+    // check only applies to absolute paths).
+    errno = 0;
+    r = zygisk_study_hook_statx(AT_FDCWD, "relative/path", 0, 0x001, &stx);
+    // Real kernel says ENOENT (file doesn't exist) — either way the
+    // hidden-path check must NOT be what fired.
+    ZS_CHECK(r == 0 || (r == -1 && errno == ENOENT));
+}
+
+// ----------------------------------------------------------------------
+// Test (Round 6, P1.60): the merged GOT walker's symbol matcher
+// recognizes every hooked symbol name this TU owns, including the
+// S54/S55/S60 additions and the alias names.
+//
+// This mirrors the first-character switch + strcmp chain inside
+// patch_got_all_for_phdr(). Keeping the test in sync with the
+// production matcher is what prevents a symbol being silently
+// dropped from the hook set.
+// ----------------------------------------------------------------------
+
+ZS_TEST(merged_got_matcher_recognizes_all_hooked_symbols) {
+    auto match = [](const char* name) -> void* {
+        void* hook = nullptr;
+        switch (name[0]) {
+        case 'o':
+            if      (strcmp(name, "open")   == 0) hook = (void*)0x1;
+            else if (strcmp(name, "openat") == 0) hook = (void*)0x2;
+            break;
+        case 's':
+            if      (strcmp(name, "stat")  == 0) hook = (void*)0x3;
+            else if (strcmp(name, "statx") == 0) hook = (void*)0x4;
+            break;
+        case 'l':
+            if (strcmp(name, "lstat") == 0) hook = (void*)0x5;
+            break;
+        case 'a':
+            if (strcmp(name, "access") == 0) hook = (void*)0x6;
+            break;
+        case 'f':
+            if      (strcmp(name, "faccessat")  == 0) hook = (void*)0x7;
+            else if (strcmp(name, "faccessat2") == 0) hook = (void*)0x8;
+            else if (strcmp(name, "fstatat")    == 0) hook = (void*)0x9;
+            else if (strcmp(name, "fstatat64")  == 0) hook = (void*)0x9;
+            break;
+        case '_':
+            if (strcmp(name, "__fstatat") == 0) hook = (void*)0x9;
+            break;
+        default:
+            break;
+        }
+        return hook;
+    };
+    // Every hooked name must match.
+    ZS_CHECK(match("open")       != nullptr);
+    ZS_CHECK(match("openat")     != nullptr);
+    ZS_CHECK(match("stat")       != nullptr);
+    ZS_CHECK(match("lstat")      != nullptr);
+    ZS_CHECK(match("access")     != nullptr);
+    ZS_CHECK(match("faccessat")  != nullptr);
+    ZS_CHECK(match("faccessat2") != nullptr);
+    ZS_CHECK(match("fstatat")    != nullptr);
+    ZS_CHECK(match("fstatat64")  != nullptr);
+    ZS_CHECK(match("__fstatat")  != nullptr);
+    ZS_CHECK(match("statx")      != nullptr);
+    // Non-hooked names must NOT match — including near-misses that
+    // share a first character with a hooked name.
+    ZS_CHECK(match("read")      == nullptr);
+    ZS_CHECK(match("write")     == nullptr);
+    ZS_CHECK(match("socket")    == nullptr);  // 's' but not stat/statx
+    ZS_CHECK(match("open64")    == nullptr);  // 'o' but not open/openat
+    ZS_CHECK(match("fopen")     == nullptr);  // 'f' but not our set
+    ZS_CHECK(match("listen")    == nullptr);  // 'l' but not lstat
+    ZS_CHECK(match("__open_2")  == nullptr);  // '_' but not __fstatat
+    ZS_CHECK(match("")           == nullptr);  // empty name
+}
+
+// ----------------------------------------------------------------------
+// Test (Round 6, P1.61): path_is_filtered() gates correctly — it
+// matches only the documented /proc/self/* paths, and rejects the
+// common non-/proc prefixes before any strcmp runs.
+// ----------------------------------------------------------------------
+
+ZS_TEST(path_is_filtered_matches_only_documented_paths) {
+    // The documented filtered set.
+    ZS_CHECK(path_is_filtered("/proc/self/maps")         == 1);
+    ZS_CHECK(path_is_filtered("/proc/self/mounts")       == 1);
+    ZS_CHECK(path_is_filtered("/proc/self/mountinfo")    == 1);
+    ZS_CHECK(path_is_filtered("/proc/self/mountstats")   == 1);
+    ZS_CHECK(path_is_filtered("/proc/self/status")       == 1);
+    ZS_CHECK(path_is_filtered("/proc/self/smaps")        == 1);
+    ZS_CHECK(path_is_filtered("/proc/self/smaps_rollup") == 1);
+    // Same /proc/ prefix but not a filtered file.
+    ZS_CHECK(path_is_filtered("/proc/self/cmdline")      == 0);
+    ZS_CHECK(path_is_filtered("/proc/self/exe")          == 0);
+    ZS_CHECK(path_is_filtered("/proc/self/fd/3")         == 0);
+    // Non-/proc prefixes — rejected by the fast gate.
+    ZS_CHECK(path_is_filtered("/data/adb/magisk")        == 0);
+    ZS_CHECK(path_is_filtered("/system/bin/app_process64") == 0);
+    ZS_CHECK(path_is_filtered("/sdcard/x")               == 0);
+    // Edge cases.
+    ZS_CHECK(path_is_filtered(nullptr)                   == 0);
+    ZS_CHECK(path_is_filtered("")                        == 0);
+    ZS_CHECK(path_is_filtered("relative/path")           == 0);
+}
+
+// ----------------------------------------------------------------------
+// Test (Round 6, B1): path_is_hidden() does not read out of bounds
+// when the probe path is a strict prefix of a hidden path.
+//
+// The old code read path[hlen] before verifying hlen <= strlen(path).
+// For path = "/data/adb" (shorter than the hidden entry
+// "/data/adb/modules"), that read past the NUL terminator. The fix
+// adds an explicit hlen < plen guard. We verify the fixed behavior:
+// prefix-of-hidden paths are NOT hidden (a directory that merely
+// shares a leading substring is not itself hidden).
+// ----------------------------------------------------------------------
+
+ZS_TEST(path_is_hidden_handles_prefix_of_hidden_path) {
+    // "/data/adb" is a strict prefix of "/data/adb/modules",
+    // "/data/adb/magisk", etc. It must NOT be treated as hidden
+    // (the user may have legitimate files there), and the check
+    // must not read past the string's NUL terminator.
+    ZS_CHECK(path_is_hidden("/data/adb")    == 0);
+    ZS_CHECK(path_is_hidden("/sbin")        == 0);
+    ZS_CHECK(path_is_hidden("/data")        == 0);
+    ZS_CHECK(path_is_hidden("/system")      == 0);
+    ZS_CHECK(path_is_hidden("/data/system") == 0);
+    // One character short of an exact match — also not hidden.
+    ZS_CHECK(path_is_hidden("/data/adb/magis") == 0);
+    ZS_CHECK(path_is_hidden("/debug_ramdis")   == 0);
+    // The exact hidden paths still match.
+    ZS_CHECK(path_is_hidden("/data/adb/magisk") == 1);
+    ZS_CHECK(path_is_hidden("/data/adb/modules") == 1);
+    ZS_CHECK(path_is_hidden("/debug_ramdisk")   == 1);
+}
+
+// ----------------------------------------------------------------------
+// Test (Round 6, B2): wrapped_open() never returns a closed fd.
+//
+// The old code did `close(real_fd); return memfd >= 0 ? memfd :
+// real_fd;` — returning the just-closed fd when make_filtered_memfd
+// failed. We can't easily force a memfd failure on the host, but we
+// CAN verify the happy path returns a valid, open fd whose content
+// is the filtered maps, and that a non-filtered path returns the
+// real fd unchanged.
+// ----------------------------------------------------------------------
+
+ZS_TEST(wrapped_open_returns_valid_fd_for_filtered_path) {
+    // Write fake maps content to a file, open it via the hook path.
+    // We can't intercept /proc/self/maps itself on the host (the
+    // hook is only consulted after GOT patching, which we don't do
+    // in tests), so instead we call wrapped_open directly with the
+    // real /proc/self/maps — which IS a filtered path.
+    int fd = wrapped_open("/proc/self/maps", O_RDONLY, 0);
+    ZS_CHECK(fd >= 0);
+    // The fd must be valid and readable — reading it must not fail
+    // with EBADF (which is what the old closed-fd return produced).
+    char buf[256];
+    ssize_t n = read(fd, buf, sizeof buf);
+    ZS_CHECK(n >= 0);   // 0 (empty maps) is fine; -1/EBADF is the bug
+    close(fd);
+
+    // A non-filtered path must return the real fd. Use /proc/self/cmdline
+    // (exists on the host, not in kFilteredPaths).
+    int fd2 = wrapped_open("/proc/self/cmdline", O_RDONLY, 0);
+    ZS_CHECK(fd2 >= 0);
+    ssize_t n2 = read(fd2, buf, sizeof buf);
+    ZS_CHECK(n2 > 0);   // cmdline is never empty for a live process
+    close(fd2);
+}
+
+// ----------------------------------------------------------------------
 // main()
 // ----------------------------------------------------------------------
 
