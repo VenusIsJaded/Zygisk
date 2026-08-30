@@ -1,0 +1,6 @@
+id=zygisk_study
+name=Zygisk Study
+version=v0.1.0
+versionCode=1
+author=Zygisk Study contributors
+description=A from-scratch study reimplementation of the Zygisk loader pattern. NOT a successor to or fork of any existing Zygisk project. Educational only; do not flash on a device you depend on.

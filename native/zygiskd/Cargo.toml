@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: Apache-2.0
+# native/zygiskd/Cargo.toml
+#
+# The daemon — runs as root, holds the module registry, listens on
+# /data/system/zygisk_study/sock/sock for connections from
+# libpayload and libzn_loader.
+#
+# Dependencies are deliberately minimal: std only + libc for syscalls.
+# We avoid the heavy NDK crates because we want the resulting binary
+# to be small and easy to read in a disassembler.
+
+[package]
+name = "zygiskd"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Daemon for Zygisk Study — an educational reimplementation of the Zygisk loader pattern."
+
+[[bin]]
+name = "zygiskd"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+# We want a small binary that's still readable. opt-level 1 keeps
+# the control flow obvious to a reverse engineer while removing
+# the obvious dead-code smells.
+opt-level = 1
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
