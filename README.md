@@ -188,7 +188,7 @@ What the tests cover:
   denylist parser, decision logic, property-scrub key list
   (incl. the 9 S46 Round 5 additions), idempotency of init,
   the fixed-size `so_record` array (P1.38).
-- **`test_hide_advanced`** (20 tests) — advanced hide layer:
+- **`test_hide_advanced`** (25 tests) — advanced hide layer:
   hidden-substrings coverage (incl. P1.39 precomputed lengths),
   filtered-paths coverage (incl. S25 smaps + smaps_rollup),
   memfd filtering (drops Magisk/.so entries, preserves libc,
@@ -196,17 +196,26 @@ What the tests cover:
   GOT-patcher matcher (`open`/`openat`), env-var scrub,
   signal-reset skip list, TracerPid rewrite (S10), batched-write
   correctness on 500-line input (P1.18), the smaps filter (S25),
-  the `faccessat2` hook (S54), the `fstatat` hook (S55).
-- **`test_hide_stealth`** (10 tests) — additional stealth layer:
+  the `faccessat2` hook (S54), the `fstatat` hook (S55),
+  the `statx` hook (S60), the merged GOT-walker symbol matcher
+  (P1.60), the `path_is_filtered` fast gate (P1.61), the
+  `path_is_hidden` prefix-of-hidden + bounds-check fix (B1/P1.62),
+  and the `wrapped_open` closed-fd fix (B2).
+- **`test_hide_stealth`** (14 tests) — additional stealth layer:
   the readlink rewriter (drops Magisk/zygisk paths, preserves
   stock app_process), the readlinkat GOT-patcher matcher,
   idempotency of init, the broadened `/proc/<pid>/exe` matcher
-  (S12), the RLIMIT_CORE check (S16).
+  (S12), the RLIMIT_CORE check (S16), the `/proc/<pid>/fd/<n>`
+  matcher + fd-target rewrite (S61), the NO_NEW_PRIVS check
+  (S63), and the cwd-fixup check (S65).
 - **`test_e2e_hide`** (5 tests) — end-to-end: forks a child,
   calls `hide_apply_for_target()`, verifies the child survives
   and reports back via pipe. Also parses real `/proc/self/maps`
   content, spikes it with a fake Magisk line, and verifies the
   filter drops it.
+
+(Total: 63 host-side tests — 16 + 25 + 14 + 5 + 3 — plus the
+daemon's `cargo test` suite.)
 - **`test_perf`** (3 tests) — host-side microbenchmarks of the
   three hot paths (`make_filtered_memfd`,
   `hide_setup_for_target` fast path,
@@ -300,10 +309,18 @@ cd tests && make test_perf && ./test_perf
 Current results on x86_64:
 
 ```
-[perf] make_filtered_memfd median:           ~170 us  (was 303 us before P1.18; ~168 us after P1.39/P1.40)
+[perf] make_filtered_memfd median:           ~171-181 us  (was 303 us before P1.18; ~168 us after P1.39/P1.40)
 [perf] hide_setup_for_target fast path median:  0 us  (sub-us)
 [perf] hide_apply_for_target fast path median:  0 us  (sub-us)
 ```
+
+Round 6 additionally merged the advanced layer's two
+`dl_iterate_phdr` GOT-patching walks into one (P1.60, saves
+~60-100 µs at payload init on AArch64) and added prefix fast
+gates to the open-hook and stat-hook path matchers (P1.61/P1.62).
+These are init-time and hook-hot-path wins not captured by the
+three microbenchmarks above — see `PERFORMANCE-CLAIMS.md` for
+the honest accounting.
 
 (All three pass their host-side budgets. The actual on-Android
 numbers will differ — see `PERFORMANCE-CLAIMS.md` for the honest

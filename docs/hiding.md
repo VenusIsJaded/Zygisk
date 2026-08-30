@@ -519,6 +519,86 @@ Be honest about what the hide layer does not do:
   exercises both `flags=0` (stat-like) and
   `flags=AT_SYMLINK_NOFOLLOW` (lstat-like) behavior.
 
+## Round 6 — additional gaps closed (this round)
+
+- **Apps using `statx` to bypass the entire stat-family hook set.**
+  `statx(2)` is the modern Linux stat interface (kernel 4.11+,
+  glibc 2.28+, bionic on Android 8.0+). It is NOT routed through
+  `newfstatat` — it is its own syscall — so the `stat`/`lstat`/
+  `fstatat` hooks from Round 5 never see it. Detection code
+  increasingly prefers `statx` because it also exposes
+  `STATX_BTIME` (inode birth time), which fingerprints
+  freshly-created root files. **NEW (S60):** `statx` is now in
+  the GOT patcher with the same hidden-path check as the rest of
+  the stat family (return `ENOENT` for absolute paths in the
+  hidden set). The hook resolves `g_real_statx` via dlsym and
+  falls back to the raw `SYS_statx` syscall when the libc symbol
+  is unavailable. Covered by a new host-side test
+  (`statx_hook_returns_enoent_for_hidden_paths`).
+
+- **`readlink("/proc/<pid>/fd/<n>")` leaking hidden paths through
+  open descriptors.** The advanced layer's `close_unknown_fds()`
+  closes every fd above stdio after fork, but an app that probes
+  *during* the race window (before the cleanup runs) — or that
+  finds an fd the runtime legitimately holds open to a hidden
+  path — could readlink `/proc/self/fd/<n>` and see
+  `/data/adb/...` or our daemon socket path. **NEW (S61):** the
+  readlink/readlinkat hooks now recognize
+  `/proc/{self,<pid>}/fd/<n>` paths in addition to
+  `/proc/{self,<pid>}/exe` (S12) and run the resolved target
+  through the same suspicious-substring rewrite. The new
+  `path_is_proc_fd()` matcher is the same cheap
+  prefix + numeric-scan + suffix pattern as `path_is_proc_exe()`.
+  Covered by two new host-side tests
+  (`path_is_proc_fd_recognizes_documented_variants`,
+  `rewrite_if_suspicious_covers_fd_targets`).
+
+- **The forked child being able to re-gain privileges via
+  execve().** Without `no_new_privs`, exec'ing a setuid/setgid or
+  file-capability binary could grant the child more privileges
+  than the hide layer assumed — a privilege-boundary escape that
+  also contradicts the "confined app process" profile SELinux
+  expects. **NEW (S63):** the post-fork pipeline now calls
+  `prctl(PR_SET_NO_NEW_PRIVS, 1)`. This is one-way and idempotent
+  (Android 12+'s zygote already sets it for app processes; a
+  second set is a no-op), and the cost is one prctl syscall
+  (~1 µs) per fork on the slow path. Covered by a new host-side
+  test (`set_no_new_privs_sets_flag`) that verifies the flag via
+  `PR_GET_NO_NEW_PRIVS`.
+
+- **`getcwd()` / `/proc/self/cwd` reporting a deleted directory
+  after the hide unmounts.** If the forked child's cwd sat on a
+  Magisk/KernelSU mount that `unmount_magisk_paths()` detached,
+  the kernel reports the cwd as disconnected: `getcwd()` fails
+  with `ENOENT` and `/proc/self/cwd` readlinks to
+  `"<path> (deleted)"`. Both are anomalous — a stock app process
+  always has cwd == `/`. **NEW (S65):** the post-fork pipeline
+  now calls `chdir("/")`. On the common path the cwd is already
+  `/` and this is a no-op; on the anomalous path it re-pins the
+  cwd to the root mount so both probes return the stock answer.
+  Covered by a new host-side test
+  (`ensure_cwd_is_root_sets_cwd_to_slash`).
+
+- **Correctness fix: `wrapped_open` / `openat` hook returning a
+  closed fd (B2).** The old code did `close(real_fd); return
+  memfd >= 0 ? memfd : real_fd;` — if `make_filtered_memfd`
+  failed, the app received the just-closed fd, and any read would
+  fail with an anomalous `EBADF` (or worse, silently operate on
+  an unrelated file if the fd number was reused). Both hooks now
+  return `-1` with `errno = EBADF` on that path, which is how a
+  genuinely failed open behaves. Covered by a new host-side test
+  (`wrapped_open_returns_valid_fd_for_filtered_path`).
+
+- **Correctness fix: out-of-bounds read in `path_is_hidden`
+  (B1).** The prefix-match loop read `path[hlen]` before
+  verifying the probe path was at least `hlen` bytes long. For a
+  probe of `/data/adb` (shorter than the hidden entry
+  `/data/adb/modules`) that read past the string's NUL
+  terminator. Harmless on real systems (the NUL page is mapped)
+  but UB under sanitizers; the fix adds an explicit
+  `hlen < plen` guard. Covered by a new host-side test
+  (`path_is_hidden_handles_prefix_of_hidden_path`).
+
 ## Why this is "public knowledge"
 
 Every technique described in this file appears in one or more of:

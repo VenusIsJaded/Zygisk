@@ -243,6 +243,119 @@ ZS_TEST(disable_core_dumps_zeros_rlimit_core) {
 }
 
 // ----------------------------------------------------------------------
+// Test 11 (Round 6, S61): path_is_proc_fd() recognizes the
+// documented /proc/<pid>/fd/<n> variants.
+// ----------------------------------------------------------------------
+
+ZS_TEST(path_is_proc_fd_recognizes_documented_variants) {
+    // Self + numeric-pid variants with various fd numbers.
+    ZS_CHECK_EQ(path_is_proc_fd("/proc/self/fd/0"),      1);
+    ZS_CHECK_EQ(path_is_proc_fd("/proc/self/fd/21"),     1);
+    ZS_CHECK_EQ(path_is_proc_fd("/proc/0/fd/3"),         1);
+    ZS_CHECK_EQ(path_is_proc_fd("/proc/1234/fd/1023"),   1);
+
+    // Negative cases — must NOT match.
+    ZS_CHECK_EQ(path_is_proc_fd("/proc/self/fd"),        0);  // dir, no fd num
+    ZS_CHECK_EQ(path_is_proc_fd("/proc/self/fd/"),       0);  // trailing slash only
+    ZS_CHECK_EQ(path_is_proc_fd("/proc/self/fd/3x"),     0);  // non-digit suffix
+    ZS_CHECK_EQ(path_is_proc_fd("/proc/self/fdinfo/3"),  0);  // fdinfo, not fd
+    ZS_CHECK_EQ(path_is_proc_fd("/proc/self/exe"),       0);  // exe, not fd
+    ZS_CHECK_EQ(path_is_proc_fd("/proc/self/maps"),      0);
+    ZS_CHECK_EQ(path_is_proc_fd("/proc/abc/fd/3"),       0);  // non-numeric pid
+    ZS_CHECK_EQ(path_is_proc_fd("/data/adb/magisk"),     0);  // not a proc path
+    ZS_CHECK_EQ(path_is_proc_fd(nullptr),                0);
+    ZS_CHECK_EQ(path_is_proc_fd(""),                     0);
+    ZS_CHECK_EQ(path_is_proc_fd("self/fd/3"),            0);  // relative
+}
+
+// ----------------------------------------------------------------------
+// Test 12 (Round 6, S61): rewrite_if_suspicious() catches the fd
+// symlink targets that reveal root (daemon socket, magisk binary),
+// and preserves innocent fd targets.
+// ----------------------------------------------------------------------
+
+ZS_TEST(rewrite_if_suspicious_covers_fd_targets) {
+    char buf[256];
+    // A daemon-socket target — the path an app would see by
+    // readlink'ing /proc/self/fd/<n> if our fd cleanup raced.
+    const char* sock_target = "/data/system/zygisk_study/sock/sock";
+    size_t sock_len = strlen(sock_target);
+    memcpy(buf, sock_target, sock_len);
+    ssize_t n = rewrite_if_suspicious(buf, sizeof buf, (ssize_t)sock_len);
+    ZS_CHECK_EQ(n, (ssize_t)strlen(kStockExePath));
+    ZS_CHECK_EQ(strncmp(buf, kStockExePath, strlen(kStockExePath)), 0);
+
+    // A magisk-binary fd target.
+    const char* magisk_target = "/sbin/magisk";
+    size_t magisk_len = strlen(magisk_target);
+    memcpy(buf, magisk_target, magisk_len);
+    n = rewrite_if_suspicious(buf, sizeof buf, (ssize_t)magisk_len);
+    ZS_CHECK_EQ(n, (ssize_t)strlen(kStockExePath));
+
+    // An innocent fd target (a normal app file) must pass through.
+    const char* innocent = "/data/data/com.example.app/cache/file";
+    size_t innocent_len = strlen(innocent);
+    memcpy(buf, innocent, innocent_len);
+    n = rewrite_if_suspicious(buf, sizeof buf, (ssize_t)innocent_len);
+    ZS_CHECK_EQ(n, (ssize_t)innocent_len);
+    ZS_CHECK_EQ(strncmp(buf, innocent, innocent_len), 0);
+}
+
+// ----------------------------------------------------------------------
+// Test 13 (Round 6, S63): set_no_new_privs() actually sets the
+// no_new_privs attribute. The host kernel has supported
+// PR_SET_NO_NEW_PRIVS since Linux 3.5, and PR_GET_NO_NEW_PRIVS
+// reports the flag back.
+// ----------------------------------------------------------------------
+
+ZS_TEST(set_no_new_privs_sets_flag) {
+    // PR_GET_NO_NEW_PRIVS = 39. In a fresh process this is normally
+    // 0, but sandboxed CI environments (gVisor, Docker with a
+    // no-new-privileges seccomp profile, sandboxed shells) may have
+    // already set it — the flag is inherited across exec, so accept
+    // either starting state.
+    int before = prctl(/*PR_GET_NO_NEW_PRIVS*/39, 0, 0, 0, 0);
+    ZS_CHECK(before == 0 || before == 1);
+
+    set_no_new_privs();
+
+    // The meaningful assertion: after our call, the flag is set,
+    // regardless of the starting state (the flag is one-way, so a
+    // second set is a no-op — which also exercises the idempotency
+    // the production code relies on when the runtime already set it).
+    int after = prctl(/*PR_GET_NO_NEW_PRIVS*/39, 0, 0, 0, 0);
+    ZS_CHECK_EQ(after, 1);
+}
+
+// ----------------------------------------------------------------------
+// Test 14 (Round 6, S65): ensure_cwd_is_root() leaves the process
+// with cwd == "/". We verify with getcwd(), and restore the test
+// process's original cwd afterwards so the Makefile-driven test
+// runner isn't confused by a changed working directory.
+// ----------------------------------------------------------------------
+
+ZS_TEST(ensure_cwd_is_root_sets_cwd_to_slash) {
+    // Save the current cwd.
+    char saved[PATH_MAX];
+    ZS_CHECK(getcwd(saved, sizeof saved) != nullptr);
+
+    // Move somewhere else so the fixup has something to fix.
+    ZS_CHECK_EQ(chdir("/tmp"), 0);
+    char before[PATH_MAX];
+    ZS_CHECK(getcwd(before, sizeof before) != nullptr);
+    ZS_CHECK_STR_EQ(before, "/tmp");
+
+    ensure_cwd_is_root();
+
+    char after[PATH_MAX];
+    ZS_CHECK(getcwd(after, sizeof after) != nullptr);
+    ZS_CHECK_STR_EQ(after, "/");
+
+    // Restore the original cwd for subsequent tests / the runner.
+    ZS_CHECK_EQ(chdir(saved), 0);
+}
+
+// ----------------------------------------------------------------------
 // main()
 // ----------------------------------------------------------------------
 
