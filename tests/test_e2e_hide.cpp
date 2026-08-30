@@ -79,7 +79,8 @@ ZS_TEST(e2e_forked_child_survives_hide_apply) {
         // Child.
         close(pipefd[0]);
         g_will_hide.store(1);
-        g_self_so_records.clear();  // ensure unmap_self is a no-op
+        // P1.38: fixed-size array, reset count to ensure unmap_self is a no-op.
+        g_self_so_count = 0;
         hide_apply_for_target("test");
         const char* msg = "OK";
         write(pipefd[1], msg, 2);

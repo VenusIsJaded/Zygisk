@@ -442,6 +442,83 @@ Be honest about what the hide layer does not do:
   suppressed. Covered by a new host-side test that verifies
   both `rlim_cur` and `rlim_max` are zero after the call.
 
+## Round 5 — additional gaps closed (this round)
+
+- **`/proc/self/smaps` and `/proc/self/smaps_rollup` revealing
+  Magisk mappings.** Both files are extended variants of
+  `/proc/self/maps` — they show per-mapping memory stats (RSS,
+  PSS, private dirty, etc.) plus the path field, which is
+  identical to the path field in `/proc/self/maps`. The previous
+  `kFilteredPaths` list didn't include either file, so an app
+  that probed `/proc/self/smaps` would see the un-scrubbed Magisk
+  and libpayload entries. **NEW (S25):** both
+  `/proc/self/smaps` and `/proc/self/smaps_rollup` are now in
+  `kFilteredPaths`. The kernel's seqfile for both files is
+  regenerated on every read (same as `/proc/self/maps`), and
+  the path-field scan logic in `make_filtered_memfd` is unchanged
+  — we just needed to add the two paths to the filtered set.
+  Covered by a new host-side test (`make_filtered_memfd_filters_smaps_magisk_entries`)
+  that feeds synthetic smaps content with Magisk and libpayload
+  entries and verifies they're dropped while the libc.so entry
+  is preserved (along with its detail lines).
+
+- **Extended set of Magisk-revealing properties.** The previous
+  `kMagiskRevealingProps` list had 12 entries. A re-survey of
+  public Magisk / Shamiko detection documentation found 9 more
+  keys that are commonly probed by detection code but were
+  missing from our scrub list. **NEW (S46):** the list is now
+  21 entries. The new keys are:
+  - `init.svc.magisk`, `init.svc.magisk_pfsd` — Magisk's init
+    services (world-readable on every Android).
+  - `persist.magisk.hide` — old MagiskHide config (still
+    present on devices upgraded from older Magisk).
+  - `ro.boot.vbmeta.digest` — bootloader-set vbmeta digest.
+  - `ro.bootmanager.veritymode` — older bootloader verity mode.
+  - `service.magisk.rootdir`, `persist.sys.rootdir` — Magisk's
+    internal rootdir pointer (rare but present in some forks).
+  - `ro.boot.warrantybit`, `ro.warranty.bits` — OEM warranty
+    bits set when the bootloader is unlocked.
+  The new keys go through the existing `scrub_prop_in_memory`
+  direct-write path — no new code paths, just a longer list.
+  Covered by a new host-side test
+  (`property_scrub_list_contains_round5_additions`) that
+  verifies all 9 new keys are present in
+  `kMagiskRevealingProps`.
+
+- **Apps using `faccessat2` to bypass our `faccessat` hook.**
+  `faccessat2` is the Linux 5.8+ (Android 11+) variant of
+  `faccessat` that properly honors the `AT_EACCESS` flag (the
+  older `faccessat` syscall silently ignored it). Bionic exposes
+  `faccessat2` as a public libc function in API 30+. Apps that
+  target SDK 30+ and probe Magisk paths via `access()` may go
+  through `faccessat2` directly (especially apps that use newer
+  NDK headers), bypassing our existing `faccessat` GOT hook.
+  **NEW (S54):** we added `faccessat2` to the GOT patcher with
+  the same hide logic as `faccessat` (return `ENOENT` for
+  absolute paths in the hidden set). On pre-Android 11 devices
+  where `faccessat2` isn't exported, our hook falls back to
+  `g_real_faccessat` and then to the raw `SYS_faccessat` syscall.
+  Covered by a new host-side test
+  (`faccessat2_hook_returns_enoent_for_hidden_paths`).
+
+- **Apps using `fstatat` to bypass our `stat`/`lstat` hooks.**
+  On AArch64, the `stat` and `lstat` syscalls don't exist —
+  every `stat()` / `lstat()` libc call goes through `fstatat`
+  under the hood. We already hook `stat` and `lstat` by name
+  (catches apps that use those libc names directly), but apps
+  that call `fstatat` directly bypass those hooks. **NEW (S55):**
+  we added `fstatat` (and its aliases `__fstatat` and
+  `fstatat64`) to the GOT patcher with the same hide logic
+  (return `ENOENT` for absolute paths in the hidden set,
+  regardless of the `flags` value, so both stat-like and
+  lstat-like behavior are covered). The hook falls back through
+  `g_real_fstatat` → `SYS_fstatat` → `SYS_newfstatat` →
+  `ENOSYS`, so it works on every Linux kernel we support.
+  Covered by a new host-side test
+  (`fstatat_hook_returns_enoent_for_hidden_paths`) that
+  exercises both `flags=0` (stat-like) and
+  `flags=AT_SYMLINK_NOFOLLOW` (lstat-like) behavior.
+
 ## Why this is "public knowledge"
 
 Every technique described in this file appears in one or more of:

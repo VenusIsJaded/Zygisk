@@ -73,12 +73,43 @@ static void remove_temp(const std::string& path) {
 // ----------------------------------------------------------------------
 
 ZS_TEST(snapshot_self_so_runs_clean_when_nothing_matches) {
-    // Reset the recorded snapshot.
-    g_self_so_records.clear();
+    // Reset the recorded snapshot (P1.38: fixed-size array, reset count).
+    g_self_so_count = 0;
     snapshot_self_so();
     // On the host, none of libpayload/libzygisk/libzn_loader are
     // mapped, so the snapshot is empty. The function must not crash.
-    ZS_CHECK_EQ(g_self_so_records.size(), (size_t)0);
+    ZS_CHECK_EQ(g_self_so_count, (size_t)0);
+}
+
+// ----------------------------------------------------------------------
+// Test (Round 5, P1.38): the fixed-size array for g_self_so_records
+// has the expected capacity and is bounded safely.
+//
+// We verify that kMaxSoRecords is at least 16 (covers the typical
+// 3 .so files × ~4 segments each = ~12 entries plus headroom) and
+// at most 64 (covers pathological cases without excessive memory).
+// We also verify the array is at file scope and accessible.
+// ----------------------------------------------------------------------
+
+ZS_TEST(self_so_records_array_has_sensible_capacity) {
+    ZS_CHECK(kMaxSoRecords >= 16);
+    ZS_CHECK(kMaxSoRecords <= 64);
+    // The array itself must be accessible without crashing.
+    ZS_CHECK(g_self_so_records != nullptr);
+    // Reset and verify count is 0 after reset.
+    g_self_so_count = 0;
+    ZS_CHECK_EQ(g_self_so_count, (size_t)0);
+    // Simulate one entry: write directly to the array.
+    if (kMaxSoRecords > 0) {
+        g_self_so_records[0].base = 0x1000;
+        g_self_so_records[0].size = 0x1000;
+        g_self_so_records[0].path[0] = '\0';
+        g_self_so_count = 1;
+        ZS_CHECK_EQ(g_self_so_records[0].base, (uintptr_t)0x1000);
+        ZS_CHECK_EQ(g_self_so_count, (size_t)1);
+        // Reset for other tests.
+        g_self_so_count = 0;
+    }
 }
 
 // ----------------------------------------------------------------------
@@ -196,10 +227,11 @@ ZS_TEST(hide_setup_for_target_returns_zero_for_null_or_empty) {
 
 ZS_TEST(hide_register_globals_is_idempotent) {
     g_initialized.store(0);
-    g_self_so_records.clear();
+    // P1.38: fixed-size array, reset count.
+    g_self_so_count = 0;
 
     hide_register_globals();
-    size_t after_first = g_self_so_records.size();
+    size_t after_first = g_self_so_count;
     // Snapshot is empty on host (none of our .so mapped).
     ZS_CHECK_EQ(after_first, (size_t)0);
 
@@ -244,6 +276,48 @@ ZS_TEST(property_scrub_list_contains_expected_keys) {
 }
 
 // ----------------------------------------------------------------------
+// Test (Round 5, S46): the extended property scrub list contains
+// the new Magisk / KernelSU / bootloader-revealing keys added in
+// Round 5. We verify the new keys are present in kMagiskRevealingProps
+// so the scrub_prop_in_memory path will hit them.
+//
+// Without this test, someone could accidentally remove a key from
+// the array (regression) and we wouldn't catch it.
+// ----------------------------------------------------------------------
+
+ZS_TEST(property_scrub_list_contains_round5_additions) {
+    bool has_init_svc_magisk      = false;
+    bool has_init_svc_magisk_pfsd = false;
+    bool has_persist_magisk_hide  = false;
+    bool has_vbmeta_digest        = false;
+    bool has_bootmanager_verity   = false;
+    bool has_service_magisk_root  = false;
+    bool has_persist_sys_rootdir  = false;
+    bool has_warrantybit          = false;
+    bool has_warranty_bits        = false;
+    for (const char* k : kMagiskRevealingProps) {
+        if (strcmp(k, "init.svc.magisk")         == 0) has_init_svc_magisk      = true;
+        if (strcmp(k, "init.svc.magisk_pfsd")    == 0) has_init_svc_magisk_pfsd = true;
+        if (strcmp(k, "persist.magisk.hide")     == 0) has_persist_magisk_hide  = true;
+        if (strcmp(k, "ro.boot.vbmeta.digest")   == 0) has_vbmeta_digest        = true;
+        if (strcmp(k, "ro.bootmanager.veritymode")== 0) has_bootmanager_verity  = true;
+        if (strcmp(k, "service.magisk.rootdir")  == 0) has_service_magisk_root  = true;
+        if (strcmp(k, "persist.sys.rootdir")     == 0) has_persist_sys_rootdir  = true;
+        if (strcmp(k, "ro.boot.warrantybit")     == 0) has_warrantybit          = true;
+        if (strcmp(k, "ro.warranty.bits")        == 0) has_warranty_bits        = true;
+    }
+    ZS_CHECK(has_init_svc_magisk);
+    ZS_CHECK(has_init_svc_magisk_pfsd);
+    ZS_CHECK(has_persist_magisk_hide);
+    ZS_CHECK(has_vbmeta_digest);
+    ZS_CHECK(has_bootmanager_verity);
+    ZS_CHECK(has_service_magisk_root);
+    ZS_CHECK(has_persist_sys_rootdir);
+    ZS_CHECK(has_warrantybit);
+    ZS_CHECK(has_warranty_bits);
+}
+
+// ----------------------------------------------------------------------
 // Test 6: hide_apply_for_target() with g_will_hide=false is a no-op.
 // ----------------------------------------------------------------------
 
@@ -263,7 +337,8 @@ ZS_TEST(hide_apply_for_target_is_noop_when_not_hiding) {
 
 ZS_TEST(hide_apply_for_target_continues_when_unshare_fails) {
     g_will_hide.store(1);
-    g_self_so_records.clear();  // ensure unmap_self is a no-op
+    // P1.38: fixed-size array, reset count to ensure unmap_self is a no-op.
+    g_self_so_count = 0;
     hide_apply_for_target("test");
     // No assertions on return value (function is void). The test
     // passes if we did not crash. The non-root host cannot do unshare,

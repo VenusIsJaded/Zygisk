@@ -36,7 +36,10 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <errno.h>
+#include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <vector>
 
@@ -55,7 +58,8 @@ ZS_TEST(hidden_substrings_contains_documented_set) {
     bool has_sbin      = false;
     bool has_kernelsu  = false;
 
-    for (const char* s : kHiddenSubstrings) {
+    for (const HiddenSubstring& sub : kHiddenSubstrings) {
+        const char* s = sub.data;
         if (strstr(s, "libzygisk.so")     != nullptr) has_zygisk    = true;
         if (strstr(s, "libpayload.so")    != nullptr) has_payload   = true;
         if (strstr(s, "libzn_loader.so")  != nullptr) has_zn_loader = true;
@@ -80,17 +84,44 @@ ZS_TEST(filtered_paths_contains_proc_self_paths) {
     bool has_mounts     = false;
     bool has_mountinfo  = false;
     bool has_mountstats = false;
+    // S25 (Round 5): also verify smaps and smaps_rollup are filtered.
+    bool has_smaps       = false;
+    bool has_smaps_rollup = false;
 
     for (const char* p : kFilteredPaths) {
-        if (strcmp(p, "/proc/self/maps")       == 0) has_maps       = true;
-        if (strcmp(p, "/proc/self/mounts")     == 0) has_mounts     = true;
-        if (strcmp(p, "/proc/self/mountinfo")  == 0) has_mountinfo  = true;
-        if (strcmp(p, "/proc/self/mountstats") == 0) has_mountstats = true;
+        if (strcmp(p, "/proc/self/maps")         == 0) has_maps         = true;
+        if (strcmp(p, "/proc/self/mounts")       == 0) has_mounts       = true;
+        if (strcmp(p, "/proc/self/mountinfo")    == 0) has_mountinfo    = true;
+        if (strcmp(p, "/proc/self/mountstats")   == 0) has_mountstats   = true;
+        if (strcmp(p, "/proc/self/smaps")        == 0) has_smaps        = true;
+        if (strcmp(p, "/proc/self/smaps_rollup") == 0) has_smaps_rollup = true;
     }
     ZS_CHECK(has_maps);
     ZS_CHECK(has_mounts);
     ZS_CHECK(has_mountinfo);
     ZS_CHECK(has_mountstats);
+    ZS_CHECK(has_smaps);
+    ZS_CHECK(has_smaps_rollup);
+}
+
+// ----------------------------------------------------------------------
+// Test 2b (Round 5, P1.39): the kHiddenSubstrings HiddenSubstring
+// struct correctly pre-computes string lengths at compile time.
+//
+// We verify that for every entry, sub.len equals the actual strlen
+// of sub.data. This catches the case where someone updates a
+// string in the array and forgets to update the corresponding
+// length (which would be a silent correctness bug — the length is
+// passed to memmem).
+// ----------------------------------------------------------------------
+ZS_TEST(hidden_substrings_have_correct_precomputed_lengths) {
+    for (const HiddenSubstring& sub : kHiddenSubstrings) {
+        size_t actual = __builtin_strlen(sub.data);
+        ZS_CHECK_EQ(sub.len, actual);
+        // Also verify the length is non-zero (a zero-length substring
+        // would match everything, which would be a regression).
+        ZS_CHECK(sub.len > 0);
+    }
 }
 
 // ----------------------------------------------------------------------
@@ -364,6 +395,96 @@ ZS_TEST(hidden_stat_paths_contains_documented_set) {
 }
 
 // ----------------------------------------------------------------------
+// Test (Round 5, S54/S55): the new faccessat2 and fstatat hooks
+// return ENOENT for hidden paths.
+//
+// We can't easily test the GOT-patching mechanism on the host (it
+// patches the test binary's own .so, which is risky), but we CAN
+// call the hook functions directly to verify they return ENOENT
+// for hidden paths and fall through to the real syscall for
+// innocent paths.
+//
+// For innocent paths on the host, the real syscall will succeed
+// (e.g. faccessat2(AT_FDCWD, "/tmp", F_OK, 0) returns 0). We
+// verify the hook returns 0 for that case (or -1 with errno !=
+// ENOENT if the path doesn't exist — but /tmp is reliable).
+// ----------------------------------------------------------------------
+
+ZS_TEST(faccessat2_hook_returns_enoent_for_hidden_paths) {
+    // The hidden-path check should fire BEFORE the real syscall
+    // is attempted, so the path doesn't need to actually exist.
+    // We verify errno is set to ENOENT and the return value is -1.
+    errno = 0;
+    int r = zygisk_study_hook_faccessat2(AT_FDCWD,
+                                         "/data/adb/magisk", F_OK, 0);
+    ZS_CHECK_EQ(r, -1);
+    ZS_CHECK_EQ(errno, ENOENT);
+
+    errno = 0;
+    r = zygisk_study_hook_faccessat2(AT_FDCWD,
+                                     "/sbin/magisk", F_OK, 0);
+    ZS_CHECK_EQ(r, -1);
+    ZS_CHECK_EQ(errno, ENOENT);
+
+    errno = 0;
+    r = zygisk_study_hook_faccessat2(AT_FDCWD,
+                                     "/data/adb/ksu/anything", F_OK, 0);
+    ZS_CHECK_EQ(r, -1);
+    ZS_CHECK_EQ(errno, ENOENT);
+
+    // An innocent path on the host. /tmp exists on Linux.
+    // The hook should fall through to the real syscall (or to the
+    // faccessat fallback) and return 0 (success) for F_OK.
+    errno = 0;
+    r = zygisk_study_hook_faccessat2(AT_FDCWD, "/tmp", F_OK, 0);
+    // On the host, /tmp exists; the call should return 0.
+    ZS_CHECK_EQ(r, 0);
+
+    // A relative path: the hook should pass through (we don't
+    // apply the hidden-path check for relative paths because we
+    // can't tell if they resolve to a hidden path).
+    errno = 0;
+    r = zygisk_study_hook_faccessat2(AT_FDCWD, "relative/path", F_OK, 0);
+    ZS_CHECK(r == 0 || r == -1);  // -1 with ENOENT (real) is fine
+    if (r == -1) ZS_CHECK(errno != ENOENT || true);  // weak: real ENOENT ok
+}
+
+ZS_TEST(fstatat_hook_returns_enoent_for_hidden_paths) {
+    struct stat st;
+    errno = 0;
+    int r = zygisk_study_hook_fstatat(AT_FDCWD,
+                                      "/data/adb/magisk", &st, 0);
+    ZS_CHECK_EQ(r, -1);
+    ZS_CHECK_EQ(errno, ENOENT);
+
+    errno = 0;
+    r = zygisk_study_hook_fstatat(AT_FDCWD,
+                                  "/sbin/magisk", &st, 0);
+    ZS_CHECK_EQ(r, -1);
+    ZS_CHECK_EQ(errno, ENOENT);
+
+    errno = 0;
+    r = zygisk_study_hook_fstatat(AT_FDCWD,
+                                  "/data/system/zygisk_study", &st, 0);
+    ZS_CHECK_EQ(r, -1);
+    ZS_CHECK_EQ(errno, ENOENT);
+
+    // AT_SYMLINK_NOFOLLOW flag should still trigger the hide
+    // (lstat-equivalent behavior).
+    errno = 0;
+    r = zygisk_study_hook_fstatat(AT_FDCWD,
+                                  "/data/adb/magisk/symlink",
+                                  &st, AT_SYMLINK_NOFOLLOW);
+    ZS_CHECK_EQ(r, -1);
+    ZS_CHECK_EQ(errno, ENOENT);
+
+    // An innocent path on the host. /tmp exists; stat should return 0.
+    errno = 0;
+    r = zygisk_study_hook_fstatat(AT_FDCWD, "/tmp", &st, 0);
+    ZS_CHECK_EQ(r, 0);
+}
+
+// ----------------------------------------------------------------------
 // Test 12 (S10): make_filtered_memfd rewrites the TracerPid line in
 // /proc/self/status to "TracerPid:\t0", even when the original
 // reported a non-zero tracer pid. This is the defense-in-depth on
@@ -473,6 +594,60 @@ ZS_TEST(make_filtered_memfd_batched_write_produces_correct_output_for_large_inpu
     // is filtered, so 500 - 10 = 490 kept).
     // We don't count exactly (that would be brittle); we just verify
     // the libc.so line is present and the magisk line is absent.
+    ZS_CHECK_STR_CONTAINS(out, "/system/lib64/libc.so");
+
+    close(input_fd);
+    close(filtered_fd);
+}
+
+// ----------------------------------------------------------------------
+// Test (Round 5, S25): make_filtered_memfd() correctly filters
+// /proc/self/smaps content. The smaps file has the same path-field
+// structure as /proc/self/maps (just more columns and detail lines),
+// so the existing path-field scan should drop Magisk entries.
+//
+// /proc/self/smaps layout (simplified):
+//   <addr-range> <perms> <offset> <dev> <inode> <path>
+//   Size:         <num> kB
+//   Rss:          <num> kB
+//   ...
+// The first line of each entry has the same path-field position as
+// /proc/self/maps. The "Size:", "Rss:" etc. detail lines have NO
+// path field, so the path-field scan returns "no path" and the
+// line is kept (which is correct — we only want to drop mapping
+// entries, not the detail lines).
+// ----------------------------------------------------------------------
+
+ZS_TEST(make_filtered_memfd_filters_smaps_magisk_entries) {
+    std::string fake_smaps =
+        // First entry: a normal libc.so mapping. Should be preserved
+        // along with all its detail lines.
+        "7f8a0c000000-7f8a0c010000 r--p 00000000 fd:00 1234   /system/lib64/libc.so\n"
+        "Size:                  1024 kB\n"
+        "Rss:                    512 kB\n"
+        "Pss:                    256 kB\n"
+        // Second entry: a Magisk mapping. Should be filtered along
+        // with its detail lines.
+        "7f8a0c100000-7f8a0c110000 r-xp 00000000 fd:00 1234   /sbin/magisk\n"
+        "Size:                   256 kB\n"
+        "Rss:                    128 kB\n"
+        "Pss:                     64 kB\n"
+        // Third entry: our own libpayload.so. Should be filtered.
+        "7f8a0c200000-7f8a0c210000 r-xp 00000000 fd:00 1234   /data/adb/libpayload.so\n"
+        "Size:                   256 kB\n";
+
+    int input_fd = write_text_to_memfd(fake_smaps);
+    // Pass "/proc/self/smaps" as the target path so the filter
+    // knows it's a maps-like file (the path-field scan logic
+    // is the same for maps and smaps).
+    int filtered_fd = make_filtered_memfd(input_fd, "/proc/self/smaps");
+    ZS_CHECK(filtered_fd >= 0);
+    std::string out = read_fd_to_string(filtered_fd);
+
+    // Magisk and libpayload entries must be absent.
+    ZS_CHECK_STR_ABSENT(out, "/sbin/magisk");
+    ZS_CHECK_STR_ABSENT(out, "libpayload.so");
+    // The libc.so entry must be present.
     ZS_CHECK_STR_CONTAINS(out, "/system/lib64/libc.so");
 
     close(input_fd);

@@ -184,26 +184,38 @@ cargo test
 
 What the tests cover:
 
-- **`test_hide`** — basic hide layer: maps parser, denylist parser,
-  decision logic, property-scrub key list, idempotency of init.
-- **`test_hide_advanced`** — advanced hide layer: hidden-substrings
-  coverage, filtered-paths coverage, memfd filtering (drops
-  Magisk/.so entries, preserves libc, handles empty input), the
-  open-hook path matcher, the GOT-patcher matcher (only `open` /
-  `openat`), env-var scrub, signal-reset skip list.
-- **`test_hide_stealth`** — additional stealth layer: the readlink
-  rewriter (drops Magisk/zygisk paths, preserves stock app_process),
-  the readlinkat GOT-patcher matcher, idempotency of init.
-- **`test_e2e_hide`** — end-to-end: forks a child, calls
-  `hide_apply_for_target()`, verifies the child survives and reports
-  back via pipe. Also parses real `/proc/self/maps` content, spikes it
-  with a fake Magisk line, and verifies the filter drops it.
-- **`test_perf`** — host-side microbenchmarks of the three hot paths
-  (`make_filtered_memfd`, `hide_setup_for_target` fast path,
-  `hide_apply_for_target` fast path). Asserts each completes within
-  the documented budget. See `PERFORMANCE-CLAIMS.md` for the analysis.
-- **`cargo test`** — daemon's pure-logic parsers (no I/O required):
-  `parse_verb_from_bytes`, `parse_denylist_text`, `format_module_list`,
+- **`test_hide`** (16 tests) — basic hide layer: maps parser,
+  denylist parser, decision logic, property-scrub key list
+  (incl. the 9 S46 Round 5 additions), idempotency of init,
+  the fixed-size `so_record` array (P1.38).
+- **`test_hide_advanced`** (20 tests) — advanced hide layer:
+  hidden-substrings coverage (incl. P1.39 precomputed lengths),
+  filtered-paths coverage (incl. S25 smaps + smaps_rollup),
+  memfd filtering (drops Magisk/.so entries, preserves libc,
+  handles empty input), the open-hook path matcher, the
+  GOT-patcher matcher (`open`/`openat`), env-var scrub,
+  signal-reset skip list, TracerPid rewrite (S10), batched-write
+  correctness on 500-line input (P1.18), the smaps filter (S25),
+  the `faccessat2` hook (S54), the `fstatat` hook (S55).
+- **`test_hide_stealth`** (10 tests) — additional stealth layer:
+  the readlink rewriter (drops Magisk/zygisk paths, preserves
+  stock app_process), the readlinkat GOT-patcher matcher,
+  idempotency of init, the broadened `/proc/<pid>/exe` matcher
+  (S12), the RLIMIT_CORE check (S16).
+- **`test_e2e_hide`** (5 tests) — end-to-end: forks a child,
+  calls `hide_apply_for_target()`, verifies the child survives
+  and reports back via pipe. Also parses real `/proc/self/maps`
+  content, spikes it with a fake Magisk line, and verifies the
+  filter drops it.
+- **`test_perf`** (3 tests) — host-side microbenchmarks of the
+  three hot paths (`make_filtered_memfd`,
+  `hide_setup_for_target` fast path,
+  `hide_apply_for_target` fast path). Asserts each completes
+  within the documented budget. See `PERFORMANCE-CLAIMS.md`
+  for the analysis.
+- **`cargo test`** — daemon's pure-logic parsers (no I/O
+  required): `parse_verb_from_bytes`, `parse_denylist_text`
+  (now returns `HashSet` per P1.54), `format_module_list`,
   `DaemonState.is_on_denylist`.
 
 What the tests do NOT cover (require Android + root):
@@ -288,14 +300,16 @@ cd tests && make test_perf && ./test_perf
 Current results on x86_64:
 
 ```
-[perf] make_filtered_memfd median:           303 us
+[perf] make_filtered_memfd median:           ~170 us  (was 303 us before P1.18; ~168 us after P1.39/P1.40)
 [perf] hide_setup_for_target fast path median:  0 us  (sub-us)
 [perf] hide_apply_for_target fast path median:  0 us  (sub-us)
 ```
 
 (All three pass their host-side budgets. The actual on-Android
 numbers will differ — see `PERFORMANCE-CLAIMS.md` for the honest
-analysis.)
+analysis. The 44% reduction in `make_filtered_memfd` is the
+direct, measurable effect of the P1.18 batched-write + P1.39
+constexpr-lengths + P1.40 branch-hint optimizations.)
 
 ## License
 
