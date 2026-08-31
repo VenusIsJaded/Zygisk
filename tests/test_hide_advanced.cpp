@@ -2178,7 +2178,7 @@ ZS_TEST(fd_shadow_stale_entries_self_heal) {
     hide_advanced_set_active(1);
     int fd = zygisk_study_hook_open("/proc/self/maps", O_RDONLY);
     ZS_CHECK(fd >= 0);
-    ZS_CHECK(fd_shadow_lookup(fd) != nullptr);
+    ZS_CHECK(fd_shadow_lookup(fd, FD_SHADOW_MEMFD) != nullptr);
     close(fd);
 
     // Reuse the number deterministically: dup to force the SAME
@@ -2195,7 +2195,7 @@ ZS_TEST(fd_shadow_stale_entries_self_heal) {
     ZS_CHECK_EQ(st.st_mode & 0777, (mode_t)0600);
     if (reg == fd) {
         // The number WAS reused — the entry must have been dropped.
-        ZS_CHECK(fd_shadow_lookup(reg) == nullptr);
+        ZS_CHECK(fd_shadow_lookup(reg, FD_SHADOW_MEMFD) == nullptr);
     }
     unlink(tmpl);
     close(reg);
@@ -2398,4 +2398,258 @@ ZS_TEST(tier_b_registry_contains_round15_hooks) {
         }
         ZS_CHECK(w.found);
     }
+}
+
+// ----------------------------------------------------------------------
+// Round 16 — readdir / readdir_r entry filtering
+// ----------------------------------------------------------------------
+
+// opendir + readdir through the hooks: hidden entry names vanish,
+// normal entries survive in order, and the loop terminates cleanly.
+ZS_TEST(readdir_hook_drops_hidden_entries) {
+    std::string dir = "/tmp/zstest_r16_rd_XXXXXX";
+    char* d = mkdtemp(&dir[0]);
+    ZS_CHECK(d != nullptr);
+    const char* names[] = {"alpha", "magisk", "beta", "zygisk_study",
+                           "gamma", "ksu", "libpayload.so", "delta"};
+    for (const char* n : names) {
+        std::string p = dir + "/" + n;
+        FILE* f = fopen(p.c_str(), "w");
+        ZS_CHECK(f != nullptr);
+        fputs("x", f);
+        fclose(f);
+    }
+
+    hide_advanced_set_active(1);
+    DIR* dp = zygisk_study_hook_opendir(dir.c_str());
+    ZS_CHECK(dp != nullptr);
+    std::vector<std::string> seen;
+    for (;;) {
+        struct dirent* e = zygisk_study_hook_readdir(dp);
+        if (!e) break;
+        seen.push_back(e->d_name);
+    }
+    closedir(dp);
+    hide_advanced_set_active(0);
+
+    int alpha = 0, beta = 0, gamma = 0, delta = 0, hidden = 0;
+    for (const std::string& n : seen) {
+        if (n == "alpha") ++alpha;
+        else if (n == "beta") ++beta;
+        else if (n == "gamma") ++gamma;
+        else if (n == "delta") ++delta;
+        else if (zs_dirent_name_is_hidden(n.c_str())) ++hidden;
+    }
+    ZS_CHECK_EQ(alpha, 1);
+    ZS_CHECK_EQ(beta, 1);
+    ZS_CHECK_EQ(gamma, 1);
+    ZS_CHECK_EQ(delta, 1);
+    ZS_CHECK_EQ(hidden, 0);
+    // 4 files + "." + ".." (dot entries never match the hidden set).
+    ZS_CHECK_EQ(seen.size(), (size_t)6);
+
+    // readdir_r: same contract through the deprecated-but-exported
+    // symbol.
+    hide_advanced_set_active(1);
+    dp = zygisk_study_hook_opendir(dir.c_str());
+    ZS_CHECK(dp != nullptr);
+    std::vector<std::string> seen2;
+    struct dirent entry, *rslt = nullptr;
+    for (;;) {
+        int rv = zygisk_study_hook_readdir_r(dp, &entry, &rslt);
+        ZS_CHECK_EQ(rv, 0);
+        if (rslt == nullptr) break;
+        seen2.push_back(entry.d_name);
+    }
+    closedir(dp);
+    hide_advanced_set_active(0);
+    ZS_CHECK_EQ(seen2.size(), (size_t)6);   // same as readdir
+
+    for (const char* n : names) unlink((dir + "/" + n).c_str());
+    rmdir(d);
+}
+
+// Raw syscall(SYS_getdents64) on a directory with planted artifacts:
+// the buffer is compacted in place and the hidden names never reach
+// the caller's parser.
+// Variadic passthrough so the SYS_getdents64 arm can run with the
+// real kernel behind it (production resolves g_real_syscall at init;
+// tests drive the hook directly).
+static long zs_test_syscall_passthrough(long number, ...) {
+    va_list ap;
+    va_start(ap, number);
+    long a[6];
+    for (int i = 0; i < 6; ++i) a[i] = va_arg(ap, long);
+    va_end(ap);
+    return syscall(number, a[0], a[1], a[2], a[3], a[4], a[5]);
+}
+
+ZS_TEST(getdents64_syscall_buffer_is_filtered) {
+    std::string dir = "/tmp/zstest_r16_gd_XXXXXX";
+    char* d = mkdtemp(&dir[0]);
+    ZS_CHECK(d != nullptr);
+    const char* names[] = {"file1", "magisk", "file2", "zygiskd",
+                           "file3"};
+    for (const char* n : names) {
+        std::string p = dir + "/" + n;
+        FILE* f = fopen(p.c_str(), "w");
+        ZS_CHECK(f != nullptr);
+        fputs("x", f);
+        fclose(f);
+    }
+
+    int dfd = open(dir.c_str(), O_RDONLY | O_DIRECTORY);
+    ZS_CHECK(dfd >= 0);
+
+    g_real_syscall = (SyscallFn)&zs_test_syscall_passthrough;
+    hide_advanced_set_active(1);
+    char buf[8192];
+    long n = zygisk_study_hook_syscall((long)SYS_getdents64,
+                                       (long)dfd, (long)buf,
+                                       (long)sizeof buf);
+    hide_advanced_set_active(0);
+    ZS_CHECK(n > 0);
+
+    std::vector<std::string> seen;
+    for (long off = 0; off < n;) {
+        struct zs_linux_dirent64* de =
+            (struct zs_linux_dirent64*)(buf + off);
+        off += de->d_reclen;
+        seen.push_back(de->d_name);
+    }
+    int normal = 0, hidden = 0;
+    for (const std::string& s : seen) {
+        if (s == "file1" || s == "file2" || s == "file3") ++normal;
+        else if (zs_dirent_name_is_hidden(s.c_str())) ++hidden;
+    }
+    ZS_CHECK_EQ(normal, 3);
+    ZS_CHECK_EQ(hidden, 0);
+
+    close(dfd);
+    for (const char* nm : names) unlink((dir + "/" + nm).c_str());
+    rmdir(d);
+}
+
+// ----------------------------------------------------------------------
+// Round 16 — relative /proc opens (chdir state + proc dirfds)
+// ----------------------------------------------------------------------
+
+ZS_TEST(proc_dir_prefix_classifier_table) {
+    char mine[32];
+    snprintf(mine, sizeof mine, "/proc/%d", (int)getpid());
+    char mine_task[48], mine_task_tid[64];
+    snprintf(mine_task, sizeof mine_task, "/proc/%d/task", (int)getpid());
+    snprintf(mine_task_tid, sizeof mine_task_tid, "/proc/%d/task/%d",
+             (int)getpid(), (int)getpid());
+    struct { const char* path; int want; } cases[] = {
+        {"/proc", 1}, {"/proc/", 0},
+        {"/proc/net", 1},
+        {"/proc/self", 1},
+        {"/proc/thread-self", 1},
+        {mine, 1},
+        {"/proc/1", 0},                     // another process
+        {"/proc/self/task", 1},
+        {"/proc/self/task/1234", 1},
+        {"/proc/self/task/12a", 0},
+        {mine_task, 1},
+        {mine_task_tid, 1},
+        {"/proc/self/net", 1},
+        {mine, 1},                          // re-verify ours
+        {"/proc/self/maps", 0},             // a FILE, not a dir
+        {"/proc/self/fd", 0},               // fd dir: relative opens
+                                            // are fd numbers, never a
+                                            // filtered basename
+        {"/procX", 0},
+        {"/data", 0},
+        {"/proc/selfx", 0},
+    };
+    for (auto& c : cases) {
+        if (zs_is_proc_dir_prefix(c.path) != c.want) {
+            std::fprintf(stderr, "  [prefix misclassified: %s]\n",
+                         c.path);
+        }
+        ZS_CHECK_EQ(zs_is_proc_dir_prefix(c.path), c.want);
+    }
+}
+
+// chdir("/proc/self") + open("maps") must hit the filter exactly like
+// the absolute path — and chdir away must clear the state.
+ZS_TEST(relative_open_after_chdir_into_proc_self) {
+    hide_advanced_set_active(1);
+
+    ZS_CHECK_EQ(zygisk_study_hook_chdir("/proc/self"), 0);
+    int fd = zygisk_study_hook_open("maps", O_RDONLY);
+    ZS_CHECK(fd >= 0);
+
+    struct stat st;
+    ZS_CHECK_EQ(zygisk_study_hook_fstat(fd, &st), 0);
+    ZS_CHECK_EQ(st.st_size, (off_t)0);          // procfs fiction
+    char buf[256];
+    ssize_t rn = read(fd, buf, sizeof buf - 1);
+    ZS_CHECK(rn > 8);
+    ZS_CHECK(isxdigit((unsigned char)buf[0]) != 0);
+    close(fd);
+
+    // readlink of the same descriptor answers the FULL original path.
+    fd = zygisk_study_hook_open("maps", O_RDONLY);
+    ZS_CHECK(fd >= 0);
+    char path[64], link[256];
+    snprintf(path, sizeof path, "/proc/self/fd/%d", fd);
+    ssize_t n = readlink(path, link, sizeof link - 1);
+    ZS_CHECK(n > 0);
+    const char* mark = (link[0] == '/') ? link + 1 : link;
+    ZS_CHECK(strncmp(mark, "memfd:scudo", 11) == 0);
+    close(fd);
+
+    // chdir away: state cleared, relative open is a plain ENOENT.
+    std::string tmp = "/tmp/zstest_r16_ch_XXXXXX";
+    char* td = mkdtemp(&tmp[0]);
+    ZS_CHECK(td != nullptr);
+    ZS_CHECK_EQ(zygisk_study_hook_chdir(tmp.c_str()), 0);
+    errno = 0;
+    fd = zygisk_study_hook_open("maps", O_RDONLY);
+    ZS_CHECK_EQ(fd, -1);
+    ZS_CHECK_EQ(errno, ENOENT);
+    rmdir(td);
+
+    hide_advanced_set_active(0);
+    ZS_CHECK_EQ(chdir("/"), 0);   // leave the test's cwd sane
+}
+
+// openat(dirfd, "maps") with a /proc directory fd: the tracked
+// dirfd reconstructs the absolute path; the kernel resolves the
+// relative path itself exactly the same way.
+ZS_TEST(relative_openat_against_proc_dirfd) {
+    hide_advanced_set_active(1);
+
+    int dirfd = zygisk_study_hook_open("/proc/self", O_RDONLY);
+    ZS_CHECK(dirfd >= 0);
+    ZS_CHECK(fd_shadow_lookup(dirfd, FD_SHADOW_PROC_DIR) != nullptr);
+
+    int fd = zygisk_study_hook_openat(dirfd, "maps", O_RDONLY);
+    ZS_CHECK(fd >= 0);
+    struct stat st;
+    ZS_CHECK_EQ(zygisk_study_hook_fstat(fd, &st), 0);
+    ZS_CHECK_EQ(st.st_size, (off_t)0);
+    char buf[256];
+    ssize_t rn = read(fd, buf, sizeof buf - 1);
+    ZS_CHECK(rn > 8);
+    close(fd);
+
+    // A dirfd of a NON-proc directory is untouched (relative open
+    // passes through).
+    std::string tmp = "/tmp/zstest_r16_at_XXXXXX";
+    char* td = mkdtemp(&tmp[0]);
+    ZS_CHECK(td != nullptr);
+    int plain = zygisk_study_hook_open(tmp.c_str(), O_RDONLY);
+    ZS_CHECK(plain >= 0);
+    errno = 0;
+    fd = zygisk_study_hook_openat(plain, "maps", O_RDONLY);
+    ZS_CHECK_EQ(fd, -1);
+    ZS_CHECK_EQ(errno, ENOENT);
+    close(plain);
+    rmdir(td);
+    close(dirfd);
+
+    hide_advanced_set_active(0);
 }

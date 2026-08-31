@@ -938,14 +938,61 @@ static int make_filtered_memfd(int orig_fd, const char* target_path) {
 
 struct FdShadow {
     int      fd;            // -1 = free slot
+    int      kind;          // FD_SHADOW_* below
     uint64_t dev;
     uint64_t ino;
-    uint64_t size;          // exact st_size at creation
-    char     orig_path[96]; // path the caller opened (what readlink
-                            // must answer with)
+    uint64_t size;          // exact st_size at creation (memfd only)
+    char     orig_path[96]; // MEMFD: path the caller opened (the
+                            // readlink spoof answer). PROC_DIR: the
+                            // directory prefix (relative-path
+                            // reconstruction).
+};
+enum {
+    FD_SHADOW_MEMFD    = 0, // a filtered memfd we handed to the caller
+    FD_SHADOW_PROC_DIR = 1, // a directory fd under /proc of OUR process
 };
 static FdShadow g_fd_shadow[32];
 static size_t   g_fd_shadow_count;   // high-water mark, scan bounded
+
+// Is `path` a /proc DIRECTORY whose relative opens we must filter?
+// Covers /proc, /proc/net, /proc/self, /proc/thread-self, /proc/<pid>
+// (ours only), and each of those plus /net, /task, /task/<tid>.
+// openat(dirfd, "maps") with such a dirfd, or open("maps") after
+// chdir into one, must resolve to the same filtered file as the
+// absolute path would — Round 16 closes exactly that bypass.
+static int zs_is_proc_dir_prefix(const char* path) {
+    if (ZS_UNLIKELY(!path)) return 0;
+    if (strncmp(path, "/proc", 5) != 0) return 0;
+    if (path[5] == '\0') return 1;                 // "/proc"
+    if (path[5] != '/') return 0;
+    const char* rest = path + 6;
+    if (strcmp(rest, "net") == 0) return 1;        // "/proc/net"
+    if (strncmp(rest, "self", 4) == 0) {
+        rest += 4;
+    } else if (strncmp(rest, "thread-self", 11) == 0) {
+        rest += 11;
+    } else {
+        const char* p = rest;
+        while (*p >= '0' && *p <= '9') ++p;
+        if (p == rest || (*p != '/' && *p != '\0')) return 0;
+        long v = 0;
+        for (const char* q = rest; q < p; ++q) v = v * 10 + (*q - '0');
+        if (v != (long)getpid()) return 0;         // another process
+        rest = p;
+    }
+    if (*rest == '\0') return 1;
+    if (*rest != '/') return 0;
+    ++rest;
+    if (strcmp(rest, "net") == 0)  return 1;
+    if (strcmp(rest, "task") == 0) return 1;
+    if (strncmp(rest, "task/", 5) == 0) {
+        const char* p = rest + 5;
+        while (*p >= '0' && *p <= '9') ++p;
+        if (p == rest + 5 || *p != '\0') return 0;
+        return 1;
+    }
+    return 0;
+}
 
 // st_dev of the procfs mount — sampled once (lazily) from a real
 // unfiltered /proc file so our spoofed stats report a believable
@@ -969,49 +1016,77 @@ static uint64_t zs_procfs_dev() {
 }
 
 // Record the memfd we are about to hand to the caller.
+static FdShadow* fd_shadow_alloc_slot(int want_fd);
+static void      fd_shadow_set_path(FdShadow* slot, const char* path);
+
 static void fd_shadow_register(int memfd, const char* orig_path) {
-    if (memfd < 0 || !orig_path) return;
     struct stat st;
     // g_real_fstat may not be resolved yet on the first call; use the
     // libc fstat directly — it cannot recurse into our hooks because
     // fstat is not intercepted at libc-internal call sites.
     if (fstat(memfd, &st) != 0) return;
-    // Reuse the slot of a dead entry, else the next free one.
-    FdShadow* slot = nullptr;
-    for (size_t i = 0; i < g_fd_shadow_count; ++i) {
-        if (g_fd_shadow[i].fd == memfd) { slot = &g_fd_shadow[i]; break; }
-    }
-    if (!slot) {
-        for (size_t i = 0; i < g_fd_shadow_count; ++i) {
-            if (g_fd_shadow[i].fd < 0) { slot = &g_fd_shadow[i]; break; }
-        }
-    }
-    if (!slot && g_fd_shadow_count <
-                 sizeof(g_fd_shadow) / sizeof(g_fd_shadow[0])) {
-        slot = &g_fd_shadow[g_fd_shadow_count++];
-    }
+    FdShadow* slot = fd_shadow_alloc_slot(memfd);
     if (!slot) return;   // table full: plain memfd behavior (documented)
     slot->fd   = memfd;
+    slot->kind = FD_SHADOW_MEMFD;
     slot->dev  = (uint64_t)st.st_dev;
     slot->ino  = (uint64_t)st.st_ino;
     slot->size = (uint64_t)st.st_size;
+    fd_shadow_set_path(slot, orig_path);
+}
+
+// Round 16: record a /proc directory fd the app opened — relative
+// opens against it (openat(dirfd, "maps")) are resolved through the
+// stored prefix so the filter applies exactly like the absolute path.
+static void fd_shadow_register_proc_dir(int dirfd, const char* path) {
+    if (dirfd < 0) return;
+    struct stat st;
+    if (fstat(dirfd, &st) != 0) return;
+    if (!S_ISDIR(st.st_mode)) return;
+    FdShadow* slot = fd_shadow_alloc_slot(dirfd);
+    if (!slot) return;
+    slot->fd   = dirfd;
+    slot->kind = FD_SHADOW_PROC_DIR;
+    slot->dev  = (uint64_t)st.st_dev;
+    slot->ino  = (uint64_t)st.st_ino;
+    slot->size = 0;          // dir sizes change; identity is dev+ino
+    fd_shadow_set_path(slot, path);
+}
+
+// Shared slot allocator for both register flavors.
+static FdShadow* fd_shadow_alloc_slot(int want_fd) {
+    for (size_t i = 0; i < g_fd_shadow_count; ++i) {
+        if (g_fd_shadow[i].fd == want_fd) return &g_fd_shadow[i];
+    }
+    for (size_t i = 0; i < g_fd_shadow_count; ++i) {
+        if (g_fd_shadow[i].fd < 0) return &g_fd_shadow[i];
+    }
+    if (g_fd_shadow_count < sizeof(g_fd_shadow) / sizeof(g_fd_shadow[0])) {
+        return &g_fd_shadow[g_fd_shadow_count++];
+    }
+    return nullptr;
+}
+
+static void fd_shadow_set_path(FdShadow* slot, const char* orig_path) {
     size_t n = strlen(orig_path);
     if (n >= sizeof slot->orig_path) n = sizeof slot->orig_path - 1;
     memcpy(slot->orig_path, orig_path, n);
     slot->orig_path[n] = '\0';
 }
 
-// Find the shadow record whose fd matches AND whose dev/ino/size still
-// match the live descriptor. Returns nullptr for "not one of ours"
-// (including stale entries — which are invalidated here).
-static FdShadow* fd_shadow_lookup(int fd) {
+// Find the shadow record whose fd matches AND whose identity still
+// matches the live descriptor (memfd: dev/ino/size; proc dir: dev/ino
+// — directory st_size can legitimately change). Returns nullptr for
+// "not one of ours" (stale entries are invalidated here).
+static FdShadow* fd_shadow_lookup(int fd, int kind) {
     for (size_t i = 0; i < g_fd_shadow_count; ++i) {
-        if (g_fd_shadow[i].fd != fd) continue;
+        if (g_fd_shadow[i].fd != fd || g_fd_shadow[i].kind != kind) continue;
         struct stat st;
         if (fstat(fd, &st) != 0) { g_fd_shadow[i].fd = -1; return nullptr; }
         if ((uint64_t)st.st_dev == g_fd_shadow[i].dev &&
             (uint64_t)st.st_ino == g_fd_shadow[i].ino &&
-            (uint64_t)st.st_size == g_fd_shadow[i].size) {
+            (kind == FD_SHADOW_PROC_DIR ||
+             (uint64_t)st.st_size == g_fd_shadow[i].size)) {
             return &g_fd_shadow[i];
         }
         // fd number reused for a different file — entry is dead.
@@ -1023,9 +1098,13 @@ static FdShadow* fd_shadow_lookup(int fd) {
 
 // Find the shadow record by FILE IDENTITY (dup'd descriptors have new
 // fd numbers but the same dev/ino). Caller has already fstat'd.
+// memfd flavor only — readlink dups of directories answer the real
+// directory path anyway (nothing to hide there).
 static FdShadow* fd_shadow_scan_by_identity(uint64_t dev, uint64_t ino) {
     for (size_t i = 0; i < g_fd_shadow_count; ++i) {
-        if (g_fd_shadow[i].fd >= 0 && g_fd_shadow[i].dev == dev &&
+        if (g_fd_shadow[i].fd >= 0 &&
+            g_fd_shadow[i].kind == FD_SHADOW_MEMFD &&
+            g_fd_shadow[i].dev == dev &&
             g_fd_shadow[i].ino == ino) {
             return &g_fd_shadow[i];
         }
@@ -1067,7 +1146,7 @@ ssize_t hide_advanced_spoof_memfd_readlink(int fd, const char* real_target,
         return 0;   // not one of ours (or a genuinely other memfd)
     }
     // Direct hit by fd number, else identity scan for dups.
-    FdShadow* rec = fd_shadow_lookup(fd);
+    FdShadow* rec = fd_shadow_lookup(fd, FD_SHADOW_MEMFD);
     if (!rec) {
         struct stat st;
         if (fstat(fd, &st) != 0) return 0;
@@ -1081,21 +1160,80 @@ ssize_t hide_advanced_spoof_memfd_readlink(int fd, const char* real_target,
     return (ssize_t)n;
 }
 
+// Round 16: relative-path /proc resolution. A detector that cannot
+// use an absolute /proc path (both arms of the R11 fix) can still get
+// there relatively:
+//     chdir("/proc/self");   open("maps", ...)
+//     dirfd = open("/proc/self", O_RDONLY|O_DIRECTORY);
+//     openat(dirfd, "maps", ...)
+// Both resolve to /proc/self/maps in the kernel; both must resolve
+// to the same FILTERED file with us. State:
+//   - g_cwd_proc_prefix: set by the chdir/fchdir hooks (and the
+//     SYS_chdir/SYS_fchdir arms of the syscall hook) whenever the
+//     process cwd is a /proc directory of ours; cleared on any other
+//     successful chdir.
+//   - FD_SHADOW_PROC_DIR records: any successful open of a /proc
+//     directory fd (registered in wrapped_open/openat) lets a later
+//     relative openat against that fd resolve through the prefix.
+// The real syscall still receives the caller's ORIGINAL relative
+// path and dirfd — kernel resolution semantics are unchanged; only
+// the filter decision uses the reconstructed absolute path (and the
+// memfd's readlink answer, which must match).
+static char   g_cwd_proc_prefix[80];
+static size_t g_cwd_proc_prefix_len = 0;
+
+static void zs_set_cwd_proc_prefix(const char* dir) {
+    if (dir && zs_is_proc_dir_prefix(dir)) {
+        size_t n = strlen(dir);
+        if (n >= sizeof g_cwd_proc_prefix) n = sizeof g_cwd_proc_prefix - 1;
+        memcpy(g_cwd_proc_prefix, dir, n);
+        g_cwd_proc_prefix[n] = '\0';
+        g_cwd_proc_prefix_len = n;
+        return;
+    }
+    g_cwd_proc_prefix[0] = '\0';
+    g_cwd_proc_prefix_len = 0;
+}
+
+// prefix + "/" + rel into out. Returns 0 when it cannot fit.
+static int zs_join_proc_dir(const char* prefix, const char* rel,
+                             char* out, size_t cap) {
+    size_t n = strlen(prefix), m = strlen(rel);
+    if (n + 1 + m + 1 > cap) return 0;
+    memcpy(out, prefix, n);
+    out[n] = '/';
+    memcpy(out + n + 1, rel, m + 1);
+    return 1;
+}
+
 // Wrap the original open so the caller gets back either the original
 // fd (for non-filtered paths) or a filtered memfd (for filtered
 // paths).
 static int wrapped_open(const char* path, int flags, mode_t mode) {
+    // Round 16: a relative open with a /proc cwd names the same file
+    // the absolute path would — decide the filter on that path.
+    char full[160];
+    const char* filter_path = path;
+    if (path && path[0] != '/' && g_cwd_proc_prefix_len > 0) {
+        if (zs_join_proc_dir(g_cwd_proc_prefix, path, full, sizeof full)) {
+            filter_path = full;
+        }
+    }
     int real_fd = g_real_open
         ? g_real_open(path, flags, mode)
         : (int)syscall(SYS_openat, AT_FDCWD, path, flags, mode);
     if (real_fd < 0) return real_fd;
 
-    if (!zs_path_is_filtered(path)) return real_fd;
+    if (filter_path && filter_path[0] == '/' &&
+        zs_is_proc_dir_prefix(filter_path)) {
+        fd_shadow_register_proc_dir(real_fd, filter_path);
+    }
+    if (!zs_path_is_filtered(filter_path)) return real_fd;
 
-    int memfd = make_filtered_memfd(real_fd, path);
+    int memfd = make_filtered_memfd(real_fd, filter_path);
     close(real_fd);
     if (memfd >= 0) {
-        fd_shadow_register(memfd, path);
+        fd_shadow_register(memfd, filter_path);
         return memfd;
     }
     // Round 15: fail-open. memfd_create exists since Linux 3.17 —
@@ -1105,7 +1243,7 @@ static int wrapped_open(const char* path, int flags, mode_t mode) {
     // fail bizarrely in exactly that situation — a louder anomaly
     // than serving the unfiltered file. Log and hand back the real fd.
     ZS_LOGW("hide_advanced: filter memfd unavailable; passing the real "
-            "fd for %s through unfiltered", path);
+            "fd for %s through unfiltered", filter_path);
     // B2 history: never return the closed fd — re-open instead.
     return g_real_open
         ? g_real_open(path, flags & ~O_TRUNC, mode)
@@ -1114,6 +1252,27 @@ static int wrapped_open(const char* path, int flags, mode_t mode) {
 
 static int wrapped_openat(int dirfd, const char* path, int flags,
                           mode_t mode) {
+    // Round 16: relative path + tracked /proc dirfd (or a /proc cwd
+    // with AT_FDCWD) resolves through the reconstructed absolute
+    // path, exactly like wrapped_open above.
+    char full[160];
+    const char* filter_path = path;
+    if (path && path[0] != '/' && hide_advanced_is_active()) {
+        FdShadow* rec = (dirfd != AT_FDCWD)
+            ? fd_shadow_lookup(dirfd, FD_SHADOW_PROC_DIR)
+            : nullptr;
+        if (rec) {
+            if (zs_join_proc_dir(rec->orig_path, path, full,
+                                 sizeof full)) {
+                filter_path = full;
+            }
+        } else if (dirfd == AT_FDCWD && g_cwd_proc_prefix_len > 0) {
+            if (zs_join_proc_dir(g_cwd_proc_prefix, path, full,
+                                 sizeof full)) {
+                filter_path = full;
+            }
+        }
+    }
     // Round 11: an ABSOLUTE path ignores dirfd (POSIX), so the filter
     // decision must not depend on dirfd either — the old
     // `dirfd != AT_FDCWD` passthrough let a detector bypass the
@@ -1121,27 +1280,26 @@ static int wrapped_openat(int dirfd, const char* path, int flags,
     // path. Relative paths still pass through untouched (we lack
     // the context to resolve them). The real openat below receives
     // the caller's dirfd unchanged, which preserves exact semantics.
-    if (ZS_UNLIKELY(!path || path[0] != '/')) {
-        return g_real_openat
-            ? g_real_openat(dirfd, path, flags, mode)
-            : (int)syscall(SYS_openat, dirfd, path, flags, mode);
-    }
     int real_fd = g_real_openat
         ? g_real_openat(dirfd, path, flags, mode)
         : (int)syscall(SYS_openat, dirfd, path, flags, mode);
     if (real_fd < 0) return real_fd;
 
-    if (!zs_path_is_filtered(path)) return real_fd;
+    if (filter_path && filter_path[0] == '/' &&
+        zs_is_proc_dir_prefix(filter_path)) {
+        fd_shadow_register_proc_dir(real_fd, filter_path);
+    }
+    if (!zs_path_is_filtered(filter_path)) return real_fd;
 
-    int memfd = make_filtered_memfd(real_fd, path);
+    int memfd = make_filtered_memfd(real_fd, filter_path);
     close(real_fd);
     if (memfd >= 0) {
-        fd_shadow_register(memfd, path);
+        fd_shadow_register(memfd, filter_path);
         return memfd;
     }
     // Round 15 fail-open — see wrapped_open.
     ZS_LOGW("hide_advanced: filter memfd unavailable; passing the real "
-            "fd for %s through unfiltered", path);
+            "fd for %s through unfiltered", filter_path);
     return g_real_openat
         ? g_real_openat(dirfd, path, flags & ~O_TRUNC, mode)
         : (int)syscall(SYS_openat, dirfd, path, flags & ~O_TRUNC, mode);
@@ -1551,7 +1709,7 @@ static FstatFn g_real_fstat = nullptr;
 // the procfs fiction and return 1. Returns 0 (st untouched) otherwise.
 static int fd_stat_as_procfs(int fd, struct stat* st) {
     if (fd < 0 || !st) return 0;
-    FdShadow* rec = fd_shadow_lookup(fd);
+    FdShadow* rec = fd_shadow_lookup(fd, FD_SHADOW_MEMFD);
     if (!rec) return 0;
     struct stat raw;
     if (fstat(fd, &raw) != 0) return 0;
@@ -1583,7 +1741,7 @@ extern "C" void* zygisk_study_hook_mmap(void* addr, size_t len, int prot,
         return g_real_mmap ? g_real_mmap(addr, len, prot, flags, fd, off)
                            : mmap(addr, len, prot, flags, fd, off);
     }
-    if (fd_shadow_lookup(fd)) {
+    if (fd_shadow_lookup(fd, FD_SHADOW_MEMFD)) {
         errno = ENODEV;             // exactly what procfs answers
         return MAP_FAILED;
     }
@@ -1915,6 +2073,59 @@ extern "C" int zygisk_study_hook_prop_foreach(
 using SyscallFn = long (*)(long, ...);
 static SyscallFn g_real_syscall = nullptr;
 
+// Raw getdents64 layout (neither glibc nor bionic headers expose it
+// for direct syscall use). d_reclen advances the walk; d_name is the
+// file name. Defined here (rather than at the fd scan below, which
+// also uses it) because the SYS_getdents64 arm of the syscall hook
+// needs it first.
+#pragma pack(push, 1)
+struct zs_linux_dirent64 {
+    uint64_t        d_ino;
+    int64_t         d_off;
+    unsigned short  d_reclen;
+    unsigned char   d_type;
+    char            d_name[256];
+};
+#pragma pack(pop)
+
+static int zs_dirent_name_is_hidden(const char* name);   // scandir sect.
+
+// Round 16: in-place compaction of a getdents64 buffer that drops
+// every entry naming a root-framework artifact. Applied to the
+// RESULT of a raw syscall(SYS_getdents64) call (the only way to read
+// a directory without libc readdir). Each kept record keeps its own
+// d_off cookie — seekdir/telldir semantics survive entry removal.
+//
+// NOTE: d_name in zs_linux_dirent64 is a max-size template; real
+// records are variable-length (d_reclen = 19-byte header + name +
+// NUL, padded). The bounds checks validate the HEADER before the
+// reclen is trusted, then the reclen before anything else is read —
+// the first version of this function demanded a full 275-byte struct
+// per record and "filtered" every directory to empty (caught by its
+// own test).
+static size_t zs_filter_getdents64(char* buf, size_t len) {
+    constexpr size_t kHdr = 19;   // d_ino(8)+d_off(8)+d_reclen(2)+d_type(1)
+    size_t off = 0, write = 0;
+    while (off < len) {
+        if (len - off < kHdr) break;             // truncated header
+        struct zs_linux_dirent64* de =
+            (struct zs_linux_dirent64*)(buf + off);
+        if (de->d_reclen < kHdr + 2 ||           // name + NUL minimum
+            off + de->d_reclen > len) {
+            break;                               // corrupt record
+        }
+        size_t reclen = de->d_reclen;
+        if (!zs_dirent_name_is_hidden(de->d_name)) {
+            if (write != off) {
+                memmove(buf + write, buf + off, reclen);
+            }
+            write += reclen;
+        }
+        off += reclen;
+    }
+    return write;
+}
+
 // openat2's argument struct (Linux >= 5.6). Defined locally because
 // no bionic release ships <linux/openat2.h> (verified against
 // main-branch bionic libc/include/fcntl.h) and NDK sysroot headers
@@ -1988,6 +2199,40 @@ extern "C" long zygisk_study_hook_syscall(long number, ...) {
         // is fstatat AT_EMPTY_PATH, covered by the statx hook).
         struct stat* st = (struct stat*)a[1];
         if (fd_stat_as_procfs((int)a[0], st)) return 0;
+    }
+#endif
+#ifdef SYS_getdents64
+    if (number == (long)SYS_getdents64 && hide_advanced_is_active()) {
+        // Round 16: raw getdents64 (bypassing libc readdir) on any
+        // directory drops entries naming root-framework artifacts.
+        long rv = g_real_syscall
+            ? g_real_syscall(number, a[0], a[1], a[2], a[3], a[4], a[5])
+            : -ENOSYS;
+        if (rv > 0) {
+            rv = (long)zs_filter_getdents64((char*)a[1], (size_t)rv);
+        }
+        return rv;
+    }
+#endif
+#ifdef SYS_chdir
+    if (number == (long)SYS_chdir && hide_advanced_is_active()) {
+        long rv = g_real_syscall
+            ? g_real_syscall(number, a[0], a[1], a[2], a[3], a[4], a[5])
+            : -ENOSYS;
+        if (rv == 0) zs_set_cwd_proc_prefix((const char*)a[0]);
+        return rv;
+    }
+#endif
+#ifdef SYS_fchdir
+    if (number == (long)SYS_fchdir && hide_advanced_is_active()) {
+        long rv = g_real_syscall
+            ? g_real_syscall(number, a[0], a[1], a[2], a[3], a[4], a[5])
+            : -ENOSYS;
+        if (rv == 0) {
+            FdShadow* rec = fd_shadow_lookup((int)a[0], FD_SHADOW_PROC_DIR);
+            zs_set_cwd_proc_prefix(rec ? rec->orig_path : nullptr);
+        }
+        return rv;
     }
 #endif
 #ifdef SYS_open
@@ -2434,6 +2679,96 @@ extern "C" DIR* zygisk_study_hook_opendir(const char* name) {
 }
 
 // ------------------------------------------------------------------------
+// chdir / fchdir hooks (Tier B) — Round 16
+// ------------------------------------------------------------------------
+//
+// These exist ONLY to maintain g_cwd_proc_prefix: after
+// chdir("/proc/self"), a relative open("maps") must resolve through
+// the filter (see wrapped_open). Every other chdir is a pure
+// passthrough that clears the state.
+using ChdirFn  = int (*)(const char*);
+using FchdirFn = int (*)(int);
+static ChdirFn  g_real_chdir  = nullptr;
+static FchdirFn g_real_fchdir = nullptr;
+
+extern "C" int zygisk_study_hook_chdir(const char* path) {
+    int rv = g_real_chdir ? g_real_chdir(path) : chdir(path);
+    if (rv == 0 && hide_advanced_is_active()) {
+        zs_set_cwd_proc_prefix(path);
+    }
+    return rv;
+}
+
+extern "C" int zygisk_study_hook_fchdir(int fd) {
+    int rv = g_real_fchdir ? g_real_fchdir(fd) : fchdir(fd);
+    if (rv == 0 && hide_advanced_is_active()) {
+        FdShadow* rec = fd_shadow_lookup(fd, FD_SHADOW_PROC_DIR);
+        zs_set_cwd_proc_prefix(rec ? rec->orig_path : nullptr);
+    }
+    return rv;
+}
+
+// ------------------------------------------------------------------------
+// readdir / readdir_r hooks (Tier B) — Round 16
+// ------------------------------------------------------------------------
+//
+// opendir()/scandir() gate HIDDEN directories, but the entries
+// INSIDE a visible directory are the actual leak: listing "/" shows
+// "debug_ramdisk", listing "/data" shows "adb" (stock non-root
+// devices have no /data/adb — RootBeer and a decade of bank-app
+// checkers look exactly there). The scandir hooks post-filter the
+// namelist; plain opendir+readdir loops (Java File.list() included)
+// go through the readdir symbol and were uncovered.
+//
+// The hook loops the real readdir until it yields a non-hidden entry
+// or end-of-directory. Cost when active: a first-char gate plus at
+// most ~14 exact strcmps per entry (kHiddenDirentNames is shared
+// with the scandir filter — one source of truth). readdir_r is the
+// same loop with its entry/result contract.
+using ReaddirFn   = struct dirent* (*)(DIR*);
+using ReaddirRFn = int (*)(DIR*, struct dirent*, struct dirent**);
+static ReaddirFn   g_real_readdir   = nullptr;
+static ReaddirRFn g_real_readdir_r = nullptr;
+
+extern "C" struct dirent* zygisk_study_hook_readdir(DIR* dirp) {
+    if (ZS_LIKELY(!hide_advanced_is_active())) {
+        return g_real_readdir ? g_real_readdir(dirp) : readdir(dirp);
+    }
+    for (;;) {
+        struct dirent* e =
+            g_real_readdir ? g_real_readdir(dirp) : readdir(dirp);
+        if (!e) return nullptr;
+        if (!zs_dirent_name_is_hidden(e->d_name)) return e;
+        // hidden entry — silently advance to the next one
+    }
+}
+
+// readdir_r is deprecated on glibc AND in new bionic headers, but it
+// remains exported from every bionic release (verified against
+// main-branch bionic dirent.h) and 32-bit-era app code still calls
+// it — hooking it is exactly as necessary as readdir.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+extern "C" int zygisk_study_hook_readdir_r(DIR* dirp,
+                                           struct dirent* entry,
+                                           struct dirent** result) {
+    if (ZS_LIKELY(!hide_advanced_is_active()) || !entry || !result) {
+        return g_real_readdir_r
+            ? g_real_readdir_r(dirp, entry, result)
+            : readdir_r(dirp, entry, result);
+    }
+    for (;;) {
+        int rv = g_real_readdir_r
+            ? g_real_readdir_r(dirp, entry, result)
+            : readdir_r(dirp, entry, result);
+        if (rv != 0) return rv;
+        if (!*result) return 0;                    // end of directory
+        if (!zs_dirent_name_is_hidden(entry->d_name)) return 0;
+    }
+}
+#pragma GCC diagnostic pop
+
+// ------------------------------------------------------------------------
 // scandir / scandirat hooks (Tier B) — Round 9 (S1)
 // ------------------------------------------------------------------------
 //
@@ -2465,6 +2800,19 @@ static const char* const kHiddenDirentNames[] = {
 
 static int zs_dirent_name_is_hidden(const char* name) {
     if (!name) return 0;
+    // First-char gate: readdir filters EVERY directory entry of a
+    // hidden app, so this runs millions of times; only names starting
+    // with one of the hidden set's first chars reach the strcmp loop.
+    switch (name[0]) {
+        case 'm':   // magisk, magisk32, magisk64, magiskinit, magiskboot
+        case '.':   // .magisk
+        case 'k':   // ksu
+        case 'z':   // zygiskd, zygisk_study
+        case 'l':   // libzygisk.so, libpayload.so, libzn_loader.so
+            break;
+        default:
+            return 0;
+    }
     for (const char* h : kHiddenDirentNames) {
         if (strcmp(name, h) == 0) return 1;
     }
@@ -2582,18 +2930,9 @@ extern "C" int zygisk_study_hook_scandirat(
 using ReadlinkFn = ssize_t (*)(const char*, char*, size_t);
 static ReadlinkFn g_real_readlink_for_fd_scan = nullptr;
 
-// Raw getdents64 layout (neither glibc nor bionic headers expose it
-// for direct syscall use). d_reclen advances the walk; d_name is the
-// fd number string.
-#pragma pack(push, 1)
-struct zs_linux_dirent64 {
-    uint64_t        d_ino;
-    int64_t         d_off;
-    unsigned short  d_reclen;
-    unsigned char   d_type;
-    char            d_name[256];
-};
-#pragma pack(pop)
+// Raw getdents64 walk for this scan uses zs_linux_dirent64, defined
+// at the syscall hook section (5d) where the getdents64 filter also
+// lives. d_name is the fd number string.
 
 // Root-path prefixes for the fd-link scan. File-scope (not a local
 // constant) so host tests can point the scanner at a directory they
@@ -2737,6 +3076,11 @@ void hide_advanced_init() {
         "android_dlopen_ext");
     g_real_dlclose    = (DlcloseFn)zs_resolve_libc("dlclose");
     g_real_opendir    = (OpendirFn)zs_resolve_libc("opendir");
+    // Round 16 — relative-path resolution and directory-entry filtering.
+    g_real_chdir      = (ChdirFn)zs_resolve_libc("chdir");
+    g_real_fchdir     = (FchdirFn)zs_resolve_libc("fchdir");
+    g_real_readdir    = (ReaddirFn)zs_resolve_libc("readdir");
+    g_real_readdir_r  = (ReaddirRFn)zs_resolve_libc("readdir_r");
     // Round 15 — the fd-observable and linker-enumeration layers.
     g_real_fstat      = (FstatFn)zs_resolve_libc("fstat");
     g_real_mmap       = (MmapFn)zs_resolve_libc("mmap");
@@ -2828,6 +3172,21 @@ void hide_advanced_init() {
         (void*)&zygisk_study_hook_dladdr);
     hide_advanced_register_tier_b_hook("dladdr1",
         (void*)&zygisk_study_hook_dladdr1);
+    // Round 16 — chdir tracking + readdir entry filtering. stat64/
+    // lstat64 are 32-bit-ABI twins of already-hooked symbols (one
+    // symbol on LP64); registering the names is free where absent.
+    hide_advanced_register_tier_b_hook("chdir",
+        (void*)&zygisk_study_hook_chdir);
+    hide_advanced_register_tier_b_hook("fchdir",
+        (void*)&zygisk_study_hook_fchdir);
+    hide_advanced_register_tier_b_hook("readdir",
+        (void*)&zygisk_study_hook_readdir);
+    hide_advanced_register_tier_b_hook("readdir_r",
+        (void*)&zygisk_study_hook_readdir_r);
+    hide_advanced_register_tier_b_hook("stat64",
+        (void*)&zygisk_study_hook_stat);
+    hide_advanced_register_tier_b_hook("lstat64",
+        (void*)&zygisk_study_hook_lstat);
 }
 
 #ifdef ZS_HOST_TEST
