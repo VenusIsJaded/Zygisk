@@ -1326,3 +1326,47 @@ slow to bind (residual; upstream loads at zygote start by design).
   microseconds-wide boot-time window, no app code running).
 
 169 host tests (158 → 169), 0 warnings, ASan+UBSan+leaks green.
+
+## Round 20 — the opendir dirfd bypass, stat parity for the mounted properties file
+
+### The opendir+openat bypass (REAL hole, closed)
+
+opendir()'s internal open is a libc-INTERNAL openat — it never
+crosses the GOT, so the open-family hooks never see it and no
+FD_SHADOW_PROC_DIR record existed for the dirfd libc hands back.
+A detector doing `DIR* d = opendir("/proc/self"); openat(dirfd(d),
+"maps", O_RDONLY)` read the REAL, unfiltered maps through the Round
+16 relative-open path — the openat hook found no proc-dir record and
+fell through to the kernel. This was the last documented R16
+residual. The opendir hook now registers the dirfd for every /proc
+directory it opens (hidden paths still answer ENOENT without
+touching the filesystem); fchdir through an opendir-derived fd
+resolves the prefix too. Regression test drives the exact bypass
+sequence.
+
+### Stat parity for the mounted properties file
+
+Through the Round 19 bind mount, stat()/fstat()/statx() of
+/dev/__properties__/properties_serial reported the SESSION file's
+st_dev/st_ino — a cross-check against another /dev file would see a
+device id from /data's filesystem. The mount phase now captures both
+identities around the bind (real pre-bind, served post-bind) and the
+stat hooks answer the REAL identity for the path-keyed
+(stat/lstat/statx-with-path) and fd-keyed (fstat, statx with
+AT_EMPTY_PATH — the aarch64 fstat implementation) queries. The mode
+is 0444 on the served file itself (daemon writes it that way now),
+the size is byte-identical by construction, so the full stat()
+observable set now matches a stock device.
+
+### Honest residuals (Round 20)
+
+- The fiction is keyed by the served file's dev/ino pair captured at
+  mount time; an fd of the REAL file opened BEFORE the bind (by the
+  app, pre-hide) keeps answering the real identity — which is also
+  what the fiction answers, so both agree. No divergence found.
+- opendir registration happens at hook time; a DIR* whose fd was
+  obtained while hooks were inactive (pre-hide window) has no record
+  — but no filter is active in that window either, so there is
+  nothing to bypass yet.
+
+171 host tests (169 → 171), 0 warnings, ASan+UBSan+leaks green.

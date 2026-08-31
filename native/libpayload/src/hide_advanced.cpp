@@ -28,6 +28,7 @@
 //     bytes first.
 
 #include "hide_advanced.h"
+#include "hide.h"
 #include "log.h"
 #include "resolve_libc.h"
 
@@ -1966,6 +1967,13 @@ static int path_is_hidden(const char* path) {
 }
 
 extern "C" int zygisk_study_hook_stat(const char* path, struct stat* st) {
+    // Round 20: the mounted properties file answers the REAL file's
+    // identity (stock st_dev/st_ino), never the session file's.
+    if (hide_advanced_is_active() && path && st &&
+        strcmp(path, hide_props_serial_target_path()) == 0 &&
+        hide_props_stat_fiction(st)) {
+        return 0;
+    }
     if (ZS_LIKELY(!hide_advanced_is_active()) || !path_is_hidden(path)) {
         return g_real_stat
             ? g_real_stat(path, st)
@@ -1976,6 +1984,13 @@ extern "C" int zygisk_study_hook_stat(const char* path, struct stat* st) {
 }
 
 extern "C" int zygisk_study_hook_lstat(const char* path, struct stat* st) {
+    // Round 20: same fiction as stat() — the target is a plain file,
+    // so lstat and stat must agree on its identity.
+    if (hide_advanced_is_active() && path && st &&
+        strcmp(path, hide_props_serial_target_path()) == 0 &&
+        hide_props_stat_fiction(st)) {
+        return 0;
+    }
     if (ZS_LIKELY(!hide_advanced_is_active()) || !path_is_hidden(path)) {
         return g_real_lstat
             ? g_real_lstat(path, st)
@@ -2064,6 +2079,8 @@ extern "C" int zygisk_study_hook_statx(int dirfd, const char* path,
             // Overlay the procfs fiction onto the real statx result.
             stx->stx_mode  = (uint16_t)(S_IFREG | 0444);
             stx->stx_size  = 0;
+            // NOTE: the mounted-properties fd fiction is handled
+            // BELOW (after this block) so both arms share it.
 #ifdef STATX_BLOCKS
             if (stx->stx_mask & STATX_BLOCKS) stx->stx_blocks = 0;
 #else
@@ -2076,6 +2093,49 @@ extern "C" int zygisk_study_hook_statx(int dirfd, const char* path,
             }
             return 0;
         }
+        // Round 20: statx(fd) of the MOUNTED properties file answers
+        // the REAL file's identity (aarch64 bionic implements fstat()
+        // as exactly this call, so the fd-keyed fiction must live
+        // here too).
+        struct stat raw;
+        if (fstat(dirfd, &raw) == 0) {
+            if (hide_props_stat_is_mounted_identity(&raw)) {
+                struct stat fiction;
+                if (hide_props_stat_fiction(&fiction)) {
+                    if (!stx) { errno = EFAULT; return -1; }
+                    stx->stx_mode = (uint16_t)fiction.st_mode;
+                    stx->stx_size = (uint64_t)fiction.st_size;
+                    stx->stx_ino  = fiction.st_ino;
+                    stx->stx_dev_major = (uint16_t)(fiction.st_dev >> 8);
+                    stx->stx_dev_minor = (uint16_t)(fiction.st_dev & 0xff);
+                    return 0;
+                }
+            }
+        }
+    }
+    // Round 20: statx(path) of the mounted properties file answers
+    // the real file's identity fields.
+    if (hide_advanced_is_active() && path && path[0] == '/' &&
+        strcmp(path, hide_props_serial_target_path()) == 0) {
+        int rv = g_real_statx
+            ? g_real_statx(dirfd, path, flags, mask, stx)
+#ifdef SYS_statx
+            : (int)syscall(SYS_statx, dirfd, path, flags, mask, stx);
+#else
+            : -1;
+#endif
+        if (rv == 0 && stx) {
+            struct stat fiction;
+            if (hide_props_stat_fiction(&fiction)) {
+                stx->stx_mode = (uint16_t)fiction.st_mode;
+                stx->stx_size = (uint64_t)fiction.st_size;
+                stx->stx_ino  = fiction.st_ino;
+                stx->stx_dev_major = (uint16_t)(fiction.st_dev >> 8);
+                stx->stx_dev_minor = (uint16_t)(fiction.st_dev & 0xff);
+                return 0;
+            }
+        }
+        return rv;
     }
     if (ZS_LIKELY(!hide_advanced_is_active()) ||
         !(path && path[0] == '/' && path_is_hidden(path))) {
@@ -2127,7 +2187,13 @@ extern "C" int zygisk_study_hook_fstat(int fd, struct stat* st) {
                             : fstat(fd, st);
     }
     if (fd_stat_as_procfs(fd, st)) return 0;
-    return g_real_fstat ? g_real_fstat(fd, st) : fstat(fd, st);
+    // Round 20: an fd of the MOUNTED properties file must answer the
+    // REAL file's identity, not the session file's.
+    int rv = g_real_fstat ? g_real_fstat(fd, st) : fstat(fd, st);
+    if (rv == 0 && st && hide_props_stat_is_mounted_identity(st)) {
+        if (hide_props_stat_fiction(st)) return 0;
+    }
+    return rv;
 }
 
 using MmapFn = void* (*)(void*, size_t, int, int, int, off_t);
@@ -3145,19 +3211,43 @@ using OpendirFn = DIR* (*)(const char*);
 static OpendirFn g_real_opendir = nullptr;
 
 extern "C" DIR* zygisk_study_hook_opendir(const char* name) {
-    if (ZS_LIKELY(!hide_advanced_is_active()) || !name ||
-        !(name[0] == '/' && path_is_hidden(name))) {
-        if (g_real_opendir) return g_real_opendir(name);
+    if (!name) {
+        errno = ENOENT;
+        return nullptr;
+    }
+    // Hidden paths: answer ENOENT without touching the filesystem
+    // (unchanged from Round 8).
+    if (hide_advanced_is_active() && name[0] == '/' &&
+        path_is_hidden(name)) {
+        errno = ENOENT;
+        return nullptr;
+    }
+    // Round 20: even for NON-hidden paths we must register a /proc
+    // directory fd. opendir()'s internal open is a libc-INTERNAL
+    // openat — it never crosses the GOT, so the open-family hooks
+    // never see it, so no FD_SHADOW_PROC_DIR record exists for the
+    // dirfd libc hands back. A detector doing
+    //     DIR* d = opendir("/proc/self");
+    //     openat(dirfd(d), "maps", O_RDONLY);
+    // then read the REAL, unfiltered maps through the Round 16
+    // relative-open path (the openat hook found no proc-dir record
+    // and fell through to the kernel). Registering here closes the
+    // last R16 residual: every subsequent openat/fchdir against
+    // that fd resolves through the stored prefix and filters.
+    DIR* d = g_real_opendir ? g_real_opendir(name) : nullptr;
+    if (!d && !g_real_opendir) {
         // Fallback when dlsym failed: openat + fdopendir.
         int fd = (int)syscall(SYS_openat, AT_FDCWD, name,
                               O_RDONLY | O_DIRECTORY | O_CLOEXEC);
         if (fd < 0) return nullptr;
-        DIR* d = fdopendir(fd);
-        if (!d) close(fd);
-        return d;
+        d = fdopendir(fd);
+        if (!d) { close(fd); return nullptr; }
     }
-    errno = ENOENT;
-    return nullptr;
+    if (d && hide_advanced_is_active() && name[0] == '/' &&
+        zs_is_proc_dir_prefix(name)) {
+        fd_shadow_register_proc_dir(dirfd(d), name);
+    }
+    return d;
 }
 
 // ------------------------------------------------------------------------

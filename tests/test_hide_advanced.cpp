@@ -3206,3 +3206,162 @@ ZS_TEST(spoofed_serial_area_builder_rejects_unmapped_paths) {
     unlink(area_path);
     zs_test_reset_prop_find();
 }
+
+// Round 20 — the opendir dirfd registration. opendir()'s internal
+// open is libc-internal (never crosses the GOT), so before this
+// round the dirfd it handed back had NO proc-dir record:
+// opendir("/proc/self") + openat(dirfd, "maps") read the REAL,
+// unfiltered maps. This is the exact R16 residual, closed.
+ZS_TEST(opendir_dirfd_registers_proc_dir_for_relative_opens) {
+    hide_advanced_set_active(1);
+
+    // 1. The bypass that used to work: opendir + dirfd + openat.
+    DIR* d = zygisk_study_hook_opendir("/proc/self");
+    ZS_CHECK(d != nullptr);
+    if (d) {
+        int dfd = dirfd(d);
+        ZS_CHECK(dfd >= 0);
+        // The shadow record now exists (this lookup is the exact
+        // miss that produced the pre-Round-20 bypass).
+        ZS_CHECK(fd_shadow_lookup(dfd, FD_SHADOW_PROC_DIR) != nullptr);
+
+        int fd = zygisk_study_hook_openat(dfd, "maps", O_RDONLY);
+        ZS_CHECK(fd >= 0);
+        struct stat st;
+        ZS_CHECK_EQ(zygisk_study_hook_fstat(fd, &st), 0);
+        ZS_CHECK_EQ(st.st_size, (off_t)0);      // procfs fiction: FILTERED
+        char buf[256];
+        ssize_t rn = read(fd, buf, sizeof buf - 1);
+        ZS_CHECK(rn > 8);
+        close(fd);
+        closedir(d);
+    }
+
+    // 2. readdir still works through the hook (the same DIR*).
+    d = zygisk_study_hook_opendir("/proc/self");
+    ZS_CHECK(d != nullptr);
+    if (d) {
+        struct dirent* de;
+        int saw_maps = 0;
+        while ((de = zygisk_study_hook_readdir(d)) != nullptr) {
+            if (strcmp(de->d_name, "maps") == 0) saw_maps = 1;
+        }
+        ZS_CHECK(saw_maps);      // "maps" itself is not a hidden name
+        closedir(d);
+    }
+
+    // 3. fchdir through an opendir-derived fd ALSO resolves the
+    //    prefix now (the fchdir hook consults the same record).
+    d = zygisk_study_hook_opendir("/proc/self");
+    ZS_CHECK(d != nullptr);
+    if (d) {
+        int dfd = dirfd(d);
+        ZS_CHECK_EQ(zygisk_study_hook_fchdir(dfd), 0);
+        int fd = zygisk_study_hook_open("status", O_RDONLY);
+        ZS_CHECK(fd >= 0);
+        struct stat st;
+        ZS_CHECK_EQ(zygisk_study_hook_fstat(fd, &st), 0);
+        ZS_CHECK_EQ(st.st_size, (off_t)0);      // filtered, not real
+        close(fd);
+        closedir(d);
+        ZS_CHECK_EQ(chdir("/"), 0);             // leave cwd sane
+    }
+
+    // 4. Hidden paths still answer ENOENT without opening anything.
+    errno = 0;
+    DIR* h = zygisk_study_hook_opendir("/data/adb");
+    ZS_CHECK(h == nullptr);
+    ZS_CHECK_EQ(errno, ENOENT);
+
+    hide_advanced_set_active(0);
+}
+
+// Round 20 — stat parity for the mounted properties file. Through a
+// (recorded) bind, the target path and the served file have DIFFERENT
+// inode identities on host (two real files); the hooks must answer
+// the REAL (pre-bind) identity for both the path-keyed and fd-keyed
+// queries, exactly as a stock device would.
+ZS_TEST(props_stat_fiction_answers_real_identity) {
+    hide_advanced_set_active(1);
+
+    // The REAL file (pre-bind target) and the served file (source).
+    char tgt[] = "/tmp/zs_props_real_XXXXXX";
+    char src[] = "/tmp/zs_props_served_XXXXXX";
+    int fd = mkstemp(tgt);
+    ZS_CHECK(fd >= 0);
+    uint32_t magic = 0x504f5250;
+    ZS_CHECK(write(fd, &magic, 4) == 4);
+    close(fd);
+    fd = mkstemp(src);
+    ZS_CHECK(fd >= 0);
+    ZS_CHECK(write(fd, &magic, 4) == 4);
+    close(fd);
+
+    struct stat real_st{}, served_st{};
+    ZS_CHECK(stat(tgt, &real_st) == 0);
+    ZS_CHECK(stat(src, &served_st) == 0);
+    ZS_CHECK(real_st.st_ino != served_st.st_ino);   // distinct files
+
+    // Production setters + the fiction capture (what the mount phase
+    // does around the bind).
+    hide_props_file_set_source(src, magic);
+    zs_test_set_prop_serial_target(tgt);
+    zs_test_props_fiction_capture_both();
+    struct stat out{};
+    ZS_CHECK_EQ(hide_props_stat_fiction(&out), 1);
+    ZS_CHECK_EQ(out.st_ino, real_st.st_ino);
+    ZS_CHECK_EQ(out.st_dev, real_st.st_dev);
+
+    // stat(path) -> the REAL identity, never the served one.
+    struct st_wrap { struct stat s; };
+    struct stat got{};
+    ZS_CHECK_EQ(zygisk_study_hook_stat(tgt, &got), 0);
+    ZS_CHECK_EQ(got.st_ino, real_st.st_ino);
+    ZS_CHECK(got.st_ino != served_st.st_ino);
+    // lstat agrees with stat (the target is a plain file).
+    ZS_CHECK_EQ(zygisk_study_hook_lstat(tgt, &got), 0);
+    ZS_CHECK_EQ(got.st_ino, real_st.st_ino);
+
+    // fstat(fd of the SERVED file) -> the REAL identity.
+    fd = open(src, O_RDONLY);
+    ZS_CHECK(fd >= 0);
+    ZS_CHECK_EQ(zygisk_study_hook_fstat(fd, &got), 0);
+    ZS_CHECK_EQ(got.st_ino, real_st.st_ino);
+    ZS_CHECK(got.st_ino != served_st.st_ino);
+    close(fd);
+
+    // statx(fd, "", AT_EMPTY_PATH) on the served fd -> REAL identity
+    // (the aarch64 fstat path).
+    fd = open(src, O_RDONLY);
+    ZS_CHECK(fd >= 0);
+    struct statx sx{};
+#ifdef SYS_statx
+    ZS_CHECK_EQ(zygisk_study_hook_statx(fd, "", AT_EMPTY_PATH,
+                                        0x7ff, &sx), 0);
+    ZS_CHECK_EQ((uint64_t)sx.stx_ino, (uint64_t)real_st.st_ino);
+#endif
+    close(fd);
+
+    // A DIFFERENT file is untouched (the fiction must be keyed, not
+    // blanket).
+    char other[] = "/tmp/zs_props_other_XXXXXX";
+    fd = mkstemp(other);
+    ZS_CHECK(fd >= 0);
+    close(fd);
+    ZS_CHECK_EQ(zygisk_study_hook_stat(other, &got), 0);
+    ZS_CHECK(got.st_ino != real_st.st_ino);
+    unlink(other);
+
+    // statx with the path key too.
+#ifdef SYS_statx
+    struct statx sx2{};
+    ZS_CHECK_EQ(zygisk_study_hook_statx(AT_FDCWD, tgt, 0, 0x7ff, &sx2), 0);
+    ZS_CHECK_EQ((uint64_t)sx2.stx_ino, (uint64_t)real_st.st_ino);
+#endif
+
+    unlink(tgt);
+    unlink(src);
+    zs_test_set_prop_serial_target(nullptr);
+    zs_test_props_source_clear();
+    hide_advanced_set_active(0);
+}

@@ -730,6 +730,17 @@ SPOOFED properties_serial through a private-namespace bind mount —
 the same mechanism, in the same SELinux domain and the same boot
 window, that AOSP itself uses for appcompat property overrides.
 
-**169/169 host tests** (35 hide / 89 advanced / 18 stealth / 5 e2e /
+### Round 20 — the opendir dirfd bypass + stat parity
+
+`opendir("/proc/self")` + `openat(dirfd, "maps")` read the REAL
+unfiltered maps: opendir's internal open never crosses the GOT, so
+no proc-dir record existed for the dirfd it hands back (the last R16
+residual). The dirfd is now registered in the opendir hook. And the
+mounted properties file now answers the REAL file's full stat()
+identity (st_dev/st_ino/mode/size) through every query path —
+stat/lstat/statx/fstat — closing the device-id cross-check gap from
+Round 19.
+
+**171/171 host tests** (35 hide / 91 advanced / 18 stealth / 5 e2e /
 4 perf / 2 trampoline / 16 dispatch), 0 warnings, ASan+UBSan+leaks
 green, every test binary exits 0.

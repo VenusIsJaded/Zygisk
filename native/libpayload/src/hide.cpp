@@ -712,6 +712,69 @@ void zs_test_set_prop_serial_target(const char* target) {
 }
 #endif
 
+// Round 20 — stat parity for the mounted properties file. Through
+// the bind mount, stat() of /dev/__properties__/properties_serial
+// (and fstat() of an fd the app opened on it) reports the SESSION
+// file's st_dev/st_ino — while a stock device reports the /dev
+// tmpfs file's identity. A detector cross-checking the property
+// file's device id against another /dev file would see the
+// difference. The fiction below answers the REAL file's identity,
+// captured in the mount phase BEFORE the bind covers it.
+static struct {
+    int         active;
+    struct stat real;     // identity of the real properties_serial
+    struct stat mounted;  // identity of the session file we serve
+} g_props_stat_fiction{};
+
+// Capture both identities around the bind mount. Call order matters:
+// capture_real() BEFORE the mount, capture_mounted() AFTER.
+static void props_fiction_capture_real() {
+    int fd = open(g_props_target_override ? g_props_target_override
+                                          : kPropSerialTarget,
+                  O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return;
+    if (fstat(fd, &g_props_stat_fiction.real) == 0) {
+        g_props_stat_fiction.active = 1;
+    }
+    close(fd);
+}
+
+// The mounted identity is simply the SOURCE file we serve (the bind
+// makes the path resolve to it) — fstat it directly, which also works
+// on host tests where the bind is only recorded.
+static void props_fiction_capture_mounted() {
+    if (!g_props_src[0]) return;
+    int fd = open(g_props_src, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return;
+    (void)fstat(fd, &g_props_stat_fiction.mounted);
+    close(fd);
+}
+
+// The path the stat hooks must answer with the fiction (the bind
+// target; override-aware for host tests).
+const char* hide_props_serial_target_path() {
+    return g_props_target_override ? g_props_target_override
+                                   : kPropSerialTarget;
+}
+
+int hide_props_stat_fiction(struct stat* out) {
+    if (!g_props_stat_fiction.active || !out) return 0;
+    *out = g_props_stat_fiction.real;
+    return 1;
+}
+
+// Is this stat result the identity of our MOUNTED session file
+// (i.e. what the kernel now answers for the properties path)?
+int hide_props_stat_is_mounted_identity(const struct stat* st) {
+    return g_props_stat_fiction.active && st &&
+           (uint64_t)st->st_dev == (uint64_t)g_props_stat_fiction.mounted.st_dev &&
+           (uint64_t)st->st_ino == (uint64_t)g_props_stat_fiction.mounted.st_ino;
+}
+
+void hide_props_stat_fiction_clear() {
+    memset(&g_props_stat_fiction, 0, sizeof g_props_stat_fiction);
+}
+
 // Bind-mount the spoofed area over the real properties_serial, then
 // VERIFY the mount serves our bytes (open + magic compare). Any
 // failure umounts immediately — fail-closed back to the pre-Round-19
@@ -731,10 +794,16 @@ static void mount_spoofed_properties_file() {
     const char* target = g_props_target_override
         ? g_props_target_override
         : kPropSerialTarget;
+    // Round 20: capture the real file's identity BEFORE the bind
+    // covers it (the stat fiction needs it).
+    hide_props_stat_fiction_clear();
+    props_fiction_capture_real();
+    props_fiction_capture_mounted();
     if (g_fn_bind_mount(g_props_src, target) != 0) {
         ZS_LOGW("hide: properties bind mount failed: %s — exec'd "
                 "helpers will see real property values",
                 strerror(errno));
+        hide_props_stat_fiction_clear();
         return;
     }
     // Self-check: open the MOUNTED path and verify the magic. A
@@ -745,6 +814,7 @@ static void mount_spoofed_properties_file() {
         ZS_LOGW("hide: properties mount self-check open failed: %s "
                 "— reverting", strerror(errno));
         g_fn_umount2(target, MNT_DETACH);
+        hide_props_stat_fiction_clear();
         return;
     }
     uint32_t served = 0;
@@ -755,6 +825,7 @@ static void mount_spoofed_properties_file() {
                 "(got %#x want %#x) — reverting",
                 (unsigned)served, (unsigned)g_props_magic);
         g_fn_umount2(target, MNT_DETACH);
+        hide_props_stat_fiction_clear();
         return;
     }
     ZS_LOGD("hide: spoofed properties_serial mounted over "
@@ -1259,10 +1330,18 @@ void zs_test_props_source_clear() {
     g_props_src[0] = '\0';
     g_props_magic = 0;
     g_props_file_ready.store(0, std::memory_order_release);
+    hide_props_stat_fiction_clear();
 }
 // extern "C" so the dlopen-based dispatch test can resolve it.
 extern "C" void zs_test_props_source_clear_c() {
     zs_test_props_source_clear();
+}
+// Drive both fiction captures around a (recorded) bind mount so the
+// hide_advanced hook tests can exercise the stat parody end to end.
+extern "C" void zs_test_props_fiction_capture_both() {
+    hide_props_stat_fiction_clear();
+    props_fiction_capture_real();
+    props_fiction_capture_mounted();
 }
 extern "C" int zs_test_props_ready_c() {
     return hide_props_file_ready();

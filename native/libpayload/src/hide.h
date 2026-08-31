@@ -54,6 +54,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <sys/stat.h>
 #include <sys/types.h>
 
 namespace zygisk_study {
@@ -132,6 +133,16 @@ void hide_apply_for_target(const char* package_name);
 // ------------------------------------------------------------------------
 void hide_props_file_set_source(const char* src, uint32_t magic);
 int  hide_props_file_ready();
+
+// Round 20 — stat parity for the mounted properties file. The mount
+// phase captures the REAL file's identity (pre-bind) and the served
+// file's identity; the stat hooks in hide_advanced answer the real
+// identity for the properties path / any fd of the served file, so a
+// st_dev/st_ino cross-check sees exactly what a stock device reports.
+int  hide_props_stat_fiction(struct stat* out);
+int  hide_props_stat_is_mounted_identity(const struct stat* st);
+const char* hide_props_serial_target_path();
+void hide_props_stat_fiction_clear();
 
 // Clean up any traces we left behind after apply, before user code
 // runs. The caller (entry.cpp) calls this from postAppSpecialize.
@@ -247,3 +258,9 @@ void zs_test_set_prop_serial_target(const char* target);
 #endif
 
 } // namespace zygisk_study
+
+#ifdef ZS_HOST_TEST
+// Round 20: C-linkage test seam (defined in hide.cpp) so the
+// dlopen-based and link-based tests can both resolve it.
+extern "C" void zs_test_props_fiction_capture_both();
+#endif

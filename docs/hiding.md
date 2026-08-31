@@ -770,6 +770,18 @@ path, or a mountinfo root-field form. The Round 8-18 filter only
 understood the maps column layout and leaked every mounts-format
 line.
 
+**opendir-derived dirfds (Round 20)** — the fd opendir() hands back
+is registered as a proc-dir, so `opendir("/proc/self") +
+openat(dirfd, "maps")` (and fchdir through it) filters exactly like
+the absolute open. opendir's internal open never crosses the GOT —
+this was the last R16 relative-open hole.
+
+**stat parity for the mounted properties file (Round 20)** —
+stat/lstat/statx/fstat of /dev/__properties__/properties_serial
+(through the Round 19 bind) answer the REAL file's identity: mode
+0444, size identical by construction, and the pre-bind st_dev/st_ino
+instead of the session file's.
+
 **exec'd helpers (Round 19)** — fork+exec'd children inherit the
 private mount namespace; the hide mount phase bind-mounts a spoofed
 properties_serial over /dev/__properties__/properties_serial (self-
@@ -778,6 +790,5 @@ values trie instead of the real one. `getprop` in an exec'd child
 prints the stock device's story.
 
 Still open (see ANDROID-REALISM residuals): dup'd memfd fstat size,
->383-byte traversal strings, fdopendir dirfds, st_dev/st_ino of the
-mounted properties file, present-but-empty absent keys in the file
-image, on-device chcon validation.
+>383-byte traversal strings, present-but-empty absent keys in the
+file image, on-device chcon validation.
