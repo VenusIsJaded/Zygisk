@@ -717,3 +717,20 @@ any other project — the implementation choices (use of
 operations, the cloak name `subsysd`, the choice of `/data/system/`
 over `/data/adb/`) are mine, but the underlying concepts are not
 novel.
+
+## Round 11 — additional gaps closed (this round)
+
+1. **The openat dirfd bypass.** All three open paths (libc openat
+   via wrapped_openat, the FORTIFY __openat_2, and raw
+   syscall(SYS_openat)) gated filtering on `dirfd == AT_FDCWD`.
+   POSIX says an absolute path ignores dirfd, so a detector could
+   pass any arbitrary fd with an absolute /proc path and bypass
+   every filter. Fixed on all three paths (the statx/faccessat/
+   fstatat hooks never had the gate); regression-tested with the
+   memfd-vs-procfd observable.
+
+2. **freopen().** The last stdio entry point that bypassed the
+   filters — it rebinds an existing FILE to /proc/self/maps with no
+   open()/fopen() GOT call. Now hooked: the stream is rebound to
+   the filtered memfd via its /proc/self/fd link, with write modes
+   and non-proc paths passing through untouched.

@@ -1746,6 +1746,166 @@ ZS_TEST(fd_target_prefixes_match_stock_paths) {
 }
 
 // ----------------------------------------------------------------------
+// Round 11: absolute-path openat must filter regardless of dirfd
+// (POSIX: an absolute path ignores dirfd). The old AT_FDCWD gate
+// was a detector bypass: openat(7, "/proc/self/maps", ...) sailed
+// through unfiltered. Observable: a filtered read returns a MEMFD
+// (fstat st_size > 0), a passthrough returns the procfs fd
+// (st_size == 0).
+// ----------------------------------------------------------------------
+
+ZS_TEST(openat_absolute_path_filters_with_any_dirfd) {
+    hide_advanced_set_active(1);
+
+    int arbitrary_fd = open("/etc/hostname", O_RDONLY);
+    if (arbitrary_fd < 0) arbitrary_fd = open("/proc/self/status", O_RDONLY);
+    ZS_CHECK(arbitrary_fd >= 0);
+
+    int fd = zygisk_study_hook_openat(arbitrary_fd, "/proc/self/status",
+                                      O_RDONLY);
+    ZS_CHECK(fd >= 0);
+    if (fd >= 0) {
+        struct stat st;
+        ZS_CHECK(fstat(fd, &st) == 0);
+        // memfd content has a real size; the raw procfs fd reports 0.
+        ZS_CHECK(st.st_size > 0);
+        close(fd);
+    }
+    // Belt: AT_FDCWD still filters (the pre-existing behavior).
+    fd = zygisk_study_hook_openat(AT_FDCWD, "/proc/self/status", O_RDONLY);
+    ZS_CHECK(fd >= 0);
+    if (fd >= 0) {
+        struct stat st;
+        ZS_CHECK(fstat(fd, &st) == 0);
+        ZS_CHECK(st.st_size > 0);
+        close(fd);
+    }
+    // Relative path with a dirfd: passthrough (cannot resolve). Use a
+    // REAL directory fd so the kernel's errno is meaningful.
+    int dir_fd = open("/tmp", O_RDONLY | O_DIRECTORY);
+    if (dir_fd < 0) dir_fd = open(".", O_RDONLY | O_DIRECTORY);
+    ZS_CHECK(dir_fd >= 0);
+    errno = 0;
+    fd = zygisk_study_hook_openat(dir_fd, "definitely/not/here",
+                                  O_RDONLY);
+    ZS_CHECK_EQ(fd, -1);
+    ZS_CHECK_EQ(errno, ENOENT);
+    close(dir_fd);
+
+    close(arbitrary_fd);
+    hide_advanced_set_active(0);
+}
+
+ZS_TEST(openat2_fortify_hook_filters_with_any_dirfd) {
+    hide_advanced_set_active(1);
+
+    int arbitrary_fd = open("/etc/hostname", O_RDONLY);
+    if (arbitrary_fd < 0) arbitrary_fd = open("/proc/self/status", O_RDONLY);
+    ZS_CHECK(arbitrary_fd >= 0);
+
+    int fd = zygisk_study_hook___openat_2(arbitrary_fd,
+                                          "/proc/self/status", O_RDONLY);
+    ZS_CHECK(fd >= 0);
+    if (fd >= 0) {
+        struct stat st;
+        ZS_CHECK(fstat(fd, &st) == 0);
+        ZS_CHECK(st.st_size > 0);
+        close(fd);
+    }
+    close(arbitrary_fd);
+    hide_advanced_set_active(0);
+}
+
+ZS_TEST(syscall_hook_openat_filters_with_any_dirfd) {
+    // The raw syscall path had the same AT_FDCWD gate. g_real_syscall
+    // must resolve (the earlier host test pretends init ran — undo).
+    g_advanced_initialized.store(0);
+    hide_advanced_init();
+    ZS_CHECK(g_real_syscall != nullptr);
+
+    hide_advanced_set_active(1);
+    int arbitrary_fd = open("/etc/hostname", O_RDONLY);
+    if (arbitrary_fd < 0) arbitrary_fd = open("/proc/self/status", O_RDONLY);
+    ZS_CHECK(arbitrary_fd >= 0);
+
+    long fd = zygisk_study_hook_syscall((long)SYS_openat, arbitrary_fd,
+                                        (long)"/proc/self/status",
+                                        (long)O_RDONLY, 0, 0);
+    ZS_CHECK(fd >= 0);
+    if (fd >= 0) {
+        struct stat st;
+        ZS_CHECK(fstat((int)fd, &st) == 0);
+        ZS_CHECK(st.st_size > 0);
+        close((int)fd);
+    }
+    close(arbitrary_fd);
+    hide_advanced_set_active(0);
+}
+
+// Round 11 (S3): freopen() rebinds an EXISTING FILE to a /proc file
+// without open()/fopen() ever going through the GOT — the last stdio
+// bypass. The hook rebinds the caller's stream to the filtered
+// memfd via its /proc/self/fd link; the resulting FILE* must read
+// the FILTERED content (memfd: fstat size > 0, and for a spiked
+// stream the hidden marker line is absent).
+ZS_TEST(freopen_hook_filters_proc_files) {
+    // g_real_freopen resolves on glibc; g_real_open too (fopen test
+    // already relies on it).
+    g_advanced_initialized.store(0);
+    hide_advanced_init();
+    ZS_CHECK(g_real_freopen != nullptr);
+
+    // A scratch stream to rebind (freopen closes it whatever happens).
+    FILE* scratch = tmpfile();
+    ZS_CHECK(scratch != nullptr);
+
+    hide_advanced_set_active(1);
+    FILE* f = zygisk_study_hook_freopen("/proc/self/status", "r", scratch);
+    hide_advanced_set_active(0);
+    ZS_CHECK(f != nullptr);
+    if (f) {
+        struct stat st;
+        ZS_CHECK(fstat(fileno(f), &st) == 0);
+        // memfd content has a real size; the raw procfs file reports 0.
+        ZS_CHECK(st.st_size > 0);
+        // The stream reads the (filtered) status content: Name: line
+        // survives filtering, and the TracerPid rewrite applies.
+        char line[512] = {0};
+        int found_name = 0, found_tracerpid = 0;
+        while (fgets(line, sizeof line, f)) {
+            if (strncmp(line, "Name:", 5) == 0) found_name = 1;
+            if (strncmp(line, "TracerPid:\t0", 12) == 0) found_tracerpid = 1;
+        }
+        ZS_CHECK(found_name);
+        ZS_CHECK(found_tracerpid);
+        fclose(f);
+    }
+}
+
+ZS_TEST(freopen_hook_passes_through_nonproc_and_write_modes) {
+    g_advanced_initialized.store(0);
+    hide_advanced_init();
+
+    hide_advanced_set_active(1);
+    // Write mode on a filtered path: passthrough (never intercept).
+    FILE* scratch = tmpfile();
+    ZS_CHECK(scratch != nullptr);
+    errno = 0;
+    // "/proc/self/maps" with "w" — the real call will fail (EACCES on
+    // procfs write), but the hook must NOT intercept it: the failure
+    // comes from the kernel, not from us.
+    FILE* f = zygisk_study_hook_freopen("/proc/self/maps", "w", scratch);
+    ZS_CHECK(f == nullptr);   // kernel refuses; stream was closed by freopen
+    // Non-proc path: passthrough with a REAL rebinding.
+    FILE* scratch2 = tmpfile();
+    ZS_CHECK(scratch2 != nullptr);
+    FILE* g = zygisk_study_hook_freopen("/etc/hostname", "r", scratch2);
+    ZS_CHECK(g != nullptr);
+    if (g) fclose(g);
+    hide_advanced_set_active(0);
+}
+
+// ----------------------------------------------------------------------
 // P1: TLS filter scratch — one allocation per thread, ever.
 // ----------------------------------------------------------------------
 

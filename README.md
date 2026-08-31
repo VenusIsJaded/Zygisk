@@ -264,7 +264,7 @@ What the tests cover (Round 9):
   restore).
 - **`test_perf`** (4 tests) — the microbenchmarks.
 
-(Total: 108 host-side tests, plus the daemon's `cargo test` suite.)
+(Total: 113 host-side tests, plus the daemon's `cargo test` suite.)
 
 The logic suites also run clean under **ASan + UBSan with leak
 detection** — `cd tests && make run-sanitize`. That run is where

@@ -891,9 +891,14 @@ static int wrapped_open(const char* path, int flags, mode_t mode) {
 
 static int wrapped_openat(int dirfd, const char* path, int flags,
                           mode_t mode) {
-    // Only absolute paths can name a /proc file; relative paths pass
-    // through untouched (we lack the context to resolve them).
-    if (ZS_UNLIKELY(!path || path[0] != '/' || dirfd != AT_FDCWD)) {
+    // Round 11: an ABSOLUTE path ignores dirfd (POSIX), so the filter
+    // decision must not depend on dirfd either — the old
+    // `dirfd != AT_FDCWD` passthrough let a detector bypass the
+    // filter by passing any arbitrary fd with an absolute /proc
+    // path. Relative paths still pass through untouched (we lack
+    // the context to resolve them). The real openat below receives
+    // the caller's dirfd unchanged, which preserves exact semantics.
+    if (ZS_UNLIKELY(!path || path[0] != '/')) {
         return g_real_openat
             ? g_real_openat(dirfd, path, flags, mode)
             : (int)syscall(SYS_openat, dirfd, path, flags, mode);
@@ -1005,6 +1010,45 @@ extern "C" FILE* zygisk_study_hook_fopen(const char* path,
     return rf;
 }
 
+// Round 11 (S3): freopen(). The one stdio entry point that still
+// bypassed every filter — freopen("/proc/self/maps", "r", stdout)
+// rebinds an EXISTING FILE to the raw procfs file with no open()/
+// fopen() call ever happening through the GOT. Implementation uses
+// the same wrapped_open (which returns the filtered memfd), then
+// rebinds the caller's stream to the memfd via its /proc/self/fd
+// link — which our own hooks deliberately do NOT filter (only
+// /proc/{self,<pid>}/{maps,mounts,...} basename files match). Our
+// scratch fd is closed after the rebind: real freopen opened its
+// OWN descriptor for the memfd, and fclose(stream) will close that
+// one, never ours.
+using FreopenFn = FILE* (*)(const char*, const char*, FILE*);
+static FreopenFn g_real_freopen = nullptr;
+
+extern "C" FILE* zygisk_study_hook_freopen(const char* path,
+                                           const char* mode, FILE* stream) {
+    if (ZS_LIKELY(!hide_advanced_is_active()) || !path || !mode ||
+        strchr(mode, 'w') || strchr(mode, 'a') ||
+        path[0] != '/' || !zs_path_is_filtered(path)) {
+        return g_real_freopen ? g_real_freopen(path, mode, stream)
+                              : nullptr;
+    }
+    int fd = wrapped_open(path, O_RDONLY, 0);
+    if (fd < 0) {
+        // Fall back to the unfiltered real call — a failed filter
+        // must never break the caller's semantics.
+        return g_real_freopen ? g_real_freopen(path, mode, stream)
+                              : nullptr;
+    }
+    char fdpath[64];
+    int n = snprintf(fdpath, sizeof fdpath, "/proc/self/fd/%d", fd);
+    FILE* out = nullptr;
+    if (n > 0 && (size_t)n < sizeof fdpath && g_real_freopen) {
+        out = g_real_freopen(fdpath, mode, stream);
+    }
+    close(fd);
+    return out;
+}
+
 // Round 7 (S2): FORTIFY variants. Code compiled with
 // _FORTIFY_SOURCE (the NDK default) calls __open_2/__openat_2
 // instead of open/openat. These bypass the plain-name hooks.
@@ -1028,7 +1072,9 @@ extern "C" int zygisk_study_hook___openat_2(int dirfd, const char* path,
             ? g_real_openat(dirfd, path, flags, 0)
             : (int)syscall(SYS_openat, dirfd, path, flags, 0);
     }
-    if (path[0] != '/' || dirfd != AT_FDCWD) {
+    // Round 11: absolute path → dirfd is irrelevant (POSIX) → the
+    // filter applies. (Was: `dirfd != AT_FDCWD` bypass.)
+    if (path[0] != '/') {
         return g_real_openat
             ? g_real_openat(dirfd, path, flags, 0)
             : (int)syscall(SYS_openat, dirfd, path, flags, 0);
@@ -1393,8 +1439,13 @@ extern "C" long zygisk_study_hook_syscall(long number, ...) {
 #ifdef SYS_openat
     if (number == (long)SYS_openat) {
         const char* path = (const char*)a[1];
-        if (path && path[0] == '/' && (int)a[0] == AT_FDCWD &&
-            zs_path_is_filtered(path)) {
+        // Round 11: an ABSOLUTE path ignores dirfd (POSIX), so the
+        // filter must apply regardless of what the caller passed in
+        // a[0]. The old AT_FDCWD requirement meant a detector could
+        // bypass the filter entirely by handing any arbitrary fd to
+        // openat() with an absolute /proc path. Relative paths still
+        // pass through untouched (we cannot cheaply resolve them).
+        if (path && path[0] == '/' && zs_path_is_filtered(path)) {
             int flags = (int)a[2];
             mode_t mode = (flags & O_CREAT) ? (mode_t)a[3] : 0;
             return wrapped_openat((int)a[0], path, flags, mode);
@@ -2104,6 +2155,7 @@ void hide_advanced_init() {
     g_real_open     = (OpenFn)zs_resolve_libc("open");
     g_real_openat   = (OpenAtFn)zs_resolve_libc("openat");
     g_real_fopen    = (FopenFn)zs_resolve_libc("fopen");
+    g_real_freopen  = (FreopenFn)zs_resolve_libc("freopen");  // Round 11
     g_real_stat     = (StatFn)zs_resolve_libc("stat");
     g_real_lstat    = (LstatFn)zs_resolve_libc("lstat");
     g_real_access   = (AccessFn)zs_resolve_libc("access");
@@ -2143,6 +2195,10 @@ void hide_advanced_init() {
         (void*)&zygisk_study_hook___openat_2);
     hide_advanced_register_tier_b_hook("fopen",
         (void*)&zygisk_study_hook_fopen);
+    // Round 11 (S3): the last stdio entry point that bypassed the
+    // filter (rebinds an existing FILE without open/fopen).
+    hide_advanced_register_tier_b_hook("freopen",
+        (void*)&zygisk_study_hook_freopen);
     hide_advanced_register_tier_b_hook("stat",
         (void*)&zygisk_study_hook_stat);
     hide_advanced_register_tier_b_hook("lstat",

@@ -864,3 +864,55 @@ so the blob is verified by construction + parity, not execution.
   unsanitized host x86_64 execution test.
 - UBSan found nothing to fix; that is a fact about this run, not a
   guarantee — instrumented coverage is only as deep as the tests.
+
+## Round 11 — the review-pass round
+
+A line-by-line review sweep of the paths not scrutinized earlier
+this session (syscall hook, openat family, entry.cpp pipeline,
+hide_stealth, the asm blobs' header contract). Two real findings:
+
+### B1 (stealth bypass, fixed): the openat dirfd gate
+
+`wrapped_openat`, `__openat_2`, and the raw `syscall(SYS_openat)`
+branch all required `dirfd == AT_FDCWD` before filtering. POSIX
+says an ABSOLUTE path ignores dirfd — so
+`openat(7, "/proc/self/maps", O_RDONLY)` with ANY descriptor sailed
+through unfiltered on all three paths. The statx/faccessat/fstatat
+branches never had the gate (they were already correct). All three
+open paths now filter on absolute /proc paths regardless of dirfd;
+relative paths still pass through (unresolvable cheaply). Verified
+by three new tests that use the memfd-vs-procfd observable
+(fstat st_size > 0 means the filter applied).
+
+### S3 (stealth gap, closed): freopen()
+
+The one stdio entry point that bypassed every filter: freopen
+REBINDS an existing FILE to /proc/self/maps with no open()/fopen()
+GOT call. The hook rebinds the caller's stream to the filtered
+memfd via its /proc/self/fd link (a path our own hooks deliberately
+do not match), closing the scratch descriptor after the rebind —
+the caller's fclose() closes the real freopen's descriptor, never
+ours. Write/append modes and non-proc paths pass through
+untouched; a filter failure falls back to the real call.
+
+### Reviewed and confirmed correct (no change)
+
+- The Tier A pipeline ordering in entry.cpp: unmount → clone+spoof
+  → stealth → prepare records → GOT uninstall → REAL privilege
+  drop → trampoline (the real setresgid runs BEFORE the jump —
+  leaving the app as root would be both a detection and a hole).
+- The double-call idempotency when the trampoline setup fails and
+  Tier B takes over (setres*/set* are idempotent).
+- g_hide_done + getpid() gating across the app's own forks (no
+  re-hide, no leak of the gate to unrelated children).
+- The asm blob frame contract vs the header tables (all 20
+  callee-saved slots, both architectures).
+- The dlopen re-walk's mark-set/GC interplay (no linker-lock
+  re-entry: the walk runs after real dlopen returned).
+- The fopen FORTIFY/open fallbacks and the `va_arg` register-slot
+  argument extraction in the syscall hook (compilers zero-extend
+  32-bit varargs into 64-bit register slots on both x86_64 and
+  aarch64 in practice; documented as a known-ABI nuance rather
+  than changed).
+
+113 host tests (108 → 113), all green, sanitizer run green.
