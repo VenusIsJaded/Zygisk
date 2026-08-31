@@ -813,6 +813,13 @@ static int make_filtered_memfd(int orig_fd, const char* target_path) {
     size_t carry = 0;      // unterminated record bytes at buf[0..carry)
     size_t file_off = 0;   // pread offset into orig_fd
     int ok = 1;
+    // Round 17: when a record larger than the whole scratch chunk
+    // appears (hostile input only — every real filtered /proc file
+    // has < 4 KB lines), the old code dropped the FIRST chunk and
+    // then happily emitted the record's TAIL as a fresh record. The
+    // dropping flag now skips everything up to and including the next
+    // separator before filtering resumes.
+    int dropping = 0;
 
     for (;;) {
         ssize_t n = pread(orig_fd, buf + carry, kChunk - carry,
@@ -820,6 +827,21 @@ static int make_filtered_memfd(int orig_fd, const char* target_path) {
         if (n <= 0) break;
         file_off += (size_t)n;
         size_t have = carry + (size_t)n;
+
+        if (dropping) {
+            char* sep_pos = (char*)memchr(buf, sep, have);
+            if (!sep_pos) {
+                // The whole chunk belongs to the oversized record.
+                carry = 0;
+                continue;
+            }
+            size_t consumed = (size_t)(sep_pos - buf) + 1;
+            memmove(buf, buf + consumed, have - consumed);
+            have -= consumed;
+            carry = have;
+            dropping = 0;
+            if (have == 0) continue;
+        }
 
         // Locate the LAST separator in the buffer; everything after
         // it is a partial record carried into the next iteration.
@@ -830,10 +852,12 @@ static int make_filtered_memfd(int orig_fd, const char* target_path) {
         if (last_sep == (size_t)-1) {
             // No complete record in this chunk (a >64 KB single line
             // does not occur in any filtered /proc file; if a hostile
-            // source produces one, drop it rather than stall).
+            // source produces one, drop it rather than stall — and
+            // keep dropping until its separator arrives).
             if (have >= kChunk - 1) {
                 ZS_LOGW("hide_advanced: oversized record (%zu B) in "
                         "filtered /proc file; dropping it", have);
+                dropping = 1;
                 carry = 0;
             } else {
                 carry = have;
@@ -1195,15 +1219,53 @@ static void zs_set_cwd_proc_prefix(const char* dir) {
     g_cwd_proc_prefix_len = 0;
 }
 
-// prefix + "/" + rel into out. Returns 0 when it cannot fit.
+// Lexically normalize an absolute path: resolve "." and ".."
+// textually (the kernel resolves them too — a relative
+// "task/../maps" from a proc dirfd lands on the filtered file, so
+// the reconstruction must classify it). Bounded; returns the length
+// written (with NUL), or 0 when it does not fit / is not absolute.
+static size_t zs_normalize_path(const char* in, char* out, size_t cap) {
+    if (!in || in[0] != '/' || cap < 2) return 0;
+    size_t w = 0;
+    const char* p = in;
+    while (*p) {
+        while (*p == '/') ++p;
+        if (!*p) break;
+        const char* comp = p;
+        size_t clen = 0;
+        while (*p && *p != '/') { ++p; ++clen; }
+        if (clen == 1 && comp[0] == '.') continue;
+        if (clen == 2 && comp[0] == '.' && comp[1] == '.') {
+            while (w > 0 && out[w - 1] != '/') --w;
+            if (w > 0) --w;              // drop the '/' as well
+            continue;
+        }
+        if (w + 1 + clen + 1 > cap) return 0;
+        out[w++] = '/';
+        memcpy(out + w, comp, clen);
+        w += clen;
+    }
+    if (w == 0) out[w++] = '/';
+    out[w] = '\0';
+    return w + 1;
+}
+
+// prefix + "/" + rel, lexically normalized, into out. Returns 0 when
+// it cannot fit (then the caller keeps the unfiltered relative path
+// — document as the residual for >383-byte traversal strings).
 static int zs_join_proc_dir(const char* prefix, const char* rel,
                              char* out, size_t cap) {
-    size_t n = strlen(prefix), m = strlen(rel);
-    if (n + 1 + m + 1 > cap) return 0;
-    memcpy(out, prefix, n);
-    out[n] = '/';
-    memcpy(out + n + 1, rel, m + 1);
-    return 1;
+    if (!prefix || !rel || prefix[0] != '/' || !rel[0]) return 0;
+    constexpr size_t kMaxJoined = 384;
+    size_t plen = strlen(prefix);
+    while (plen > 1 && prefix[plen - 1] == '/') --plen;
+    size_t rlen = strlen(rel);
+    if (plen + 1 + rlen + 1 > kMaxJoined) return 0;
+    char joined[kMaxJoined];
+    memcpy(joined, prefix, plen);
+    joined[plen] = '/';
+    memcpy(joined + plen + 1, rel, rlen + 1);
+    return zs_normalize_path(joined, out, cap) > 0;
 }
 
 // Wrap the original open so the caller gets back either the original
@@ -2115,7 +2177,19 @@ static size_t zs_filter_getdents64(char* buf, size_t len) {
             break;                               // corrupt record
         }
         size_t reclen = de->d_reclen;
-        if (!zs_dirent_name_is_hidden(de->d_name)) {
+        // Bounded name check: the kernel NUL-terminates names within
+        // the record, but a garbage/hostile buffer might not — strcmp
+        // would then walk past the buffer. strnlen bounds it first.
+        size_t name_max = reclen - kHdr;
+        size_t name_len = strnlen(de->d_name, name_max);
+        if (name_len == name_max) {
+            // No terminator inside the record: not a valid kernel
+            // record — keep it verbatim (kernel never produces this).
+            if (write != off) {
+                memmove(buf + write, buf + off, reclen);
+            }
+            write += reclen;
+        } else if (!zs_dirent_name_is_hidden(de->d_name)) {
             if (write != off) {
                 memmove(buf + write, buf + off, reclen);
             }
@@ -2278,7 +2352,12 @@ extern "C" long zygisk_study_hook_syscall(long number, ...) {
 // GOT hook registry + the single walker
 // ------------------------------------------------------------------------
 
-constexpr size_t kMaxGotHooks = 48;
+constexpr size_t kMaxGotHooks = 64;
+// Round 17: the live registry hit 47/48 entries after Rounds 15-16 —
+// one more hook and register_got_hook() would have SILENTLY refused
+// (log warning only), leaving a stealth hole with zero test signal.
+// Capacity is now 64, and the tier-B promotion test pins the exact
+// live count so this can never drift unnoticed again.
 struct GotHookEntry {
     const char* name;
     void*       fn;
@@ -2397,9 +2476,57 @@ constexpr size_t kMaxPatchedSlots = 1024;
 struct PatchedSlot {
     void** slot;
     void*  original;
+    int    orig_prot;   // Round 17: the page protection the linker
+                        // left the page with (see zs_page_prot_below).
 };
 static PatchedSlot g_patched_slots[kMaxPatchedSlots];
 static size_t      g_patched_slot_count = 0;
+
+// Round 17 (REAL BUG, found by the registry pin test): the patch and
+// uninstall passes used to leave every touched GOT page as
+// PROT_READ|PROT_EXEC. Two consequences:
+//
+//   1. LAZY BINDING CRASH: for any DSO whose .got.plt still resolves
+//      lazily (third-party dlopen'd libs — exactly what the Tier B
+//      dlopen re-walk patches), the dynamic linker WRITES the resolved
+//      address into the slot at the first call. Writing to an RX page
+//      faults. The host test binary hit this at process exit; an app
+//      would hit it on the first call of any not-yet-resolved import
+//      in a patched DSO.
+//
+//   2. PROT_EXEC on data pages is both wrong (GOT is data) and an
+//      SELinux execmem-class check on Android that RW does not
+//      trigger.
+//
+// The original protection is now COMPUTED from the ELF headers we
+// are already iterating: pages inside PT_GNU_RELRO are what the
+// linker made read-only; pages in a writable PT_LOAD are RW; the
+// conservative fallback is RW (a writable page can never fault the
+// lazy resolver).
+static int zs_page_original_prot(const struct dl_phdr_info* info,
+                                  uintptr_t page, size_t pagesize) {
+    if (!info) return PROT_READ | PROT_WRITE;
+    uintptr_t base = (uintptr_t)info->dlpi_addr;
+    for (int i = 0; i < info->dlpi_phnum; ++i) {
+        const ElfW(Phdr)& ph = info->dlpi_phdr[i];
+        if (ph.p_type != PT_GNU_RELRO) continue;
+        uintptr_t lo = base + ph.p_vaddr;
+        uintptr_t hi = lo + ph.p_memsz;
+        hi = (hi + pagesize - 1) & ~((uintptr_t)pagesize - 1);
+        if (page >= lo && page < hi) return PROT_READ;
+    }
+    for (int i = 0; i < info->dlpi_phnum; ++i) {
+        const ElfW(Phdr)& ph = info->dlpi_phdr[i];
+        if (ph.p_type != PT_LOAD) continue;
+        uintptr_t lo = base + ph.p_vaddr;
+        uintptr_t hi = lo + ph.p_memsz;
+        if (page >= lo && page < hi) {
+            return (ph.p_flags & PF_W) ? (PROT_READ | PROT_WRITE)
+                                       : PROT_READ;
+        }
+    }
+    return PROT_READ | PROT_WRITE;   // not in any segment: safe default
+}
 
 static long got_pagesize() {
     static long ps = sysconf(_SC_PAGESIZE);
@@ -2507,13 +2634,20 @@ static int patch_got_all_for_phdr(struct dl_phdr_info* info,
         uintptr_t page = reinterpret_cast<uintptr_t>(slot)
                          & ~((uintptr_t)pagesize - 1);
         void* pageptr = reinterpret_cast<void*>(page);
+        int orig_prot = zs_page_original_prot(info, page,
+                                              (size_t)pagesize);
+        // Round 17: RW for the write window (no PROT_EXEC — data
+        // pages must not gain execute permission, and SELinux
+        // execmem checks on Android make that a real failure mode).
         if (mprotect(pageptr, (size_t)pagesize,
-                     PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
+                     PROT_READ | PROT_WRITE) == 0) {
             // Record the original so the uninstall pass can restore
             // it before we unmap ourselves.
             if (g_patched_slot_count < kMaxPatchedSlots) {
                 g_patched_slots[g_patched_slot_count].slot     = slot;
                 g_patched_slots[g_patched_slot_count].original = current;
+                g_patched_slots[g_patched_slot_count].orig_prot =
+                    orig_prot;
                 ++g_patched_slot_count;
             } else if (g_patched_slot_count == kMaxPatchedSlots) {
                 ZS_LOGW("hide_advanced: patched-slot table full; "
@@ -2521,7 +2655,10 @@ static int patch_got_all_for_phdr(struct dl_phdr_info* info,
                 ++g_patched_slot_count;  // log once
             }
             *slot = hook;
-            mprotect(pageptr, (size_t)pagesize, PROT_READ | PROT_EXEC);
+            // Restore the protection the linker left (RELRO pages R,
+            // lazy .got.plt pages RW — leaving RW keeps the lazy
+            // resolver working; leaving RX crashed it).
+            mprotect(pageptr, (size_t)pagesize, orig_prot);
         }
     }
     return 0;
@@ -2547,10 +2684,14 @@ void hide_advanced_uninstall_got_hooks() {
         uintptr_t page = reinterpret_cast<uintptr_t>(slot)
                          & ~((uintptr_t)pagesize - 1);
         void* pageptr = reinterpret_cast<void*>(page);
+        // Round 17: RW window, then the RECORDED original protection
+        // (the old hard-coded RX broke lazy binding — see
+        // zs_page_original_prot).
         if (mprotect(pageptr, (size_t)pagesize,
-                     PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
+                     PROT_READ | PROT_WRITE) == 0) {
             *slot = g_patched_slots[i].original;
-            mprotect(pageptr, (size_t)pagesize, PROT_READ | PROT_EXEC);
+            mprotect(pageptr, (size_t)pagesize,
+                     g_patched_slots[i].orig_prot);
         }
     }
     g_patched_slot_count = 0;

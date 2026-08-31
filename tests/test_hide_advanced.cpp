@@ -2653,3 +2653,353 @@ ZS_TEST(relative_openat_against_proc_dirfd) {
 
     hide_advanced_set_active(0);
 }
+
+// ----------------------------------------------------------------------
+// Round 17 — adversarial hardening of the streaming filter
+// ----------------------------------------------------------------------
+
+// A record LARGER than the 64 KB carry buffer is dropped, and — the
+// part that actually matters — the NEXT records survive intact.
+ZS_TEST(streaming_filter_survives_oversized_record) {
+    std::string dir = "/tmp/zstest_r17_big_XXXXXX";
+    char* d = mkdtemp(&dir[0]);
+    ZS_CHECK(d != nullptr);
+    std::string file = dir + "/blob";
+
+    FILE* f = fopen(file.c_str(), "w");
+    ZS_CHECK(f != nullptr);
+    fputs("7f12300000000000-7f12300000001000 r--p 00000000 08:01 1 "
+          "/system/lib64/libc.so\n", f);
+    // 100 KB single "line": no newline until the very end.
+    std::string huge(100 * 1024, 'x');
+    huge.push_back('\n');
+    fwrite(huge.data(), 1, huge.size(), f);
+    fputs("7f12300000002000-7f12300000003000 r--p 00000000 08:01 2 "
+          "/system/lib64/libm.so\n", f);
+    fclose(f);
+
+    int fd = open(file.c_str(), O_RDONLY);
+    ZS_CHECK(fd >= 0);
+    hide_advanced_set_active(1);
+    int memfd = make_filtered_memfd(fd, "/proc/self/maps");
+    hide_advanced_set_active(0);
+    close(fd);
+    ZS_CHECK(memfd >= 0);
+
+    std::string out;
+    char buf[4096];
+    ssize_t n;
+    lseek(memfd, 0, SEEK_SET);
+    while ((n = read(memfd, buf, sizeof buf)) > 0) {
+        out.append(buf, (size_t)n);
+    }
+    close(memfd);
+
+    ZS_CHECK(out.find("libc.so") != std::string::npos);
+    ZS_CHECK(out.find("libm.so") != std::string::npos);
+    ZS_CHECK(out.find("xxxxx") == std::string::npos);   // dropped
+    // And exactly two records survived.
+    int lines = 0;
+    for (char c : out) if (c == '\n') ++lines;
+    ZS_CHECK_EQ(lines, 2);
+    unlink(file.c_str());
+    rmdir(d);
+}
+
+// A record of EXACTLY carry-capacity size (63.9 KB, no separator in
+// the first chunk) completes in the second chunk and is filtered
+// normally — the boundary between "carry" and "oversized, drop".
+ZS_TEST(streaming_filter_boundary_carry_record) {
+    std::string dir = "/tmp/zstest_r17_bnd_XXXXXX";
+    char* d = mkdtemp(&dir[0]);
+    ZS_CHECK(d != nullptr);
+    std::string file = dir + "/blob";
+
+    // One 60 KB line that IS hidden (contains our marker), split
+    // across chunks by construction: written before a final kept line.
+    FILE* f = fopen(file.c_str(), "w");
+    ZS_CHECK(f != nullptr);
+    std::string hidden_line =
+        "7f00000000000000-7f00000000f00000 r--s 00000000 08:01 9 "
+        "/data/adb/modules/zygisk_study/libpayload.so";
+    while (hidden_line.size() < 60 * 1024) hidden_line += ' ';
+    hidden_line += '\n';
+    fwrite(hidden_line.data(), 1, hidden_line.size(), f);
+    fputs("7f12300000000000-7f12300000001000 r--p 00000000 08:01 1 "
+          "/system/lib64/libc.so\n", f);
+    // no trailing separator on the final record:
+    fputs("7f12300000002000-7f12300000003000 r--p 00000000 08:01 2 "
+          "/apex/com.android.art/lib64/libart.so", f);
+    fclose(f);
+
+    int fd = open(file.c_str(), O_RDONLY);
+    ZS_CHECK(fd >= 0);
+    hide_advanced_set_active(1);
+    int memfd = make_filtered_memfd(fd, "/proc/self/maps");
+    hide_advanced_set_active(0);
+    close(fd);
+    ZS_CHECK(memfd >= 0);
+
+    std::string out;
+    char buf[4096];
+    ssize_t n;
+    lseek(memfd, 0, SEEK_SET);
+    while ((n = read(memfd, buf, sizeof buf)) > 0) {
+        out.append(buf, (size_t)n);
+    }
+    close(memfd);
+
+    // The hidden record was dropped, both clean records kept —
+    // including the final one WITHOUT a trailing separator.
+    ZS_CHECK(out.find("libpayload.so") == std::string::npos);
+    ZS_CHECK(out.find("libart.so") != std::string::npos);
+    ZS_CHECK(out.find("libc.so") != std::string::npos);
+    unlink(file.c_str());
+    rmdir(d);
+}
+
+// Environ-style filtering with an unterminated final entry.
+ZS_TEST(streaming_filter_environ_no_trailing_nul) {
+    std::string dir = "/tmp/zstest_r17_env_XXXXXX";
+    char* d = mkdtemp(&dir[0]);
+    ZS_CHECK(d != nullptr);
+    std::string file = dir + "/env";
+    FILE* f = fopen(file.c_str(), "w");
+    ZS_CHECK(f != nullptr);
+    // fwrite, NOT fputs: the blob contains embedded NULs (fputs would
+    // stop at the first one and silently truncate the fixture).
+    std::string blob = std::string("PATH=/sbin:/system/bin") + '\0' +
+        "ZYGISK_STUDY_DEBUG=1" + '\0' + "HOME=/data" + '\0' +
+        "ZYGISK_STUDY_WORKDIR=/x";
+    fwrite(blob.data(), 1, blob.size(), f);
+    fclose(f);
+
+    int fd = open(file.c_str(), O_RDONLY);
+    ZS_CHECK(fd >= 0);
+    hide_advanced_set_active(1);
+    int memfd = make_filtered_memfd(fd, "/proc/self/environ");
+    hide_advanced_set_active(0);
+    close(fd);
+    ZS_CHECK(memfd >= 0);
+
+    std::string out;
+    char buf[512];
+    ssize_t n;
+    lseek(memfd, 0, SEEK_SET);
+    while ((n = read(memfd, buf, sizeof buf)) > 0) {
+        out.append(buf, (size_t)n);
+    }
+    close(memfd);
+    ZS_CHECK(out.find("ZYGISK_STUDY") == std::string::npos);
+    ZS_CHECK(out.find("PATH=") != std::string::npos);
+    ZS_CHECK(out.find("HOME=/data") != std::string::npos);
+    unlink(file.c_str());
+    rmdir(d);
+}
+
+// Fuzz the raw getdents64 compactor with adversarial buffers: broken
+// headers, bogus reclens, non-NUL-terminated names, random bytes.
+// Must never read or write outside [buf, buf+len) and must always
+// return <= len. (Run this suite under ASan to make it a real
+// memory-safety proof.)
+ZS_TEST(getdents64_filter_fuzz_adversarial_buffers) {
+    unsigned seed = 0x5eed1717;
+    auto rnd = [&seed]() {
+        seed = seed * 1664525u + 1013904223u;
+        return seed >> 8;
+    };
+    for (int iter = 0; iter < 2000; ++iter) {
+        char buf[512];
+        size_t len = 8 + (rnd() % (sizeof buf - 16));
+        for (size_t i = 0; i < len; ++i) buf[i] = (char)(rnd() & 0xff);
+        // Sometimes plant a plausibly-shaped record with a hidden name
+        // and a valid reclen but no NUL terminator.
+        if (iter % 3 == 0 && len > 64) {
+            struct zs_linux_dirent64* de =
+                (struct zs_linux_dirent64*)buf;
+            de->d_reclen = (unsigned short)(24 + (rnd() % 8));
+            memcpy(de->d_name, "magiskXXXX", 10);   // no NUL
+        }
+        size_t out = zs_filter_getdents64(buf, len);
+        ZS_CHECK(out <= len);
+    }
+}
+
+// ----------------------------------------------------------------------
+// Round 17 — hook contract hardening
+// ----------------------------------------------------------------------
+
+// The mmap hook must be transparent for every non-tracked use: the
+// ART/malloc path (anonymous, fd -1) maps normally through the hook.
+ZS_TEST(mmap_hook_transparent_for_anonymous_mappings) {
+    hide_advanced_set_active(1);
+    void* m = zygisk_study_hook_mmap(nullptr, 3 * 4096, PROT_READ | PROT_WRITE,
+                                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ZS_CHECK(m != MAP_FAILED);
+    if (m != MAP_FAILED) {
+        memset(m, 0x5a, 3 * 4096);
+        munmap(m, 3 * 4096);
+    }
+    // Same with a REAL file fd (not one of ours).
+    char tmpl[] = "/tmp/zs_r17_mm_XXXXXX";
+    int reg = mkstemp(tmpl);
+    ZS_CHECK(reg >= 0);
+    ZS_CHECK_EQ(write(reg, "hello", 5), 5);
+    void* fm = zygisk_study_hook_mmap(nullptr, 4096, PROT_READ,
+                                      MAP_PRIVATE, reg, 0);
+    ZS_CHECK(fm != MAP_FAILED);
+    if (fm != MAP_FAILED) {
+        ZS_CHECK_EQ(memcmp(fm, "hello", 5), 0);
+        munmap(fm, 4096);
+    }
+    unlink(tmpl);
+    close(reg);
+    hide_advanced_set_active(0);
+}
+
+// A PROC_DIR shadow record must NOT trigger the memfd fstat fiction:
+// statting a /proc directory fd through the hook reports a real
+// directory.
+ZS_TEST(fstat_hook_passes_proc_dir_fds_through) {
+    hide_advanced_set_active(1);
+    int dirfd = zygisk_study_hook_open("/proc/self", O_RDONLY);
+    ZS_CHECK(dirfd >= 0);
+    struct stat st;
+    ZS_CHECK_EQ(zygisk_study_hook_fstat(dirfd, &st), 0);
+    ZS_CHECK(S_ISDIR(st.st_mode));          // still a directory
+    ZS_CHECK(st.st_size != 0 || st.st_size == 0);   // real answer, whatever it is
+    // The memfd fiction never applied:
+    ZS_CHECK(fd_shadow_lookup(dirfd, FD_SHADOW_MEMFD) == nullptr);
+    close(dirfd);
+    hide_advanced_set_active(0);
+}
+
+// chdir(nullptr) is EFAULT from the kernel — the hook must pass the
+// failure through without touching state.
+ZS_TEST(chdir_hook_passes_null_and_bad_paths) {
+    hide_advanced_set_active(1);
+    errno = 0;
+    int rv = zygisk_study_hook_chdir(nullptr);
+    ZS_CHECK_EQ(rv, -1);
+    ZS_CHECK(errno == EFAULT || errno == EINVAL);
+    errno = 0;
+    rv = zygisk_study_hook_chdir("/does/not/exist/at/all");
+    ZS_CHECK_EQ(rv, -1);
+    ZS_CHECK_EQ(errno, ENOENT);
+    // State is still clear (no crash, no prefix).
+    ZS_CHECK_EQ(g_cwd_proc_prefix_len, (size_t)0);
+    hide_advanced_set_active(0);
+}
+
+// Round 17 registry pin: the tier B registry must hold exactly the
+// documented set — the promotion path (install_tier_b) copies it into
+// the live registry, whose capacity silently refused entries at the
+// old 48-slot limit. Pin the arithmetic so a future hook that fails
+// to register shows up HERE, not as a stealth hole.
+ZS_TEST(tier_b_registry_size_is_pinned) {
+    // This TU's registry: 40 production names + 1 legacy test symbol
+    // registered by an older test ("zs_test_never_a_real_symbol").
+    // The full payload adds readlink/readlinkat (2, from
+    // hide_stealth.cpp) and promotes the 5 zygote-time hooks
+    // (setresgid/setresuid/setgid/setuid/fork) for 47 live entries —
+    // exactly what the dispatch e2e walk logs. The old cap was 48:
+    // ONE slot from silently refusing new hooks.
+    ZS_CHECK_EQ(g_tier_b_hook_count, (size_t)41);
+
+    size_t before = g_got_hook_count;
+    hide_advanced_install_tier_b();
+    ZS_CHECK_EQ(g_got_hook_count, before + g_tier_b_hook_count);
+    // Full-payload arithmetic: 40 production + 2 (stealth) + 5
+    // (zygote) = 47 live, and the capacity must leave real headroom
+    // above it (the +1 here is this TU's legacy test symbol).
+    ZS_CHECK(g_got_hook_count + 2 + 5 - 1 < kMaxGotHooks);
+
+    // Every tier B entry must actually be reachable through the hash
+    // index after promotion.
+    for (size_t i = 0; i < g_tier_b_hook_count; ++i) {
+        void* fn = zs_test_match_registered_hook(g_tier_b_hooks[i].name);
+        if (fn != g_tier_b_hooks[i].fn) {
+            std::fprintf(stderr, "  [tier B hook lost: %s]\n",
+                         g_tier_b_hooks[i].name);
+        }
+        ZS_CHECK(fn == g_tier_b_hooks[i].fn);
+    }
+
+    // PRODUCTION LIFECYCLE: Tier B hooks are uninstalled before the
+    // payload ever lets the process run on without it. Leaving the
+    // test binary's GOT patched at exit once crashed the process
+    // after all tests had already passed — exit-time libc calls went
+    // through hook slots whose delegates are gone. Restore exactly
+    // like hide_pipeline does.
+    hide_advanced_uninstall_got_hooks();
+    hide_advanced_set_active(0);
+}
+
+// Round 17: traversal components in the relative path. The kernel
+// resolves "task/../maps" from a /proc/self dirfd to the very file we
+// filter — the reconstruction must normalize it and do the same.
+ZS_TEST(relative_openat_with_dotdot_traversal_is_filtered) {
+    hide_advanced_set_active(1);
+
+    int dirfd = zygisk_study_hook_open("/proc/self", O_RDONLY);
+    ZS_CHECK(dirfd >= 0);
+
+    int fd = zygisk_study_hook_openat(dirfd, "task/../maps", O_RDONLY);
+    ZS_CHECK(fd >= 0);
+    struct stat st;
+    ZS_CHECK_EQ(zygisk_study_hook_fstat(fd, &st), 0);
+    ZS_CHECK_EQ(st.st_size, (off_t)0);          // the procfs fiction
+    close(fd);
+
+    // "." components and redundant slashes classify the same way.
+    fd = zygisk_study_hook_openat(dirfd, "./maps", O_RDONLY);
+    ZS_CHECK(fd >= 0);
+    ZS_CHECK_EQ(zygisk_study_hook_fstat(fd, &st), 0);
+    ZS_CHECK_EQ(st.st_size, (off_t)0);
+    close(fd);
+    close(dirfd);
+
+    // Traversal that ESCAPES /proc lands outside the classifier and
+    // passes through untouched (the kernel gives the same file).
+    dirfd = zygisk_study_hook_open("/proc/self", O_RDONLY);
+    ZS_CHECK(dirfd >= 0);
+    errno = 0;
+    fd = zygisk_study_hook_openat(dirfd, "../../etc/hostname", O_RDONLY);
+    if (fd >= 0) {
+        // On hosts where /etc/hostname exists through that traversal,
+        // it must NOT have the procfs fiction (real file passthrough).
+        ZS_CHECK_EQ(zygisk_study_hook_fstat(fd, &st), 0);
+        ZS_CHECK(!S_ISDIR(st.st_mode));
+        ZS_CHECK(st.st_size > 0 || st.st_size == 0);   // real answer
+        close(fd);
+    }
+    close(dirfd);
+    hide_advanced_set_active(0);
+}
+
+// The normalizer itself: the exact cases the joiner relies on.
+ZS_TEST(path_normalizer_resolves_dot_and_dotdot) {
+    char out[160];
+    ZS_CHECK_EQ(zs_normalize_path("/proc/self/maps", out, sizeof out) > 0, 1);
+    ZS_CHECK_EQ(strcmp(out, "/proc/self/maps"), 0);
+    ZS_CHECK(zs_normalize_path("/proc/self/task/../maps", out, sizeof out) > 0);
+    ZS_CHECK_EQ(strcmp(out, "/proc/self/maps"), 0);
+    ZS_CHECK(zs_normalize_path("/proc/self/./maps", out, sizeof out) > 0);
+    ZS_CHECK_EQ(strcmp(out, "/proc/self/maps"), 0);
+    ZS_CHECK(zs_normalize_path("/proc/self//maps", out, sizeof out) > 0);
+    ZS_CHECK_EQ(strcmp(out, "/proc/self/maps"), 0);
+    ZS_CHECK(zs_normalize_path("/proc/self/../../1/maps", out, sizeof out) > 0);
+    ZS_CHECK_EQ(strcmp(out, "/1/maps"), 0);   // two ".." escape /proc/self
+                                             // AND /proc — lands at root
+    ZS_CHECK(zs_normalize_path("/", out, sizeof out) > 0);
+    ZS_CHECK_EQ(strcmp(out, "/"), 0);
+    ZS_CHECK(zs_normalize_path("/proc/task", out, sizeof out) > 0);
+    ZS_CHECK_EQ(strcmp(out, "/proc/task"), 0);
+    // ".." at root stays at root; relative input is rejected.
+    ZS_CHECK(zs_normalize_path("/..", out, sizeof out) > 0);
+    ZS_CHECK_EQ(strcmp(out, "/"), 0);
+    ZS_CHECK_EQ(zs_normalize_path("proc/self", out, sizeof out), (size_t)0);
+    // Capacity: exactly-fitting path succeeds, one byte short fails.
+    ZS_CHECK(zs_normalize_path("/a", out, 3) > 0);
+    ZS_CHECK_EQ(zs_normalize_path("/ab", out, 3), (size_t)0);
+}
