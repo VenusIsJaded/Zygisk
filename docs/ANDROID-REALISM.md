@@ -801,3 +801,66 @@ ADOPTED (after understanding WHY they do it):
 - The fd scan's cost on a process with hundreds of descriptors
   (bounded: one getdents64 round per ~200 fds + one readlink per
   descriptor; both single-digit microseconds).
+
+## Round 10 — sanitizer-hardened
+
+### What the ASan+UBSan run found
+
+- **REAL production bug (fixed)**: `zs_filter_kind_for_path` used
+  `memcmp(path, "/proc/", 6)` — a caller handing the open()/stat()
+  hook a path shorter than 6 bytes ("" from a miscomputed buffer,
+  "/", ...) made memcmp read past the caller's string. Harmless
+  99.999% of the time; a SIGSEGV in the open() hot path the day a
+  short path lands at the end of a page. Now `strncmp`, which stops
+  at either string's NUL. This is the entry point of EVERY filtered
+  /proc read in a hidden app. (All other memcmp call sites in the
+  payload were audited: each is length-guarded by a measured field
+  length — the maps/mounts parsers and the fd-target matcher.)
+- **Zero leaks, zero UB across the logic suites** with
+  detect_leaks=1: the scandir hook's ownership contract (it frees
+  exactly the entries it drops), the memfd filter's lifecycle, the
+  fake-foreach driver, and the fd scan are all allocation-clean.
+
+### The one deliberate sanitizer exclusion
+
+`test_unmap_trampoline` is not in the sanitized target
+(`make run-sanitize`): its purpose is raw mapping manipulation, and
+the Tier A anonymize step legitimately memcpy()s ENTIRE read-only
+segments of libpayload.so — which, under instrumentation, contain
+ASan global redzones, so the copy reports a false
+"global-buffer-overflow" at the first redzone byte (the read is an
+exact page multiple from a page-aligned start; ASan reports the
+first poisoned byte, not the access start). The unsanitized
+`make run` target exercises the trampoline against real mappings —
+that is the test that matters for it.
+
+### AArch64 blob audit (no cross-toolchain in this sandbox)
+
+Manual parity audit of unmap_trampoline_aarch64.S against the
+host-VERIFIED x86_64 blob and the header contract:
+- Frame slots: all 20 callee-saved slots (x19-x28, d8-d15) match
+  the wrapper's stp sequence and the header layout table exactly.
+- Record stride: `lsl #4` = 16 bytes = sizeof(ZsTrampRecord
+  {base, size}). The 24-byte so_record is converted to the 16-byte
+  trampoline record by hide_prepare_tier_a_records before the blob
+  sees it.
+- `__NR_munmap` = 215 (correct for aarch64; x86_64 uses a
+  different number and its blob has the right one).
+- arm64 Linux preserves every register across `svc` except x0, so
+  the unmap loop's use of x19-x24/x16/x8 is safe; the restore
+  phase reloads every one of them from the wrapper frame.
+- x28 (the frame pointer during restore) is staged through x0 and
+  committed AFTER `add sp, x28, #16`, and the retval is loaded into
+  x0 only after that — the same self-referential-register ordering
+  that the x86_64 blob got wrong once (r13/r12 swap) and the host
+  test now guards.
+Still inspection-only: no aarch64 toolchain exists in this sandbox,
+so the blob is verified by construction + parity, not execution.
+
+### Round 10 residuals
+
+- The sanitized run covers the logic suites only (see the exclusion
+  above). The trampoline's correctness continues to rest on the
+  unsanitized host x86_64 execution test.
+- UBSan found nothing to fix; that is a fact about this run, not a
+  guarantee — instrumented coverage is only as deep as the tests.

@@ -1005,3 +1005,14 @@ this sandbox.
 - Nothing in this round speeds up the denylist decision or the GOT
   walk further; those were Round 8 work and remain as measured
   there.
+
+## Round 10 — sanitizer run
+
+Not a performance round: an ASan+UBSan pass over the logic suites
+(108 assertions, leak detection on) that found one real hot-path bug
+(the `memcmp(path, "/proc/", 6)` overread — fixed to `strncmp`) and
+confirmed zero leaks and zero UB in the filter engine, the scandir
+ownership contract, and the fd scan. Sanitized builds are ~2x slower
+(the perf medians under ASan: 420 us filter, 49 ns matcher) — that
+is instrumentation cost, not a production claim; the unsanitized
+numbers above remain the reference.

@@ -61,5 +61,36 @@ run: all
 	done; \
 	exit $$fail
 
+# Round 10: sanitized build of the logic suites (ASan + UBSan, leak
+# detection on). This is where the memcmp("/proc/") overread was
+# found; keep it green in CI-style runs.
+#
+# test_unmap_trampoline is deliberately NOT in this target: its whole
+# purpose is raw mapping manipulation -- the Tier A anonymize step
+# memcpy()s entire read-only segments of libpayload.so, and under
+# instrumentation those segments CONTAIN ASan global redzones, so the
+# copy trips a false "global-buffer-overflow" on the first redzone
+# byte (read size = exact page multiple from a page-aligned start;
+# ASan reports the first poisoned byte, not the access start). The
+# unsanitized `run` target exercises it against real mappings.
+SAN_CXXFLAGS = -std=c++17 -O1 -g -Wall -Wextra -fno-omit-frame-pointer \
+               -fsanitize=address,undefined
+SAN_TESTS = test_hide test_hide_advanced test_hide_stealth \
+            test_e2e_hide test_perf
+
+.PHONY: run-sanitize
+
+run-sanitize:
+	@fail=0; \
+	for t in $(SAN_TESTS); do \
+		echo "=== $$t (ASan+UBSan) ==="; \
+		$(MAKE) $$t CXXFLAGS="$(SAN_CXXFLAGS)"; \
+		ASAN_OPTIONS=detect_leaks=1:abort_on_error=0 \
+		UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=0 \
+		./$$t || fail=1; \
+	done; \
+	$(MAKE) clean >/dev/null; \
+	exit $$fail
+
 clean:
 	rm -f $(TESTS) libpayload.so

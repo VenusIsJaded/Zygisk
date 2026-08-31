@@ -569,7 +569,15 @@ static int parse_proc_prefix(const char* rest, const char** base,
 
 ZsFilterKind zs_filter_kind_for_path(const char* path) {
     if (ZS_UNLIKELY(!path)) return ZS_FILTER_NONE;
-    if (memcmp(path, "/proc/", 6) != 0) return ZS_FILTER_NONE;
+    // Round 10 (ASan): strncmp, NOT memcmp. A caller can hand us a
+    // path SHORTER than 6 bytes ("" from a miscomputed buffer, "/" ,
+    // ...); memcmp(path, "/proc/", 6) then reads past the caller's
+    // buffer — harmless 99.999% of the time and a SIGSEGV in the
+    // open() hot path the day a short path lands at the end of a
+    // page. strncmp stops at either string's NUL, so a 1-byte path
+    // reads exactly 1 byte. (Found by the ASan run, reproduced by
+    // the documented-paths test feeding "" through the matcher.)
+    if (strncmp(path, "/proc/", 6) != 0) return ZS_FILTER_NONE;
     const char* rest = path + 6;
 
     const char* base = nullptr;

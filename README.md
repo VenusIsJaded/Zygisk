@@ -265,6 +265,17 @@ What the tests cover (Round 9):
 - **`test_perf`** (4 tests) — the microbenchmarks.
 
 (Total: 108 host-side tests, plus the daemon's `cargo test` suite.)
+
+The logic suites also run clean under **ASan + UBSan with leak
+detection** — `cd tests && make run-sanitize`. That run is where
+Round 10 found and fixed a real production bug: the /proc path
+matcher used `memcmp(path, "/proc/", 6)`, which reads past any
+caller string shorter than 6 bytes — a latent SIGSEGV in the open()
+hot path of every hidden app. `test_unmap_trampoline` is excluded
+from the sanitized target on purpose: the Tier A anonymize step
+legitimately copies entire read-only segments, which under
+instrumentation contain ASan redzones (a false positive by
+construction — the raw-mapping test runs unsanitized).
 - **`test_perf`** (3 tests) — host-side microbenchmarks of the
   three hot paths (`make_filtered_memfd`,
   `hide_setup_for_target` fast path,
