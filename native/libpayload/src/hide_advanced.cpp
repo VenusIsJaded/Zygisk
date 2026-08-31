@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // native/libpayload/src/hide_advanced.cpp
 //
-// Advanced runtime stealth layer. See hide_advanced.h for the
-// public surface and a description of what each piece does.
+// Advanced runtime stealth layer. See hide_advanced.h for the public
+// surface and the Round 7 two-tier architecture note.
 //
 // Important design notes:
 //
@@ -12,21 +12,24 @@
 //     Magisk / Shamiko / LSPosed docs and in public Android
 //     security research; the implementation is mine.
 //
-//   - The code is deliberately written to be easy to read in a
-//     disassembler. No inline asm. No setjmp/longjmp tricks. No
-//     register manipulation. The intent is that a reverse engineer
-//     reading the resulting .so sees straightforward C++ that
-//     matches the source in this repo line-for-line.
+//   - The Tier B hooks are installed at HIDE TIME in the target
+//     child, never in the zygote. A pre-Round-7 version patched the
+//     GOTs of every process forked from the zygote — including
+//     system_server — and filtered /proc files for every app on the
+//     device. That was both a system-wide performance regression and
+//     a behavioral anomaly. Now a non-hidden process never executes
+//     a single hooked call.
 //
-//   - The advanced layer is a SUPPLEMENT to the basic layer. The
-//     basic layer (hide.cpp) is enough to defeat the "default"
-//     detection probe (the one most apps use). The advanced layer
-//     is for apps with a more sophisticated probe. Both layers
-//     must be applied in the right order; the order is documented
-//     in entry.cpp.
+//   - The property-area clone is CONTENT-PRESERVING. The pre-Round-7
+//     version mmap'd MAP_FIXED|MAP_ANONYMOUS over the property area
+//     and returned — leaving a zero-filled mapping where the property
+//     trie used to be. Every __system_property_get in the app then
+//     walked garbage. mmap does not copy; the clone must save the
+//     bytes first.
 
 #include "hide_advanced.h"
 #include "log.h"
+#include "resolve_libc.h"
 
 #include <cctype>
 #include <dlfcn.h>
@@ -63,92 +66,140 @@
 namespace zygisk_study {
 
 // ------------------------------------------------------------------------
-// 4. Property-area cloning
+// Per-process activation gate (Tier B) + tracked fds
 // ------------------------------------------------------------------------
-//
-// Android's __system_property area is a set of mmap'd files under
-// /dev/__properties__/. Each file corresponds to one "property
-// namespace". A process reads a property by:
-//
-//   a. Calling __system_property_get(name, buf) — the libc
-//      implementation walks an in-memory trie and returns the
-//      value as a string.
-//
-//   b. Directly opening /dev/__properties__/u:object_r:<ns>:*
-//      and parsing the binary trie format.
-//
-// The basic hide layer only defeats (a) by calling
-// __system_property_set(key, "") which writes a new value to the
-// underlying mmap. This works for the common probe but fails if
-// the app re-reads the property after we set it (the property is
-// still in the trie, just with an empty value — and the *presence*
-// of the key itself is a tell).
-//
-// The advanced approach is:
-//
-//   - Walk /proc/self/maps to find the /dev/__properties__/ mmaps
-//     the runtime has already established.
-//   - For each one, mmap MAP_PRIVATE over the existing range. This
-//     creates a private copy that the runtime now sees instead of
-//     the original. Writes to our private copy are COW'd into
-//     private pages; reads see our scrubbed version.
-//   - The runtime's __system_property_get() now walks *our*
-//     private copy.
-//
-// This is the documented Magisk DenyList approach for the
-// property layer; it's described in the LSPosed hide-my-applist
-// README as well.
+
+static std::atomic<int> g_hide_active{0};
+
+void hide_advanced_set_active(int active) {
+    g_hide_active.store(active ? 1 : 0, std::memory_order_release);
+}
+int  hide_advanced_is_active() {
+    return g_hide_active.load(std::memory_order_relaxed);
+}
+
+// Fds we opened ourselves. The hide pipeline closes exactly these.
+static int   g_tracked_fds[16];
+static size_t g_tracked_fd_count;
+
+void hide_advanced_track_fd(int fd) {
+    if (fd < 0) return;
+    for (size_t i = 0; i < g_tracked_fd_count; ++i) {
+        if (g_tracked_fds[i] == fd) return;
+    }
+    if (g_tracked_fd_count < sizeof(g_tracked_fds) / sizeof(g_tracked_fds[0])) {
+        g_tracked_fds[g_tracked_fd_count++] = fd;
+    }
+}
+
+// Close exactly the fds we tracked. NEVER the runtime's: the
+// pre-Round-7 close_unknown_fds() closed every fd >= 3, which killed
+// the GPU driver / gralloc / ashmem descriptors every app process
+// inherits from the zygote — black screens and renderer crashes on
+// real devices, invisible in host tests (the host child only had
+// stdio + a pipe).
+static void close_tracked_fds() {
+    for (size_t i = 0; i < g_tracked_fd_count; ++i) {
+        close(g_tracked_fds[i]);
+    }
+    g_tracked_fd_count = 0;
+}
+
+// ------------------------------------------------------------------------
+// 4. Property-area cloning (content-preserving) + value spoofing
+// ------------------------------------------------------------------------
+
+// Spoof values: what a STOCK, LOCKED device reports. Empty values are
+// never used for boot-state keys — a probe that sees
+// verifiedbootstate == "" knows something is wrong, because stock
+// Android always reports green/orange/red/yellow. Keys with nullptr
+// are magisk/kernelSU-specific: on a stock device they do not exist.
+// Tier B additionally hooks __system_property_find/get so they truly
+// report "absent"; Tier A leaves them present-but-empty (Java's
+// SystemProperties.get() returns "" for both cases, which covers the
+// overwhelming majority of real-world probes).
+static const ZsPropSpoof kPropSpoofTable[] = {
+    {"ro.boot.verifiedbootstate",   "green"},
+    {"ro.boot.vbmeta.device_state", "locked"},
+    {"ro.boot.veritymode",          "enforcing"},
+    {"ro.bootmanager.veritymode",   "enforcing"},
+    {"ro.boot.flash.locked",        "1"},
+    {"ro.boot.warrantybit",         "0"},
+    {"ro.warranty.bits",            "0"},
+    {"ro.boot.vbmeta.hash_algo",    ""},
+    {"ro.boot.vbmeta.digest",       ""},
+    // Magisk / KernelSU / our own keys: no stock device has them.
+    {"init.svc.magisk",             ""},
+    {"init.svc.magisk_pfsd",        ""},
+    {"ro.magisk.version",           ""},
+    {"ro.magisk.versioncode",       ""},
+    {"persist.sys.magisk_denylist", ""},
+    {"persist.magisk.hide",         ""},
+    {"service.magisk.rootdir",      ""},
+    {"persist.sys.rootdir",         ""},
+    {"ro.kernelsu.version",         ""},
+    {"ro.kernelsu.exposed",         ""},
+    {"ro.zygisk_study.version",     ""},
+    // init.svc.adbd is deliberately NOT spoofed: adbd exists on stock
+    // devices and "running"/"stopped" are both normal values.
+};
+
+const ZsPropSpoof* zs_prop_spoof_table(size_t* count) {
+    if (count) *count = sizeof(kPropSpoofTable) / sizeof(kPropSpoofTable[0]);
+    return kPropSpoofTable;
+}
 
 static std::atomic<int> g_props_cloned{0};
 
-static void clone_property_area_private() {
-    if (g_props_cloned.exchange(1)) return;
+using FindPropFn = const void* (*)(const char*);
+static FindPropFn g_find_prop = nullptr;
 
-    // PERF (Android-specific): the previous implementation used
-    // fopen("/proc/self/maps", "r") + fgets(line, ...). On real
-    // Android:
-    //   - fopen allocates a ~552-byte FILE struct + an 8 KB stdio
-    //     buffer on the heap (two Bionic scudo mallocs).
-    //   - fgets does ~1 KB read() syscalls per line on a typical
-    //     50 KB maps file = ~50 read() syscalls.
-    //   - Each read() on AArch64 takes ~1-3 µs of kernel work
-    //     (SVC exception entry + VFS read path + return).
-    //   - Total: ~50 × 2 µs = ~100 µs of pure syscall overhead per
-    //     first-fork slow path. Plus ~5 µs of FILE struct allocation
-    //     and free.
-    //
-    // The new path does ONE pread() into a 64 KB stack buffer +
-    // memchr-based scan. Saves ~49 syscalls = ~100 µs per first-
-    // fork slow path. The function is idempotent (g_props_cloned
-    // guard), so this only runs once per process — but that once
-    // is on the denylist slow path, where every µs matters.
-    constexpr size_t kMapsCap = 64 * 1024;
-    char buf[kMapsCap];
-    int fd = open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return;
-    ssize_t total = 0;
-    while ((size_t)total < kMapsCap) {
-        ssize_t n = pread(fd, buf + total, kMapsCap - total, (off_t)total);
-        if (n <= 0) break;
-        total += n;
-    }
-    close(fd);
-    if (total <= 0) return;
+// Bionic prop_info layout (stable Android 5 → 15+):
+//   offset 0:  atomic_uint_least32_t serial   (4 bytes)
+//   offset 4:  char value[92]                 (PROP_VALUE_MAX)
+//   offset 96: uint32_t namelen
+//   offset 100:char name[]
+constexpr size_t kPropSerialOffset = 0;
+constexpr size_t kPropValueOffset  = 4;
+constexpr size_t kPropValueSize    = 92;  // PROP_VALUE_MAX
 
-    // In-memory scan for /dev/__properties__/ paths. We use memchr
-    // for the path prefix "/dev/__properties__/" (19 chars) — this
-    // is a NEON-optimized scan on AArch64.
+// Update one prop_info value using bionic's serial protocol so
+// concurrent readers in other threads of THIS process never observe
+// a torn value. The mapping must be writable when this is called.
+static void patch_prop_value(const void* pi, const char* value) {
+    if (!pi || !value) return;
+    auto* serial_atomic =
+        reinterpret_cast<std::atomic<uint32_t>*>(
+            reinterpret_cast<uintptr_t>(pi) + kPropSerialOffset);
+    char* value_field =
+        reinterpret_cast<char*>(reinterpret_cast<uintptr_t>(pi)
+                                + kPropValueOffset);
+
+    uint32_t serial = serial_atomic->load(std::memory_order_relaxed);
+    // Don't touch an entry mid-update by another writer.
+    if (serial & 1u) return;
+    serial_atomic->store(serial | 1u, std::memory_order_release);
+    memset(value_field, 0, kPropValueSize);
+    size_t len = strnlen(value, kPropValueSize - 1);
+    memcpy(value_field, value, len);
+    serial_atomic->store((serial + 2) & ~1u, std::memory_order_release);
+}
+
+// Find /dev/__properties__/ mappings in a maps buffer. Pure function
+// (no I/O) so host tests can feed synthetic maps content. Writes up
+// to cap {lo, hi} spans and returns how many were found.
+struct PropMapping { uintptr_t lo, hi; };
+static size_t find_prop_mappings(const char* buf, size_t total,
+                                 PropMapping* out, size_t cap) {
     static const char kPropPath[] = "/dev/__properties__/";
-    static const size_t kPropPathLen = sizeof(kPropPath) - 1;
-
+    const size_t kPropPathLen = sizeof(kPropPath) - 1;
+    size_t n = 0;
     const char* p = buf;
     const char* end = buf + total;
-    while (p < end) {
-        // Find the next newline.
+    while (p < end && n < cap) {
         const char* nl = (const char*)memchr(p, '\n', end - p);
         const char* line_end = nl ? nl : end;
-        // Find the path field (start of column 6). Scan from p,
-        // counting whitespace runs.
+        // Path field = after the 5th whitespace run.
         const char* fp = p;
         const char* path_field = nullptr;
         int col = 0;
@@ -162,153 +213,167 @@ static void clone_property_area_private() {
                 ++fp;
             }
         }
-
         if (path_field && path_field + kPropPathLen <= line_end &&
             memcmp(path_field, kPropPath, kPropPathLen) == 0) {
-            // Parse the line header: lo-hi perms ...
             uintptr_t lo = 0, hi = 0;
             char perms[8] = {};
-            int n = sscanf(p, "%lx-%lx %7s", &lo, &hi, perms);
-            if (n >= 3 && perms[0] == 'r' && perms[1] == '-') {
-                size_t size = hi - lo;
-                void* addr  = reinterpret_cast<void*>(lo);
-                void* remapped = mmap(addr, size,
-                                      PROT_READ,
-                                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
-                                      -1, 0);
-                if (remapped != MAP_FAILED) {
-                    // STEALTH: rename the new anon mapping via
-                    // prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME). This is an
-                    // Android kernel vendor extension (PR_SET_VMA = 0x53564d41,
-                    // PR_SET_VMA_ANON_NAME = 0) available on Pixel 6+ / Android
-                    // 11+ / kernels with the CONFIG_ANDROID vendor patch.
-                    //
-                    // Without this, the new anon mapping shows up in
-                    // /proc/self/maps as `[anon:...]` with a kernel-generated
-                    // name. Some root scanners look for unexpected anon
-                    // mappings with non-standard names as a side channel.
-                    //
-                    // We name it `[anon:linker_alloc]` — the same label that
-                    // Bionic's regular malloc allocations get, which makes
-                    // it indistinguishable from normal libc activity.
-                    //
-                    // On devices without PR_SET_VMA, this prctl returns -EINVAL
-                    // and the rename is silently skipped. The mmap itself
-                    // already worked; the only loss is the cosmetic name.
-                    constexpr int kPrSetVma = 0x53564d41;          // "AVMS"
-                    constexpr int kPrSetVmaAnonName = 0;
-                    const char kAnonName[] = "linker_alloc";
-                    (void)prctl(kPrSetVma, kPrSetVmaAnonName,
-                                reinterpret_cast<unsigned long>(addr),
-                                (unsigned long)size,
-                                reinterpret_cast<unsigned long>(kAnonName));
-                } else {
-                    ZS_LOGW("hide_advanced: mmap(MAP_FIXED, %p, %zu) failed: %s",
-                            addr, size, strerror(errno));
-                }
+            char linebuf[512];
+            size_t copy = (size_t)(line_end - p);
+            if (copy >= sizeof linebuf) copy = sizeof linebuf - 1;
+            memcpy(linebuf, p, copy);
+            linebuf[copy] = '\0';
+            int k = sscanf(linebuf, "%lx-%lx %7s", &lo, &hi, perms);
+            if (k >= 3 && perms[0] == 'r' && perms[1] == '-' && hi > lo) {
+                out[n].lo = lo;
+                out[n].hi = hi;
+                ++n;
             }
         }
-
         p = line_end + (nl ? 1 : 0);
     }
+    return n;
+}
 
-    ZS_LOGD("hide_advanced: property area cloned MAP_PRIVATE");
+// Replace ONE property mapping with a private, content-identical,
+// writable copy; returns 1 on success. The steps:
+//
+//   1. mmap a scratch region and memcpy the original bytes out.
+//   2. mmap MAP_FIXED|MAP_ANONYMOUS|MAP_PRIVATE over the original
+//      range (this is the step the old code did WITHOUT step 1 —
+//      which zeroed the trie and broke every property read).
+//   3. memcpy the saved bytes back in.
+//
+// After step 3 the range holds a byte-identical private copy. The
+// page is left writable so patch_prop_value() can fix values; the
+// caller mprotects it back to PROT_READ after patching.
+static int remap_prop_mapping_private(uintptr_t lo, uintptr_t hi) {
+    size_t size = hi - lo;
+    void* addr = reinterpret_cast<void*>(lo);
+
+    void* scratch = mmap(nullptr, size, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (scratch == MAP_FAILED) return 0;
+    memcpy(scratch, addr, size);  // save original content
+
+    void* remapped = mmap(addr, size, PROT_READ | PROT_WRITE,
+                          MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
+                          -1, 0);
+    if (remapped == MAP_FAILED) {
+        munmap(scratch, size);
+        return 0;
+    }
+    memcpy(addr, scratch, size);  // restore content into the copy
+    munmap(scratch, size);
+    return 1;
+}
+
+static void clone_property_area_private() {
+    if (g_props_cloned.exchange(1)) return;
+
+    // Resolve bionic's property lookup once. On the host there is no
+    // __system_property_find; the clone is skipped (host tests assert
+    // the pure helpers instead).
+    if (!g_find_prop) {
+        g_find_prop = (FindPropFn)zs_resolve_libc("__system_property_find");
+    }
+
+    constexpr size_t kMapsCap = 96 * 1024;
+    static char maps_buf[kMapsCap];   // static: runs once, keep it off the stack
+    int fd = open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return;
+    ssize_t total = 0;
+    while ((size_t)total < kMapsCap) {
+        ssize_t n = read(fd, maps_buf + total, kMapsCap - total);
+        if (n <= 0) break;
+        total += n;
+    }
+    close(fd);
+    if (total <= 0) return;
+
+    PropMapping mappings[32];
+    size_t n_mappings = find_prop_mappings(maps_buf, (size_t)total,
+                                           mappings, 32);
+    int n_remapped = 0;
+    for (size_t i = 0; i < n_mappings; ++i) {
+        if (remap_prop_mapping_private(mappings[i].lo,
+                                       mappings[i].hi)) {
+            ++n_remapped;
+        } else {
+            ZS_LOGW("hide_advanced: property remap %lx-%lx failed: %s",
+                    (unsigned long)mappings[i].lo,
+                    (unsigned long)mappings[i].hi, strerror(errno));
+        }
+    }
+    if (n_remapped == 0) {
+        g_props_cloned.store(0);  // allow a retry on a later fork
+        return;
+    }
+
+    // Patch spoof values through bionic's own lookup. The cached trie
+    // pointers still resolve (the MAP_FIXED replacement keeps every
+    // address identical), so find() now walks OUR private copy.
+    if (g_find_prop) {
+        size_t n_spoof = 0;
+        for (const ZsPropSpoof& s : kPropSpoofTable) {
+            const void* pi = g_find_prop(s.key);
+            if (pi) {
+                patch_prop_value(pi, s.value ? s.value : "");
+                ++n_spoof;
+            }
+        }
+        ZS_LOGD("hide_advanced: spoofed %zu property value(s)", n_spoof);
+    }
+
+    // Restore read-only protection on every remapped range — the
+    // original property mappings are PROT_READ, and leaving pages
+    // writable is both an anomaly and a corruption risk.
+    for (size_t i = 0; i < n_mappings; ++i) {
+        void* addr = reinterpret_cast<void*>(mappings[i].lo);
+        size_t size = mappings[i].hi - mappings[i].lo;
+        if (mprotect(addr, size, PROT_READ) != 0) {
+            ZS_LOGW("hide_advanced: mprotect(R) on property clone "
+                    "failed: %s", strerror(errno));
+        }
+        // STEALTH: rename the new anon mapping so /proc/self/maps
+        // shows a benign "[anon:linker_alloc]" style label instead
+        // of a bare anonymous mapping at the property-area address.
+        // No-op on kernels without the vendor PR_SET_VMA extension.
+        constexpr int kPrSetVma = 0x53564d41;          // "AVMS"
+        constexpr int kPrSetVmaAnonName = 0;
+        const char kAnonName[] = "linker_alloc";
+        (void)prctl(kPrSetVma, kPrSetVmaAnonName,
+                    reinterpret_cast<unsigned long>(addr),
+                    (unsigned long)size,
+                    reinterpret_cast<unsigned long>(kAnonName));
+    }
+    ZS_LOGD("hide_advanced: property area cloned (%d mapping(s))",
+            n_remapped);
 }
 
 // ------------------------------------------------------------------------
-// 5. /proc/self/maps and /proc/self/mounts filtering
+// 5. /proc file filtering (Tier B)
 // ------------------------------------------------------------------------
-//
-// The technique: hook libc's open() and openat() via PLT/GOT patching
-// so that when the app opens "/proc/self/maps" or "/proc/self/mounts",
-// we redirect the open to a private (memfd_create) copy that has our
-// entries filtered out.
-//
-// PLT/GOT patching on Android:
-//
-//   - Every ELF .so has a Procedure Linkage Table (PLT) and a Global
-//     Offset Table (GOT). The PLT contains stubs that jump through
-//     the GOT to the actual function in libc.so.
-//   - We can overwrite the GOT entry for "open" in any .so that
-//     imports it, replacing the address of libc's open with the
-//     address of our own open hook.
-//   - To do this safely, we use mprotect to make the GOT page
-//     writable, overwrite the entry, then restore protection.
-//
-// The traversal of every loaded .so is done via dl_iterate_phdr,
-// which is a libc function that walks the dynamic linker's
-// internal module list.
-//
-// Filtered file content is produced by reading the original and
-// dropping any line that contains a known Magisk path or our own
-// .so name.
 
-static constexpr const char* kFilteredPaths[] = {
-    "/proc/self/maps",
-    "/proc/self/mounts",
-    "/proc/self/mountinfo",
-    "/proc/self/mountstats",
-    // /proc/self/status contains the "TracerPid:" field, which apps
-    // read to detect ptrace attachment. We rewrite the line to
-    // "TracerPid:\t0" in the filtered copy. Defense-in-depth on top
-    // of prctl(PR_SET_DUMPABLE, 0) in hide_stealth — that prctl
-    // already makes the kernel report TracerPid: 0, but if the app
-    // reads /proc/self/status text directly, we want the bytes to
-    // also say 0.
-    "/proc/self/status",
-    // S25 (Round 5): /proc/self/smaps and /proc/self/smaps_rollup
-    // are extended versions of /proc/self/maps. They show per-
-    // mapping memory stats (RSS, PSS, private dirty, etc.) plus
-    // the path field — same path field as /proc/self/maps, so the
-    // same Magisk / Zygisk entries appear here too. Apps that probe
-    // /proc/self/smaps typically look for:
-    //   (a) unexpected .so mappings (same probe as /proc/self/maps)
-    //   (b) suspicious anon mappings with non-default VMA names
-    //       (we addressed this with PR_SET_VMA = "linker_alloc"
-    //       in clone_property_area_private)
-    //   (c) the kernel's "Name:" field for any anon mapping
-    // Filtering the path field drops (a); the PR_SET_VMA rename
-    // addresses (b) and (c). Both smaps and smaps_rollup have the
-    // same line format with respect to the path field, so the
-    // existing make_filtered_memfd logic handles them correctly.
-    //
-    // smaps_rollup is the aggregated version (one entry per mm),
-    // less commonly probed but still a tell if the per-mapping
-    // path appears. We filter both for completeness.
-    "/proc/self/smaps",
-    "/proc/self/smaps_rollup",
+// The /proc files whose contents would reveal us. Matched by base
+// name; see zs_path_is_filtered for the /proc/self, /proc/thread-self
+// and /proc/<pid> prefix handling.
+static const char* const kFilteredBaseNames[] = {
+    "maps",
+    "mounts",
+    "mountinfo",
+    "mountstats",
+    // status carries TracerPid (rewritten to 0 in the filtered copy).
+    "status",
+    "smaps",
+    "smaps_rollup",
 };
 
-// PERF (Android-specific, P1.39): previously this was
-// `static constexpr const char* kHiddenSubstrings[] = {...}` and the
-// inner loop in make_filtered_memfd called `__builtin_strlen(s)` for
-// every substring on EVERY line of the maps file. With 9 substrings
-// and ~500 lines on a typical /proc/self/maps file, that's 4500
-// strlen() calls per filtered read. strlen of a ~14-byte string is
-// ~14 cycles with NEON (16-byte load + mask + clz), so 4500 × 14 =
-// 63000 cycles = ~30 µs of pure strlen overhead per filtered read.
-//
-// The new path uses a constexpr struct that pre-computes each
-// substring's length at COMPILE TIME via `__builtin_strlen` in a
-// constexpr constructor. The compiler folds the lengths into the
-// .rodata entries alongside the string pointers, so the runtime
-// strlen() calls are eliminated entirely.
-//
-// `__builtin_strlen` is constexpr in both GCC and Clang (since
-// GCC 4.6 / Clang 3.0), so this works on Android NDK clang r25+
-// (the minimum NDK version we target).
-//
-// Savings: ~30 µs per make_filtered_memfd call. For a denylisted
-// app fork, make_filtered_memfd is called ~5-10 times during the
-// first ~100 ms of execution (apps probe /proc/self/maps repeatedly).
-// Total savings: ~150-300 µs per denylisted fork on Android.
-// HIGH confidence because the strlen -> constexpr-fold swap is a
-// pure compile-time transformation; the runtime behavior is
-// identical except for the saved cycles.
+// Tier B also filters these in the maps/mounts content:
 struct HiddenSubstring {
     const char* data;
     size_t      len;
-    constexpr HiddenSubstring(const char* s) : data(s), len(__builtin_strlen(s)) {}
+    constexpr HiddenSubstring(const char* s)
+        : data(s), len(__builtin_strlen(s)) {}
 };
 
 static constexpr HiddenSubstring kHiddenSubstrings[] = {
@@ -327,6 +392,42 @@ static constexpr HiddenSubstring kHiddenSubstrings[] = {
     "/data/system/zygisk_study",
 };
 
+// True if `rest` (the part after "/proc/<id>/") names a file we
+// filter.
+static int basename_is_filtered(const char* rest) {
+    for (const char* b : kFilteredBaseNames) {
+        if (strcmp(rest, b) == 0) return 1;
+    }
+    return 0;
+}
+
+int zs_path_is_filtered(const char* path) {
+    if (ZS_UNLIKELY(!path)) return 0;
+    if (memcmp(path, "/proc/", 6) != 0) return 0;
+    const char* rest = path + 6;
+
+    if (strncmp(rest, "thread-self/", 12) == 0) {
+        rest += 12;
+    } else if (strncmp(rest, "self/", 5) == 0) {
+        rest += 5;
+    } else {
+        // Numeric pid form: /proc/<pid>/<file>. Only OUR pid counts —
+        // /proc/1/mounts from an app fails with EACCES anyway.
+        const char* p = rest;
+        while (*p >= '0' && *p <= '9') ++p;
+        if (ZS_UNLIKELY(p == rest || *p != '/')) return 0;
+        // Verify the pid is ours. getpid() is a raw syscall on
+        // bionic (~0.5 µs); this path only runs for /proc/<digits>
+        // opens in hidden apps, so no caching is worth the
+        // stale-across-fork risk.
+        long v = 0;
+        for (const char* q = rest; q < p; ++q) v = v * 10 + (*q - '0');
+        if (v != (long)getpid()) return 0;
+        rest = p + 1;
+    }
+    return basename_is_filtered(rest);
+}
+
 // We hold the original libc open/openat addresses so our hook can
 // delegate to them when the path is not one we filter.
 using OpenFn   = int (*)(const char*, int, ...);
@@ -336,11 +437,13 @@ static OpenAtFn g_real_openat = nullptr;
 
 // Forward decls.
 extern "C" int   zygisk_study_hook_open(const char* path, int flags, ...);
-extern "C" int   zygisk_study_hook_openat(int dirfd, const char* path, int flags, ...);
+extern "C" int   zygisk_study_hook_openat(int dirfd, const char* path,
+                                          int flags, ...);
+extern "C" FILE* zygisk_study_hook_fopen(const char* path, const char* mode);
 
-// sys_memfd_create — call the memfd_create syscall directly. We use
-// syscall() rather than the libc wrapper because the libc wrapper
-// is itself a PLT entry we might have hooked (chicken-and-egg).
+// sys_memfd_create — call the memfd_create syscall directly so we do
+// not depend on the libc wrapper (older bionic lacks it) and never
+// recurse through our own hooks.
 static int syscall_memfd_create(const char* name, unsigned int flags) {
 #ifdef __NR_memfd_create
     return (int)syscall(__NR_memfd_create, name, flags);
@@ -350,79 +453,53 @@ static int syscall_memfd_create(const char* name, unsigned int flags) {
 #endif
 }
 
+// Rewrite the TracerPid line of /proc/self/status to "TracerPid:\t0".
+static ssize_t rewrite_status_line(char* dst, size_t dst_cap,
+                                    const char* line_start,
+                                    size_t line_len) {
+    static const char kPrefix[] = "TracerPid:";
+    constexpr size_t kPrefixLen = sizeof(kPrefix) - 1;
+    if (line_len < kPrefixLen) return 0;
+    if (memcmp(line_start, kPrefix, kPrefixLen) != 0) return 0;
+
+    static const char kReplacement[] = "TracerPid:\t0\n";
+    constexpr size_t kReplacementLen = sizeof(kReplacement) - 1;
+    if (dst_cap < kReplacementLen) return 0;
+    memcpy(dst, kReplacement, kReplacementLen);
+    return (ssize_t)kReplacementLen;
+}
+
+// True if `path` is a filtered /proc path whose base name is `base`.
+static int filtered_path_basename_is(const char* path, const char* base) {
+    if (!path) return 0;
+    size_t plen = strlen(path);
+    size_t blen = strlen(base);
+    if (plen <= blen + 1) return 0;
+    if (path[plen - blen - 1] != '/') return 0;
+    return strcmp(path + plen - blen, base) == 0;
+}
+
 // Produce a filtered copy of the given file's contents in a memfd.
 // Returns the memfd fd, or -1 on error.
 //
-// PERF NOTE (Android-specific):
-// The naive approach (strstr every hidden substring against every
-// full line) is ~4500 strstr()s per read on a typical ~500-line maps
-// file. We do two things that are real wins on Android's AArch64:
-//
-//   1. Skip the libc FILE* / fdopen / fgets buffering layer.
-//      Bionic's FILE* does ~1 KB read() syscalls + memcpy into a
-//      user buffer + line-splitting on '\n'. The maps file is
-//      typically 50-100 KB; reading it in one pread() call (which
-//      the kernel serves from the page cache in 1-2 µs) is 5-10×
-//      faster than the stdio line-at-a-time path.
-//
-//   2. Find the PATH field of each line and strstr only in that
-//      field. The path field is typically < 100 chars vs. ~200 for
-//      a full maps line. This cuts the strstr search space roughly
-//      in half.
-//
-//   3. Use a single-pass scan to find both '\n' AND the path field
-//      start (the column after the 5th whitespace run) in one walk
-//      of the line, rather than scanning the line twice (once to
-//      find the path field, once to strstr within it).
-//
-// MEASURED HOST RESULT (test_perf.cpp, 500-line synthetic maps):
-//   median = 303 µs on x86_64 (Intel i5-class, single core).
-//   This is slower than the original 25 µs estimate above —
-//   the estimate was based on bionic's NEON strstr, which is
-//   significantly faster than glibc's on x86_64 for short needles.
-//   On Android's AArch64, bionic's memmem uses a different
-//   algorithm that is typically 2-3x faster than glibc's for
-//   sub-100-byte needles.
-//
-// HONEST PREDICTION for real Android (Pixel 6, Cortex-X1):
-//   - memmem: ~2x faster than glibc → ~150 µs
-//   - pread: ~1 µs (page cache hot)
-//   - 5 hidden substrings × 500 lines = 2500 memmem calls
-//   - Total estimated: ~150-200 µs on real Android
-//
-// This is well under the typical 5 ms zygote fork budget on
-// Android 14/15. The optimization is real; the absolute numbers
-// need on-device measurement to be cited with confidence.
-// STEALTH: We use the name "scudo" for the memfd_create label so
-// that, if an app stat()s our returned fd via fstatfs+name_to_handle_at,
-// the /proc/self/fd/<n> readlink and the /proc/self/maps entry show
-// "/memfd:scudo (deleted)" rather than "/memfd:filtered (deleted)".
-// "scudo" is the name of Bionic's default allocator — it blends
-// in with normal libc internal allocations.
-//
-// On Android 11+ we ALSO call prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME)
-// to rename the memfd's anonymous mapping in /proc/self/maps so
-// it doesn't show the "/memfd:" prefix at all. (This requires the
-// Android kernel vendor extension PR_SET_VMA, present on Pixel 6+
-// and other modern devices.) On older devices, the rename is a
-// no-op — we still get the "/memfd:scudo" name from above, which
-// is at least innocuous.
-// Forward decl — definition further down. Used by make_filtered_memfd
-// to rewrite the TracerPid line in /proc/self/status.
-static ssize_t rewrite_status_line(char* /*dst*/, size_t /*dst_cap*/,
-                                   const char* /*line_start*/,
-                                   size_t /*line_len*/);
-
+// PERF/SAFETY NOTE (Round 7): the pre-Round-7 version used a 256 KB
+// STACK array. This runs inside an open() hook on whatever app thread
+// performed the open — including deep ART call stacks on threads with
+// 1 MB stacks. 256 KB of stack there is a silent stack-overflow bomb
+// that only fires on device. The scratch buffer is now an anonymous
+// mmap: two extra syscalls (~4 µs) against a ~200 µs filtering pass,
+// and zero stack pressure on any thread.
 static int make_filtered_memfd(int orig_fd, const char* target_path) {
     int memfd = syscall_memfd_create("scudo", 0);
     if (memfd < 0) return -1;
 
-    // Slurp the whole file in one pread() — no stdio buffering.
-    // Typical maps file is 50-100 KB; 256 KB is a safe upper bound
-    // that fits in 4 Bionic page-sized allocations on AArch64 (4 KiB
-    // pages, 64 entries).
     constexpr size_t kReadCap = 256 * 1024;
-    char buf[kReadCap];
+    char* buf = (char*)mmap(nullptr, kReadCap, PROT_READ | PROT_WRITE,
+                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (buf == MAP_FAILED) {
+        close(memfd);
+        return -1;
+    }
     ssize_t total = 0;
     while ((size_t)total < kReadCap) {
         ssize_t n = pread(orig_fd, buf + total, kReadCap - total,
@@ -430,86 +507,32 @@ static int make_filtered_memfd(int orig_fd, const char* target_path) {
         if (n <= 0) break;
         total += n;
     }
-    // Empty input is a valid case: produce an empty memfd. The
-    // caller will read zero bytes and the kernel will return EOF
-    // immediately. This matches the original fgets-based behavior.
     if (total < 0) {
-        // pread actually failed (not just EOF). Return -1 so the
-        // caller falls back to the real fd.
+        munmap(buf, kReadCap);
         close(memfd);
         return -1;
     }
 
-    // ---- in-place compaction pass -----------------------------------
-    //
-    // We compact the buffer in place: every kept line is memmove'd
-    // to the front of `buf` so that, after the scan completes, the
-    // entire kept range is contiguous at buf[0..kept_total). We then
-    // issue a SINGLE write() syscall to push the whole filtered
-    // result into the memfd.
-    //
-    // PERF (Android-specific):
-    //
-    // The previous implementation issued one write() per kept line.
-    // On a typical 500-line maps file with ~490 kept lines, that was
-    // ~490 write() syscalls per filtered read. Each write() on
-    // AArch64 takes ~1-3 µs of kernel work (SVC exception entry +
-    // VFS write path + return). Total: ~500-1500 µs of pure syscall
-    // overhead per filtered read on real Android.
-    //
-    // For a denylisted app fork, make_filtered_memfd is called once
-    // per probe (apps that read /proc/self/maps usually do so 5-10
-    // times during the first ~100 ms of execution). So the savings
-    // are ~2500-7500 µs per denylisted fork on Android.
-    //
-    // The memmove overhead is negligible: on AArch64 with NEON,
-    // memmove does 16 bytes/cycle; ~40 KB of data is ~2.5K cycles =
-    // ~1 µs total. So we trade ~500 µs of syscalls for ~1 µs of
-    // memmove — a ~500× improvement.
-    //
-    // The in-place compaction is safe because:
-    //   - write_ptr <= line_start always (we only drop lines, never
-    //     add bytes, so the kept bytes always fit in their original
-    //     space).
-    //   - memmove (not memcpy) is used to handle the case where
-    //     write_ptr < line_start (overlapping-byte case is rare on
-    //     AArch64 but memmove is correct on every platform).
+    // In-place compaction: kept lines move to the front, then ONE
+    // write() pushes the whole result into the memfd (P1.18 history:
+    // this replaced one write() per line, ~490 syscalls per read).
     char* write_ptr = buf;
     const char* line_start = buf;
     const char* end = buf + total;
-    // Determine whether this is /proc/self/status, which needs the
-    // TracerPid rewrite pass. We pass target_path through to this
-    // function so we can decide.
-    int is_status = target_path != nullptr &&
-                    strcmp(target_path, "/proc/self/status") == 0;
+    int is_status = zs_path_is_filtered(target_path ? target_path : "") &&
+                    filtered_path_basename_is(target_path, "status");
     while (line_start < end) {
-        // Find the end of this line ('\n' or end-of-buffer).
         const char* line_end = (const char*)memchr(line_start, '\n',
-                                                    end - line_start);
+                                                   end - line_start);
         if (!line_end) line_end = end;
         size_t line_len = line_end - line_start;
         size_t nl_len   = (line_end < end && *line_end == '\n') ? 1 : 0;
         size_t full_len = line_len + nl_len;
 
-        // ---------------------------------------------------------
-        // /proc/self/status: rewrite TracerPid line in place.
-        // ---------------------------------------------------------
-        // For /proc/self/status we rewrite the "TracerPid:\t<n>" line
-        // to "TracerPid:\t0" so an app that probes for an attached
-        // tracer sees 0 (no tracer). This is defense-in-depth on top
-        // of prctl(PR_SET_DUMPABLE, 0) in hide_stealth — that prctl
-        // already makes the kernel report TracerPid: 0, but if the
-        // app reads /proc/self/status directly (not via the kernel's
-        // /proc report path), we want the bytes to also say 0.
-        //
-        // We rewrite into a small stack buffer (the line is < 64
-        // bytes: "TracerPid:\t4294967295\n" is 23 bytes worst case)
-        // and copy the rewritten bytes into the compacted output.
         if (is_status) {
             char rewrite_buf[64];
             ssize_t rewritten = rewrite_status_line(
-                rewrite_buf, sizeof rewrite_buf,
-                line_start, full_len);
+                rewrite_buf, sizeof rewrite_buf, line_start, full_len);
             if (rewritten > 0) {
                 size_t rlen = (size_t)rewritten;
                 if (write_ptr + rlen <= buf + kReadCap) {
@@ -519,176 +542,80 @@ static int make_filtered_memfd(int orig_fd, const char* target_path) {
                 line_start = line_end + nl_len;
                 continue;
             }
-            // Not the TracerPid line — fall through to the normal
-            // path-field filter below.
         }
 
-        // Find the path field (start of column 6). We scan the line
-        // once, counting whitespace runs and tracking the path
-        // start position. This is a tight loop on AArch64 — each
-        // iteration is ~2 cycles (ldrb + cmp + b.eq).
+        // Find the path field (after the 5th whitespace run) and
+        // search the hidden substrings only within it (P1.39/P1.40
+        // history: compile-time lengths + branch hints).
         const char* p = line_start;
         const char* path_field = nullptr;
         int col = 0;
         while (p < line_end) {
             char c = *p;
             if (c == ' ' || c == '\t') {
-                // Whitespace run: skip it.
                 while (p < line_end && (*p == ' ' || *p == '\t')) ++p;
                 ++col;
-                if (col == 5) {
-                    // Next non-whitespace is the path field.
-                    path_field = p;
-                    break;
-                }
+                if (col == 5) { path_field = p; break; }
             } else {
                 ++p;
             }
         }
 
-        // If we found a path field, strstr only in that field.
-        // If we didn't (line too short), keep the line as-is.
         int skip = 0;
         if (path_field && path_field < line_end) {
             size_t path_len = line_end - path_field;
             for (const HiddenSubstring& sub : kHiddenSubstrings) {
-                // P1.39: lengths are pre-computed at compile time;
-                // no per-iteration strlen() call. This saves ~4500
-                // strlen calls (and ~30 µs of cycles) per filtered
-                // read of a 500-line /proc/self/maps file.
                 if (sub.len == 0 || sub.len > path_len) continue;
-                if (memmem(path_field, path_len, sub.data, sub.len) != nullptr) {
+                if (memmem(path_field, path_len, sub.data, sub.len)) {
                     skip = 1;
                     break;
                 }
             }
         }
 
-        // P1.40: the "skip" branch is taken ~1% of the time (only
-        // ~10 Magisk lines out of ~500 in a typical maps file).
-        // Marking the "keep" branch as LIKELY helps the AArch64
-        // branch predictor train on the actual instruction stream.
-        // A correctly-predicted branch is ~1 cycle; a mispredicted
-        // one is ~10-20 cycles on Cortex-A76 / A78 / X1 / X4.
-        // Over ~500 iterations of this loop, the difference is
-        // ~5000 cycles = ~2.5 µs per filtered read.
         if (ZS_LIKELY(!skip)) {
-            // Compact the line into the write region.
             if (write_ptr != line_start) {
                 memmove(write_ptr, line_start, full_len);
             }
             write_ptr += full_len;
         }
-
         line_start = line_end + nl_len;
     }
 
-    // Single write() syscall pushes the entire compacted buffer
-    // into the memfd in one VFS call. Saves ~489 syscalls on a
-    // 500-line maps file with ~10 filtered lines.
     size_t kept_total = (size_t)(write_ptr - buf);
     if (kept_total > 0) {
         ssize_t w = write(memfd, buf, kept_total);
         (void)w;
     }
-
-    // Rewind the memfd so the caller can read from the start.
+    munmap(buf, kReadCap);
     lseek(memfd, 0, SEEK_SET);
     return memfd;
 }
 
-// Rewrite the TracerPid line of /proc/self/status. Returns the number
-// of bytes written into dst (incl. trailing '\n'), or 0 if the input
-// line is not the TracerPid line. dst_cap must be >= 23 bytes (the
-// worst-case "TracerPid:\t4294967295\n" is 23 bytes; we cap at 64).
-//
-// Format we write: "TracerPid:\t0\n" (14 bytes).
-//
-// Why this is a real Android stealth win: apps that probe for ptrace
-// typically read /proc/self/status line-by-line and parse the
-// TracerPid field. The kernel's /proc report path already returns 0
-// after we set PR_SET_DUMPABLE=0 in hide_stealth — but on some Android
-// versions (notably Android 10 and earlier, before the kernel
-// /proc/status hardening was tightened), the kernel still reports the
-// real tracer pid in the text file even when dumpable=0. Rewriting
-// the bytes here is a belt-and-braces defense.
-static ssize_t rewrite_status_line(char* dst, size_t dst_cap,
-                                     const char* line_start,
-                                     size_t line_len) {
-    // TracerPid line starts with "TracerPid:". 10 chars + optional
-    // tab/space separator. We're conservative: match "TracerPid:" as
-    // a prefix.
-    static const char kPrefix[] = "TracerPid:";
-    static const size_t kPrefixLen = sizeof(kPrefix) - 1;
-    if (line_len < kPrefixLen) return 0;
-    if (memcmp(line_start, kPrefix, kPrefixLen) != 0) return 0;
-
-    // Write "TracerPid:\t0\n" (14 bytes).
-    static const char kReplacement[] = "TracerPid:\t0\n";
-    static const size_t kReplacementLen = sizeof(kReplacement) - 1;
-    if (dst_cap < kReplacementLen) return 0;
-    memcpy(dst, kReplacement, kReplacementLen);
-    return (ssize_t)kReplacementLen;
-}
-
-// P1.61 (Round 6): is `path` one of the /proc/self/* files we filter?
-// Every entry in kFilteredPaths starts with "/proc/" (6 chars), so a
-// single prefix memcmp rejects the overwhelming majority of opens an
-// app makes (which are for /data, /system, /apex, /vendor paths)
-// before any of the 7 strcmp calls run. On the hook hot path this
-// turns ~7 strcmp calls (~70 cycles) into 1 memcmp (~4 cycles) for
-// the common case.
-static int path_is_filtered(const char* path) {
-    if (ZS_UNLIKELY(!path)) return 0;
-    if (memcmp(path, "/proc/", 6) != 0) return 0;
-    for (const char* p : kFilteredPaths) {
-        if (strcmp(path, p) == 0) return 1;
-    }
-    return 0;
-}
-
 // Wrap the original open so the caller gets back either the original
-// fd (for non-filtered paths) or a filtered memfd (for filtered paths).
+// fd (for non-filtered paths) or a filtered memfd (for filtered
+// paths).
 static int wrapped_open(const char* path, int flags, mode_t mode) {
     int real_fd = g_real_open
         ? g_real_open(path, flags, mode)
         : (int)syscall(SYS_openat, AT_FDCWD, path, flags, mode);
     if (real_fd < 0) return real_fd;
 
-    if (!path_is_filtered(path)) return real_fd;
+    if (!zs_path_is_filtered(path)) return real_fd;
 
     int memfd = make_filtered_memfd(real_fd, path);
     close(real_fd);
     if (memfd >= 0) return memfd;
-    // B2 fix (Round 6): the original fd is already closed here, so
-    // returning it would hand the app a CLOSED descriptor (the old
-    // `return memfd >= 0 ? memfd : real_fd` did exactly that). Fail
-    // like a normal failed open instead. This path is only reachable
-    // if memfd_create or the pread of the original fails, which is
-    // already an anomaly.
+    // B2 history: never return the closed fd.
     errno = EBADF;
     return -1;
 }
 
-extern "C" int zygisk_study_hook_open(const char* path, int flags, ...) {
-    mode_t mode = 0;
-    if (flags & O_CREAT) {
-        va_list ap; va_start(ap, flags);
-        mode = va_arg(ap, int); va_end(ap);
-    }
-    return wrapped_open(path, flags, mode);
-}
-
-extern "C" int zygisk_study_hook_openat(int dirfd, const char* path, int flags, ...) {
-    mode_t mode = 0;
-    if (flags & O_CREAT) {
-        va_list ap; va_start(ap, flags);
-        mode = va_arg(ap, int); va_end(ap);
-    }
-    // For our purposes, only handle absolute paths. Relative paths
-    // are passed through unchanged — we don't have enough context
-    // to know if they resolve to one of our filtered paths.
-    if (path[0] != '/' || dirfd != AT_FDCWD) {
+static int wrapped_openat(int dirfd, const char* path, int flags,
+                          mode_t mode) {
+    // Only absolute paths can name a /proc file; relative paths pass
+    // through untouched (we lack the context to resolve them).
+    if (ZS_UNLIKELY(!path || path[0] != '/' || dirfd != AT_FDCWD)) {
         return g_real_openat
             ? g_real_openat(dirfd, path, flags, mode)
             : (int)syscall(SYS_openat, dirfd, path, flags, mode);
@@ -698,68 +625,121 @@ extern "C" int zygisk_study_hook_openat(int dirfd, const char* path, int flags, 
         : (int)syscall(SYS_openat, dirfd, path, flags, mode);
     if (real_fd < 0) return real_fd;
 
-    if (!path_is_filtered(path)) return real_fd;
+    if (!zs_path_is_filtered(path)) return real_fd;
 
     int memfd = make_filtered_memfd(real_fd, path);
     close(real_fd);
     if (memfd >= 0) return memfd;
-    // B2 fix (Round 6): see wrapped_open — never return the closed fd.
     errno = EBADF;
     return -1;
 }
 
-// P1.60 (Round 6): the old standalone open/openat walker
-// (patch_got_for_phdr + install_open_hooks) used to live here. It was
-// merged into patch_got_all_for_phdr + install_all_got_hooks below,
-// which patches every symbol this translation unit owns in ONE
-// dl_iterate_phdr walk. See the P1.60 comment block there.
+extern "C" int zygisk_study_hook_open(const char* path, int flags, ...) {
+    // Tier B gate: one relaxed atomic load when inactive. Every
+    // non-hidden process pays exactly that.
+    if (ZS_UNLIKELY(!hide_advanced_is_active())) {
+        mode_t mode = 0;
+        if (flags & O_CREAT) {
+            va_list ap; va_start(ap, flags);
+            mode = va_arg(ap, int); va_end(ap);
+        }
+        return g_real_open
+            ? g_real_open(path, flags, mode)
+            : (int)syscall(SYS_openat, AT_FDCWD, path, flags, mode);
+    }
+    mode_t mode = 0;
+    if (flags & O_CREAT) {
+        va_list ap; va_start(ap, flags);
+        mode = va_arg(ap, int); va_end(ap);
+    }
+    return wrapped_open(path, flags, mode);
+}
+
+extern "C" int zygisk_study_hook_openat(int dirfd, const char* path,
+                                        int flags, ...) {
+    if (ZS_UNLIKELY(!hide_advanced_is_active())) {
+        mode_t mode = 0;
+        if (flags & O_CREAT) {
+            va_list ap; va_start(ap, flags);
+            mode = va_arg(ap, int); va_end(ap);
+        }
+        return g_real_openat
+            ? g_real_openat(dirfd, path, flags, mode)
+            : (int)syscall(SYS_openat, dirfd, path, flags, mode);
+    }
+    mode_t mode = 0;
+    if (flags & O_CREAT) {
+        va_list ap; va_start(ap, flags);
+        mode = va_arg(ap, int); va_end(ap);
+    }
+    return wrapped_openat(dirfd, path, flags, mode);
+}
+
+// Round 7 (S2): fopen() bypass. libc's fopen calls openat
+// *internally* (hidden alias — NOT via the caller's PLT), so a
+// stdio-based detector reading /proc/self/maps sailed past the
+// open/openat GOT hooks. std::ifstream and plain C detectors using
+// fopen are extremely common, so we hook fopen itself and serve the
+// filtered memfd through fdopen().
+using FopenFn = FILE* (*)(const char*, const char*);
+static FopenFn g_real_fopen = nullptr;
+
+extern "C" FILE* zygisk_study_hook_fopen(const char* path,
+                                         const char* mode) {
+    if (ZS_UNLIKELY(!hide_advanced_is_active()) || !path || !mode) {
+        return g_real_fopen ? g_real_fopen(path, mode) : nullptr;
+    }
+    // Never intercept write/append modes (and path_is_filtered only
+    // ever matches /proc reads anyway).
+    if (strchr(mode, 'w') || strchr(mode, 'a') ||
+        !zs_path_is_filtered(path)) {
+        return g_real_fopen ? g_real_fopen(path, mode) : nullptr;
+    }
+    FILE* f = g_real_fopen ? g_real_fopen(path, mode) : nullptr;
+    if (!f) return f;
+    int fd = fileno(f);
+    int memfd = make_filtered_memfd(fd, path);
+    fclose(f);
+    if (memfd < 0) { errno = EBADF; return nullptr; }
+    FILE* rf = fdopen(memfd, "r");
+    if (!rf) close(memfd);
+    return rf;
+}
+
+// Round 7 (S2): FORTIFY variants. Code compiled with
+// _FORTIFY_SOURCE (the NDK default) calls __open_2/__openat_2
+// instead of open/openat. These bypass the plain-name hooks.
+extern "C" int zygisk_study_hook___open_2(const char* path, int flags);
+extern "C" int zygisk_study_hook___openat_2(int dirfd, const char* path,
+                                            int flags);
+
+extern "C" int zygisk_study_hook___open_2(const char* path, int flags) {
+    if (ZS_UNLIKELY(!hide_advanced_is_active()) || !path) {
+        return g_real_open ? g_real_open(path, flags, 0)
+                           : (int)syscall(SYS_openat, AT_FDCWD, path,
+                                          flags, 0);
+    }
+    return wrapped_open(path, flags, 0);
+}
+
+extern "C" int zygisk_study_hook___openat_2(int dirfd, const char* path,
+                                            int flags) {
+    if (ZS_UNLIKELY(!hide_advanced_is_active()) || !path) {
+        return g_real_openat
+            ? g_real_openat(dirfd, path, flags, 0)
+            : (int)syscall(SYS_openat, dirfd, path, flags, 0);
+    }
+    if (path[0] != '/' || dirfd != AT_FDCWD) {
+        return g_real_openat
+            ? g_real_openat(dirfd, path, flags, 0)
+            : (int)syscall(SYS_openat, dirfd, path, flags, 0);
+    }
+    return wrapped_openat(dirfd, path, flags, 0);
+}
 
 // ------------------------------------------------------------------------
-// 5b. stat / lstat / access hook — hide Magisk directories.
-//
-// The open/openat hook above only intercepts apps that try to OPEN
-// /proc/self/maps or /proc/self/mounts. But many Magisk detection
-// probes use stat / lstat / access instead:
-//
-//   struct stat st;
-//   if (stat("/data/adb/magisk", &st) == 0) {
-//       // Magisk is installed!
-//   }
-//   if (access("/data/adb/ksu", F_OK) == 0) {
-//       // KernelSU is installed!
-//   }
-//
-// The open hook doesn't catch these because stat/access don't go
-// through open(). We add separate GOT patches for stat, lstat,
-// access, and faccessat (the variant used by Bionic's std::filesystem
-// and some JNI code paths) to return ENOENT for known Magisk paths.
-//
-// S54 (Round 5): we ALSO hook `faccessat2`, the Linux 5.8+ variant
-// of faccessat that properly honors the AT_EACCESS flag. Bionic
-// added `faccessat2` to its public surface in API 30 (Android 11).
-// Apps targeting SDK 30+ that probe Magisk paths via access() may
-// go through `faccessat2` directly (especially apps that use newer
-// NDK headers), bypassing our `faccessat` hook. Adding
-// `faccessat2` to the GOT patcher catches this.
-//
-// S55 (Round 5): we ALSO hook `fstatat`, the libc wrapper around
-// the `newfstatat` syscall. On AArch64, the `stat` and `lstat`
-// syscalls don't exist (they were removed in favor of `newfstatat`).
-// Bionic's `stat()` and `lstat()` library functions call
-// `fstatat(AT_FDCWD, path, st, 0)` (or with AT_SYMLINK_NOFOLLOW).
-// We hook `stat` and `lstat` already (catches apps that use those
-// libc names), but some apps use `fstatat` directly — especially
-// cross-platform code that already had `fstatat` calls for Linux
-// compat. Adding `fstatat` to the GOT patcher catches this.
-//
-// This is a publicly documented technique — every serious root hide
-// (Shamiko, LSPosed hide-my-applist, Magisk DenyList with the
-// "DenyList on stat" toggle) does the same thing.
-//
-// The list of paths we hide is deliberately small and conservative —
-// only the documented Magisk / KernelSU / ZygiskNext directories
-// that apps grep for. We do NOT hide /data/adb itself (the user might
-// have legitimate files there) or /data (too broad).
+// 5b. stat / access family hooks (Tier B)
+// ------------------------------------------------------------------------
 
 using StatFn      = int (*)(const char*, struct stat*);
 using LstatFn     = int (*)(const char*, struct stat*);
@@ -767,68 +747,54 @@ using AccessFn    = int (*)(const char*, int);
 using FAccessAtFn = int (*)(int, const char*, int, int);
 using FAccessAt2Fn = int (*)(int, const char*, int, int);
 using FStatAtFn   = int (*)(int, const char*, struct stat*, int);
+using StatxFn     = int (*)(int, const char*, int, unsigned int,
+                            struct statx*);
 
 static StatFn       g_real_stat        = nullptr;
 static LstatFn      g_real_lstat       = nullptr;
 static AccessFn     g_real_access      = nullptr;
 static FAccessAtFn  g_real_faccessat   = nullptr;
-// S54 / S55: the new libc functions we hook.
 static FAccessAt2Fn g_real_faccessat2  = nullptr;
-static FStatAtFn    g_real_fstatat      = nullptr;
-
-// S60 (Round 6): statx hook. See the S60 comment block above
-// zygisk_study_hook_statx for why the existing stat/lstat/fstatat
-// hooks don't cover this.
-//
-// `struct statx` comes from <sys/stat.h> (glibc 2.28+, bionic on
-// every NDK we target). The hook body treats the buffer as opaque —
-// we never read its fields — so the definition is only needed for
-// the pointer type.
-using StatxFn = int (*)(int, const char*, int, unsigned int,
-                        struct statx*);
-static StatxFn g_real_statx = nullptr;
+static FStatAtFn    g_real_fstatat     = nullptr;
+static StatxFn      g_real_statx       = nullptr;
 
 extern "C" int zygisk_study_hook_stat(const char* path, struct stat* st);
 extern "C" int zygisk_study_hook_lstat(const char* path, struct stat* st);
 extern "C" int zygisk_study_hook_access(const char* path, int mode);
 extern "C" int zygisk_study_hook_faccessat(int dirfd, const char* path,
-                                            int mode, int flags);
-// S54 / S55: new hook entry points for faccessat2 and fstatat.
+                                           int mode, int flags);
 extern "C" int zygisk_study_hook_faccessat2(int dirfd, const char* path,
-                                             int mode, int flags);
+                                            int mode, int flags);
 extern "C" int zygisk_study_hook_fstatat(int dirfd, const char* path,
-                                          struct stat* st, int flags);
-// S60: statx hook entry point.
+                                         struct stat* st, int flags);
 extern "C" int zygisk_study_hook_statx(int dirfd, const char* path,
-                                        int flags, unsigned int mask,
-                                        struct statx* stx);
+                                       int flags, unsigned int mask,
+                                       struct statx* stx);
 
-// Paths whose existence would reveal Magisk / KernelSU / ZygiskNext.
-// We return ENOENT ("no such file or directory") for these.
-static constexpr const char* kHiddenStatPaths[] = {
+// Paths whose existence would reveal a root framework. We return
+// ENOENT for these.
+//
+// On a real device /data/adb is mode 0700 root:root, so an
+// untrusted_app probe already gets EACCES there — the hooks are
+// defense-in-depth for ROMs with looser permissions and for the
+// /system overlay paths some frameworks use.
+static const char* const kHiddenStatPaths[] = {
     "/data/adb/magisk",
-    "/data/adb/magisk/",
     "/data/adb/modules",
     "/data/adb/modules_update",
     "/data/adb/ksu",
-    "/data/adb/ksu/",
     "/data/adb/zygisk_study",
     "/sbin/magisk",
     "/sbin/zygisk_study",
     "/system/bin/magisk",
     "/debug_ramdisk",
-    // The zygiskd working directory is hidden too.
     "/data/system/zygisk_study",
 };
 
 static int path_is_hidden(const char* path) {
-    if (!path || path[0] != '/') return 0;
-    // P1.62 (Round 6): all entries in kHiddenStatPaths start with
-    // one of three prefixes: /data (5), /sbin (5), /system (7),
-    // /debug_ramdisk (14). A path that starts with none of them
-    // (e.g. /sdcard, /vendor, /apex, /proc) cannot match any entry,
-    // so bail out before the two loops. This is a fast gate for the
-    // common case on the stat/access hook hot path.
+    if (ZS_UNLIKELY(!path || path[0] != '/')) return 0;
+    // Fast gate (P1.62 history): all hidden paths start with one of
+    // these prefixes.
     if (strncmp(path, "/data",          5) != 0 &&
         strncmp(path, "/sbin",          5) != 0 &&
         strncmp(path, "/system",        7) != 0 &&
@@ -838,23 +804,12 @@ static int path_is_hidden(const char* path) {
     for (const char* h : kHiddenStatPaths) {
         if (strcmp(path, h) == 0) return 1;
     }
-    // Also match any path that starts with a hidden prefix + '/' —
-    // e.g. /data/adb/magisk/anything or /sbin/magisk/foo. This catches
-    // apps that probe for a specific known file inside the directory.
+    // Prefix match (hidden path + '/' + anything), with the B1
+    // bounds check fixed in Round 6.
     size_t plen = strlen(path);
     for (const char* h : kHiddenStatPaths) {
         size_t hlen = __builtin_strlen(h);
-        // Skip the trailing '/' variants in the list above; we want
-        // to match the prefix without it.
         if (hlen > 0 && h[hlen-1] == '/') hlen--;
-        // B1 fix (Round 6): guard the path[hlen] read. The original
-        // `path[hlen] == '/' && strncmp(...)` read path[hlen] BEFORE
-        // checking hlen <= plen, which is an out-of-bounds read when
-        // the probe path is shorter than the hidden prefix (e.g.
-        // path "/data/adb" vs. hidden "/data/adb/modules"). Harmless
-        // on real systems (the NUL page is mapped) but UB under
-        // sanitizers; the explicit length check is also one branch
-        // the compiler can fold into the comparison.
         if (hlen < plen && path[hlen] == '/' &&
             strncmp(path, h, hlen) == 0) return 1;
     }
@@ -862,205 +817,333 @@ static int path_is_hidden(const char* path) {
 }
 
 extern "C" int zygisk_study_hook_stat(const char* path, struct stat* st) {
-    if (path_is_hidden(path)) {
-        errno = ENOENT;
-        return -1;
+    if (ZS_LIKELY(!hide_advanced_is_active()) || !path_is_hidden(path)) {
+        return g_real_stat
+            ? g_real_stat(path, st)
+            : (int)syscall(SYS_stat, path, st);
     }
-    return g_real_stat
-        ? g_real_stat(path, st)
-        : (int)syscall(SYS_stat, path, st);
+    errno = ENOENT;
+    return -1;
 }
 
 extern "C" int zygisk_study_hook_lstat(const char* path, struct stat* st) {
-    if (path_is_hidden(path)) {
-        errno = ENOENT;
-        return -1;
+    if (ZS_LIKELY(!hide_advanced_is_active()) || !path_is_hidden(path)) {
+        return g_real_lstat
+            ? g_real_lstat(path, st)
+            : (int)syscall(SYS_lstat, path, st);
     }
-    return g_real_lstat
-        ? g_real_lstat(path, st)
-        : (int)syscall(SYS_lstat, path, st);
+    errno = ENOENT;
+    return -1;
 }
 
 extern "C" int zygisk_study_hook_access(const char* path, int mode) {
-    if (path_is_hidden(path)) {
-        errno = ENOENT;
-        return -1;
+    if (ZS_LIKELY(!hide_advanced_is_active()) || !path_is_hidden(path)) {
+        return g_real_access
+            ? g_real_access(path, mode)
+            : (int)syscall(SYS_access, path, mode);
     }
-    return g_real_access
-        ? g_real_access(path, mode)
-        : (int)syscall(SYS_access, path, mode);
+    errno = ENOENT;
+    return -1;
 }
 
 extern "C" int zygisk_study_hook_faccessat(int dirfd, const char* path,
-                                            int mode, int flags) {
-    // For absolute paths, we can apply the same hide check.
-    if (path && path[0] == '/' && path_is_hidden(path)) {
-        errno = ENOENT;
-        return -1;
+                                           int mode, int flags) {
+    if (ZS_LIKELY(!hide_advanced_is_active()) ||
+        !(path && path[0] == '/' && path_is_hidden(path))) {
+        return g_real_faccessat
+            ? g_real_faccessat(dirfd, path, mode, flags)
+            : (int)syscall(SYS_faccessat, dirfd, path, mode, flags);
     }
-    return g_real_faccessat
-        ? g_real_faccessat(dirfd, path, mode, flags)
-        : (int)syscall(SYS_faccessat, dirfd, path, mode, flags);
+    errno = ENOENT;
+    return -1;
 }
 
-// S54 (Round 5): faccessat2 hook. The signature is identical to
-// faccessat — the difference is that the kernel (Linux 5.8+)
-// actually honors the AT_EACCESS flag in the faccessat2 syscall,
-// whereas the older faccessat syscall silently ignores it (a long-
-// standing kernel bug that faccessat2 was added to fix).
-//
-// On Android 11+ (API 30+), Bionic exposes `faccessat2` as a
-// public libc function. Apps that link against newer NDK headers
-// may use it directly. Our `faccessat` GOT patch doesn't catch
-// `faccessat2` calls because they go through a different PLT
-// slot. Adding a separate hook here closes the gap.
-//
-// The hide logic is identical to faccessat — for absolute paths
-// in our hidden set, return ENOENT.
 extern "C" int zygisk_study_hook_faccessat2(int dirfd, const char* path,
-                                             int mode, int flags) {
-    if (path && path[0] == '/' && path_is_hidden(path)) {
-        errno = ENOENT;
-        return -1;
-    }
-    // Try the resolved `faccessat2` symbol first; fall back to
-    // `faccessat` if it's not available (older Bionic); finally
-    // fall back to the raw syscall. On Android 11+, all three
-    // paths exist; on older Android, only the second and third.
-    if (g_real_faccessat2) {
-        return g_real_faccessat2(dirfd, path, mode, flags);
-    }
-    if (g_real_faccessat) {
-        return g_real_faccessat(dirfd, path, mode, flags);
-    }
-    // SYS_faccessat2 = 439 on aarch64, 449 on x86_64. We use the
-    // libc syscall() wrapper with the SYS_ macro so the right
-    // number is picked per-arch.
+                                            int mode, int flags) {
+    if (ZS_LIKELY(!hide_advanced_is_active()) ||
+        !(path && path[0] == '/' && path_is_hidden(path))) {
+        if (g_real_faccessat2) return g_real_faccessat2(dirfd, path, mode, flags);
+        if (g_real_faccessat)  return g_real_faccessat(dirfd, path, mode, flags);
 #ifdef SYS_faccessat2
-    return (int)syscall(SYS_faccessat2, dirfd, path, mode, flags);
+        return (int)syscall(SYS_faccessat2, dirfd, path, mode, flags);
 #else
-    // Older kernel without faccessat2 — fall back to faccessat
-    // (which ignores AT_EACCESS but otherwise behaves the same).
-    return (int)syscall(SYS_faccessat, dirfd, path, mode, flags);
+        return (int)syscall(SYS_faccessat, dirfd, path, mode, flags);
 #endif
+    }
+    errno = ENOENT;
+    return -1;
 }
 
-// S55 (Round 5): fstatat hook. fstatat is the libc wrapper around
-// the newfstatat syscall (Linux 3.0+). On AArch64, the stat and
-// lstat syscalls don't exist — every stat() / lstat() libc call
-// goes through fstatat under the hood. We hook stat and lstat by
-// name (catches apps that use those libc names), but apps that
-// call fstatat directly bypass those hooks.
-//
-// The signature: `int fstatat(int dirfd, const char* path, struct
-// stat* st, int flags)`. The flags argument can include
-// AT_SYMLINK_NOFOLLOW (in which case fstatat behaves like lstat —
-// does not follow symlinks). For our purposes, we apply the same
-// hidden-path check regardless of the flags value: if the path is
-// in our hidden set, we return ENOENT for both stat-like and
-// lstat-like behavior.
 extern "C" int zygisk_study_hook_fstatat(int dirfd, const char* path,
-                                          struct stat* st, int flags) {
-    if (path && path[0] == '/' && path_is_hidden(path)) {
-        errno = ENOENT;
-        return -1;
-    }
-    // Try the resolved `fstatat` symbol first; fall back to
-    // `newfstatat` (the syscall name) if not available. On Bionic,
-    // `fstatat` is the public name; the `__fstatat64` symbol is
-    // the legacy alias.
-    if (g_real_fstatat) {
-        return g_real_fstatat(dirfd, path, st, flags);
-    }
-    // SYS_newfstatat = 79 on aarch64, 262 on x86_64. SYS_fstatat
-    // is sometimes defined as an alias; we try both.
+                                         struct stat* st, int flags) {
+    if (ZS_LIKELY(!hide_advanced_is_active()) ||
+        !(path && path[0] == '/' && path_is_hidden(path))) {
+        if (g_real_fstatat) return g_real_fstatat(dirfd, path, st, flags);
 #if defined(SYS_fstatat)
-    return (int)syscall(SYS_fstatat, dirfd, path, st, flags);
+        return (int)syscall(SYS_fstatat, dirfd, path, st, flags);
 #elif defined(SYS_newfstatat)
-    return (int)syscall(SYS_newfstatat, dirfd, path, st, flags);
+        return (int)syscall(SYS_newfstatat, dirfd, path, st, flags);
 #else
-    // Should not happen on any Linux we support.
-    errno = ENOSYS;
-    return -1;
-#endif
-}
-
-// S60 (Round 6): statx hook.
-//
-// statx(2) is the modern Linux stat interface (kernel 4.11+,
-// glibc 2.28+, bionic on Android 8.0+). Unlike stat/lstat/fstatat,
-// it is NOT routed through the newfstatat syscall — it is its own
-// syscall (SYS_statx = 291 on aarch64). Apps that probe Magisk
-// paths via statx bypass every hook we installed above:
-//
-//   struct statx stx;
-//   if (statx(AT_FDCWD, "/data/adb/magisk", 0, STATX_TYPE, &stx) == 0) {
-//       // Magisk is installed — and stat/lstat/fstatat hooks never saw it.
-//   }
-//
-// statx is increasingly common in detection code because it also
-// exposes STATX_BTIME (inode birth time) — useful for fingerprinting
-// freshly-created root files. We hook the libc `statx` symbol and
-// return ENOENT for hidden paths, matching the other stat-family
-// hooks.
-extern "C" int zygisk_study_hook_statx(int dirfd, const char* path,
-                                        int flags, unsigned int mask,
-                                        struct statx* stx) {
-    if (path && path[0] == '/' && path_is_hidden(path)) {
-        errno = ENOENT;
+        errno = ENOSYS;
         return -1;
-    }
-    if (g_real_statx) {
-        return g_real_statx(dirfd, path, flags, mask, stx);
-    }
-#ifdef SYS_statx
-    return (int)syscall(SYS_statx, dirfd, path, flags, mask, stx);
-#else
-    // Kernel/libc without statx — fail the same way libc would.
-    errno = ENOSYS;
-    return -1;
 #endif
+    }
+    errno = ENOENT;
+    return -1;
+}
+
+extern "C" int zygisk_study_hook_statx(int dirfd, const char* path,
+                                       int flags, unsigned int mask,
+                                       struct statx* stx) {
+    if (ZS_LIKELY(!hide_advanced_is_active()) ||
+        !(path && path[0] == '/' && path_is_hidden(path))) {
+        if (g_real_statx) return g_real_statx(dirfd, path, flags, mask, stx);
+#ifdef SYS_statx
+        return (int)syscall(SYS_statx, dirfd, path, flags, mask, stx);
+#else
+        errno = ENOSYS;
+        return -1;
+#endif
+    }
+    errno = ENOENT;
+    return -1;
 }
 
 // ------------------------------------------------------------------------
-// GOT-patching — merged walker (P1.60)
+// 5c. Property READ hooks (Tier B)
 // ------------------------------------------------------------------------
+
+// For keys whose stock behavior is "does not exist", find()/get()
+// must report absence. The clone alone can only empty the VALUE —
+// the key still enumerates and find() still returns non-NULL.
+// Hooking the two read entry points closes that residual.
 //
-// PERF (Android-specific, P1.60): previously we walked
-// dl_iterate_phdr twice from this translation unit (once for
-// open/openat, once for stat/lstat/access/faccessat/faccessat2/
-// fstatat) and hide_stealth.cpp walked it a third time for
-// readlink/readlinkat. Each walk of ~30 loaded modules means ~30
-// dl_iterate_phdr callbacks, ~30 PT_DYNAMIC header scans, and ~30
-// dynamic-section walks — roughly 60-100 µs on AArch64 per extra
-// walk, paid at payload init.
-//
-// The merged walker below patches every symbol this TU owns in ONE
-// dl_iterate_phdr walk: open/openat plus the entire stat family
-// (including the S54 faccessat2, S55 fstatat, and S60 statx hooks).
-// hide_stealth's readlink/readlinkat walk remains separate by design
-// (layer ordering: it installs after ours), but eliminating one of
-// the three walks still saves ~60-100 µs at init.
-//
-// The per-relocation matcher uses a first-character switch so the
-// common case (symbol name isn't ours) exits after one byte compare
-// instead of up to 8 strcmp calls. strcmp of a non-matching name
-// against "open" is cheap but not free; over ~300 JUMP_SLOT
-// relocations in a typical .so the switch saves a few µs per module.
+// libandroid_runtime (SystemProperties JNI) calls both of these
+// through its PLT, so the GOT patch covers every Java-level
+// SystemProperties.get() call.
+using PropFindFn = const void* (*)(const char*);
+using PropGetFn  = int (*)(const char*, char*);
+static PropFindFn g_real_prop_find = nullptr;
+static PropGetFn  g_real_prop_get  = nullptr;
+
+static int prop_key_is_absent(const char* key) {
+    if (!key) return 0;
+    for (const ZsPropSpoof& s : kPropSpoofTable) {
+        if (s.value == nullptr || s.value[0] == '\0') {
+            if (strcmp(key, s.key) == 0) return 1;
+        }
+    }
+    return 0;
+}
+
+extern "C" const void* zygisk_study_hook_prop_find(const char* key) {
+    if (ZS_LIKELY(!hide_advanced_is_active()) || !prop_key_is_absent(key)) {
+        return g_real_prop_find ? g_real_prop_find(key) : nullptr;
+    }
+    return nullptr;  // property "does not exist"
+}
+
+extern "C" int zygisk_study_hook_prop_get(const char* key, char* value) {
+    if (ZS_LIKELY(!hide_advanced_is_active()) || !prop_key_is_absent(key)) {
+        return g_real_prop_get ? g_real_prop_get(key, value) : 0;
+    }
+    if (value) value[0] = '\0';
+    return 0;  // length 0 = not found
+}
+
+// ------------------------------------------------------------------------
+// 5d. Raw syscall() hook (Tier B)
+// ------------------------------------------------------------------------
+
+// Detectors that bypass libc wrappers call syscall(SYS_openat, ...)
+// directly. The libc syscall() wrapper itself goes through the PLT,
+// so hooking it catches every such probe that does not hand-roll
+// inline asm. The fast path (not active / not an interesting syscall
+// number) costs one atomic load plus one switch.
+using SyscallFn = long (*)(long, ...);
+static SyscallFn g_real_syscall = nullptr;
+
+extern "C" long zygisk_study_hook_syscall(long number, ...) {
+    if (ZS_UNLIKELY(!hide_advanced_is_active())) {
+        // Pass the varargs straight through.
+        va_list ap;
+        va_start(ap, number);
+        long a[6];
+        for (int i = 0; i < 6; ++i) a[i] = va_arg(ap, long);
+        va_end(ap);
+        return g_real_syscall
+            ? g_real_syscall(number, a[0], a[1], a[2], a[3], a[4], a[5])
+            : -ENOSYS;
+    }
+    // Extract the first four arguments (the most any of our handled
+    // syscalls use) and dispatch.
+    va_list ap;
+    va_start(ap, number);
+    long a0 = va_arg(ap, long);
+    long a1 = va_arg(ap, long);
+    long a2 = va_arg(ap, long);
+    long a3 = va_arg(ap, long);
+    va_end(ap);
+
+#ifdef SYS_openat
+    if (number == (long)SYS_openat) {
+        const char* path = (const char*)a1;
+        if (path && path[0] == '/' && (int)a0 == AT_FDCWD &&
+            zs_path_is_filtered(path)) {
+            int flags = (int)a2;
+            mode_t mode = (flags & O_CREAT) ? (mode_t)a3 : 0;
+            return wrapped_openat((int)a0, path, flags, mode);
+        }
+    }
+#endif
+#ifdef SYS_open
+    if (number == (long)SYS_open) {
+        const char* path = (const char*)a0;
+        if (path && zs_path_is_filtered(path)) {
+            int flags = (int)a1;
+            mode_t mode = (flags & O_CREAT) ? (mode_t)a2 : 0;
+            return wrapped_open(path, flags, mode);
+        }
+    }
+#endif
+    if (
+#ifdef SYS_statx
+        number == (long)SYS_statx ||
+#endif
+#ifdef SYS_faccessat2
+        number == (long)SYS_faccessat2 ||
+#endif
+        false) {
+        const char* path = (const char*)a1;
+        if (path && path[0] == '/' && path_is_hidden(path)) {
+            errno = ENOENT;
+            return -1;
+        }
+    }
+#if defined(SYS_newfstatat)
+    if (number == (long)SYS_newfstatat) {
+        const char* path = (const char*)a1;
+        if (path && path[0] == '/' && path_is_hidden(path)) {
+            errno = ENOENT;
+            return -1;
+        }
+    }
+#endif
+    // Not ours — pass all four extracted args through. (Handled
+    // syscalls never use more than four; callers passing fewer are
+    // harmless — extra register args are ignored by the kernel.)
+    return g_real_syscall
+        ? g_real_syscall(number, a0, a1, a2, a3)
+        : -ENOSYS;
+}
+
+// ------------------------------------------------------------------------
+// GOT hook registry + the single walker
+// ------------------------------------------------------------------------
+
+constexpr size_t kMaxGotHooks = 48;
+struct GotHookEntry {
+    const char* name;
+    void*       fn;
+};
+// Immediate registry: walked by hide_advanced_install_got_hooks()
+// (payload init installs ONLY the fork/privilege-drop hooks here).
+static GotHookEntry g_got_hooks[kMaxGotHooks];
+static size_t       g_got_hook_count = 0;
+// Deferred (Tier B) registry: promoted into the main registry by
+// hide_advanced_install_tier_b() — i.e. only in a child we are
+// actually hiding. Installing these in the zygote would hook every
+// process on the device (system_server included) for zero benefit.
+static GotHookEntry g_tier_b_hooks[kMaxGotHooks];
+static size_t       g_tier_b_hook_count = 0;
+
+int hide_advanced_register_got_hook(const char* name, void* fn) {
+    if (!name || !fn) return 0;
+    if (g_got_hook_count >= kMaxGotHooks) {
+        ZS_LOGW("hide_advanced: GOT hook registry full (%zu)",
+                kMaxGotHooks);
+        return 0;
+    }
+    for (size_t i = 0; i < g_got_hook_count; ++i) {
+        if (strcmp(g_got_hooks[i].name, name) == 0) return 1; // dup
+    }
+    g_got_hooks[g_got_hook_count].name = name;
+    g_got_hooks[g_got_hook_count].fn   = fn;
+    ++g_got_hook_count;
+    return 1;
+}
+
+int hide_advanced_register_tier_b_hook(const char* name, void* fn) {
+    if (!name || !fn) return 0;
+    if (g_tier_b_hook_count >= kMaxGotHooks) {
+        ZS_LOGW("hide_advanced: Tier B hook registry full (%zu)",
+                kMaxGotHooks);
+        return 0;
+    }
+    for (size_t i = 0; i < g_tier_b_hook_count; ++i) {
+        if (strcmp(g_tier_b_hooks[i].name, name) == 0) return 1;
+    }
+    g_tier_b_hooks[g_tier_b_hook_count].name = name;
+    g_tier_b_hooks[g_tier_b_hook_count].fn   = fn;
+    ++g_tier_b_hook_count;
+    return 1;
+}
+
+// Every slot we patched, with its original value, so we can restore
+// the process to a byte-stock state before the self-unmap.
+constexpr size_t kMaxPatchedSlots = 1024;
+struct PatchedSlot {
+    void** slot;
+    void*  original;
+};
+static PatchedSlot g_patched_slots[kMaxPatchedSlots];
+static size_t      g_patched_slot_count = 0;
+
+static long got_pagesize() {
+    static long ps = sysconf(_SC_PAGESIZE);
+    return ps > 0 ? ps : 4096;
+}
+
+// Resolve a registered hook by symbol name; first-char gate then
+// strcmp (P1.60 history: one byte compare rejects most names).
+// Only the LIVE registry is consulted: deferred Tier B entries are
+// invisible until hide_advanced_install_tier_b() promotes them,
+// which happens before the walk runs — so the walker never misses
+// anything and non-hidden processes provably carry no Tier B hooks.
+static void* match_registered_hook(const char* name) {
+    const char c = name[0];
+    for (size_t i = 0; i < g_got_hook_count; ++i) {
+        const char* h = g_got_hooks[i].name;
+        if (h[0] == c && strcmp(name, h) == 0) {
+            return g_got_hooks[i].fn;
+        }
+    }
+    return nullptr;
+}
+
+// Portable relocation-symbol extraction. Bionic's <link.h> defines
+// ELF_R_SYM for both classes; glibc's does not, so pick explicitly.
+// (Round 7 / P5: the old ELF64_R_SYM broke armeabi-v7a builds, where
+// the symbol index lives in the UPPER 24 bits of r_info, not 32.)
+#ifdef __LP64__
+#  define ZS_ELF_R_SYM(info) ELF64_R_SYM(info)
+#else
+#  define ZS_ELF_R_SYM(info) ELF32_R_SYM(info)
+#endif
 
 static int patch_got_all_for_phdr(struct dl_phdr_info* info,
                                   size_t /*size*/, void* /*data*/) {
     if (!info || !info->dlpi_name || info->dlpi_name[0] == '\0') return 0;
 
-    // Skip our own .so files.
+    // Skip our own .so files — never patch ourselves (our internal
+    // calls must keep resolving to the real libc functions, or the
+    // hooks would recurse).
     if (strstr(info->dlpi_name, "libpayload.so")   != nullptr ||
         strstr(info->dlpi_name, "libzygisk.so")    != nullptr ||
         strstr(info->dlpi_name, "libzn_loader.so") != nullptr) {
         return 0;
     }
 
-    // Find PT_DYNAMIC. The dynamic section is at info->dlpi_addr +
-    // p_vaddr for the PT_DYNAMIC program header.
     const ElfW(Dyn)* dyn = nullptr;
     for (int i = 0; i < info->dlpi_phnum; i++) {
         const ElfW(Phdr)& ph = info->dlpi_phdr[i];
@@ -1089,258 +1172,115 @@ static int patch_got_all_for_phdr(struct dl_phdr_info* info,
     if (!symtab || !strtab || !jmprel || pltrelsz == 0) return 0;
 
     size_t n = pltrelsz / sizeof(ElfW(Rela));
-    void* hook_open        = reinterpret_cast<void*>(&zygisk_study_hook_open);
-    void* hook_openat      = reinterpret_cast<void*>(&zygisk_study_hook_openat);
-    void* hook_stat        = reinterpret_cast<void*>(&zygisk_study_hook_stat);
-    void* hook_lstat       = reinterpret_cast<void*>(&zygisk_study_hook_lstat);
-    void* hook_access      = reinterpret_cast<void*>(&zygisk_study_hook_access);
-    void* hook_faccessat   = reinterpret_cast<void*>(&zygisk_study_hook_faccessat);
-    // S54 / S55 / S60: faccessat2, fstatat, statx.
-    void* hook_faccessat2  = reinterpret_cast<void*>(&zygisk_study_hook_faccessat2);
-    void* hook_fstatat     = reinterpret_cast<void*>(&zygisk_study_hook_fstatat);
-    void* hook_statx       = reinterpret_cast<void*>(&zygisk_study_hook_statx);
+    long pagesize = got_pagesize();
 
-    long pagesize = sysconf(_SC_PAGESIZE);
     for (size_t i = 0; i < n; i++) {
         const ElfW(Rela)& r = jmprel[i];
-        // The ELF64 r_info layout is: symbol index in upper 32 bits,
-        // relocation type in lower 32 bits. R_SYM pulls the upper
-        // 32 bits.
-        size_t sym_idx = ELF64_R_SYM(r.r_info);
+        // Round 7 (P5): ELF_R_SYM (not ELF64_R_SYM) so 32-bit ELF
+        // relocations parse correctly on armeabi-v7a builds.
+        size_t sym_idx = ZS_ELF_R_SYM(r.r_info);
         const ElfW(Sym)& sym = symtab[sym_idx];
         const char* name = strtab + sym.st_name;
 
-        // First-character switch: reject ~25/26 of symbols with one
-        // byte compare before any strcmp runs. Our hooked names all
-        // start with 'o', 's', 'l', 'a', 'f', or '_'.
-        void* hook = nullptr;
-        switch (name[0]) {
-        case 'o':
-            if      (strcmp(name, "open")   == 0) hook = hook_open;
-            else if (strcmp(name, "openat") == 0) hook = hook_openat;
-            break;
-        case 's':
-            if      (strcmp(name, "stat")  == 0) hook = hook_stat;
-            // S60: statx.
-            else if (strcmp(name, "statx") == 0) hook = hook_statx;
-            break;
-        case 'l':
-            if (strcmp(name, "lstat") == 0) hook = hook_lstat;
-            break;
-        case 'a':
-            if (strcmp(name, "access") == 0) hook = hook_access;
-            break;
-        case 'f':
-            if      (strcmp(name, "faccessat")  == 0) hook = hook_faccessat;
-            // S54 / S55: faccessat2 and fstatat.
-            else if (strcmp(name, "faccessat2") == 0) hook = hook_faccessat2;
-            else if (strcmp(name, "fstatat")    == 0) hook = hook_fstatat;
-            // Also catch the LFS alias that some third-party
-            // NDK-built libs use.
-            else if (strcmp(name, "fstatat64")  == 0) hook = hook_fstatat;
-            break;
-        case '_':
-            // `__fstatat` is the internal Bionic name — defensive.
-            if (strcmp(name, "__fstatat") == 0) hook = hook_fstatat;
-            break;
-        default:
-            break;
-        }
+        void* hook = match_registered_hook(name);
         if (!hook) continue;
 
         void** slot = reinterpret_cast<void**>(
             reinterpret_cast<char*>(info->dlpi_addr) + r.r_offset);
-        uintptr_t page = reinterpret_cast<uintptr_t>(slot) & ~(pagesize - 1);
+        void* current = *slot;
+        if (current == hook) continue;  // already patched (re-walk)
+
+        uintptr_t page = reinterpret_cast<uintptr_t>(slot)
+                         & ~((uintptr_t)pagesize - 1);
         void* pageptr = reinterpret_cast<void*>(page);
-        if (mprotect(pageptr, pagesize,
+        if (mprotect(pageptr, (size_t)pagesize,
                      PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
+            // Record the original so the uninstall pass can restore
+            // it before we unmap ourselves.
+            if (g_patched_slot_count < kMaxPatchedSlots) {
+                g_patched_slots[g_patched_slot_count].slot     = slot;
+                g_patched_slots[g_patched_slot_count].original = current;
+                ++g_patched_slot_count;
+            } else if (g_patched_slot_count == kMaxPatchedSlots) {
+                ZS_LOGW("hide_advanced: patched-slot table full; "
+                        "uninstall will be partial");
+                ++g_patched_slot_count;  // log once
+            }
             *slot = hook;
-            mprotect(pageptr, pagesize, PROT_READ | PROT_EXEC);
+            mprotect(pageptr, (size_t)pagesize, PROT_READ | PROT_EXEC);
         }
     }
     return 0;
 }
 
-// P1.60 (Round 6): one-shot installer that resolves every real libc
-// symbol this TU's hooks delegate to, then performs the single merged
-// GOT walk. Replaces the old install_open_hooks() + install_stat_hooks()
-// pair (which did two dl_iterate_phdr walks).
-static void install_all_got_hooks() {
-    g_real_open   = (OpenFn)dlsym(RTLD_NEXT, "open");
-    g_real_openat = (OpenAtFn)dlsym(RTLD_NEXT, "openat");
-    if (!g_real_open || !g_real_openat) {
-        ZS_LOGW("hide_advanced: dlsym(RTLD_NEXT, open/openat) failed");
-    }
-
-    g_real_stat       = (StatFn)dlsym(RTLD_NEXT, "stat");
-    g_real_lstat      = (LstatFn)dlsym(RTLD_NEXT, "lstat");
-    g_real_access     = (AccessFn)dlsym(RTLD_NEXT, "access");
-    g_real_faccessat  = (FAccessAtFn)dlsym(RTLD_NEXT, "faccessat");
-    // S54 / S55 / S60: resolve the newer libc symbols. On older
-    // Bionic (pre-Android 11), `faccessat2` may not be exported —
-    // that's fine, our hook falls back to `faccessat`. `statx` is
-    // exported on all bionic versions that have the syscall; where
-    // absent, the hook falls back to the raw SYS_statx syscall.
-    g_real_faccessat2 = (FAccessAt2Fn)dlsym(RTLD_NEXT, "faccessat2");
-    g_real_fstatat    = (FStatAtFn)dlsym(RTLD_NEXT, "fstatat");
-    g_real_statx      = (StatxFn)dlsym(RTLD_NEXT, "statx");
-
-    // stat/lstat/access not being available via dlsym is a warning,
-    // not an error — our hooks fall back to direct syscalls.
-    if (!g_real_stat || !g_real_lstat || !g_real_access || !g_real_faccessat) {
-        ZS_LOGW("hide_advanced: dlsym stat/lstat/access/faccessat "
-                "(some may be unavailable)");
-    }
-    if (!g_real_faccessat2) {
-        // Expected on pre-Android 11. Our hook_faccessat2 falls back
-        // to g_real_faccessat (or the raw syscall).
-        ZS_LOGD("hide_advanced: faccessat2 not in libc (pre-Android 11?)");
-    }
-    if (!g_real_fstatat) {
-        ZS_LOGW("hide_advanced: dlsym fstatat failed "
-                "(hook will fall back to syscall)");
-    }
-    if (!g_real_statx) {
-        ZS_LOGD("hide_advanced: statx not in libc "
-                "(hook will fall back to SYS_statx)");
-    }
-
+void hide_advanced_install_got_hooks() {
     dl_iterate_phdr(patch_got_all_for_phdr, nullptr);
-    ZS_LOGD("hide_advanced: open/openat + stat/lstat/access/faccessat/"
-            "faccessat2/fstatat/statx hooks installed (single GOT walk)");
+    ZS_LOGD("hide_advanced: GOT walk done (%zu hook(s), %zu slot(s))",
+            g_got_hook_count, g_patched_slot_count);
 }
 
-// ------------------------------------------------------------------------
-// 6. Fd cleanup after fork
-// ------------------------------------------------------------------------
-//
-// After fork, the child inherits all of the parent's file
-// descriptors. We opened several during init (the maps snapshot,
-// the daemon socket, etc.). These fds are a tell — an app can
-// fstat each fd and find our socket.
-//
-// We close every fd above 2 except for stdio (0, 1, 2) and any
-// fd the runtime is known to hold open (the zygote socket, the
-// ART-internal fds). The standard way to do this is to read
-// /proc/self/fd and close everything we don't recognize.
-//
-// PERF (Android-specific): the previous implementation used
-// opendir("/proc/self/fd") + readdir + closedir. On Android:
-//   - opendir allocates a ~88-byte DIR struct on the heap.
-//   - readdir does a getdents64 syscall (good), but wraps each
-//     entry in a struct dirent + does string parsing for d_name.
-//   - closedir does another syscall + free.
-//   - Total: 2 syscalls + 1 malloc + 1 free + per-entry parsing.
-//
-// The new path uses the raw getdents64 syscall directly. Saves:
-//   - The heap allocation (DIR struct): ~1 µs.
-//   - The closedir syscall: ~1 µs.
-//   - The per-entry dirent parsing overhead: ~50 ns × ~20 entries
-//     = ~1 µs.
-//   - Total savings: ~3 µs per fork on the slow path.
-//
-// getdents64 is the documented Linux syscall for listing directory
-// entries (since Linux 2.6, ~2003). It's the syscall that readdir
-// internally uses — we just skip the libc wrapper layer.
-static void close_unknown_fds() {
-    // Open /proc/self/fd. We use openat + O_RDONLY | O_DIRECTORY
-    // because that's the documented way to get a directory fd for
-    // getdents64.
-    int dirfd = openat(AT_FDCWD, "/proc/self/fd",
-                       O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    if (dirfd < 0) return;
-
-    // 8 KB stack buffer. /proc/self/fd typically has 20-50 entries;
-    // each linux_dirent64 is ~24 bytes + d_name (up to 256). 8 KB
-    // fits ~300 entries — enough for all reasonable cases. If the
-    // fd table is larger, we loop and re-read.
-    constexpr size_t kBufCap = 8 * 1024;
-    char buf[kBufCap];
-
-    while (true) {
-        // SYS_getdents64 = 217 on aarch64, 220 on x86_64. Use the
-        // libc syscall() wrapper so we don't need to hard-code the
-        // syscall number (and so the host test build works on x86_64).
-        ssize_t n = syscall(SYS_getdents64, dirfd, buf, kBufCap);
-        if (n <= 0) break;
-
-        // Walk the entries. Each entry is:
-        //   struct linux_dirent64 {
-        //     ino64_t        d_ino;    // 8 bytes
-        //     off64_t        d_off;    // 8 bytes
-        //     unsigned short d_reclen; // 2 bytes
-        //     unsigned char  d_type;   // 1 byte
-        //     char           d_name[]; // variable, NUL-terminated
-        //   };
-        // We don't need <linux/types.h> — we just use the offset
-        // of d_reclen (= 16) and the d_name field (= 19). On
-        // aarch64/x86_64, ino64_t and off64_t are both 8 bytes.
-        constexpr size_t kReclenOff = 16;
-        constexpr size_t kNameOff   = 19;
-        for (size_t off = 0; off < (size_t)n; ) {
-            // Read reclen.
-            unsigned short reclen;
-            memcpy(&reclen, buf + off + kReclenOff, sizeof(reclen));
-            if (reclen == 0) break;
-
-            // d_name is at off + kNameOff, NUL-terminated. Parse
-            // as integer (fd numbers are decimal ASCII).
-            const char* name = buf + off + kNameOff;
-            // atoi-equivalent: parse leading digits.
-            int fd = 0;
-            int valid = 0;
-            for (const char* p = name; *p >= '0' && *p <= '9'; ++p) {
-                fd = fd * 10 + (*p - '0');
-                valid = 1;
-            }
-            if (valid && fd >= 3 && fd != dirfd) {
-                // We close everything above stdio (0, 1, 2) except
-                // our own dirfd. The runtime will reopen the fds
-                // it needs.
-                close(fd);
-            }
-
-            off += reclen;
+void hide_advanced_uninstall_got_hooks() {
+    long pagesize = got_pagesize();
+    for (size_t i = 0; i < g_patched_slot_count &&
+                       i < kMaxPatchedSlots; ++i) {
+        void** slot = g_patched_slots[i].slot;
+        uintptr_t page = reinterpret_cast<uintptr_t>(slot)
+                         & ~((uintptr_t)pagesize - 1);
+        void* pageptr = reinterpret_cast<void*>(page);
+        if (mprotect(pageptr, (size_t)pagesize,
+                     PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
+            *slot = g_patched_slots[i].original;
+            mprotect(pageptr, (size_t)pagesize, PROT_READ | PROT_EXEC);
         }
     }
-    close(dirfd);
+    g_patched_slot_count = 0;
 }
 
 // ------------------------------------------------------------------------
-// 7. Signal and altstack cleanup
+// dlopen hook (Tier B): patch libs the app loads later
 // ------------------------------------------------------------------------
-//
-// Some apps install a SIGSEGV handler and check it's still there
-// after their own setup. If our hooks have disturbed it (we don't
-// currently install any signal handlers, but a module might), the
-// app's check fails.
-//
-// We reset every signal to its default disposition and clear any
-// alternate signal stack. This is the safe thing to do anyway —
-// any handlers we installed during init were for our own benefit,
-// not the app's.
 
-static void reset_signals() {
-    for (int sig = 1; sig <= 31; sig++) {
-        // Skip signals we cannot catch (SIGKILL=9, SIGSTOP=19).
-        if (sig == SIGKILL || sig == SIGSTOP) continue;
-        signal(sig, SIG_DFL);
+// In Tier B the payload stays resident, and apps load their detector
+// .so files via System.loadLibrary AFTER our hide-time walk. The
+// freshly loaded library's GOT is pristine, so its open()/stat()
+// calls bypass every hook. Hooking dlopen/android_dlopen_ext and
+// re-running the walk after each load closes that window.
+using DlopenFn = void* (*)(const char*, int);
+static DlopenFn g_real_dlopen = nullptr;
+
+extern "C" void* zygisk_study_hook_dlopen(const char* path, int flags) {
+    void* h = g_real_dlopen ? g_real_dlopen(path, flags) : nullptr;
+    if (h && hide_advanced_is_active()) {
+        // Re-walk: patches the newly loaded module's GOT (and is
+        // idempotent for everything already patched).
+        dl_iterate_phdr(patch_got_all_for_phdr, nullptr);
     }
-    // Clear any altstack.
-    stack_t ss{};
-    ss.ss_flags = SS_DISABLE;
-    sigaltstack(&ss, nullptr);
+    return h;
+}
+
+// android_dlopen_ext is the variant actually used by
+// System.loadLibrary / libart on Android.
+struct android_dlopen_ext_t;  // opaque
+using AndroidDlopenExtFn =
+    void* (*)(const char*, int, const struct android_dlopen_ext_t*);
+static AndroidDlopenExtFn g_real_android_dlopen_ext = nullptr;
+
+extern "C" void* zygisk_study_hook_android_dlopen_ext(
+        const char* path, int flags,
+        const struct android_dlopen_ext_t* extinfo) {
+    void* h = g_real_android_dlopen_ext
+        ? g_real_android_dlopen_ext(path, flags, extinfo) : nullptr;
+    if (h && hide_advanced_is_active()) {
+        dl_iterate_phdr(patch_got_all_for_phdr, nullptr);
+    }
+    return h;
 }
 
 // ------------------------------------------------------------------------
-// 8. Environment variable cleanup
+// Env scrub
 // ------------------------------------------------------------------------
-//
-// We may have set environment variables during init (e.g., to pass
-// debug flags to ourselves). Clear them. The list below is the
-// complete set of env vars we ever set.
 
-static constexpr const char* kOurEnvVars[] = {
+static const char* const kOurEnvVars[] = {
     "ZYGISK_STUDY_DEBUG",
     "ZYGISK_STUDY_LOG_TAG",
     "ZYGISK_STUDY_WORKDIR",
@@ -1353,8 +1293,9 @@ static void scrub_env() {
 }
 
 // ------------------------------------------------------------------------
-// Public surface (see hide_advanced.h)
+// Public surface
 // ------------------------------------------------------------------------
+
 
 static std::atomic<int> g_advanced_initialized{0};
 
@@ -1363,33 +1304,98 @@ void hide_advanced_init() {
     if (!g_advanced_initialized.compare_exchange_strong(expected, 1)) {
         return;
     }
-    // P1.60: install ALL of this layer's GOT hooks (open/openat,
-    // stat family, faccessat2/fstatat/statx) in a single
-    // dl_iterate_phdr walk. The hooks themselves check the path
-    // argument and only filter /proc/self/{maps,mounts}* or the
-    // documented Magisk/KernelSU directories.
-    install_all_got_hooks();
+    // Resolve the real libc symbols every hook delegates to. Using
+    // dlsym on libc.so directly (not RTLD_NEXT) because our library
+    // is loaded with RTLD_LOCAL and is not in the global search order.
+    g_real_open     = (OpenFn)zs_resolve_libc("open");
+    g_real_openat   = (OpenAtFn)zs_resolve_libc("openat");
+    g_real_fopen    = (FopenFn)zs_resolve_libc("fopen");
+    g_real_stat     = (StatFn)zs_resolve_libc("stat");
+    g_real_lstat    = (LstatFn)zs_resolve_libc("lstat");
+    g_real_access   = (AccessFn)zs_resolve_libc("access");
+    g_real_faccessat  = (FAccessAtFn)zs_resolve_libc("faccessat");
+    g_real_faccessat2 = (FAccessAt2Fn)zs_resolve_libc("faccessat2");
+    g_real_fstatat    = (FStatAtFn)zs_resolve_libc("fstatat");
+    g_real_statx      = (StatxFn)zs_resolve_libc("statx");
+    g_real_prop_find  = (PropFindFn)zs_resolve_libc("__system_property_find");
+    g_real_prop_get   = (PropGetFn)zs_resolve_libc("__system_property_get");
+    g_real_syscall    = (SyscallFn)zs_resolve_libc("syscall");
+    g_real_dlopen     = (DlopenFn)zs_resolve_libc("dlopen");
+    g_real_android_dlopen_ext = (AndroidDlopenExtFn)zs_resolve_libc(
+        "android_dlopen_ext");
+
+    // Register the Tier B hooks into the DEFERRED registry. They are
+    // promoted and walked only when a hide actually lands on the
+    // fallback tier (hide_advanced_install_tier_b).
+    hide_advanced_register_tier_b_hook("open",
+        (void*)&zygisk_study_hook_open);
+    hide_advanced_register_tier_b_hook("openat",
+        (void*)&zygisk_study_hook_openat);
+    hide_advanced_register_tier_b_hook("__open_2",
+        (void*)&zygisk_study_hook___open_2);
+    hide_advanced_register_tier_b_hook("__openat_2",
+        (void*)&zygisk_study_hook___openat_2);
+    hide_advanced_register_tier_b_hook("fopen",
+        (void*)&zygisk_study_hook_fopen);
+    hide_advanced_register_tier_b_hook("stat",
+        (void*)&zygisk_study_hook_stat);
+    hide_advanced_register_tier_b_hook("lstat",
+        (void*)&zygisk_study_hook_lstat);
+    hide_advanced_register_tier_b_hook("access",
+        (void*)&zygisk_study_hook_access);
+    hide_advanced_register_tier_b_hook("faccessat",
+        (void*)&zygisk_study_hook_faccessat);
+    hide_advanced_register_tier_b_hook("faccessat2",
+        (void*)&zygisk_study_hook_faccessat2);
+    hide_advanced_register_tier_b_hook("fstatat",
+        (void*)&zygisk_study_hook_fstatat);
+    hide_advanced_register_tier_b_hook("fstatat64",
+        (void*)&zygisk_study_hook_fstatat);
+    hide_advanced_register_tier_b_hook("__fstatat",
+        (void*)&zygisk_study_hook_fstatat);
+    hide_advanced_register_tier_b_hook("statx",
+        (void*)&zygisk_study_hook_statx);
+    hide_advanced_register_tier_b_hook("__system_property_find",
+        (void*)&zygisk_study_hook_prop_find);
+    hide_advanced_register_tier_b_hook("__system_property_get",
+        (void*)&zygisk_study_hook_prop_get);
+    hide_advanced_register_tier_b_hook("syscall",
+        (void*)&zygisk_study_hook_syscall);
+    hide_advanced_register_tier_b_hook("dlopen",
+        (void*)&zygisk_study_hook_dlopen);
+    hide_advanced_register_tier_b_hook("android_dlopen_ext",
+        (void*)&zygisk_study_hook_android_dlopen_ext);
 }
 
-void hide_advanced_apply_pre_fork() {
-    // Pre-fork, we don't do anything advanced — the basic hide
-    // layer's hide_setup_for_target already decided whether to
-    // hide, and we just need to be ready for post-fork.
+void hide_advanced_install_tier_b() {
+    // Promote every deferred hook into the live registry, flip the
+    // per-process gate, then run the single walk. This runs in the
+    // forked child we are hiding — no other process is affected.
+    for (size_t i = 0; i < g_tier_b_hook_count; ++i) {
+        hide_advanced_register_got_hook(g_tier_b_hooks[i].name,
+                                        g_tier_b_hooks[i].fn);
+    }
+    hide_advanced_set_active(1);
+    hide_advanced_install_got_hooks();
 }
 
 void hide_advanced_apply_post_fork(const char* /*package_name*/) {
-    // Order matters here. We do these AFTER the basic hide layer
-    // (which does unmount + scrub props + munmap our .so) so:
-    //   - the property-area clone sees a maps file that already
-    //     has our entries removed
-    //   - the fd cleanup runs after our munmap, so the munmap'd
-    //     fd state is consistent
-    //   - the signal/env cleanup runs after our fork hook is done
-    //     running, so any module-installed handlers are dropped.
-
+    // Order (both tiers):
+    //   1. Property clone + spoof — see clone_property_area_private
+    //      for why this must preserve content.
+    //   2. Close OUR fds (tracked) — never the runtime's.
+    //   3. Env scrub.
+    //
+    // REMOVED in Round 7:
+    //   - reset_signals(): ART installs the SIGSEGV/SIGBUS handlers for
+    //     implicit null checks and stack-overflow detection in the
+    //     zygote BEFORE forking. Resetting to SIG_DFL in the child
+    //     turned every NullPointerException and every deep recursion
+    //     into a hard crash. Nothing we install ever sets handlers,
+    //     so there is nothing to reset anyway.
+    //   - close_unknown_fds(): see close_tracked_fds().
     clone_property_area_private();
-    close_unknown_fds();
-    reset_signals();
+    close_tracked_fds();
     scrub_env();
 }
 

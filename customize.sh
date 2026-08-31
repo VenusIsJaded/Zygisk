@@ -71,6 +71,23 @@ ui_print "- Native artifacts present"
 chmod 0755 "$DAEMON_BIN"
 chmod 0644 "$LIBZYGISK" "$LIBPAYLOAD" "$LIBLOADER"
 
+# Round 7: systemless /system layout. Magisk magic-mounts
+# $MODPATH/system over /system, so placing the two libraries here
+# makes them appear at /system/lib[64]/libzygisk.so — the path
+# ro.dalvik.vm.native.bridge must name for ART to dlopen them.
+# (Before Round 7 the property swap was entirely stubbed: nothing
+# ever put libzygisk.so where ART could load it.)
+if [ "$IS64BIT" = "true" ]; then
+  SYS_LIB_DIR="$MODPATH/system/lib64"
+else
+  SYS_LIB_DIR="$MODPATH/system/lib"
+fi
+mkdir -p "$SYS_LIB_DIR"
+cp "$LIBZYGISK"  "$SYS_LIB_DIR/libzygisk.so"
+cp "$LIBPAYLOAD" "$SYS_LIB_DIR/libpayload.so"
+chmod 0644 "$SYS_LIB_DIR/libzygisk.so" "$SYS_LIB_DIR/libpayload.so"
+ui_print "- Systemless bridge layout at $SYS_LIB_DIR"
+
 # Pick the right libzygisk.so for the system property trick (see
 # service.sh). Magisk's standard pattern is to swap ro.dalvik.vm.native.bridge
 # to point at libzygisk.so on platforms where that property is honored.

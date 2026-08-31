@@ -362,6 +362,103 @@ scudo configuration, page-cache behavior, etc.).
   `execve("/system/bin/su")` and regain root.
 - **Android-realism confidence: HIGH.**
 
+
+## Round 7 — what changed and why (the audit pass)
+
+Round 7 re-audited every claim in this file against the code. Three
+entries turned out to be wrong in ways the host tests structurally
+could not catch. This section supersedes them.
+
+### T1.10 (direct in-memory property scrub) — SUPERSEDED, was UNSAFE
+
+The claim "HIGH confidence, guaranteed by construction" was wrong.
+The implementation wrote to the shared property pages, which are
+mapped PROT_READ (crash) and MAP_SHARED (a write would have been
+visible system-wide — a stealth regression, not an improvement). It
+also emptied values instead of spoofing stock ones, and empty
+`ro.boot.verifiedbootstate` does not occur on any stock device.
+
+Replacement: a **content-preserving per-process clone** — save the
+mapping's bytes, mmap MAP_FIXED|ANONYMOUS over the range, copy the
+bytes back, then patch the spoof values through bionic's own
+`__system_property_find` (the trie pointers still resolve; the
+replaced mapping keeps every address) using the serial protocol so
+concurrent readers never see torn values. Boot-state keys get stock
+values ("green"/"locked"/"enforcing"); framework-specific keys are
+reported absent (Tier B's find/get hooks return "not found"; Tier A
+leaves them empty, which Java cannot distinguish from absent).
+
+### T1.7 (unmap_self) — SUPERSEDED by the Tier A trampoline
+
+The fast path was fine; the slow path munmap()ed the segment it was
+executing from. The fix is architectural (see
+native/libpayload/src/unmap_trampoline.h): every hook installs through
+a hand-written asm wrapper that saves the caller's callee-saved
+registers at a fixed frame layout; when the pipeline decides to
+vanish, a position-independent blob on a private executable page
+munmaps every record with raw syscalls, restores the wrapper's frame,
+and jumps to the wrapper's original caller with the real call's
+return value. No libpayload instruction executes after the munmaps.
+
+The e2e test now builds the real sources into an actual
+`libpayload.so`, dlopen()s it, and drives the real wrapper — the
+record set is real, the maps really contain the library, and the
+child must both survive AND come back with `libpayload` absent from
+its maps. (The first version of the x86_64 blob restored the
+callee-saved registers from the wrong stack slots — every register
+came back shifted by one — and only this test caught it. That is
+exactly the class of bug "static analysis positive, device
+negative" this document exists to flag.)
+
+### Hook installation moved from zygote init to hide time
+
+The old model installed the open/stat filtering hooks in the zygote
+and inherited them into every process — system_server included. The
+new model: the zygote carries ONLY the four privilege-drop hooks (a
+pid comparison and a set lookup on the non-hidden fast path); the
+filtering hooks are deferred and installed exclusively inside a child
+we are actually hiding. Every other process on the device executes
+zero hooked calls and reads true /proc content.
+
+### New Tier A / Tier B model
+
+- **Tier A (arm64, x86_64):** unmount (still root) → property clone
+  with stock spoofed values → close tracked fds → munmap module
+  .so files → restore every patched GOT slot → asm trampoline unmaps
+  libpayload/libzygisk/libzn_loader and returns to the runtime. The
+  hidden app then holds nothing: no mounts, no libs, no hooks, no
+  fds, plausible props. Raw-syscall /proc readers see a clean process
+  because the process IS clean.
+- **Tier B (32-bit fallback):** the payload stays resident and hides
+  functionally: filtered /proc reads (self, thread-self AND
+  /proc/<pid> forms), fopen + FORTIFY variant hooks, stat family
+  ENOENT for root paths, readlink rewrites, property find/get
+  "absent" reports, the raw syscall() wrapper, and dlopen
+  re-patching for libraries loaded after the hide. Gated by a
+  per-process flag; a single relaxed atomic load when inactive.
+
+### Verified in this sandbox (Round 7)
+
+- 70 host tests, all passing, including the real-dlopen trampoline
+  e2e (survival + complete self-unmap + correct return value relay)
+  and the content-preservation test for the property clone.
+- The x86_64 blob is verified by disassembly (offsets 512/520/528
+  match the C data area; the restore maps every stack slot to the
+  register the wrapper saved there).
+- The aarch64 blob follows the identical design but could not be
+  assembled here (no cross toolchain); it is written against the same
+  verified layout constants and needs an on-device (or cross-arch
+  CI) run for the same level of proof.
+
+### Still needs a device
+
+Everything the sandbox cannot prove: the fork-latency deltas, the
+SELinux behavior of the RWX trampoline page on untrusted_app domains
+(execmem is expected to be allowed — apps JIT — but that is
+policy-dependent), the linker's tolerance of the dangling soinfo
+entries, and the real zygote's specialization order (setresgid →
+setresuid assumption) across OEM forks.
+
 ## Summary table
 
 | # | Optimization | Tier | Confidence | Magnitude on Android |

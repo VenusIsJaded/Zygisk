@@ -30,6 +30,10 @@
 #include "test_framework.h"
 
 // Pull in the production source directly so we can test its internals.
+// hide_stealth.cpp now registers its readlink hooks through the shared
+// GOT registry and the per-process active gate in hide_advanced.cpp,
+// so pull that in too.
+#include "../native/libpayload/src/hide_advanced.cpp"
 #include "../native/libpayload/src/hide_stealth.cpp"
 
 #include <cstdio>
@@ -73,11 +77,11 @@ ZS_TEST(rewrite_if_suspicious_rewrites_magisk_path) {
     size_t in_len = strlen(input);
     memcpy(buf, input, in_len);
 
-    ssize_t n = rewrite_if_suspicious(buf, sizeof buf, (ssize_t)in_len);
+    ssize_t n = rewrite_if_suspicious(buf, sizeof buf, (ssize_t)in_len, 0);
     ZS_CHECK(n > 0);
     // The result should be the stock path.
-    ZS_CHECK_EQ(strncmp(buf, kStockExePath, strlen(kStockExePath)), 0);
-    ZS_CHECK_EQ(n, (ssize_t)strlen(kStockExePath));
+    ZS_CHECK_EQ(strncmp(buf, stock_exe_path(), strlen(stock_exe_path())), 0);
+    ZS_CHECK_EQ(n, (ssize_t)strlen(stock_exe_path()));
 }
 
 // ----------------------------------------------------------------------
@@ -91,7 +95,7 @@ ZS_TEST(rewrite_if_suspicious_preserves_stock_path) {
     size_t in_len = strlen(input);
     memcpy(buf, input, in_len);
 
-    ssize_t n = rewrite_if_suspicious(buf, sizeof buf, (ssize_t)in_len);
+    ssize_t n = rewrite_if_suspicious(buf, sizeof buf, (ssize_t)in_len, 0);
     // Length should be unchanged.
     ZS_CHECK_EQ(n, (ssize_t)in_len);
     // Content should be unchanged.
@@ -109,10 +113,10 @@ ZS_TEST(rewrite_if_suspicious_rewrites_zygisk_path) {
     size_t in_len = strlen(input);
     memcpy(buf, input, in_len);
 
-    ssize_t n = rewrite_if_suspicious(buf, sizeof buf, (ssize_t)in_len);
+    ssize_t n = rewrite_if_suspicious(buf, sizeof buf, (ssize_t)in_len, 0);
     ZS_CHECK(n > 0);
-    ZS_CHECK_EQ(strncmp(buf, kStockExePath, strlen(kStockExePath)), 0);
-    ZS_CHECK_EQ(n, (ssize_t)strlen(kStockExePath));
+    ZS_CHECK_EQ(strncmp(buf, stock_exe_path(), strlen(stock_exe_path())), 0);
+    ZS_CHECK_EQ(n, (ssize_t)strlen(stock_exe_path()));
 }
 
 // ----------------------------------------------------------------------
@@ -124,7 +128,7 @@ ZS_TEST(rewrite_if_suspicious_handles_tiny_buffer) {
     char buf[1];
     buf[0] = 'x';
     // Real n = 0 (no content); should return 0.
-    ssize_t n = rewrite_if_suspicious(buf, 1, 0);
+    ssize_t n = rewrite_if_suspicious(buf, 1, 0, 0);
     ZS_CHECK_EQ(n, (ssize_t)0);
 }
 
@@ -281,22 +285,25 @@ ZS_TEST(rewrite_if_suspicious_covers_fd_targets) {
     const char* sock_target = "/data/system/zygisk_study/sock/sock";
     size_t sock_len = strlen(sock_target);
     memcpy(buf, sock_target, sock_len);
-    ssize_t n = rewrite_if_suspicious(buf, sizeof buf, (ssize_t)sock_len);
-    ZS_CHECK_EQ(n, (ssize_t)strlen(kStockExePath));
-    ZS_CHECK_EQ(strncmp(buf, kStockExePath, strlen(kStockExePath)), 0);
+    // Round 7: fd targets rewrite to /dev/null — an fd symlink
+    // resolving to the app_process path would be nonsense and itself
+    // a probe signal.
+    ssize_t n = rewrite_if_suspicious(buf, sizeof buf, (ssize_t)sock_len, 1);
+    ZS_CHECK_EQ(n, (ssize_t)strlen("/dev/null"));
+    ZS_CHECK_EQ(strncmp(buf, "/dev/null", strlen("/dev/null")), 0);
 
     // A magisk-binary fd target.
     const char* magisk_target = "/sbin/magisk";
     size_t magisk_len = strlen(magisk_target);
     memcpy(buf, magisk_target, magisk_len);
-    n = rewrite_if_suspicious(buf, sizeof buf, (ssize_t)magisk_len);
-    ZS_CHECK_EQ(n, (ssize_t)strlen(kStockExePath));
+    n = rewrite_if_suspicious(buf, sizeof buf, (ssize_t)magisk_len, 1);
+    ZS_CHECK_EQ(n, (ssize_t)strlen("/dev/null"));
 
     // An innocent fd target (a normal app file) must pass through.
     const char* innocent = "/data/data/com.example.app/cache/file";
     size_t innocent_len = strlen(innocent);
     memcpy(buf, innocent, innocent_len);
-    n = rewrite_if_suspicious(buf, sizeof buf, (ssize_t)innocent_len);
+    n = rewrite_if_suspicious(buf, sizeof buf, (ssize_t)innocent_len, 1);
     ZS_CHECK_EQ(n, (ssize_t)innocent_len);
     ZS_CHECK_EQ(strncmp(buf, innocent, innocent_len), 0);
 }

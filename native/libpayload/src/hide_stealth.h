@@ -22,4 +22,12 @@ namespace zygisk_study {
 void hide_stealth_init();
 void hide_stealth_apply_post_fork(const char* package_name);
 
+// Exposed for unit tests only — NOT called by the shipped pipeline.
+// See hide_stealth.cpp's header comment for why each was removed
+// (each one made the child LESS stock-looking, not more).
+void set_pdeathsig_if_safe();
+void set_dumpable_zero();
+void set_no_new_privs();
+void disable_core_dumps();
+
 } // namespace zygisk_study

@@ -4,50 +4,120 @@
 // Advanced runtime stealth layer — additional hiding techniques
 // layered on top of the basic hide layer in hide.h.
 //
-// The basic layer (hide.cpp) does three things:
-//   1. unshare(CLONE_NEWNS) + umount2(/data/adb/...)
-//   2. __system_property_set(magisk_keys, "")
-//   3. munmap(our_own_so_files)
+// ROUND 7 ARCHITECTURE NOTE — two hide tiers:
 //
-// The advanced layer (hide_advanced.cpp) does four more things, all
-// of which are publicly-documented Android rooting techniques:
+//   Tier A ("physical hide", primary on arm64/x86_64):
+//     For denylisted targets we remove ourselves *physically*:
+//       unmount (private mount ns) → per-process property clone with
+//       spoofed values → close our fds → munmap every module .so →
+//       restore every GOT slot we patched → finally munmap our own
+//       .so files from an asm trampoline that never executes another
+//       byte of libpayload code. After Tier A the process is
+//       byte-for-byte stock: no hooks, no libs, no fds, no mounts.
+//     With nothing resident, the open/stat/readlink filtering hooks
+//     are NOT needed — there is nothing left to filter out of
+//     /proc/self/maps. (Installing them and then unmapping ourselves
+//     would leave dangling GOT entries and crash the app on its next
+//     open() call — the exact failure mode the pre-Round-7 code had
+//     in miniature.)
 //
-//   4. Clone the property area MAP_PRIVATE so a direct
-//      __system_property_get() (or a direct mmap of
-//      /dev/__properties__/...) returns scrubbed values, not just
-//      the __system_property_set() view.
+//   Tier B ("hook hide", fallback — 32-bit devices, or a missing
+//     self-unmap record set):
+//     When the trampoline is unavailable we keep libpayload mapped
+//     and hide *functionally*: GOT hooks on open/openat/stat-family/
+//     fopen/dlopen/readlink/__system_property_* redirect /proc reads
+//     to filtered memfd copies. The hooks are installed at hide time
+//     (in the forked child) — NOT in the zygote — so every other
+//     process on the system, including system_server, runs 100%
+//     unhooked.
 //
-//   5. Hook libc open()/openat() via PLT/GOT patching so reads of
-//      /proc/self/maps and /proc/self/mounts return a filtered
-//      version with our entries removed. Defeats the standard
-//      "read /proc/self/maps and grep for lib*.so" detection.
+// Public surface:
 //
-//   6. After fork, scrub our file descriptors and any environment
-//      variables we set during init. Defeats the "check open fds"
-//      and "check env" detection.
-//
-//   7. Reset all signal handlers to default and clear any
-//      alternate signal stacks. Defeats the "install a SIGSEGV
-//      handler and check it's still there" detection.
-//
-// All seven together is what one would call "the Magisk +
-// Shamiko + DenyList + a bit of extra paranoia" surface. Every
-// piece here is documented in either the Magisk guide, the
-// Shamiko README, or in public Android security research writeups.
-//
-// Public surface (called from entry.cpp at the right times):
-//
-//   hide_advanced_init()                — call once at payload init
-//   hide_advanced_apply_pre_fork()     — call from pre-fork path
-//   hide_advanced_apply_post_fork()    — call from post-fork path,
-//                                         AFTER the basic hide_apply_for_target()
+//   hide_advanced_init()               — register this layer's hooks
+//   hide_advanced_register_got_hook()  — registry used by entry.cpp
+//                                        (fork/setresuid family) and
+//                                        hide_stealth (readlink)
+//   hide_advanced_install_got_hooks()  — the ONE dl_iterate_phdr walk
+//   hide_advanced_uninstall_got_hooks()— restore every patched slot
+//   hide_advanced_set_active()         — per-process gate for Tier B
+//   hide_advanced_track_fd()           — fds we own; closed on hide
 
 #pragma once
 
+#include <cstddef>
+
 namespace zygisk_study {
 
+// Register hook `fn` as the GOT replacement for libc symbol `name`.
+// Returns 1 on success, 0 if the table is full or args are bad.
+// Call BEFORE hide_advanced_install_got_hooks(). The registry is
+// written only during payload init (zygote, single-threaded) and read
+// afterwards — no locking needed.
+int  hide_advanced_register_got_hook(const char* name, void* fn);
+
+// Deferred (Tier B) registration: promoted into the live registry
+// only by hide_advanced_install_tier_b(), i.e. only inside a forked
+// child we are actually hiding. Everything registered here stays
+// completely absent from every other process on the device.
+int  hide_advanced_register_tier_b_hook(const char* name, void* fn);
+
+// Run the single merged dl_iterate_phdr walk that patches every
+// registered symbol's GOT slot in every loaded module (except our
+// own three .so files). Records each patched slot so
+// hide_advanced_uninstall_got_hooks() can restore the originals.
+void hide_advanced_install_got_hooks();
+
+// Restore every GOT slot patched by hide_advanced_install_got_hooks()
+// to its original value. MUST run before the self-unmap trampoline —
+// a patched slot pointing into unmapped memory is a guaranteed crash
+// on the app's next call.
+void hide_advanced_uninstall_got_hooks();
+
+// Per-process activation gate for the Tier B hooks. Set to 1 in the
+// forked child we are hiding; the hooks then actually filter. Every
+// other process (zygote, system_server, normal apps) sees a pure
+// passthrough (one relaxed atomic load).
+void hide_advanced_set_active(int active);
+int  hide_advanced_is_active();
+
+// Register an fd opened by us (e.g. the daemon socket) so the hide
+// pipeline closes exactly those — and nothing else. The old
+// close-everything behavior destroyed GPU/graphics descriptors
+// inherited from the zygote.
+void hide_advanced_track_fd(int fd);
+
+// One-time init: resolve real libc symbols and register this layer's
+// Tier B hooks into the registry. Does NOT walk yet.
 void hide_advanced_init();
-void hide_advanced_apply_pre_fork();
+
+// Install the Tier B hook set NOW (at hide time, in the child) and
+// set the active gate. Used only on the fallback tier.
+void hide_advanced_install_tier_b();
+
+// Post-fork actions common to both tiers:
+//   - property-area clone (content-preserving!) + value spoofing
+//   - tracked-fd close
+//   - env scrub
+// The signal reset and the close-all-fds steps from earlier rounds
+// are GONE: resetting signals wiped ART's SIGSEGV handler (every
+// NullPointerException then crashed the app), and closing all fds
+// killed the GPU driver fds every app inherits from the zygote.
 void hide_advanced_apply_post_fork(const char* package_name);
+
+// Spoof table entry (definition lives in hide_advanced.cpp).
+struct ZsPropSpoof {
+    const char* key;
+    const char* value;   // nullptr = pretend the key does not exist
+};
+
+// Accessor for tests: the full spoof table.
+const ZsPropSpoof* zs_prop_spoof_table(size_t* count);
+
+// Tier-B-only: is `path` one of the /proc files we filter? Matches
+// the /proc/self/<f>, /proc/thread-self/<f> and /proc/<pid>/<f>
+// forms (most real detectors use their own numeric pid — the
+// pre-Round-7 code only matched the literal "/proc/self/..." string,
+// which every pid-based probe trivially bypassed).
+int zs_path_is_filtered(const char* path);
 
 } // namespace zygisk_study

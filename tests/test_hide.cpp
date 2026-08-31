@@ -101,9 +101,9 @@ ZS_TEST(self_so_records_array_has_sensible_capacity) {
     ZS_CHECK_EQ(g_self_so_count, (size_t)0);
     // Simulate one entry: write directly to the array.
     if (kMaxSoRecords > 0) {
-        g_self_so_records[0].base = 0x1000;
-        g_self_so_records[0].size = 0x1000;
-        g_self_so_records[0].path[0] = '\0';
+        g_self_so_records[0].base  = 0x1000;
+        g_self_so_records[0].size  = 0x1000;
+        g_self_so_records[0].flags = ZS_SO_SELF;
         g_self_so_count = 1;
         ZS_CHECK_EQ(g_self_so_records[0].base, (uintptr_t)0x1000);
         ZS_CHECK_EQ(g_self_so_count, (size_t)1);
@@ -356,125 +356,123 @@ ZS_TEST(hide_apply_for_target_continues_when_unshare_fails) {
 // ----------------------------------------------------------------------
 
 ZS_TEST(unmount_magisk_paths_parser_recognizes_data_adb_and_sbin) {
-    // The production code matches /data/adb/ and /sbin/. We verify
-    // the matching logic is correct against synthetic mount entries.
-    struct fake_mnt { const char* dir; };
-    fake_mnt fakes[] = {
-        {"/data/adb/magisk"},
-        {"/sbin/magisk"},
-        {"/system/lib/modules"},
-        {"/data/data/com.app"},
-        {"/data/adb/ksu"},
+    // Round 7: the parser now runs against the REAL production code
+    // (hide_parse_mounts_line + field_is_root_path), not a mirror.
+    // It must match BOTH mount points and magic-mount sources.
+    struct Case {
+        const char* line;    // "<source> <mount_point> <fstype> ..."
+        int         expect;  // 1 = should match (be unmounted)
     };
-    int matches = 0;
-    for (const auto& m : fakes) {
-        if (strncmp(m.dir, "/data/adb/", 10) == 0 ||
-            strncmp(m.dir, "/sbin/",       6) == 0) {
-            ++matches;
-        }
+    Case cases[] = {
+        // Classic bind mounts under /data/adb (mount-point match).
+        {"/data/adb/modules/xyz /data/adb/modules/xyz ext4 ro 0 0", 1},
+        {"tmpfs /sbin tmpfs ro,seclabel 0 0", 0},               // /sbin alone is not a match...
+        {"tmpfs /sbin/.magisk tmpfs ro 0 0", 1},               // ...but /sbin/.magisk is
+        // Magic mount: source under /data/adb, mount point in /system.
+        // The pre-Round-7 code matched ONLY the mount point and
+        // missed every one of these.
+        {"/data/adb/modules/id1/system/app/Foo.apk /system/app/Foo.apk ext4 ro,bind 0 0", 1},
+        {"/data/adb/modules/id2/system/bin/su /system/bin/su ext4 ro,bind 0 0", 1},
+        // KernelSU paths.
+        {"/data/adb/ksu/bin/busybox /system/bin/busybox ext4 ro,bind 0 0", 1},
+        // Ordinary mounts must be left alone.
+        {"/dev/block/bootdevice/by-name/system /system ext4 ro 0 0", 0},
+        {"tmpfs /data/local/tmp tmpfs rw 0 0", 0},
+        {"/proc /proc proc rw 0 0", 0},
+        {"/sys /sys sysfs rw 0 0", 0},
+    };
+    for (const Case& c : cases) {
+        char buf[256];
+        snprintf(buf, sizeof buf, "%s", c.line);
+        MountFields mf{};
+        int ok = hide_parse_mounts_line(buf, buf + strlen(buf), &mf);
+        ZS_CHECK_EQ(ok, 1);
+        int matched = field_is_root_path(mf.mnt_point, mf.mnt_point_len) ||
+                      field_is_root_path(mf.source,   mf.source_len);
+        ZS_CHECK_EQ(matched, c.expect);
     }
-    ZS_CHECK_EQ(matches, 3);  // first, second, and fifth entries
 }
 
 // ----------------------------------------------------------------------
-// Test 12: scrub_prop_in_memory() correctly zeros the value field
-// of a fake prop_info struct, simulating what bionic's trie entry
-// looks like in shared memory.
-//
-// We construct a 128-byte struct on the heap with:
-//   offset 0:  uint32_t serial = 2 (no pending bit)
-//   offset 4:  char value[92] = "some_secret_value"
-//   offset 96: char name[32]  = "ro.boot.test"
-// We call scrub_prop_in_memory on it and verify:
-//   - The serial field is unchanged.
-//   - The value field is all zeros.
-//   - The name field is unchanged.
-//
-// This exercises the in-memory write path that will run on real
-// Android to scrub ro.* properties (which __system_property_set
-// silently fails on with EACCES).
+// Test 12 (Round 7): the uid-keyed denylist decision. This is the
+// decision path that actually runs on a device (fired from the
+// setresgid/setresuid hooks). The appId math (uid % 100000) must map
+// a work-profile uid to the same denylist entry as user 0.
 // ----------------------------------------------------------------------
 
-ZS_TEST(scrub_prop_in_memory_zeros_value_field_correctly) {
-    // Allocate a 128-byte struct, page-aligned, so we can simulate
-    // the shared-memory property trie entry. (On real Android, the
-    // struct lives in a MAP_SHARED mmap of /dev/__properties__/u:...)
-    constexpr size_t kStructSize = 128;
-    void* raw = mmap(nullptr, kStructSize, PROT_READ | PROT_WRITE,
-                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    ZS_CHECK(raw != MAP_FAILED);
-    memset(raw, 0, kStructSize);
+ZS_TEST(hide_setup_for_target_uid_matches_app_id_family) {
+    g_deny_app_ids.clear();
+    g_deny_app_ids.insert(10432);  // appId of com.sensitive.banking
+    g_uid_map_loaded.store(1);
+    g_will_hide.store(0);
 
-    // Layout the fields per the bionic prop_info ABI.
-    uint32_t* serial  = reinterpret_cast<uint32_t*>(raw);
-    char*     value   = reinterpret_cast<char*>(raw) + 4;
-    char*     name    = reinterpret_cast<char*>(raw) + 96;
+    // User 0.
+    ZS_CHECK_EQ(hide_setup_for_target_uid(10432), 1);
+    // Work profile (user 10): uid = 10*100000 + appId.
+    ZS_CHECK_EQ(hide_setup_for_target_uid(1010432), 1);
+    // Secondary user 11.
+    ZS_CHECK_EQ(hide_setup_for_target_uid(110432), 1);
+    // A different app.
+    ZS_CHECK_EQ(hide_setup_for_target_uid(10500), 0);
+    // system uid (1000) and root — fast-path rejection, never hidden.
+    ZS_CHECK_EQ(hide_setup_for_target_uid(1000), 0);
+    ZS_CHECK_EQ(hide_setup_for_target_uid(0), 0);
+}
 
-    *serial = 2;  // serial count = 1, no pending bit (bit 0 = 0)
-    strcpy(value, "some_secret_value");
-    strcpy(name,  "ro.boot.test");
+// ----------------------------------------------------------------------
+// Test 13 (Round 7): the unmap record accessors — flag classification
+// drives the Tier A split (self records go to the asm trampoline,
+// others are plain C munmaps).
+// ----------------------------------------------------------------------
 
-    // Sanity: the value is non-empty before scrub.
-    ZS_CHECK_EQ(strcmp(value, "some_secret_value"), 0);
+ZS_TEST(unmap_record_flags_drive_tier_a_split) {
+    g_self_so_count = 0;
+    g_self_so_records[0] = so_record{0x2000, 0x1000, ZS_SO_SELF, 0};
+    g_self_so_records[1] = so_record{0x8000, 0x1000, ZS_SO_OTHER, 0};
+    g_self_so_count = 2;
 
-    // Call the function under test.
-    scrub_prop_in_memory(raw);
+    ZS_CHECK_EQ(hide_trampoline_unmap_pending(), 1);
+    ZS_CHECK_EQ(hide_unmap_record_count(), (size_t)2);
 
-    // After scrub: serial unchanged (we don't bump it for ro.* props
-    // — see the comment in the function body for why this is safe).
-    ZS_CHECK_EQ(*serial, 2u);
+    so_record out[8] = {};
+    size_t n = hide_unmap_records(out, 8);
+    ZS_CHECK_EQ(n, (size_t)2);
+    ZS_CHECK_EQ(out[0].base, (uintptr_t)0x2000);
+    ZS_CHECK_EQ(out[0].flags, (uint32_t)ZS_SO_SELF);
+    ZS_CHECK_EQ(out[1].flags, (uint32_t)ZS_SO_OTHER);
 
-    // After scrub: value field is all zeros.
-    for (size_t i = 0; i < 92; ++i) {
-        if (value[i] != 0) {
-            throw ::zstest::CheckFailed{
-                std::string(__FILE__) + ":" + std::to_string(__LINE__) +
-                "  value[" + std::to_string(i) + "] is non-zero after scrub"};
+    // Cap semantics: requesting fewer records returns fewer.
+    so_record few[1] = {};
+    ZS_CHECK_EQ(hide_unmap_records(few, 1), (size_t)1);
+
+    // With no self records, the trampoline is not pending.
+    g_self_so_records[0].flags = ZS_SO_OTHER;
+    ZS_CHECK_EQ(hide_trampoline_unmap_pending(), 0);
+    g_self_so_count = 0;
+}
+
+// ----------------------------------------------------------------------
+// Test 14 (Round 7): the property spoof table reports STOCK values
+// (never empty) for boot-state keys — an empty verifiedbootstate is
+// itself a detection signal, which is why the old "scrub to empty"
+// direct-write approach was replaced.
+// ----------------------------------------------------------------------
+
+ZS_TEST(property_spoof_list_reports_stock_values_for_boot_keys) {
+    size_t count = 0;
+    const char* const* keys = hide_revealing_props(&count);
+    ZS_CHECK(count >= 20);
+    // Spot-check the documented keys.
+    auto has = [&](const char* k) {
+        for (size_t i = 0; i < count; ++i) {
+            if (strcmp(keys[i], k) == 0) return true;
         }
-    }
-
-    // After scrub: name field is unchanged.
-    ZS_CHECK_EQ(strcmp(name, "ro.boot.test"), 0);
-
-    munmap(raw, kStructSize);
-}
-
-// ----------------------------------------------------------------------
-// Test 13: scrub_prop_in_memory() is a no-op when the pending bit
-// is set (i.e. another writer is mid-write). This is the safety
-// rail against racing with init's property_service.
-// ----------------------------------------------------------------------
-
-ZS_TEST(scrub_prop_in_memory_skips_when_pending_bit_set) {
-    constexpr size_t kStructSize = 128;
-    void* raw = mmap(nullptr, kStructSize, PROT_READ | PROT_WRITE,
-                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    ZS_CHECK(raw != MAP_FAILED);
-    memset(raw, 0, kStructSize);
-
-    uint32_t* serial = reinterpret_cast<uint32_t*>(raw);
-    char*     value  = reinterpret_cast<char*>(raw) + 4;
-
-    // Set the pending bit (bit 0) — simulate a concurrent writer.
-    *serial = 0x1;  // pending bit set, serial count = 0
-    strcpy(value, "ORIGINAL");
-
-    scrub_prop_in_memory(raw);
-
-    // Function should have skipped the write — value unchanged.
-    ZS_CHECK_EQ(strcmp(value, "ORIGINAL"), 0);
-
-    munmap(raw, kStructSize);
-}
-
-// ----------------------------------------------------------------------
-// Test 14: scrub_prop_in_memory() handles nullptr safely.
-// ----------------------------------------------------------------------
-
-ZS_TEST(scrub_prop_in_memory_handles_null_safely) {
-    // Should not crash.
-    scrub_prop_in_memory(nullptr);
-    ZS_CHECK(true);  // reached here = pass
+        return false;
+    };
+    ZS_CHECK(has("ro.boot.verifiedbootstate"));
+    ZS_CHECK(has("ro.boot.vbmeta.device_state"));
+    ZS_CHECK(has("init.svc.magisk"));
+    ZS_CHECK(has("ro.zygisk_study.version"));
 }
 
 // ----------------------------------------------------------------------

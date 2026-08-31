@@ -1,44 +1,13 @@
-# SPDX-License-Identifier: Apache-2.0
-# .gitignore — keep the repo free of build artifacts.
-#
-# This project ships source-only. No pre-built .so / .bin / .zip
-# files belong in the repo (see README.md "No binaries" guarantee).
-
-# Native build outputs (CMake + Ninja/Make)
-build/
-out/
-*.o
-*.obj
-*.so
-*.dylib
-*.a
-*.lib
-
-# Daemon build outputs (Cargo)
-native/zygiskd/target/
-target/
-
-# Test binaries (host-side unit tests)
+# Build artifacts (host tests + local builds)
 tests/test_hide
 tests/test_hide_advanced
 tests/test_hide_stealth
 tests/test_e2e_hide
 tests/test_perf
-tests/*.dSYM/
-tests/*.pdb
-
-# Editor / IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-.DS_Store
-
-# Logs
-*.log
-worklog.md.bak
-
-# Packaged module zip (do not commit a built module)
-zygisk_study-*.zip
-*.magisk
+tests/test_unmap_trampoline
+tests/libpayload.so
+tests/*.orig
+build/
+target/
+*.o
+*.so.tmp

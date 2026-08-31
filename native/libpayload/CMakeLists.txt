@@ -9,23 +9,34 @@
 #   - zygisk_study_payload_post_fork  (called by our fork hook)
 # Everything else is hidden.
 #
-# Dependencies:
-#   - libdl   (for dlopen of third-party module .so files)
-#   - liblog  (for ZS_LOG* macros)
-#
-# We deliberately do NOT link against libbinder, libcutils, libutils,
-# or anything else from Android's framework layer. Everything we need
-# (syscalls, libc functions) is in libc.so, which is already loaded
-# in every process we end up in.
+# Round 7: the build now includes the per-architecture self-unmap
+# trampoline (asm wrappers + the PIC blob). arm64-v8a and x86_64 get
+# the full Tier A "vanish" path; other ABIs fall back to the Tier B
+# hook-based hiding at runtime (zs_trampoline_supported() == 0).
 
 cmake_minimum_required(VERSION 3.18)
 
-add_library(payload SHARED
+set(PAYLOAD_SOURCES
     src/entry.cpp
     src/hide.cpp
     src/hide_advanced.cpp
     src/hide_stealth.cpp
 )
+
+# The trampoline blob is per-arch. The NDK's ANDROID_ABI (or a plain
+# CMAKE_SYSTEM_PROCESSOR on host builds) selects the file.
+if(ANDROID_ABI STREQUAL "arm64-v8a" OR CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
+    list(APPEND PAYLOAD_SOURCES src/unmap_trampoline_aarch64.S)
+    message(STATUS "payload: aarch64 trampoline enabled (Tier A)")
+elseif(ANDROID_ABI STREQUAL "x86_64" OR ANDROID_ABI STREQUAL "x86_64-v7a" OR CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64|AMD64)")
+    list(APPEND PAYLOAD_SOURCES src/unmap_trampoline_x86_64.S)
+    message(STATUS "payload: x86_64 trampoline enabled (Tier A)")
+else()
+    message(WARNING "payload: no trampoline for ABI '${ANDROID_ABI}' — "
+                    "runtime falls back to Tier B (hook-based hiding)")
+endif()
+
+add_library(payload SHARED ${PAYLOAD_SOURCES})
 
 set_target_properties(payload PROPERTIES
     OUTPUT_NAME payload

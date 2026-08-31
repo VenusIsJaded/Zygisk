@@ -738,6 +738,115 @@ Android:
   the fd number was reused). Both hooks now return -1/EBADF.
   Covered by `wrapped_open_returns_valid_fd_for_filtered_path`.
 
+
+## ROUND 7 — corrections, crash fixes, and the Tier A architecture
+
+Round 7 was a full audit pass. Its most important result is a set of
+CORRECTIONS to earlier rounds of this ledger: several items previously
+marked HIGH-confidence were, on closer reading, guaranteed failures on
+real Android that host testing could not see. The honest ledger has to
+record those too.
+
+### ❌ RETRACTED / CORRECTED claims from earlier rounds
+
+- **T1.10 "Direct in-memory property scrub (HIGH confidence)" —
+  RETRACTED.** The implementation memset() the prop_info value field
+  inside the MAP_SHARED, PROT_READ property pages with no mprotect.
+  On a real device that is (a) a SIGSEGV, since the mapping is
+  read-only, and (b) had it worked, a *system-wide* visible change —
+  the opposite of per-process stealth. It never crashed on the host
+  because glibc has no `__system_property_find`, so the path was dead
+  code there. Replaced by the content-preserving per-process clone
+  (see below).
+- **"unmap_self early-returns if the snapshot is empty" (T1.7) — the
+  fast path was fine, but the slow path was a guaranteed SIGSEGV** on
+  device: the loop munmap()ed the r-xp segment the loop itself was
+  executing from, then continued executing it. Host tests passed
+  because the e2e test deliberately zeroed the record set. Fixed by
+  the asm trampoline (below); the e2e test now dlopen()s a real
+  libpayload.so and proves the unmap end-to-end.
+- **"clone_property_area_private creates a private copy" — it created
+  a private *zero-filled* mapping.** mmap(MAP_FIXED|MAP_ANONYMOUS)
+  does not copy the previous mapping's content; every subsequent
+  `__system_property_get` in the app walked a zeroed trie. Fixed:
+  save the bytes, remap, copy them back, then patch spoofed values
+  with bionic's serial protocol.
+- **reset_signals() / close_unknown_fds() — both harmful, both
+  removed from the pipeline.** Resetting signals wiped the SIGSEGV
+  handler ART installs in the zygote (implicit null checks — every
+  NullPointerException would have crashed the app); closing every
+  fd >= 3 killed the GPU/graphics descriptors every app inherits
+  from the zygote (black screens). "Works on host" because the host
+  child only ever held stdio + a pipe.
+
+### ✅ Round 7 — HIGH-confidence wins
+
+- **Tier A "vanish" path (aarch64 + x86_64).** For denylisted
+  targets the payload now: unmounts (private ns, while still root) →
+  clones + spoofs the property area per-process → closes exactly the
+  fds it opened → munmaps every loaded module .so → restores every
+  GOT slot it ever patched → finally munmaps its own segments from a
+  hand-written asm trampoline that restores the hook wrapper's
+  register frame and returns the real call's value to
+  libandroid_runtime. After Tier A the process is byte-for-byte
+  stock: no hooks, no libs, no fds, no mounts. This subsumes most of
+  the Tier B filtering surface (there is nothing left to filter out
+  of /proc/self/maps).
+  *Verified on host x86_64 end-to-end* (tests/test_unmap_trampoline.cpp):
+  the child survives, `libpayload` is absent from its maps, and the
+  wrapper reports the real setresgid's return value.
+- **The privilege-drop hooks actually work now.** The pre-Round-7
+  fork() interposition was never implemented (`fork` was only
+  declared); the entire pipeline could not run on a device. The hooks
+  now sit on setresgid/setresuid/setgid/setuid via the GOT walker —
+  the one place where the child's uid is known AND the child is still
+  root (unshare(CLONE_NEWNS) requires CAP_SYS_ADMIN, which is gone
+  after the real setresuid). USAP-forked apps are covered too.
+- **Hook installation moved from zygote-init to hide-time (Tier B).**
+  Non-hidden processes — including system_server — now never execute
+  a single hooked call. Pre-Round-7, every process on the device paid
+  the hook overhead on every open/stat, and every /proc/self/maps
+  read in the system got rewritten through a memfd copy (~200 µs
+  each). This was both a performance regression and a behavioral
+  anomaly.
+- **`/proc/<pid>/maps` and `/proc/thread-self/maps` are now matched**
+  (plus fopen(), the FORTIFY `__open_2`/`__openat_2` variants, the
+  libc `syscall()` wrapper, and dlopen re-patching for libs the app
+  loads later — Tier B). The pre-Round-7 filter matched only the
+  literal `/proc/self/...` string, which every pid-based probe — the
+  majority of real detectors — bypassed trivially.
+- **Unmount matching now covers magic-mount sources.** Matching only
+  the mount-point field missed every Magisk "magic mount" (source
+  under /data/adb/modules/..., mount point at the /system path).
+  Sources are matched now, plus /debug_ramdisk and /sbin/.magisk.
+- **ELF_R_SYM fix for armeabi-v7a** (ELF64_R_SYM parsed 32-bit
+  relocations wrong), **tracked-fd close** replaces close-all,
+  **256 KB stack buffer in make_filtered_memfd replaced by an mmap
+  scratch** (the open() hook fires on arbitrary app threads with 1 MB
+  stacks — the old buffer was a stack-overflow bomb), and the
+  **mounts/maps truncation paths now fall back to streaming** instead
+  of silently dropping the tail of oversized files.
+
+### ⚠️ Round 7 — accepted, documented residuals
+
+- The Tier A trampoline page (one RWX→R+X anonymous page, renamed
+  "jit-cache" via PR_SET_VMA on Android kernels that have it) remains
+  mapped. It cannot unmap itself while executing from itself.
+- Tier A leaves the property keys of root frameworks PRESENT with
+  empty values (Java's SystemProperties.get() cannot distinguish
+  empty from absent; native find() != NULL still can). Tier B closes
+  that with the find/get hooks.
+- The dynamic linker's soinfo entries for the unmapped .so files are
+  left dangling (same trade every loader-style injector makes);
+  dlopen-by-name is unaffected, dl_iterate_phdr consumers may fault
+  if they dereference the stale phdr pointers.
+- Module pre/post-specialize callbacks are not driven by the uid
+  hooks (they need the JNI-argument layer, documented as the
+  project's next phase); modules still load and run onLoad in the
+  zygote.
+- The fork latency claims still need on-device measurement; the
+  three microbenchmarks keep their Round 6 numbers (see below).
+
 ## What I cannot do in this sandbox
 
 I cannot:

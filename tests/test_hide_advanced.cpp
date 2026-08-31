@@ -88,14 +88,15 @@ ZS_TEST(filtered_paths_contains_proc_self_paths) {
     bool has_smaps       = false;
     bool has_smaps_rollup = false;
 
-    for (const char* p : kFilteredPaths) {
-        if (strcmp(p, "/proc/self/maps")         == 0) has_maps         = true;
-        if (strcmp(p, "/proc/self/mounts")       == 0) has_mounts       = true;
-        if (strcmp(p, "/proc/self/mountinfo")    == 0) has_mountinfo    = true;
-        if (strcmp(p, "/proc/self/mountstats")   == 0) has_mountstats   = true;
-        if (strcmp(p, "/proc/self/smaps")        == 0) has_smaps        = true;
-        if (strcmp(p, "/proc/self/smaps_rollup") == 0) has_smaps_rollup = true;
-    }
+    // Round 7: the path table became a base-name table matched by
+    // zs_path_is_filtered(); verify through the real matcher.
+    auto is_f = [](const char* p) { return zs_path_is_filtered(p) == 1; };
+    has_maps          = is_f("/proc/self/maps");
+    has_mounts        = is_f("/proc/self/mounts");
+    has_mountinfo     = is_f("/proc/self/mountinfo");
+    has_mountstats    = is_f("/proc/self/mountstats");
+    has_smaps         = is_f("/proc/self/smaps");
+    has_smaps_rollup  = is_f("/proc/self/smaps_rollup");
     ZS_CHECK(has_maps);
     ZS_CHECK(has_mounts);
     ZS_CHECK(has_mountinfo);
@@ -244,10 +245,7 @@ ZS_TEST(syscall_memfd_create_works_on_linux_host) {
 
 ZS_TEST(open_hook_only_filters_documented_proc_self_paths) {
     auto is_filtered = [](const char* path) -> bool {
-        for (const char* p : kFilteredPaths) {
-            if (strcmp(path, p) == 0) return true;
-        }
-        return false;
+        return zs_path_is_filtered(path) == 1;
     };
     ZS_CHECK(is_filtered("/proc/self/maps"));
     ZS_CHECK(is_filtered("/proc/self/mounts"));
@@ -285,7 +283,7 @@ ZS_TEST(got_patcher_matcher_recognizes_open_and_openat) {
     ZS_CHECK_EQ(match("read"),    0);
     ZS_CHECK_EQ(match("write"),   0);
     ZS_CHECK_EQ(match("fclose"),  0);
-    ZS_CHECK_EQ(match("__open_2"), 0);  // we only match the bare "open" name
+    ZS_CHECK_EQ(match("__open_2"), 0);  // superseded: __open_2 IS hooked (Round 7)
 }
 
 // ----------------------------------------------------------------------
@@ -411,6 +409,10 @@ ZS_TEST(hidden_stat_paths_contains_documented_set) {
 // ----------------------------------------------------------------------
 
 ZS_TEST(faccessat2_hook_returns_enoent_for_hidden_paths) {
+    // Round 7: the hooks are gated by a per-process active flag
+    // (inactive processes see a pure passthrough). Turn it on to
+    // exercise the actual hiding branch, off again afterwards.
+    hide_advanced_set_active(1);
     // The hidden-path check should fire BEFORE the real syscall
     // is attempted, so the path doesn't need to actually exist.
     // We verify errno is set to ENOENT and the return value is -1.
@@ -447,9 +449,15 @@ ZS_TEST(faccessat2_hook_returns_enoent_for_hidden_paths) {
     r = zygisk_study_hook_faccessat2(AT_FDCWD, "relative/path", F_OK, 0);
     ZS_CHECK(r == 0 || r == -1);  // -1 with ENOENT (real) is fine
     if (r == -1) ZS_CHECK(errno != ENOENT || true);  // weak: real ENOENT ok
+    hide_advanced_set_active(0);
+
 }
 
 ZS_TEST(fstatat_hook_returns_enoent_for_hidden_paths) {
+    // Round 7: the hooks are gated by a per-process active flag
+    // (inactive processes see a pure passthrough). Turn it on to
+    // exercise the actual hiding branch, off again afterwards.
+    hide_advanced_set_active(1);
     struct stat st;
     errno = 0;
     int r = zygisk_study_hook_fstatat(AT_FDCWD,
@@ -482,6 +490,8 @@ ZS_TEST(fstatat_hook_returns_enoent_for_hidden_paths) {
     errno = 0;
     r = zygisk_study_hook_fstatat(AT_FDCWD, "/tmp", &st, 0);
     ZS_CHECK_EQ(r, 0);
+    hide_advanced_set_active(0);
+
 }
 
 // ----------------------------------------------------------------------
@@ -664,6 +674,10 @@ ZS_TEST(make_filtered_memfd_filters_smaps_magisk_entries) {
 // ----------------------------------------------------------------------
 
 ZS_TEST(statx_hook_returns_enoent_for_hidden_paths) {
+    // Round 7: the hooks are gated by a per-process active flag
+    // (inactive processes see a pure passthrough). Turn it on to
+    // exercise the actual hiding branch, off again afterwards.
+    hide_advanced_set_active(1);
     struct statx stx;
     errno = 0;
     int r = zygisk_study_hook_statx(AT_FDCWD, "/data/adb/magisk",
@@ -697,6 +711,8 @@ ZS_TEST(statx_hook_returns_enoent_for_hidden_paths) {
     // Real kernel says ENOENT (file doesn't exist) — either way the
     // hidden-path check must NOT be what fired.
     ZS_CHECK(r == 0 || (r == -1 && errno == ENOENT));
+    hide_advanced_set_active(0);
+
 }
 
 // ----------------------------------------------------------------------
@@ -733,9 +749,12 @@ ZS_TEST(merged_got_matcher_recognizes_all_hooked_symbols) {
             else if (strcmp(name, "faccessat2") == 0) hook = (void*)0x8;
             else if (strcmp(name, "fstatat")    == 0) hook = (void*)0x9;
             else if (strcmp(name, "fstatat64")  == 0) hook = (void*)0x9;
+            else if (strcmp(name, "fopen")      == 0) hook = (void*)0xA;  // Round 7
             break;
         case '_':
-            if (strcmp(name, "__fstatat") == 0) hook = (void*)0x9;
+            if (strcmp(name, "__fstatat")   == 0) hook = (void*)0x9;
+            else if (strcmp(name, "__open_2")  == 0) hook = (void*)0xB;  // Round 7
+            else if (strcmp(name, "__openat_2") == 0) hook = (void*)0xC; // Round 7
             break;
         default:
             break;
@@ -754,45 +773,48 @@ ZS_TEST(merged_got_matcher_recognizes_all_hooked_symbols) {
     ZS_CHECK(match("fstatat64")  != nullptr);
     ZS_CHECK(match("__fstatat")  != nullptr);
     ZS_CHECK(match("statx")      != nullptr);
+    // Round 7: fopen + FORTIFY __open_2/__openat_2 are hooked (they
+    // bypass the bare open/openat slots), so they must match now.
     // Non-hooked names must NOT match — including near-misses that
     // share a first character with a hooked name.
     ZS_CHECK(match("read")      == nullptr);
     ZS_CHECK(match("write")     == nullptr);
     ZS_CHECK(match("socket")    == nullptr);  // 's' but not stat/statx
     ZS_CHECK(match("open64")    == nullptr);  // 'o' but not open/openat
-    ZS_CHECK(match("fopen")     == nullptr);  // 'f' but not our set
+    ZS_CHECK(match("fopen")     != nullptr);  // Round 7: stdio bypass is hooked
     ZS_CHECK(match("listen")    == nullptr);  // 'l' but not lstat
-    ZS_CHECK(match("__open_2")  == nullptr);  // '_' but not __fstatat
+    ZS_CHECK(match("__open_2")  != nullptr);  // Round 7: FORTIFY variant is hooked
     ZS_CHECK(match("")           == nullptr);  // empty name
+    ZS_CHECK(match("__openat_2") != nullptr);  // Round 7: FORTIFY variant is hooked
 }
 
 // ----------------------------------------------------------------------
-// Test (Round 6, P1.61): path_is_filtered() gates correctly — it
+// Test (Round 6, P1.61): zs_path_is_filtered() gates correctly — it
 // matches only the documented /proc/self/* paths, and rejects the
 // common non-/proc prefixes before any strcmp runs.
 // ----------------------------------------------------------------------
 
 ZS_TEST(path_is_filtered_matches_only_documented_paths) {
     // The documented filtered set.
-    ZS_CHECK(path_is_filtered("/proc/self/maps")         == 1);
-    ZS_CHECK(path_is_filtered("/proc/self/mounts")       == 1);
-    ZS_CHECK(path_is_filtered("/proc/self/mountinfo")    == 1);
-    ZS_CHECK(path_is_filtered("/proc/self/mountstats")   == 1);
-    ZS_CHECK(path_is_filtered("/proc/self/status")       == 1);
-    ZS_CHECK(path_is_filtered("/proc/self/smaps")        == 1);
-    ZS_CHECK(path_is_filtered("/proc/self/smaps_rollup") == 1);
+    ZS_CHECK(zs_path_is_filtered("/proc/self/maps")         == 1);
+    ZS_CHECK(zs_path_is_filtered("/proc/self/mounts")       == 1);
+    ZS_CHECK(zs_path_is_filtered("/proc/self/mountinfo")    == 1);
+    ZS_CHECK(zs_path_is_filtered("/proc/self/mountstats")   == 1);
+    ZS_CHECK(zs_path_is_filtered("/proc/self/status")       == 1);
+    ZS_CHECK(zs_path_is_filtered("/proc/self/smaps")        == 1);
+    ZS_CHECK(zs_path_is_filtered("/proc/self/smaps_rollup") == 1);
     // Same /proc/ prefix but not a filtered file.
-    ZS_CHECK(path_is_filtered("/proc/self/cmdline")      == 0);
-    ZS_CHECK(path_is_filtered("/proc/self/exe")          == 0);
-    ZS_CHECK(path_is_filtered("/proc/self/fd/3")         == 0);
+    ZS_CHECK(zs_path_is_filtered("/proc/self/cmdline")      == 0);
+    ZS_CHECK(zs_path_is_filtered("/proc/self/exe")          == 0);
+    ZS_CHECK(zs_path_is_filtered("/proc/self/fd/3")         == 0);
     // Non-/proc prefixes — rejected by the fast gate.
-    ZS_CHECK(path_is_filtered("/data/adb/magisk")        == 0);
-    ZS_CHECK(path_is_filtered("/system/bin/app_process64") == 0);
-    ZS_CHECK(path_is_filtered("/sdcard/x")               == 0);
+    ZS_CHECK(zs_path_is_filtered("/data/adb/magisk")        == 0);
+    ZS_CHECK(zs_path_is_filtered("/system/bin/app_process64") == 0);
+    ZS_CHECK(zs_path_is_filtered("/sdcard/x")               == 0);
     // Edge cases.
-    ZS_CHECK(path_is_filtered(nullptr)                   == 0);
-    ZS_CHECK(path_is_filtered("")                        == 0);
-    ZS_CHECK(path_is_filtered("relative/path")           == 0);
+    ZS_CHECK(zs_path_is_filtered(nullptr)                   == 0);
+    ZS_CHECK(zs_path_is_filtered("")                        == 0);
+    ZS_CHECK(zs_path_is_filtered("relative/path")           == 0);
 }
 
 // ----------------------------------------------------------------------
@@ -859,6 +881,124 @@ ZS_TEST(wrapped_open_returns_valid_fd_for_filtered_path) {
     ssize_t n2 = read(fd2, buf, sizeof buf);
     ZS_CHECK(n2 > 0);   // cmdline is never empty for a live process
     close(fd2);
+}
+
+
+// ----------------------------------------------------------------------
+// Round 7 tests
+// ----------------------------------------------------------------------
+
+// ----------------------------------------------------------------------
+// (S1) zs_path_is_filtered must match the /proc/<pid>/... and
+// /proc/thread-self/... variants. Most real detectors open
+// /proc/<their-pid>/maps — the pre-Round-7 code matched only the
+// literal "/proc/self/..." string, which every pid-based probe
+// trivially bypassed.
+// ----------------------------------------------------------------------
+ZS_TEST(zs_path_is_filtered_matches_pid_variants) {
+    char pidpath[128];
+    snprintf(pidpath, sizeof pidpath, "/proc/%d/maps", (int)getpid());
+    char pidpath2[128];
+    snprintf(pidpath2, sizeof pidpath2, "/proc/%d/mountinfo", (int)getpid());
+
+    ZS_CHECK_EQ(zs_path_is_filtered(pidpath),  1);
+    ZS_CHECK_EQ(zs_path_is_filtered(pidpath2), 1);
+
+    ZS_CHECK_EQ(zs_path_is_filtered("/proc/thread-self/maps"),   1);
+    ZS_CHECK_EQ(zs_path_is_filtered("/proc/thread-self/status"), 1);
+
+    // SOMEONE ELSE'S pid must NOT be filtered.
+    ZS_CHECK_EQ(zs_path_is_filtered("/proc/1/maps"),        0);
+    ZS_CHECK_EQ(zs_path_is_filtered("/proc/999999/maps"),   0);
+
+    // Near-misses.
+    ZS_CHECK_EQ(zs_path_is_filtered("/proc/self/maps2"),    0);
+    ZS_CHECK_EQ(zs_path_is_filtered("/proc/selfmap"),       0);
+    ZS_CHECK_EQ(zs_path_is_filtered("/proc/self"),          0);
+    ZS_CHECK_EQ(zs_path_is_filtered("/proc/self/maps/"),    0);
+}
+
+// ----------------------------------------------------------------------
+// (S7) The spoof table: boot-state keys get STOCK values (never
+// empty), framework-specific keys are marked absent.
+// ----------------------------------------------------------------------
+ZS_TEST(spoof_table_uses_stock_values_for_boot_keys) {
+    size_t count = 0;
+    const ZsPropSpoof* tbl = zs_prop_spoof_table(&count);
+    ZS_CHECK(count >= 15);
+    auto find = [&](const char* key) -> const char* {
+        for (size_t i = 0; i < count; ++i) {
+            if (strcmp(tbl[i].key, key) == 0) return tbl[i].value;
+        }
+        return nullptr;
+    };
+    ZS_CHECK_STR_EQ(find("ro.boot.verifiedbootstate"),   "green");
+    ZS_CHECK_STR_EQ(find("ro.boot.vbmeta.device_state"), "locked");
+    ZS_CHECK_STR_EQ(find("ro.boot.veritymode"),          "enforcing");
+    ZS_CHECK_STR_EQ(find("ro.boot.flash.locked"),        "1");
+    // Framework keys: empty value + "absent" semantics.
+    ZS_CHECK(find("ro.magisk.version")   != nullptr);
+    ZS_CHECK_EQ(find("ro.magisk.version")[0], '\0');
+    ZS_CHECK(find("ro.kernelsu.version") != nullptr);
+    ZS_CHECK_EQ(find("ro.kernelsu.version")[0], '\0');
+}
+
+// ----------------------------------------------------------------------
+// (B2 fix, host-simulated) The property-area clone is
+// CONTENT-PRESERVING. The pre-Round-7 version mmap'd MAP_FIXED|
+// MAP_ANONYMOUS over the property area and returned — zeroing the
+// property trie and breaking every subsequent property read.
+// ----------------------------------------------------------------------
+ZS_TEST(property_clone_preserves_content) {
+    constexpr size_t kSize = 8192;
+    unsigned char* orig = (unsigned char*)mmap(nullptr, kSize,
+        PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ZS_CHECK(orig != MAP_FAILED);
+    for (size_t i = 0; i < kSize; ++i) orig[i] = (unsigned char)(i * 7 + 3);
+
+    int ok = remap_prop_mapping_private((uintptr_t)orig,
+                                        (uintptr_t)orig + kSize);
+    ZS_CHECK_EQ(ok, 1);
+
+    for (size_t i = 0; i < kSize; ++i) {
+        if (orig[i] != (unsigned char)(i * 7 + 3)) {
+            throw ::zstest::CheckFailed{
+                std::string(__FILE__) + ":" + std::to_string(__LINE__) +
+                "  clone lost content at offset " + std::to_string(i)};
+        }
+    }
+    orig[0] = 0xAA;   // the clone must be writable (patchable)
+    ZS_CHECK_EQ(orig[0], 0xAA);
+    munmap(orig, kSize);
+}
+
+// ----------------------------------------------------------------------
+// (pure part) find_prop_mappings parses the /dev/__properties__
+// lines out of a synthetic maps buffer.
+// ----------------------------------------------------------------------
+ZS_TEST(find_prop_mappings_parses_synthetic_maps) {
+    std::string maps =
+        "7f00a00000-7f00a01000 r--p 00000000 00:05 1 /dev/__properties__/u:object_r:default_prop:s0\n"
+        "7f00b00000-7f00b02000 r--p 00000000 00:05 2 /dev/__properties__/u:object_r:vendor_default_prop:s0\n"
+        "7f00c00000-7f00c01000 r-xp 00000000 08:02 3 /system/lib64/libc.so\n";
+    PropMapping out[8];
+    size_t n = find_prop_mappings(maps.data(), maps.size(), out, 8);
+    ZS_CHECK_EQ(n, (size_t)2);
+    ZS_CHECK_EQ(out[0].lo, (uintptr_t)0x7f00a00000ull);
+    ZS_CHECK_EQ(out[0].hi, (uintptr_t)0x7f00a01000ull);
+    ZS_CHECK_EQ(out[1].lo, (uintptr_t)0x7f00b00000ull);
+}
+
+// ----------------------------------------------------------------------
+// The deferred Tier B registry: hooks registered via
+// hide_advanced_register_tier_b_hook are NOT live until promoted.
+// ----------------------------------------------------------------------
+ZS_TEST(tier_b_registry_defers_installation) {
+    static int dummy_hook = 0;
+    int ok = hide_advanced_register_tier_b_hook("zs_test_never_a_real_symbol",
+                                                (void*)&dummy_hook);
+    ZS_CHECK_EQ(ok, 1);
+    ZS_CHECK(match_registered_hook("zs_test_never_a_real_symbol") == nullptr);
 }
 
 // ----------------------------------------------------------------------

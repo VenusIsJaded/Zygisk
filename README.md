@@ -43,11 +43,14 @@ your machine, not a copy of any upstream artifact.
   build it and install it, you should expect it to crash zygote and possibly
   boot-loop your device. The source is here for study and as a starting
   point for someone who wants to do a serious reimplementation.
-- It is **not** a finished product. Several internal details (the
-  `ro.dalvik.vm.native.bridge` swap, JNI hooking, ptrace injection of
-  `libzn_loader.so`) are deliberately stubbed. They are clearly marked
-  with `// TODO:` in the source. This is a study skeleton, not a drop-in
-  replacement.
+- It is **not** a finished product. The `ro.dalvik.vm.native.bridge`
+  swap IS implemented (post-fs-data.sh + the systemless layout in
+  customize.sh, with uninstall restore), and the privilege-drop hook
+  chain works end-to-end on host tests — but JNI hooking (module
+  pre/post-specialize callbacks with real Zygote arguments) and the
+  ptrace injection of `libzn_loader.so` remain stubbed, and nothing
+  has been booted on real hardware. Treat it as a study skeleton
+  until you have personally flashed and recovered it.
 
 ## Why this exists
 
@@ -88,17 +91,21 @@ zygisk_study/
 │   │   └── src/main.rs      # (includes #[cfg(test)] unit tests)
 │   ├── libzygisk/            # C++ .so that lands in zygote via ro.dalvik.vm.native.bridge
 │   │   ├── CMakeLists.txt
-│   │   └── src/entry.cpp
+│   │   └── src/entry.cpp      # exports NativeBridgeItf (the symbol ART actually dlsyms)
 │   ├── libpayload/           # C++ in-process trampoline (loaded into every app)
 │   │   ├── CMakeLists.txt
 │   │   └── src/
-│   │       ├── entry.cpp     # entry, IPC handshake with zygiskd
+│   │       ├── entry.cpp     # the privilege-drop GOT hooks + hide pipeline
+│   │       ├── resolve_libc.h    # portable libc symbol resolution
 │   │       ├── hide.h
-│   │       └── hide.cpp          # basic hide layer (unmount, scrub, munmap)
+│   │       └── hide.cpp          # basic hide layer (unmount, denylist, records)
 │   │       ├── hide_advanced.h
-│   │       └── hide_advanced.cpp # advanced stealth (props clone, maps filter, fd cleanup)
+│   │       └── hide_advanced.cpp # Tier B hooks, property clone, GOT registry
 │   │       ├── hide_stealth.h
-│   │       └── hide_stealth.cpp # additional stealth (readlink hook, PR_SET_PDEATHSIG/DUMPABLE, comm)
+│   │       └── hide_stealth.cpp  # readlink hooks + stock-compatible prctls
+│   │       ├── unmap_trampoline.h
+│   │       ├── unmap_trampoline_aarch64.S  # Tier A self-unmap (arm64)
+│   │       └── unmap_trampoline_x86_64.S   # Tier A self-unmap (x86_64)
 │   ├── libzn_loader/         # C++ bridge used by daemon to spawn payload
 │   │   ├── CMakeLists.txt
 │   │   └── src/entry.cpp
@@ -182,40 +189,45 @@ cd native/zygiskd
 cargo test
 ```
 
-What the tests cover:
+What the tests cover (Round 7):
 
-- **`test_hide`** (16 tests) — basic hide layer: maps parser,
-  denylist parser, decision logic, property-scrub key list
-  (incl. the 9 S46 Round 5 additions), idempotency of init,
-  the fixed-size `so_record` array (P1.38).
-- **`test_hide_advanced`** (25 tests) — advanced hide layer:
-  hidden-substrings coverage (incl. P1.39 precomputed lengths),
-  filtered-paths coverage (incl. S25 smaps + smaps_rollup),
-  memfd filtering (drops Magisk/.so entries, preserves libc,
-  handles empty input), the open-hook path matcher, the
-  GOT-patcher matcher (`open`/`openat`), env-var scrub,
-  signal-reset skip list, TracerPid rewrite (S10), batched-write
-  correctness on 500-line input (P1.18), the smaps filter (S25),
-  the `faccessat2` hook (S54), the `fstatat` hook (S55),
-  the `statx` hook (S60), the merged GOT-walker symbol matcher
-  (P1.60), the `path_is_filtered` fast gate (P1.61), the
-  `path_is_hidden` prefix-of-hidden + bounds-check fix (B1/P1.62),
-  and the `wrapped_open` closed-fd fix (B2).
-- **`test_hide_stealth`** (14 tests) — additional stealth layer:
-  the readlink rewriter (drops Magisk/zygisk paths, preserves
-  stock app_process), the readlinkat GOT-patcher matcher,
-  idempotency of init, the broadened `/proc/<pid>/exe` matcher
-  (S12), the RLIMIT_CORE check (S16), the `/proc/<pid>/fd/<n>`
-  matcher + fd-target rewrite (S61), the NO_NEW_PRIVS check
-  (S63), and the cwd-fixup check (S65).
-- **`test_e2e_hide`** (5 tests) — end-to-end: forks a child,
-  calls `hide_apply_for_target()`, verifies the child survives
-  and reports back via pipe. Also parses real `/proc/self/maps`
-  content, spikes it with a fake Magisk line, and verifies the
-  filter drops it.
+- **`test_hide`** (16 tests) — basic hide layer: maps snapshot,
+  denylist parser, decision logic, the property key list, the
+  uid/appId denylist math (user 0 / work profile / secondary user
+  all collapse to the same appId), the unmap record flag split that
+  drives Tier A, and the mount-line parser matching BOTH magic-mount
+  sources and mount points.
+- **`test_hide_advanced`** (30 tests) — advanced hide layer: the
+  hidden-substring set, memfd filtering (drops Magisk/.so entries,
+  preserves libc, handles empty input), the open/fopen/FORTIFY
+  hook matchers, the **/proc/<pid>/... and /proc/thread-self/...
+  path variants** (the pre-Round-7 filter matched only
+  `/proc/self/...`), the property **spoof table** (stock values,
+  never empty), the **content-preserving property clone**
+  (host-simulated end to end), `find_prop_mappings`, the deferred
+  Tier B registry, TracerPid rewrite, batched-write correctness,
+  smaps filtering, the stat/faccessat2/fstatat/statx hooks behind
+  the per-process active gate, and the `wrapped_open` closed-fd fix.
+- **`test_hide_stealth`** (14 tests) — the readlink rewriters
+  (exe targets → stock app_process32/64 by pointer size; fd targets
+  → /dev/null), the pid-variant matchers, idempotency, RLIMIT_CORE,
+  and the cwd fixup.
+- **`test_e2e_hide`** (5 tests) — forked-child survival, denylist
+  inheritance across fork, real /proc/self/maps parsing with a
+  spiked Magisk line.
+- **`test_unmap_trampoline`** (2 tests) — THE Round 7 test: builds
+  the real production sources into an actual `libpayload.so`,
+  dlopen()s it, and drives the REAL asm wrapper through the full
+  Tier A pipeline in a forked child. Asserts the child survives,
+  the wrapper relays the REAL setresgid return value, **and
+  `libpayload` is completely gone from the child's maps** — plus
+  the pass-through behavior for a non-denylisted uid. This is the
+  test that would have caught the original self-unmap crash (and
+  that did catch an off-by-one in the first x86_64 register
+  restore).
+- **`test_perf`** (3 tests) — the three microbenchmarks.
 
-(Total: 63 host-side tests — 16 + 25 + 14 + 5 + 3 — plus the
-daemon's `cargo test` suite.)
+(Total: 70 host-side tests, plus the daemon's `cargo test` suite.)
 - **`test_perf`** (3 tests) — host-side microbenchmarks of the
   three hot paths (`make_filtered_memfd`,
   `hide_setup_for_target` fast path,
@@ -296,6 +308,28 @@ which are speculation."
   synthetic maps file. Predicted Android: ~150-200 µs.
 - **`g_self_so_records.reserve(16)`** to avoid reallocation during
   the first snapshot.
+
+### Round 7 — crash fixes first, then the wins
+
+The full audit story lives in PERFORMANCE-CLAIMS.md and
+docs/ANDROID-REALISM.md; the short version:
+
+- **Seven crash-on-device bugs fixed** that host tests could not see
+  (self-unmap executing unmapped code; a property clone that zeroed
+  the trie; a direct write to read-only shared property pages;
+  close-all-fds destroying the GPU descriptors; a signal reset that
+  killed ART's implicit null checks; a fork hook that was never
+  implemented; a native-bridge symbol ART never looks up).
+- **Tier A "vanish"**: denylisted apps end up with literally nothing
+  resident — no hooks, no libraries, no fds, no mounts — via an asm
+  self-unmap trampoline (arm64 + x86_64) that restores the original
+  register frame and returns the real libc call's result.
+- **Hooks moved out of the zygote**: system_server and every
+  non-hidden app now execute zero hooked calls.
+- Stealth coverage: `/proc/<pid>/...` + `/proc/thread-self/...`
+  variants, fopen + FORTIFY + raw syscall() interception, dlopen
+  re-patching, magic-mount source matching, stock-value property
+  spoofing, module .so unmapping.
 
 ### Host-side perf microbenchmarks
 

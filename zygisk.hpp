@@ -24,7 +24,22 @@
 
 #pragma once
 
+// The default callback bodies below are intentionally empty (modules
+// opt in by overriding). Silence the unused-parameter warnings so the
+// test builds stay clean with -Wall -Wextra.
+#define ZS_UNUSED(x) (void)(x)
+
+#if defined(__ANDROID__)
 #include <jni.h>
+#else
+// Host builds (unit tests, static analysis) have no NDK jni.h. The
+// payload only passes JNIEnv pointers through opaquely, so minimal
+// typedefs are enough for the header to compile anywhere.
+using JNIEnv = void;
+using JavaVM = void;
+using jint   = int;
+#define JNI_VERSION_1_6 0x00010006
+#endif
 
 namespace zygisk {
 
@@ -96,22 +111,24 @@ public:
     // forked-inherited fds and may take action that survives the
     // fork (e.g. set up its own hook on libc functions). Returns
     // flags the loader uses to decide whether to call postApp.
-    virtual void preAppSpecialize(Api* api, JNIEnv* env) {}
+    virtual void preAppSpecialize(Api* api, JNIEnv* env) { ZS_UNUSED(api); ZS_UNUSED(env); }
 
     // Post-fork callback for app processes. The process has now
     // specialized — i.e. setresuid / setresgid has happened, the
     // app's package name and Application object are known. This is
     // the last chance to alter the environment before user code.
     virtual void postAppSpecialize(const char* package_name,
-                                    Api* api, JNIEnv* env) {}
+                                    Api* api, JNIEnv* env) {
+        ZS_UNUSED(package_name); ZS_UNUSED(api); ZS_UNUSED(env);
+    }
 
     // Pre-fork callback for server processes (system_server).
     // Useful for modules that want to influence the system server's
     // view of the world before any system service starts.
-    virtual void preServerSpecialize(Api* api, JNIEnv* env) {}
+    virtual void preServerSpecialize(Api* api, JNIEnv* env) { ZS_UNUSED(api); ZS_UNUSED(env); }
 
     // Post-fork callback for server processes.
-    virtual void postServerSpecialize(Api* api, JNIEnv* env) {}
+    virtual void postServerSpecialize(Api* api, JNIEnv* env) { ZS_UNUSED(api); ZS_UNUSED(env); }
 
     // Module declares which capabilities it wants. The loader uses
     // this to size per-process state.
