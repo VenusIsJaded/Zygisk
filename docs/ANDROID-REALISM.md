@@ -1068,3 +1068,45 @@ behavior of the env (a fake table stands in).
    mtime test failed; each file is now checked independently.
 
 126 host tests (123 → 126), all green, sanitizer run green.
+
+## Round 14 — hot-path trims + review pass
+
+### Adopted
+
+- Single-entry derived-args cache (uid + generation keyed): saves the
+  packages.map hash lookup + the app_data_dir snprintf on every fork
+  after the first of a uid. Nanosecond-class, arithmetic not
+  measurement — documented as such in PERFORMANCE-CLAIMS.
+- Deny-decision key: the uid-drop hook skips its DenyList re-check
+  when the gid-drop hook decided on the same key (the standard
+  order). uid != gid corners and setuid-only children still re-check
+  (test-covered).
+
+### Found in review (fixed before shipping)
+
+- The args cache was first keyed on the appId family — which would
+  have served user 0's data dir to user 10's fork of the same
+  package. Re-keyed on the full uid; the multi-user dispatch test
+  now doubles as the regression.
+
+### Reviewed and confirmed correct (no change)
+
+- Dispatch state vs. concurrency: the specialize path is
+  single-threaded (fork leaves one thread; ART starts others after),
+  and the g_hide_done/g_dispatch_done/g_pre_done gates make later
+  setresuid calls from app or module-spawned threads no-ops.
+- The FORCE-path ordering (mount pre-dispatch while root; unmap
+  after post) and the Tier A rv relay with real_already_ran.
+- Session reader bounds (95-byte clamp, absolute-path check, derived
+  prefix capped at 94 + slash).
+
+### Documented constraint (not a bug)
+
+- FORCE_DENYLIST_UNMOUNT + module background threads: after the post
+  callbacks, the Tier B root-path filter is live while the module
+  .so stays mapped — a module thread opening its /data/adb files
+  then gets ENOENT. Modules must read configuration in onLoad/pre
+  (upstream modules do). Denylisted processes never run module code,
+  so only the FORCE mode is affected.
+
+133 host tests (126 → 133), all green, sanitizer run green.

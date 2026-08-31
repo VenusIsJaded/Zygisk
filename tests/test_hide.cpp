@@ -921,3 +921,52 @@ ZS_TEST(packages_list_mtime_change_refreshes_module_args_map) {
     remove_temp(pkg_path);
     hide_test_set_packages_list_path("/data/system/packages.list");
 }
+
+// ----------------------------------------------------------------------
+// Round 14
+// ----------------------------------------------------------------------
+
+// The deny-decision key: after a setup call decided on a key, the
+// uid-drop hook can skip its identical re-check; a different key
+// must re-check.
+ZS_TEST(deny_decision_key_tracks_the_last_setup_call) {
+    ZS_CHECK(hide_deny_decided_for(10234) == 0);  // nothing decided
+    ZS_CHECK_EQ(hide_setup_for_target_uid(10234), 0);
+    ZS_CHECK(hide_deny_decided_for(10234) == 1);
+    ZS_CHECK(hide_deny_decided_for(10235) == 0);
+    // The fast path (uid < 10000) is also a decision.
+    ZS_CHECK_EQ(hide_setup_for_target_uid(1000), 0);
+    ZS_CHECK(hide_deny_decided_for(1000) == 1);
+    ZS_CHECK(hide_deny_decided_for(10234) == 0);
+    // Restore the "nothing decided" state for later tests.
+    hide_setup_for_target_uid(0);
+}
+
+// The packages.map generation bumps on every reload (the dispatch
+// args cache invalidates against it).
+ZS_TEST(pkg_map_generation_bumps_on_reload) {
+    std::string path = make_temp_denylist("com.gen.app\n");
+    hide_test_set_denylist_path(path.c_str());
+    hide_test_reset_refresh();
+    ZS_CHECK_EQ(hide_setup_for_target("com.gen.app"), 1);
+    uint32_t gen1 = hide_pkg_map_generation();
+
+    // Change the denylist (mtime) and force the gate open.
+    {
+        FILE* fp = fopen(path.c_str(), "w");
+        ZS_CHECK(fp != nullptr);
+        fputs("com.gen.app\ncom.gen.two\n", fp);
+        fclose(fp);
+        struct timespec times[2];
+        times[0].tv_sec = time(nullptr) + 10;
+        times[0].tv_nsec = 0;
+        times[1] = times[0];
+        utimensat(AT_FDCWD, path.c_str(), times, 0);
+    }
+    hide_test_reset_refresh();
+    ZS_CHECK_EQ(hide_setup_for_target("com.gen.two"), 1);
+    ZS_CHECK(hide_pkg_map_generation() != gen1);
+
+    remove_temp(path);
+    hide_test_set_denylist_path("/data/system/zygisk_study/denylist");
+}

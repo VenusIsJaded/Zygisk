@@ -1070,3 +1070,22 @@ with-modules case must be priced:
 - The randomized socket adds one directory in /data/system per boot
   (cleaned at the next boot). Negligible storage; only visible to
   root.
+
+## Round 14 — hot-path trims
+
+| Path | Cost | Confidence | Notes |
+| --- | --- | --- | --- |
+| Repeated fork of the same uid (cache hit) | hash lookup + snprintf replaced by two bounded memcpy | High (arithmetic, not measurement) | ~300 ns -> ~50 ns class per fork. Correctness coupling: keyed on the packages.map generation, so a reload invalidates it atomically with the map (test-proven). |
+| uid-drop hook deny re-check (same key as the gid decision) | one atomic compare replaces a hash-set lookup | High | ~20-30 ns -> ~2 ns class. Different key still re-checks; setuid-only denied child is test-covered. |
+| Everything else | unchanged | — | The vDSO throttle, hash-indexed GOT matcher, and TLS filter scratch from Rounds 8-9 remain the dominant hot-path work. |
+
+### Round 14 honest negatives
+
+- The args cache is a single entry: an alternating two-app fork
+  pattern (e.g. a binder-heavy app spawning a service of another
+  package) thrashes it and pays the derive cost plus two memcpy per
+  fork. Two entries would cover main+service; deferred — the win is
+  nanosecond-class either way and the single entry keeps the
+  invalidation story trivial.
+- The deny-decision key is a single slot: the uid!=gid corner simply
+  re-checks (correct, just not faster).

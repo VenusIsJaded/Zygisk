@@ -96,6 +96,18 @@ int  hide_setup_for_target_uid(uid_t uid);
 // specialize arguments.
 void hide_lookup_package_for_uid(uid_t uid, char* out, size_t cap);
 
+// Round 14 — generation counter bumped on every packages.list /
+// DenyList (re)parse. Consumers (the module dispatch args cache) use
+// it to invalidate in lockstep with the map.
+uint32_t hide_pkg_map_generation();
+
+// Round 14 — true when the last hide_setup_for_target_uid call in
+// THIS process decided on exactly this uid/gid key. The uid-drop
+// hook uses it to skip its redundant re-check (the gid-drop hook
+// already decided with the same key in the standard specialization
+// order).
+int hide_deny_decided_for(uid_t uid);
+
 // Round 13 — register a runtime root-path prefix (matched by the
 // unmount table's source/mount-point filter in addition to the
 // compile-time table). Used for the daemon's randomized per-boot

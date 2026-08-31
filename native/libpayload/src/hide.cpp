@@ -117,6 +117,16 @@ static std::atomic<int>                g_uid_map_loaded{0};
 // the module dispatch layer to source the real specialize args.
 // First entry wins for shared-appId packages (rare, deprecated).
 static std::unordered_map<uid_t, std::string> g_pkg_map;
+// Round 14 — bumped on every packages.list/DenyList (re)parse. The
+// module dispatch layer's single-entry args cache keys on it, so a
+// reload invalidates the cache in the same breath as the map.
+static std::atomic<uint32_t> g_pkg_map_gen{1};
+// Round 14 — the uid/gid key the LAST hide_setup_for_target_uid
+// call decided on in this process. The uid-drop hook re-checks the
+// DenyList only when its key differs (the standard child has the
+// gid hook decide first with the same key — one hash lookup saved
+// per fork; the uid!=gid corner still re-checks and stays correct).
+static std::atomic<uint32_t> g_deny_decided_key{0};
 
 // DenyList refresh: forked children inherit the zygote's loaded copy
 // AND its load timestamp, so a wall-clock throttle would make every
@@ -423,6 +433,7 @@ static void load_denylist_locked_state() {
     // the denylist file never took effect until the next zygote
     // restart.
     g_denylist_cache.clear();
+    ++g_pkg_map_gen;
     FILE* fp = fopen(denylist_path(), "r");
     if (fp) {
         char line[256];
@@ -823,6 +834,9 @@ int hide_setup_for_target(const char* package_name) {
 }
 
 int hide_setup_for_target_uid(uid_t uid) {
+    // Record the decision key regardless of outcome: the uid-drop
+    // hook uses it to skip its own identical re-check (Round 14).
+    g_deny_decided_key.store((uint32_t)uid, std::memory_order_relaxed);
     // Fast path: not a full app uid range at all (zygote forks
     // system_server with uid 1000; native daemons keep uid 0).
     if (ZS_UNLIKELY(uid < 10000)) {
@@ -853,6 +867,19 @@ void hide_lookup_package_for_uid(uid_t uid, char* out, size_t cap) {
     if (it == g_pkg_map.end()) return;
     strncpy(out, it->second.c_str(), cap - 1);
     out[cap - 1] = '\0';
+}
+
+uint32_t hide_pkg_map_generation() {
+    return g_pkg_map_gen.load(std::memory_order_acquire);
+}
+
+int hide_deny_decided_for(uid_t uid) {
+    // 0 is the "never decided" sentinel; uid 0 is also the fast-path
+    // no-app key, so a uid-0 decision IS distinguishable from none
+    // (both mean "no hide" to the caller, so the collision is
+    // harmless by construction).
+    return g_deny_decided_key.load(std::memory_order_acquire) ==
+           (uint32_t)uid;
 }
 
 void hide_apply_for_target(const char* /*package_name*/) {

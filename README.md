@@ -283,7 +283,7 @@ What the tests cover (Round 9):
   FORCE_DENYLIST_UNMOUNT runs its unmount phase only after the
   post callbacks.
 
-(Total: 126 host-side tests, plus the daemon's `cargo test` suite.)
+(Total: 133 host-side tests, plus the daemon's `cargo test` suite.)
 
 The logic suites also run clean under **ASan + UBSan with leak
 detection** — `cd tests && make run-sanitize`. That run is where
@@ -579,6 +579,38 @@ Now (`native/libpayload/src/module_dispatch.{h,cpp}`):
   __system_property_foreach re-enters the hook, which stays correct
   (each nesting level gets a fresh stack-local context; the hook
   holds no lock of its own).
+
+### Round 14 — hot-path trims + the review pass
+
+- **Derived-args cache (per-fork win):** the common app-launch
+  pattern is the same uid forking repeatedly; the dispatch layer now
+  caches the derived package_name/app_data_dir per uid (skipping the
+  hash lookup + snprintf on every fork after the first of that uid).
+  The cache is keyed on the FULL uid (an appId-family key would
+  conflate user 0 and user 10 of the same package — different
+  /data/user/<id>/ dirs; caught in review before it shipped) and on
+  the packages.map generation, so the Round 13 staleness reload
+  invalidates the cache in the same breath as the map. The
+  invalidation is proven by a test that renames the package behind a
+  uid and asserts the next fork sees the new name.
+- **Redundant DenyList re-check eliminated:** the standard
+  specialization order has the gid-drop hook decide the deny
+  question first and the uid-drop hook re-ask it with the same key.
+  The uid hook now skips its re-check when the recorded decision key
+  matches exactly (one hash lookup less per app fork); a different
+  key — the uid != gid corner, or a legacy setuid-only child with no
+  prior decision — still re-checks, and a test drives the
+  setuid-only denied child to prove the skip never becomes a gap.
+- **Review pass over the Round 12-13 code** (the R11 discipline,
+  applied to our own additions): thread-safety of the dispatch state
+  against app threads and module-spawned threads calling setresuid
+  (single-threaded-at-specialization + the done-gates make it safe),
+  the FORCE-path ordering, the session reader's bounds, and the
+  module-thread/filtered-open interaction (documented: a FORCE
+  module's background threads that open /data/adb paths AFTER the
+  post callbacks get ENOENT from the Tier B filter — modules must
+  read their config in onLoad/pre, which is also when upstream
+  modules do it).
 
 ### Host-side perf microbenchmarks
 

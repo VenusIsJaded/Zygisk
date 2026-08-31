@@ -33,12 +33,15 @@
 #include <pthread.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include <cstdint>
 #include <cstdio>
+#include <fcntl.h>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -230,6 +233,7 @@ typedef int   (*Fn_dispatch_wanted)();
 typedef int   (*Fn_onload_done)();
 typedef void  (*Fn_set_session_file)(const char*);
 typedef int   (*Fn_load_session)();
+typedef void  (*Fn_reset_refresh)();
 
 static Fn_init            fn_init;
 static Fn_set_sock        fn_set_sock;
@@ -247,6 +251,7 @@ static Fn_dispatch_wanted fn_dispatch_wanted;
 static Fn_onload_done     fn_onload_done;
 static Fn_set_session_file fn_set_session_file;
 static Fn_load_session     fn_load_session;
+static Fn_reset_refresh    fn_reset_refresh;
 
 static void* sym(const char* name) {
     void* p = dlsym(g_payload, name);
@@ -327,6 +332,7 @@ static void setup_payload() {
     fn_onload_done     = (Fn_onload_done)sym("zs_module_onload_done");
     fn_set_session_file = (Fn_set_session_file)sym("zs_test_set_session_file");
     fn_load_session     = (Fn_load_session)sym("zs_test_load_session");
+    fn_reset_refresh    = (Fn_reset_refresh)sym("hide_test_reset_refresh");
 
     // Point the REAL hide layer at the fake files BEFORE init (init
     // loads the denylist), and the module fetch at the fake daemon.
@@ -654,6 +660,103 @@ ZS_TEST(session_file_switches_daemon_socket_end_to_end) {
     fn_set_session_file(nullptr);
     unlink(sess);
     rmdir(rand_dir.c_str());
+    rec_reset();
+}
+
+// 
+// ----------------------------------------------------------------------
+// Round 14 — args cache + deny-decision skip
+// ----------------------------------------------------------------------
+ZS_TEST(args_cache_serves_repeated_forks_and_invalidates_on_reload) {
+    // uid 10234 is force-denied by the earlier deny test; use 10195
+    // (com.other.app). The forced_unmount test dispatched it, so the
+    // single-entry cache holds 10195 — a repeat fork of the SAME uid
+    // must serve the identical values (cache hit).
+    int st = drive_child(10195, 10195);
+    ZS_CHECK(st == 0);
+    ZS_CHECK(rec_count() == 2);
+    ZS_CHECK(strcmp(rec(0)->package_name, "com.other.app") == 0);
+    ZS_CHECK(strcmp(rec(0)->app_data_dir,
+                    "/data/user/0/com.other.app") == 0);
+
+    // Now edit packages.list (rename the package behind uid 10234)
+    // and bump its mtime. The reload bumps the generation, which must
+    // invalidate the cache IN THE SAME BREATH as the map.
+    const char* new_content =
+        "com.example.app 10234 0 /data/data/com.example.app seinfo "
+        "targetSdk\n"
+        "com.renamed.app 10195 0 /data/data/com.renamed.app seinfo "
+        "targetSdk\n";
+    // rewrite the SAME temp file the setup used (its path is not
+    // tracked here — re-point via the packages seam using a fresh
+    // file with the SAME path as setup: re-derive it).
+    static char pkg_path[128];
+    if (pkg_path[0] == '\0') {
+        snprintf(pkg_path, sizeof pkg_path, "/tmp/zs_test_pkgr_XXXXXX");
+        int fd = mkstemp(pkg_path);
+        ZS_CHECK(fd >= 0);
+        close(fd);
+        fn_set_pkg_list(pkg_path);
+    }
+    {
+        FILE* fp = fopen(pkg_path, "w");
+        ZS_CHECK(fp != nullptr);
+        fputs(new_content, fp);
+        fclose(fp);
+        struct timespec times[2];
+        times[0].tv_sec = time(nullptr) + 10;
+        times[0].tv_nsec = 0;
+        times[1] = times[0];
+        utimensat(AT_FDCWD, pkg_path, times, 0);
+    }
+    fn_reset_refresh();
+
+    st = drive_child(10195, 10195);
+    ZS_CHECK(st == 0);
+    ZS_CHECK(rec_count() == 2);
+    ZS_CHECK(strcmp(rec(0)->package_name, "com.renamed.app") == 0);
+    ZS_CHECK(strcmp(rec(0)->app_data_dir,
+                    "/data/user/0/com.renamed.app") == 0);
+    rec_reset();
+}
+
+ZS_TEST(deny_decision_skip_still_hides_setuid_only_children) {
+    // The gid-drop hook never fired here (setuid-only legacy path),
+    // so no decision key exists: the uid hook MUST run its own
+    // DenyList check — the Round 14 skip must never become a gap.
+    // (The cache test's packages.list switch invalidated the
+    // parent-side mtime bookkeeping: a reload in this child would
+    // rebuild the deny set from the (empty) denylist file and lose
+    // the earlier force-deny. Point the denylist at a file that
+    // MAPPING-SAFELY denies uid 10234: com.example.app, which the
+    // cache test's packages.list maps to 10234 — any reload now
+    // rebuilds the same deny.)
+    char deny2[] = "/tmp/zs_test_deny2_XXXXXX";
+    {
+        int dfd = mkstemp(deny2);
+        ZS_CHECK(dfd >= 0);
+        const char* dl = "com.example.app\n";
+        ZS_CHECK(write(dfd, dl, strlen(dl)) > 0);
+        close(dfd);
+    }
+    fn_set_denylist(deny2);
+    fn_force_deny(10234);
+    rec_reset();
+    fflush(nullptr);
+    pid_t pid = fork();
+    ZS_CHECK(pid >= 0);
+    if (pid == 0) {
+        fn_reset_child();
+        fn_setuid(10234);   // denied uid, no prior gid decision
+        _exit(0);
+    }
+    int st = 0;
+    ZS_CHECK(waitpid(pid, &st, 0) == pid);
+    std::fprintf(stderr, "setuid-deny child status = 0x%x (sig %d, exit %d)\n",
+                 st, WIFSIGNALED(st) ? WTERMSIG(st) : 0,
+                 WIFEXITED(st) ? WEXITSTATUS(st) : -1);
+    ZS_CHECK(st == 0);
+    ZS_CHECK(rec_count() == 0);   // hidden, not dispatched
     rec_reset();
 }
 

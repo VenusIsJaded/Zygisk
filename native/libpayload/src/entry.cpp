@@ -338,9 +338,14 @@ static long uid_drop_hook(void* wrapper_fp, uid_t id,
     if (getpid() != g_origin_pid &&
         !g_hide_done.load(std::memory_order_acquire) &&
         !g_dispatch_done.load(std::memory_order_acquire)) {
-        // The DenyList check in case the gid drop did not fire (or did
-        // not match): denylisted children hide instead of dispatching.
-        if (hide_setup_for_target_uid(id)) {
+        // The DenyList check in case the gid drop did not fire (or
+        // decided on a DIFFERENT key — uid != gid): denylisted
+        // children hide instead of dispatching. Round 14: when the
+        // gid-drop hook already decided on exactly this key (the
+        // standard specialization order, gid == uid), the re-check
+        // is skipped — one hash lookup less per app fork.
+        if (!hide_deny_decided_for(id) &&
+            hide_setup_for_target_uid(id)) {
             g_hide_done.store(1, std::memory_order_release);
             if (run_hide_pipeline(wrapper_fp, call_real, real_ctx)) {
                 return 0;  // unreachable — Tier A already jumped out

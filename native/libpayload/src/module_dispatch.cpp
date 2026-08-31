@@ -467,6 +467,23 @@ int zs_module_force_unmount() {
     return g_force_unmount.load(std::memory_order_acquire);
 }
 
+// Round 14 — single-entry derived-args cache. The common app fork
+// pattern is the SAME package launching repeatedly; the cache
+// skips the hash lookup + snprintf for every fork after the first
+// of that uid. Keyed on the FULL uid (not the appId family: users
+// 0 and 10 of the same package share the map entry but need
+// different /data/user/<id>/ dirs) AND the packages.map
+// generation, so a reload (R13 staleness fix) invalidates it in the
+// same breath as the map itself. Per-child copy-on-write storage —
+// no locking (the specialize path is single-threaded).
+static struct {
+    uid_t     key;
+    uint32_t  gen;
+    char package_name[256];
+    char app_data_dir[512];
+    int  valid;
+} g_args_cache{};
+
 // Fill the app args from in-child observables. Only reads /proc when
 // a module actually asked for names (PROCESS_UNPRIORITY); the package
 // name comes from the packages.list map the hide layer already loads.
@@ -477,9 +494,34 @@ static void fill_app_args(uid_t uid) {
     gid_t gid = g_child_gid_recorded ? g_child_gid_recorded : getgid();
     g_child.gid = (jint)gid;
 
-    g_child.package_name[0] = '\0';
-    hide_lookup_package_for_uid(uid, g_child.package_name,
-                                sizeof g_child.package_name);
+    uint32_t gen = hide_pkg_map_generation();
+    if (g_args_cache.valid && g_args_cache.key == uid &&
+        g_args_cache.gen == gen) {
+        memcpy(g_child.package_name, g_args_cache.package_name,
+               sizeof g_child.package_name);
+        memcpy(g_child.app_data_dir, g_args_cache.app_data_dir,
+               sizeof g_child.app_data_dir);
+    } else {
+        g_child.package_name[0] = '\0';
+        hide_lookup_package_for_uid(uid, g_child.package_name,
+                                    sizeof g_child.package_name);
+        // /data/user/<userId>/<pkg> is the canonical per-user data
+        // dir (equals /data/data/<pkg> for user 0 through the
+        // well-known symlink; we report the canonical form).
+        g_child.app_data_dir[0] = '\0';
+        if (g_child.package_name[0] != '\0') {
+            long user_id = (long)uid / 100000L;
+            snprintf(g_child.app_data_dir, sizeof g_child.app_data_dir,
+                     "/data/user/%ld/%s", user_id, g_child.package_name);
+        }
+        g_args_cache.key = uid;
+        g_args_cache.gen = gen;
+        memcpy(g_args_cache.package_name, g_child.package_name,
+               sizeof g_args_cache.package_name);
+        memcpy(g_args_cache.app_data_dir, g_child.app_data_dir,
+               sizeof g_args_cache.app_data_dir);
+        g_args_cache.valid = 1;
+    }
 
     g_child.nice_name[0] = '\0';
     int wants_names = 0;
@@ -507,16 +549,6 @@ static void fill_app_args(uid_t uid) {
                 g_child.nice_name[sizeof g_child.nice_name - 1] = '\0';
             }
         }
-    }
-
-    // /data/user/<userId>/<pkg> is the canonical per-user data dir
-    // (equals /data/data/<pkg> for user 0 through the well-known
-    // symlink; we report the canonical form).
-    g_child.app_data_dir[0] = '\0';
-    if (g_child.package_name[0] != '\0') {
-        long user_id = (long)uid / 100000L;
-        snprintf(g_child.app_data_dir, sizeof g_child.app_data_dir,
-                 "/data/user/%ld/%s", user_id, g_child.package_name);
     }
 
     g_child.app_args.uid          = &g_child.uid;
