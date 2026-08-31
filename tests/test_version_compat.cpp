@@ -201,6 +201,61 @@ ZS_TEST(bridge_no_op_slots_answer_contract_neutral_values) {
     ZS_CHECK(g_table->getVendorNamespace() == nullptr);
 }
 
+ZS_TEST(bridge_satisfies_the_6_0_nativebridge_contract) {
+    ZS_CHECK(load_bridge());
+    // Round 26 — the Android 6.0 bridge contract, verified from
+    // system/core/libnativebridge/native_bridge.cc at
+    // android-6.0.0_r1 (byte-identical at android-6.0.1_r81):
+    //
+    //   static bool VersionCheck(const NativeBridgeCallbacks* cb) {
+    //     if (cb == nullptr || cb->version == 0) return false;
+    //     if (cb->version >= 2)
+    //       return cb->isCompatibleWith(kLibNativeBridgeVersion /* 2 */);
+    //     return true;
+    //   }
+    //
+    // M's table is the strict 8-slot prefix (v1 five + v2 two — the
+    // same struct M's native_bridge.h declares); it never reads past
+    // getSignalHandler. Replicate M's exact check against OUR table.
+    auto version_check_60 = [](const NativeBridgeCallbacks* cb) -> bool {
+        if (cb == nullptr || cb->version == 0) return false;
+        if (cb->version >= 2) return cb->isCompatibleWith(2);
+        return true;   // v1 table: accepted without a query
+    };
+    ZS_CHECK_EQ(version_check_60(g_table), true);
+    // The semantics table for the replica itself (sanity: a v0 table
+    // is rejected, a hypothetical v1 table is accepted unqueried).
+    {
+        NativeBridgeCallbacks fake{};
+        fake.version = 0;
+        ZS_CHECK_EQ(version_check_60(&fake), false);
+        fake.version = 1;
+        ZS_CHECK_EQ(version_check_60(&fake), true);
+    }
+    // The 8 slots M actually reads (5 + 2 + the version field) must
+    // all be populated — this is the entire M surface.
+    ZS_CHECK(g_table->initialize != nullptr);
+    ZS_CHECK(g_table->loadLibrary != nullptr);
+    ZS_CHECK(g_table->getTrampoline != nullptr);
+    ZS_CHECK(g_table->isSupported != nullptr);
+    ZS_CHECK(g_table->getAppEnv != nullptr);
+    ZS_CHECK(g_table->isCompatibleWith != nullptr);
+    ZS_CHECK(g_table->getSignalHandler != nullptr);
+    // M loads by BARE SONAME only: NativeBridgeNameAcceptable rejects
+    // '/' — the property must be "libzygisk.so", never a full path
+    // (verified: the same check exists on every version through 13).
+    // Our post-fs-data.sh already sets the bare name; this documents
+    // the constraint the docs section covers.
+    const char* bare = "libzygisk.so";
+    for (const char* p = bare; *p; ++p) {
+        char c = *p;
+        bool allowed = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                       (c >= '0' && c <= '9') || c == '.' || c == '_' ||
+                       c == '-';
+        ZS_CHECK(allowed);
+    }
+}
+
 int main() {
     std::fprintf(stderr, "=== Zygisk Study version-compat (bridge) tests ===\n");
     return zstest::run_all();

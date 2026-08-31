@@ -484,18 +484,23 @@ ZS_TEST(props_bind_mount_runs_after_namespace_setup_and_unmounts) {
     zs_test_set_mount_fns(rec_unshare_ok, rec_slave_ok, rec_umount_ok);
     zs_test_set_bind_mount_fn(rec_bind_ok);
 
-    // Stage a source file whose magic the self-check will accept.
+    // Stage a source file whose AREA MAGIC (offset 8 — the real
+    // bionic layout: bytes_used@0, serial@4, magic@8, version@12)
+    // the self-check will accept.
     char src_path[] = "/tmp/zs_props_src_XXXXXX";
     int fd = mkstemp(src_path);
     ZS_CHECK(fd >= 0);
-    uint32_t magic = 0x504f5250;   // "PROP"
-    ZS_CHECK(write(fd, &magic, sizeof magic) == 4);
+    unsigned char hdr[16] = {};
+    uint32_t magic = 0x504f5250;   // "PROP" — at offset 8
+    memcpy(hdr + 8, &magic, 4);
+    ZS_CHECK(write(fd, hdr, sizeof hdr) == (ssize_t)sizeof hdr);
     close(fd);
-    // The TARGET the self-check opens: a file with the SAME magic.
+    // The TARGET the self-check opens: a file with the SAME magic
+    // at offset 8.
     char tgt_path[] = "/tmp/zs_props_tgt_XXXXXX";
     fd = mkstemp(tgt_path);
     ZS_CHECK(fd >= 0);
-    ZS_CHECK(write(fd, &magic, sizeof magic) == 4);
+    ZS_CHECK(write(fd, hdr, sizeof hdr) == (ssize_t)sizeof hdr);
     close(fd);
 
     hide_props_file_set_source(src_path, magic);
@@ -531,15 +536,19 @@ ZS_TEST(props_bind_mount_reverts_on_self_check_mismatch) {
     char src_path[] = "/tmp/zs_props_src2_XXXXXX";
     int fd = mkstemp(src_path);
     ZS_CHECK(fd >= 0);
+    unsigned char hdr[16] = {};
     uint32_t magic = 0x504f5250;
-    ZS_CHECK(write(fd, &magic, sizeof magic) == 4);
+    memcpy(hdr + 8, &magic, 4);
+    ZS_CHECK(write(fd, hdr, sizeof hdr) == (ssize_t)sizeof hdr);
     close(fd);
-    // Target with the WRONG magic: the self-check must revert.
+    // Target with the WRONG magic (at offset 8, where the real
+    // self-check reads it): the self-check must revert.
     char tgt_path[] = "/tmp/zs_props_tgt2_XXXXXX";
     fd = mkstemp(tgt_path);
     ZS_CHECK(fd >= 0);
     uint32_t wrong = 0xdeadbeef;
-    ZS_CHECK(write(fd, &wrong, sizeof wrong) == 4);
+    memcpy(hdr + 8, &wrong, 4);
+    ZS_CHECK(write(fd, hdr, sizeof hdr) == (ssize_t)sizeof hdr);
     close(fd);
 
     hide_props_file_set_source(src_path, magic);
@@ -576,8 +585,10 @@ ZS_TEST(props_bind_mount_missing_target_reverts) {
     char src_path[] = "/tmp/zs_props_src3_XXXXXX";
     int fd = mkstemp(src_path);
     ZS_CHECK(fd >= 0);
+    unsigned char hdr[16] = {};
     uint32_t magic = 0x504f5250;
-    ZS_CHECK(write(fd, &magic, sizeof magic) == 4);
+    memcpy(hdr + 8, &magic, 4);
+    ZS_CHECK(write(fd, hdr, sizeof hdr) == (ssize_t)sizeof hdr);
     close(fd);
     hide_props_file_set_source(src_path, magic);
     zs_test_set_prop_serial_target("/nonexistent/zs/no_such_props_file");
@@ -982,6 +993,41 @@ ZS_TEST(tier_a_prepare_prioritizes_self_records) {
     }
 
     hide_test_set_records(nullptr, 0);
+}
+
+// ----------------------------------------------------------------------
+// Round 26 — the mount-target selection. Android 6.x maps ONE
+// regular file at /dev/__properties__ (bind-cover the FILE); 7.0+
+// map files inside the /dev/__properties__/ DIRECTORY (cover
+// properties_serial). stat() tells the forms apart.
+// ----------------------------------------------------------------------
+ZS_TEST(props_mount_target_follows_the_platform_form) {
+    // A regular file selects the 6.x single-file target.
+    char file[] = "/tmp/zs_target_probe_file_XXXXXX";
+    int fd = mkstemp(file);
+    ZS_CHECK(fd >= 0);
+    close(fd);
+    ZS_CHECK(strcmp(zs_test_props_target_for_probe(file),
+                    "/dev/__properties__") == 0);
+
+    // A directory selects the 7.0+ serial target.
+    char dir[] = "/tmp/zs_target_probe_dir_XXXXXX";
+    ZS_CHECK(mkdtemp(dir) != nullptr);
+    ZS_CHECK(strcmp(zs_test_props_target_for_probe(dir),
+                    "/dev/__properties__/properties_serial") == 0);
+
+    // A missing path defaults to the modern target (fail-open to the
+    // 7.0+ form — the far more common one).
+    ZS_CHECK(strcmp(zs_test_props_target_for_probe(
+                        "/nonexistent/zs/__properties_probe"),
+                    "/dev/__properties__/properties_serial") == 0);
+
+    // A null probe (defensive) also defaults modern.
+    ZS_CHECK(strcmp(zs_test_props_target_for_probe(nullptr),
+                    "/dev/__properties__/properties_serial") == 0);
+
+    unlink(file);
+    rmdir(dir);
 }
 
 int main() {

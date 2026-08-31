@@ -18,15 +18,20 @@
 //               socket for IPC back to us.
 //        'P' -> (Round 19) properties file. The client (the
 //               in-zygote payload) streams a u32-LE length and then
-//               that many bytes: a complete spoofed
-//               properties_serial image. We materialize it as
-//               <session_dir>/p, relabel it
-//               u:object_r:properties_serial:s0 (best-effort), and
+//               that many bytes: a complete spoofed property-area
+//               image (the verbatim file content, patched). We
+//               materialize it as <session_dir>/p, relabel it
+//               (best-effort) with the platform's own label —
+//               u:object_r:properties_serial:s0 on 7.0+ (bionic's
+//               fsetxattr), u:object_r:properties_device:s0 on 6.x
+//               (init's restorecon, see props_file_label()) — and
 //               reply "1<path>\n" (or "0\n" on failure). The hidden
-//               child later bind-mounts that file over
-//               /dev/__properties__/properties_serial, so fork+exec'd
-//               helpers — fresh libc, no hooks — re-map the SPOOFED
-//               area instead of the real one. This verb is handled
+//               child later bind-mounts that file over the platform's
+//               property file (/dev/__properties__/properties_serial
+//               on 7.0+, the single /dev/__properties__ file on
+//               6.x), so fork+exec'd helpers — fresh libc, no
+//               hooks — re-map the SPOOFED area instead of the real
+//               one. This verb is handled
 //               BEFORE the uid drop: it must write into the
 //               root-only session directory and relabel, which the
 //               nobody child cannot do.
@@ -213,13 +218,54 @@ fn chcon(path: &str, context: &str) -> bool {
     rv == 0
 }
 
-/// The area magic every properties_serial file starts with
-/// (PROP_AREA_MAGIC 0x504f5250, little-endian bytes "PROP").
+/// The area magic of a properties-area image. The image is the
+/// verbatim content of the real properties file, and bionic's
+/// prop_area header puts the magic at BYTE OFFSET 8, not 0:
+///   offset 0: bytes_used_ (uint32)
+///   offset 4: serial_     (atomic uint32)
+///   offset 8: magic_      (0x504f5250, little-endian bytes "PROP")
+///   offset 12: version_   (0xfc6ed0ab)
+/// (Verified from AOSP bionic libc/system_properties prop_area at
+/// android-6.0.0_r1, 7.0.0_r1 and 9.0.0_r1 — the layout is
+/// identical across all of them.)
+const PROP_AREA_MAGIC_OFFSET: usize = 8;
+const PROP_AREA_VERSION_OFFSET: usize = 12;
 const PROP_AREA_MAGIC_BYTES: [u8; 4] = [0x50, 0x52, 0x4f, 0x50];
+const PROP_AREA_VERSION_BYTES: [u8; 4] = [0xab, 0xd0, 0x6e, 0xfc];
 
 /// Upper bound for a properties file image (the real serial area is
 /// ~128 KB with a full preload; 8 MB is a paranoia cap).
 const PROP_FILE_MAX: usize = 8 * 1024 * 1024;
+
+/// The SELinux label to chcon the staged file with. Android 6.0
+/// maps ONE property file (/dev/__properties__, labeled
+/// u:object_r:properties_device:s0 via init's restorecon + sepolicy
+/// file_contexts — verified from AOSP android-6.0.0_r1 external/
+/// sepolicy and init/init.cpp); 7.0+ map properties_serial inside
+/// the /dev/__properties__/ directory (labeled
+/// u:object_r:properties_serial:s0 by bionic's fsetxattr). The
+/// staged file must carry the label the PLATFORM gave the real
+/// file, or exec'd helpers in untrusted_app get EACCES on the
+/// bind-mounted replacement.
+fn props_file_label() -> &'static str {
+    match std::fs::symlink_metadata("/dev/__properties__") {
+        Ok(md) => {
+            if md.file_type().is_file() {
+                // Android 6.x: the single-file property area.
+                "u:object_r:properties_device:s0"
+            } else {
+                // Android 7.0+: the directory form.
+                "u:object_r:properties_serial:s0"
+            }
+        }
+        Err(_) => {
+            // Cannot stat (should not happen — the daemon runs after
+            // /dev is populated): default to the modern label, which
+            // is also the more common case.
+            "u:object_r:properties_serial:s0"
+        }
+    }
+}
 
 /// Handle the 'P' verb as root. Returns true when the verb was
 /// consumed here (caller must not hand the stream to the
@@ -233,7 +279,9 @@ fn try_handle_props_file_root(stream: &mut UnixStream, first: u8,
     let mut lenb = [0u8; 4];
     if stream.read_exact(&mut lenb).is_err() { fail(stream); return true; }
     let len = u32::from_le_bytes(lenb) as usize;
-    if len < 4 || len > PROP_FILE_MAX { fail(stream); return true; }
+    // The header is 16 bytes minimum (bytes_used + serial + magic +
+    // version); anything shorter cannot be a real area image.
+    if len < 16 || len > PROP_FILE_MAX { fail(stream); return true; }
 
     let mut buf = vec![0u8; len];
     if stream.read_exact(&mut buf).is_err() { fail(stream); return true; }
@@ -241,7 +289,21 @@ fn try_handle_props_file_root(stream: &mut UnixStream, first: u8,
     // Defense in depth: only ever materialize a real properties-area
     // image. (The socket is already root/zygote-only; this guards a
     // hypothetical future world where that stops being true.)
-    if buf[0..4] != PROP_AREA_MAGIC_BYTES { fail(stream); return true; }
+    // ROUND 26 BUG FIX: the check used to compare bytes 0..4 — but
+    // the image is the VERBATIM file content, whose first 4 bytes are
+    // prop_area::bytes_used_, not the magic. Every real 'P' request
+    // was REJECTED here (the payload kept retrying; the staged file
+    // never existed; exec'd helpers kept seeing real values) while
+    // the host e2e stayed green because its fixture used a fantasy
+    // "PROP"@0 format. The magic lives at offset 8 and the version
+    // at offset 12 (see the constant's comment for the layout).
+    if buf[PROP_AREA_MAGIC_OFFSET..PROP_AREA_MAGIC_OFFSET + 4]
+            != PROP_AREA_MAGIC_BYTES
+        || buf[PROP_AREA_VERSION_OFFSET..PROP_AREA_VERSION_OFFSET + 4]
+            != PROP_AREA_VERSION_BYTES {
+        fail(stream);
+        return true;
+    }
 
     let path = format!("{}/p", session_dir);
     let mut opts = std::fs::OpenOptions::new();
@@ -260,7 +322,8 @@ fn try_handle_props_file_root(stream: &mut UnixStream, first: u8,
         }
     };
     if f.write_all(&buf).is_err() { fail(stream); return true; }
-    if !chcon(&path, "u:object_r:properties_serial:s0") {
+    let label = props_file_label();
+    if !chcon(&path, label) {
         // Non-fatal, same as ReZygisk: the mount still serves the
         // bytes to root/zygote-domain readers; exec'd helpers may be
         // denied by their own domain (documented residual).

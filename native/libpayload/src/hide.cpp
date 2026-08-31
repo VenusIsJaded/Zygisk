@@ -675,13 +675,17 @@ typedef int (*ZsBindMountFn)(const char*, const char*);
 static ZsBindMountFn g_fn_bind_mount = zs_prod_bind_mount;
 
 // ------------------------------------------------------------------------
-// Round 19 — the spoofed properties_serial bind mount.
+// Round 19 — the spoofed property-area bind mount.
 //
 // State set at payload init by module_dispatch (zs_module_send_props):
 //   g_props_src:  the file the daemon materialized (session dir/p).
 //                 Empty = feature unavailable this boot.
-//   g_props_magic: the first 4 bytes of the area we built (the
-//                 self-check compares against what the mount serves).
+//   g_props_magic: the AREA magic of the image we built (the uint32
+//                 at file offset 8 — bytes_used@0, serial@4, magic@8;
+//                 the self-check compares it against what the mount
+//                 serves). Round 26: was the first 4 bytes (= the
+//                 bytes_used_ field — self-consistent but weaker and
+//                 mislabeled as "magic").
 // ------------------------------------------------------------------------
 static char    g_props_src[112];
 static uint32_t g_props_magic = 0;
@@ -701,6 +705,13 @@ int hide_props_file_ready() {
 
 static const char kPropSerialTarget[] =
     "/dev/__properties__/properties_serial";
+// Round 26 — the 6.x single-file form: the whole property area is
+// ONE regular file at /dev/__properties__ (no directory, no
+// properties_serial — verified from AOSP bionic at
+// android-6.0.0_r1). The bind target must follow the platform: on
+// 6.x we cover the FILE ITSELF, so a fresh libc's open+map of
+// /dev/__properties__ lands on our spoofed image.
+static const char kPropLegacyTarget[] = "/dev/__properties__";
 
 // Test override for the bind target (host tests point this at a
 // temp file so the self-check's open() can succeed without root).
@@ -709,6 +720,41 @@ static const char* g_props_target_override = nullptr;
 #ifdef ZS_HOST_TEST
 void zs_test_set_prop_serial_target(const char* target) {
     g_props_target_override = target;
+}
+// Round 26: drive the pure target-selection core against any probe
+// path (a regular file selects the 6.x single-file target; a
+// directory or missing path selects the 7.0+ serial target).
+// Defined below props_target_for_probe (forward-declared here).
+static const char* props_target_for_probe(const char* probe);
+const char* zs_test_props_target_for_probe(const char* probe);
+#endif
+
+// Round 26: which target does THIS platform use? stat() of
+// /dev/__properties__ (regular file = the 6.x form, anything else =
+// the 7.0+ directory form); the answer is cached. The test override,
+// when set, wins — host tests have no /dev/__properties__ to probe.
+// Pure core (props_target_for_probe) so tests can drive the
+// selection against temp files/dirs.
+static const char* props_target_for_probe(const char* probe) {
+    struct stat st{};
+    if (probe && stat(probe, &st) == 0 && S_ISREG(st.st_mode)) {
+        return kPropLegacyTarget;
+    }
+    return kPropSerialTarget;
+}
+
+static const char* props_mount_target() {
+    if (g_props_target_override) return g_props_target_override;
+    static const char* target = nullptr;
+    if (!target) {
+        target = props_target_for_probe("/dev/__properties__");
+    }
+    return target;
+}
+
+#ifdef ZS_HOST_TEST
+const char* zs_test_props_target_for_probe(const char* probe) {
+    return props_target_for_probe(probe);
 }
 #endif
 
@@ -729,9 +775,7 @@ static struct {
 // Capture both identities around the bind mount. Call order matters:
 // capture_real() BEFORE the mount, capture_mounted() AFTER.
 static void props_fiction_capture_real() {
-    int fd = open(g_props_target_override ? g_props_target_override
-                                          : kPropSerialTarget,
-                  O_RDONLY | O_CLOEXEC);
+    int fd = open(props_mount_target(), O_RDONLY | O_CLOEXEC);
     if (fd < 0) return;
     if (fstat(fd, &g_props_stat_fiction.real) == 0) {
         g_props_stat_fiction.active = 1;
@@ -753,8 +797,7 @@ static void props_fiction_capture_mounted() {
 // The path the stat hooks must answer with the fiction (the bind
 // target; override-aware for host tests).
 const char* hide_props_serial_target_path() {
-    return g_props_target_override ? g_props_target_override
-                                   : kPropSerialTarget;
+    return props_mount_target();
 }
 
 int hide_props_stat_fiction(struct stat* out) {
@@ -791,9 +834,7 @@ void hide_props_stat_fiction_clear() {
 static void mount_spoofed_properties_file() {
     if (!hide_props_file_ready()) return;
 
-    const char* target = g_props_target_override
-        ? g_props_target_override
-        : kPropSerialTarget;
+    const char* target = props_mount_target();
     // Round 20: capture the real file's identity BEFORE the bind
     // covers it (the stat fiction needs it).
     hide_props_stat_fiction_clear();
@@ -806,9 +847,13 @@ static void mount_spoofed_properties_file() {
         hide_props_stat_fiction_clear();
         return;
     }
-    // Self-check: open the MOUNTED path and verify the magic. A
-    // wrong magic means the mount is not serving our file (or
-    // SELinux denied the open) — revert rather than serve garbage.
+    // Self-check: open the MOUNTED path and verify the AREA MAGIC,
+    // which lives at byte offset 8 of the file (bytes_used@0,
+    // serial@4, magic@8 — verified from AOSP bionic at 6.0/7.0/9.0;
+    // Round 26 fixed the old first-4-bytes compare, which actually
+    // compared bytes_used_). A mismatch means the mount is not
+    // serving our file (or SELinux denied the open) — revert rather
+    // than serve garbage.
     int fd = open(target, O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
         ZS_LOGW("hide: properties mount self-check open failed: %s "
@@ -817,10 +862,14 @@ static void mount_spoofed_properties_file() {
         hide_props_stat_fiction_clear();
         return;
     }
-    uint32_t served = 0;
-    ssize_t n = read(fd, &served, sizeof served);
+    unsigned char head[12] = {};
+    ssize_t n = read(fd, head, sizeof head);
     close(fd);
-    if (n != (ssize_t)sizeof served || served != g_props_magic) {
+    uint32_t served = 0;
+    if (n == (ssize_t)sizeof head) {
+        memcpy(&served, head + 8, sizeof served);
+    }
+    if (n != (ssize_t)sizeof head || served != g_props_magic) {
         ZS_LOGW("hide: properties mount self-check mismatch "
                 "(got %#x want %#x) — reverting",
                 (unsigned)served, (unsigned)g_props_magic);
@@ -828,8 +877,8 @@ static void mount_spoofed_properties_file() {
         hide_props_stat_fiction_clear();
         return;
     }
-    ZS_LOGD("hide: spoofed properties_serial mounted over "
-            "/dev/__properties__ (execve-proof)");
+    ZS_LOGD("hide: spoofed property area mounted over %s "
+            "(execve-proof)", target);
 }
 
 // Unmount everything the root framework mounted, inside our private

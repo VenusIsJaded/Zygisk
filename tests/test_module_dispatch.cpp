@@ -190,13 +190,16 @@ static void* daemon_thread(void* arg) {
                 usleep(50 * 1000);
             } else if (verb == 'P' && !cfg->props_dir.empty()) {
                 // Round 19: mirror the Rust daemon's 'P' handler —
-                // u32-LE length, that many bytes, magic check,
+                // u32-LE length, that many bytes, the AREA-MAGIC check
+                // (Round 26: at offset 8 — the real bionic layout is
+                // bytes_used@0, serial@4, magic@8, version@12; the
+                // old offset-0 check would reject every real image),
                 // write to <dir>/p, reply "1<dir>/p\n".
                 unsigned char lenb[4];
                 if (read(c, lenb, 4) == 4) {
                     uint32_t len = lenb[0] | (lenb[1] << 8) |
                                    (lenb[2] << 16) | (lenb[3] << 24);
-                    if (len >= 4 && len < 1024 * 1024) {
+                    if (len >= 16 && len < 1024 * 1024) {
                         std::string area(len, '\0');
                         size_t got = 0;
                         while (got < len) {
@@ -204,7 +207,14 @@ static void* daemon_thread(void* arg) {
                             if (n <= 0) break;
                             got += (size_t)n;
                         }
-                        if (got == len && area.compare(0, 4, "PROP") == 0) {
+                        bool magic_ok = got == len &&
+                            area.compare(8, 4, "PROP", 4) == 0;
+                        if (got == len && len >= 16) {
+                            uint32_t ver = 0;
+                            memcpy(&ver, area.data() + 12, 4);
+                            if (ver != 0xfc6ed0abu) magic_ok = false;
+                        }
+                        if (magic_ok) {
                             std::string path = cfg->props_dir + "/p";
                             FILE* fp = fopen(path.c_str(), "wb");
                             if (fp) {
@@ -827,12 +837,24 @@ ZS_TEST(props_file_protocol_round_trips_to_daemon) {
     // Point back at the main daemon — the one with props_dir set.
     fn_set_sock(g_sock_path.c_str());
 
-    // Build a fake spoofed area: magic + patched-looking values.
+    // Build a fake spoofed area in the REAL bionic file format
+    // (Round 26: the old fixture put "PROP" at offset 0 — a fantasy
+    // layout that only ever agreed with the daemon's equally-wrong
+    // offset-0 check; a real image has bytes_used@0, serial@4,
+    // magic@8, version@12, then the trie data).
     std::string area;
-    area += "PROP";
-    area += "\0\0\0\0";
-    area += "ro.boot.verifiedbootstate=green;";
-    area += "ro.magisk.version=;";
+    {
+        uint32_t bytes_used = 112;   // root(20) + first entry
+        uint32_t serial     = 7;
+        uint32_t magic      = 0x504f5250u;
+        uint32_t version    = 0xfc6ed0abu;
+        area.append((const char*)&bytes_used, 4);
+        area.append((const char*)&serial, 4);
+        area.append((const char*)&magic, 4);
+        area.append((const char*)&version, 4);
+        area += "ro.boot.verifiedbootstate=green;";
+        area += "ro.magisk.version=;";
+    }
 
     g_last_props_content.clear();
     int rc = fn_send(area.data(), area.size());
@@ -867,7 +889,15 @@ ZS_TEST(props_file_send_retries_when_daemon_is_down) {
     const char* old = g_sock_path.c_str();
     std::string saved = old;
     fn_set_sock("/tmp/zs_no_such_daemon_socket");
-    std::string area = "PROP\xDE\xAD";
+    // A real-format area (>= 16 bytes — smaller buffers are now
+    // "final" on the payload side, not a retry, mirroring the
+    // daemon's header floor).
+    std::string area(64, 'x');
+    uint32_t magic = 0x504f5250u, version = 0xfc6ed0abu;
+    area.resize(16);
+    memcpy(&area[8], &magic, 4);
+    memcpy(&area[12], &version, 4);
+    area.resize(64, 'x');
     ZS_CHECK_EQ(fn_send(area.data(), area.size()), 0);
     // Restore.
     fn_set_sock(saved.c_str());
@@ -907,6 +937,74 @@ ZS_TEST(lazy_daemon_init_latches_only_after_daemon_answers) {
 // role ART's UnloadNativeBridge plays) and prove the code is still
 // alive by calling through a cached pointer.
 //
+// ----------------------------------------------------------------------
+// Round 26 — the property-file path selection: a 6.x platform maps
+// ONE regular file (/dev/__properties__); 7.0+ map properties_serial
+// inside the directory. The lazy-init must hand the image builder
+// the platform's own path, and the stat-based detection must tell a
+// regular file from a directory.
+// ----------------------------------------------------------------------
+ZS_TEST(props_file_mode_detection_uses_the_stat_form) {
+    static int (*fn_detect)(const char*) =
+        (int (*)(const char*))sym("zs_test_prop_file_mode_detected");
+
+    // A regular file = the 6.x single-file form (0).
+    char file[] = "/tmp/zs_mode_probe_file_XXXXXX";
+    int fd = mkstemp(file);
+    ZS_CHECK(fd >= 0);
+    close(fd);
+    ZS_CHECK_EQ(fn_detect(file), 0);
+
+    // A directory = the 7.0+ form (1).
+    char dir[] = "/tmp/zs_mode_probe_dir_XXXXXX";
+    ZS_CHECK(mkdtemp(dir) != nullptr);
+    ZS_CHECK_EQ(fn_detect(dir), 1);
+
+    // Missing / null default to the modern form.
+    ZS_CHECK_EQ(fn_detect("/nonexistent/zs/mode_probe"), 1);
+    ZS_CHECK_EQ(fn_detect(nullptr), 1);
+
+    unlink(file);
+    rmdir(dir);
+}
+
+ZS_TEST(lazy_init_builds_the_platform_property_file_path) {
+    static void (*fn_set_mode)(int) =
+        (void (*)(int))sym("zs_test_set_prop_file_mode");
+    static const char* (*fn_last_path)() =
+        (const char* (*)())sym("zs_test_last_props_build_path");
+    static void (*fn_reset_lazy)() =
+        (void (*)())sym("zs_test_reset_lazy_init");
+    static int (*fn_lazy)() =
+        (int (*)())sym("zs_module_lazy_daemon_init_c");
+    static void (*fn_set_sock)(const char*) =
+        (void (*)(const char*))sym("zs_test_set_daemon_socket");
+
+    // Keep the daemon out of the way: the build attempt happens
+    // before any send, so the recorded path is set either way.
+    std::string saved = g_sock_path;
+    fn_set_sock("/tmp/zs_no_such_daemon_socket");
+
+    // The 6.x single-file form.
+    fn_set_mode(0);
+    fn_reset_lazy();
+    (void)fn_lazy();
+    ZS_CHECK(strcmp(fn_last_path(), "/dev/__properties__") == 0);
+
+    // The 7.0+ directory form.
+    fn_set_mode(1);
+    fn_reset_lazy();
+    (void)fn_lazy();
+    ZS_CHECK(strcmp(fn_last_path(),
+                    "/dev/__properties__/properties_serial") == 0);
+
+    // Restore: auto-detect (stat /dev/__properties__), and the
+    // original latches/socket.
+    fn_set_mode(-1);
+    fn_reset_lazy();
+    fn_set_sock(saved.c_str());
+}
+
 // Runs LAST (registration order): it closes the test's own handle on
 // purpose; everything after would only use cached pointers — which is
 // precisely the contract being verified.

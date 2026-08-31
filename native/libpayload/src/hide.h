@@ -256,6 +256,11 @@ const char* zs_test_mount_log();
 void zs_test_set_bind_mount_fn(int (*bind)(const char*, const char*));
 void zs_test_props_source_clear();
 void zs_test_set_prop_serial_target(const char* target);
+
+// Round 26 — the mount-target selection core (probe = the path a
+// production probe would stat): a regular file selects the 6.x
+// single-file target, a directory/missing path the 7.0+ serial one.
+const char* zs_test_props_target_for_probe(const char* probe);
 #endif
 
 } // namespace zygisk_study

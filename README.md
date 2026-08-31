@@ -886,3 +886,56 @@ to an unlinked file in the hidden target's own data dir).
 **199/199 host tests** (36 hide / 109 advanced / 20 stealth / 5 e2e /
 4 perf / 2 trampoline / 17 dispatch / 6 version-compat), 0 warnings,
 ASan+UBSan+leaks green, trampoline binary verification green.
+
+### Round 26 — Android 6.0/6.0.1 support + two more device-fatal bugs found by version research
+
+The 6.x research pass (AOSP fetched and READ at android-6.0.0_r1 and
+android-6.0.1_r81: libnativebridge, art/runtime, bionic system_properties
++ linker, Zygote.cpp, init.rc, sepolicy, installd) confirmed the R25
+bootstrap/bridge/lifecycle design works on Marshmallow **as-is** — M
+loads by bare soname (`NativeBridgeNameAcceptable` rejects `/` on
+every version 6.0 through 13.0 — the docs' full-path example was
+wrong everywhere and is now fixed), reads only the 8-slot prefix of
+our table, asks `isCompatibleWith(2)`, never calls `initialize()` in
+the zygote, dlcloses the bridge in same-arch children, and its bionic
+linker honors DF_1_NODELETE and RTLD_NOLOAD.
+
+The 6.x property layer differs in exactly three ways (all verified
+from M's own sources: same trie, same prop_info, same area header,
+same serial protocol — only the PATH, the file-vs-directory form,
+and the SELinux label differ): the maps matchers now catch the
+single-file line, one cached `stat()` selects the image-builder
+path / bind-mount target / daemon chcon label
+(`u:object_r:properties_device:s0` on 6.x), and the stock-line
+restoration covers the single 6.x maps line.
+
+The same research caught **two device-fatal bugs on ALL versions**:
+
+1. **The Rust daemon's 'P' validation read the area magic at byte
+   offset 0** — but the streamed image is the verbatim property
+   file, whose first 4 bytes are `bytes_used_` (the magic lives at
+   offset 8, the version at 12; verified across 6.0/7.0/9.0). Every
+   real 'P' request was rejected → the staged file never existed →
+   fork+exec'd helpers kept seeing real property values — the
+   entire execve-proof layer (R19/R20/R22) was dead on devices
+   while the host suite stayed green: the e2e fixture used a fantasy
+   "PROP"@0 format that agreed with the daemon's equally-wrong
+   offset-0 check. Fixed at the daemon, the fake test daemon, the
+   fixtures (now real-format), and the payload's self-check + magic
+   registration (offset 8 everywhere, 16-byte length floor).
+2. **The R22 set round-trip never woke waiters**: bionic's update
+   path (verified at 6.0 AND 7.0) ends with a +1 release-store on
+   the area serial AND a futex wake (plus a per-entry wake) — the
+   clone never saw init's bump, so `__system_property_wait_any`
+   slept forever after the app's own successful setprop. The set
+   hook now reproduces the platform protocol on the clone (entry
+   wake + area-serial bump + FUTEX_WAKE, inside the mprotect
+   window — kernel semantics verified from Linux 3.10/5.10
+   get_futex_key sources). Fully closes the round trip on 6.x
+   (single area) and for default-context keys on 7.x.
+
+**206/206 host tests** (37 hide / 112 advanced / 20 stealth / 5 e2e /
+4 perf / 2 trampoline / 19 dispatch / 7 version-compat), 0 warnings,
+ASan+UBSan+leaks green, trampoline binary verification green.
+Android support now spans **6.0 through 15**, all boundary-verified
+from AOSP sources.

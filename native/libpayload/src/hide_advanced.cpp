@@ -199,6 +199,10 @@ constexpr uint32_t kPropLongFlag    = 1u << 16;
 constexpr size_t kPropAreaHeaderSize = 128;
 constexpr size_t kPropInfoSize       = 96;
 constexpr size_t kTrieNodeSize       = 20;
+// Round 26: the GLOBAL area serial sits at header offset 4 (verified
+// byte-identical at 6.0/7.0/9.0 — the wait_any futex word; init bumps
+// it +1 with a release store after every successful property write).
+constexpr size_t kPropAreaSerialOffset = 4;
 // SERIAL_VALUE_LEN(serial) = serial >> 24 — bionic's own reader macro
 // (system_properties.cpp). A patch that changes the value's length
 // MUST rewrite that byte, or __system_property_get returns a
@@ -240,13 +244,30 @@ static void patch_prop_value(const void* pi, const char* value) {
                          std::memory_order_release);
 }
 
-// Find /dev/__properties__/ mappings in a maps buffer. Pure function
+// Find /dev/__properties__ mappings in a maps buffer. Pure function
 // (no I/O) so host tests can feed synthetic maps content. Writes up
 // to cap {lo, hi} spans and returns how many were found.
+//
+// Round 26 — the matcher is VERSION-AGNOSTIC on purpose. Android
+// 6.x maps ONE file (the path field is exactly
+// "/dev/__properties__", 19 bytes — verified from AOSP bionic
+// android-6.0.0_r1 libc/bionic/system_properties.cpp: PROP_FILENAME
+// "/dev/__properties__", a single 128K area, no directory, no
+// per-context files). Android 7.0+ map files INSIDE the directory
+// (every path starts "/dev/__properties__/..."). Matching the
+// 19-byte prefix "/dev/__properties__" covers both forms: the 6.x
+// exact line ends right after the prefix, and every 7.x line
+// continues past it. (Nothing else on a stock Android /dev starts
+// with that prefix; and the downstream trie code validates the area
+// header before walking anything, so a stray match fails closed.)
 struct PropMapping { uintptr_t lo, hi; };
+// Round 26: spans the clone successfully replaced, for the SET
+// hook's area-serial bump (bump_clone_area_serial below).
+static PropMapping g_clone_spans[8];
+static size_t      g_clone_span_count;
 static size_t find_prop_mappings(const char* buf, size_t total,
                                  PropMapping* out, size_t cap) {
-    static const char kPropPath[] = "/dev/__properties__/";
+    static const char kPropPath[] = "/dev/__properties__";
     const size_t kPropPathLen = sizeof(kPropPath) - 1;
     size_t n = 0;
     const char* p = buf;
@@ -405,9 +426,11 @@ static void collect_absent_prop_infos();
 //
 // The private clone replaces the /dev/__properties__ file mappings
 // with ANONYMOUS ones at the same addresses (the mechanism that makes
-// Tier A's hook-free property spoofing work). Side effect: every
-// stock Android process carries exactly two /dev/__properties__ lines
-// in /proc/self/maps, and the hidden process's RAW maps show blank
+// Tier A's hook-free property spoofing work). Side effect: a stock
+// Android process carries property-file lines in /proc/self/maps
+// (exactly TWO on 7.0+ — properties_serial + the default context;
+// exactly ONE on 6.x — the single /dev/__properties__ file), and the
+// hidden process's RAW maps show blank
 // anon lines there instead. Tier B reads (the filtered memfd) now
 // restore the captured stock line for any cloned range — same
 // addresses, same perms, same size, and the real file's dev/ino and
@@ -504,11 +527,14 @@ static const PropLineRestore* prop_line_restore_for(const char* rec,
 }
 
 // Capture the stock text of every /dev/__properties__ maps line.
-// Same 5th-whitespace path-field discipline as find_prop_mappings.
+// Same 5th-whitespace path-field discipline as find_prop_mappings
+// (including its Round 26 version-agnostic 19-byte prefix — on 6.x
+// devices there is exactly ONE such line, the single-file area; on
+// 7.x there are two: properties_serial + the default context).
 // Pure function over the maps buffer (host-testable directly).
 static void capture_prop_line_restores(const char* buf, size_t total) {
     g_prop_line_restore_count = 0;
-    static const char kPropPath[] = "/dev/__properties__/";
+    static const char kPropPath[] = "/dev/__properties__";
     constexpr size_t kPropPathLen = sizeof(kPropPath) - 1;
     const char* p = buf;
     const char* end = buf + total;
@@ -588,13 +614,22 @@ void zs_test_reset_props_cloned() {
 // find(), collect + trie-delete the absent keys, then restore
 // read-only protection and the linker_alloc name. Returns the number
 // of successfully remapped mappings (0 = the caller may retry).
+//
+// Round 26: the successfully remapped spans are recorded in
+// g_clone_spans — the SET hook's area-serial bump (see
+// bump_clone_area_serial) needs to find the clone header that owns
+// a prop_info at set time.
 static int clone_props_core(const PropMapping* mappings,
                             size_t n_mappings) {
     int n_remapped = 0;
+    g_clone_span_count = 0;
     for (size_t i = 0; i < n_mappings; ++i) {
         if (remap_prop_mapping_private(mappings[i].lo,
                                        mappings[i].hi)) {
             ++n_remapped;
+            if (g_clone_span_count < 8) {
+                g_clone_spans[g_clone_span_count++] = mappings[i];
+            }
         } else {
             ZS_LOGW("hide_advanced: property remap %lx-%lx failed: %s",
                     (unsigned long)mappings[i].lo,
@@ -3352,6 +3387,80 @@ static PropSetFn g_real_prop_set = nullptr;
 // production; a host-test seam relaxes it for malloc'd fakes).
 static int g_props_clone_prot = PROT_READ;
 
+// Round 26 — wake a futex word (best-effort). bionic's own update
+// path ends with __futex_wake(&serial, INT32_MAX) — the wake is what
+// unblocks threads already asleep in futex_wait; the value change
+// alone only helps FUTURE waiters. SYS_futex exists on every Linux
+// we target (glibc host and bionic both expose it via sys/syscall.h;
+// 6.0 kernels have it — futex predates Android itself). A failure
+// degrades to the pre-Round-26 behavior (sleepers keep sleeping —
+// the documented pre-round residual), never a crash.
+static void zs_futex_wake(uint32_t* addr) {
+#ifdef SYS_futex
+    // FUTEX_WAKE = 1. Goes through libc's syscall() wrapper — which
+    // may route through our own SYS_* hook; futex is not an
+    // interesting number there, so it passes through one branch.
+    (void)syscall(SYS_futex, addr, 1, INT32_MAX);
+#else
+    (void)addr;
+#endif
+}
+
+// Round 26 — the AREA-serial bump (the wait_any half of the
+// round-trip). Verified from the AOSP update path at 6.0 AND 7.0
+// (libc/system_properties __system_property_update / _add): after a
+// successful write, init stores serial+1 (release) into the CONTAIN
+// AREA's header (offset 4) and futex-wakes it — that global serial
+// is what __system_property_wait_any() polls. The clone never sees
+// init's bump (it is a private copy at the same addresses), so a
+// hidden app's wait_any slept forever even after its own successful
+// setprop. This reproduces the platform protocol on the clone: find
+// the clone span owning the prop_info, validate the area header,
+// +1 with a release store inside an mprotect window, then wake.
+// On 6.x the single area IS the wait_any area, so this fully closes
+// the round-trip there; on 7.x it closes it for props whose area is
+// the serial area (default context) — context-area props keep the
+// documented wait residual (a context write does not bump the
+// context area's header on stock either).
+static void bump_clone_area_serial(const void* pi) {
+    if (!pi || g_clone_span_count == 0) return;
+    uintptr_t a = (uintptr_t)pi;
+    for (size_t i = 0; i < g_clone_span_count; ++i) {
+        const PropMapping& m = g_clone_spans[i];
+        if (a < m.lo || a >= m.hi) continue;
+        uint8_t* base = reinterpret_cast<uint8_t*>(m.lo);
+        size_t   msize = (size_t)(m.hi - m.lo);
+        if (!pa_header_valid(base, msize)) return;   // fail closed
+        auto* serial = reinterpret_cast<std::atomic<uint32_t>*>(
+            base + kPropAreaSerialOffset);
+        static long psz = sysconf(_SC_PAGESIZE);
+        if (psz <= 0) psz = 4096;
+        uintptr_t page = (uintptr_t)base & ~(uintptr_t)(psz - 1);
+        if (mprotect((void*)page, (size_t)psz,
+                     PROT_READ | PROT_WRITE) != 0) {
+            return;   // cannot open the window — skip (residual)
+        }
+        uint32_t s = serial->load(std::memory_order_relaxed);
+        serial->store(s + 1, std::memory_order_release);
+        // Wake INSIDE the mprotect window, before the page returns to
+        // read-only: init's own wake happens from its WRITABLE mapping
+        // of the property page, and some kernels' shared-futex wake
+        // path requires a writable mapping of the page (get_futex_key
+        // GUP semantics; verified the READ fallback exists on stock
+        // 3.10/5.10, but a hardened/custom kernel may refuse). The
+        // shared key is (page, offset) — identical from either
+        // protection state, so waiters keyed before or after the
+        // window are both covered.
+        zs_futex_wake(reinterpret_cast<uint32_t*>(serial));
+        if (mprotect((void*)page, (size_t)psz,
+                     g_props_clone_prot) != 0) {
+            ZS_LOGW("hide_advanced: area-serial mprotect(R) failed "
+                    "(page left RW)");
+        }
+        return;
+    }
+}
+
 extern "C" int zygisk_study_hook_prop_set(const char* key,
                                           const char* value) {
     int rc = g_real_prop_set ? g_real_prop_set(key, value) : -1;
@@ -3380,6 +3489,15 @@ extern "C" int zygisk_study_hook_prop_set(const char* key,
     int restored = 0;
     if (mprotect((void*)start, span, PROT_READ | PROT_WRITE) == 0) {
         patch_prop_value(pi, value);
+        // Round 26 — the platform's wake pair: init's update path
+        // wakes BOTH the entry's serial and the area's serial. The
+        // entry wake unblocks __system_property_wait(pi, serial)
+        // sleepers; the area wake unblocks wait_any sleepers.
+        // (prop_info::serial lives at offset 0, so pi itself is the
+        // futex word.)
+        zs_futex_wake(const_cast<uint32_t*>(
+            reinterpret_cast<const uint32_t*>(pi)));
+        bump_clone_area_serial(pi);
         // g_props_clone_prot is what the clone finalized with (R in
         // production). Restoring to it keeps the anomaly surface flat.
         if (mprotect((void*)start, span,
@@ -4723,6 +4841,18 @@ void zs_test_set_props_clone_prot(int prot) {
 // Round 22: drive the set hook with a fake real-set + fake find.
 void zs_test_set_real_prop_set(int (*fn)(const char*, const char*)) {
     g_real_prop_set = (PropSetFn)fn;
+}
+
+// Round 26: register/clear clone spans from tests (the set hook's
+// area-serial bump needs g_clone_spans; heap-fake tests do not run
+// the production clone).
+void zs_test_register_clone_span(uintptr_t lo, uintptr_t hi) {
+    if (g_clone_span_count < 8 && hi > lo) {
+        g_clone_spans[g_clone_span_count++] = PropMapping{lo, hi};
+    }
+}
+void zs_test_clear_clone_spans() {
+    g_clone_span_count = 0;
 }
 #endif
 

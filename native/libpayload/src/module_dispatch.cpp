@@ -28,6 +28,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -87,7 +88,7 @@ static std::atomic<int>          g_modules_loaded{0};
 static std::atomic<int> g_module_fetch_done{0};   // latched: daemon answered the 'L'
 static std::atomic<int> g_props_sent{0};          // latched: 'P' answered or permanently off
 
-// Round 19: the spoofed properties_serial image. Built ONCE (the
+// Round 19: the spoofed property-area image. Built ONCE (the
 // build reads /proc/self/maps + the real area file); held until the
 // daemon accepts it, then freed. Null + build_attempted = feature
 // permanently unavailable this boot (no bionic find / no mapping /
@@ -95,6 +96,45 @@ static std::atomic<int> g_props_sent{0};          // latched: 'P' answered or pe
 static int    g_props_build_attempted = 0;
 static char*  g_props_area = nullptr;
 static size_t g_props_area_size = 0;
+
+// Round 26 — WHICH property file does this platform map?
+//   7.0+: /dev/__properties__/properties_serial (the magic-bearing
+//         serial + default-context area, inside the
+//         /dev/__properties__/ DIRECTORY)
+//   6.x:  /dev/__properties__ itself — a single regular FILE, one
+//         128K area holding the whole trie (verified from AOSP
+//         bionic android-6.0.0_r1 libc/bionic/system_properties.cpp:
+//         PROP_FILENAME "/dev/__properties__", no directory, no
+//         per-context files; the trie/prop_info/area-header layouts
+//         and the serial protocol are byte-identical to 7.0's, so
+//         only the PATH changes).
+// stat() distinguishes them (regular file = 6.x form, directory =
+// 7.0+); the answer is cached after the first probe. Host tests
+// override via zs_test_set_prop_file_mode.
+static int g_prop_file_mode = -1;   // -1 = not probed, 0 = legacy(6.x), 1 = modern(7.0+)
+#ifdef ZS_HOST_TEST
+static int g_test_prop_file_mode = -1;  // test pin: 0/1, -1 = auto
+#endif
+static const char kPropFileModern[] = "/dev/__properties__/properties_serial";
+static const char kPropFileLegacy[]  = "/dev/__properties__";
+
+static const char* props_file_path_for_platform() {
+#ifdef ZS_HOST_TEST
+    if (g_test_prop_file_mode >= 0) {
+        return g_test_prop_file_mode == 0 ? kPropFileLegacy
+                                          : kPropFileModern;
+    }
+#endif
+    if (g_prop_file_mode < 0) {
+        struct stat st{};
+        int mode = 1;   // default: the modern directory form
+        if (stat("/dev/__properties__", &st) == 0 && S_ISREG(st.st_mode)) {
+            mode = 0;   // the 6.x single-file form
+        }
+        g_prop_file_mode = mode;
+    }
+    return g_prop_file_mode == 0 ? kPropFileLegacy : kPropFileModern;
+}
 
 // Forward declarations (both defined with the module-loading code
 // below; zs_module_init and the fork hook call them).
@@ -120,6 +160,30 @@ static const char* g_daemon_socket = kDaemonSocketDefault;
 static constexpr const char* kSessionFile =
     "/data/adb/modules/zygisk_study/session.sock";
 static const char* g_session_file = kSessionFile;
+
+#ifdef ZS_HOST_TEST
+// Round 26: pin the platform form for tests (-1 = restore auto).
+extern "C" void zs_test_set_prop_file_mode(int mode) {
+    g_test_prop_file_mode = mode;
+}
+// Round 26: read back the auto-detected mode (for the detection
+// test itself: point the stat at a temp path).
+extern "C" int zs_test_prop_file_mode_detected(const char* probe_path) {
+    struct stat st{};
+    return (probe_path && stat(probe_path, &st) == 0 &&
+            S_ISREG(st.st_mode)) ? 0 : 1;
+}
+extern "C" void zs_test_reset_prop_file_mode_probe() {
+    g_prop_file_mode = -1;
+}
+// Round 26: the path the lazy-init last handed to the image builder
+// (tests assert the 6.x/7.x selection end-to-end through the
+// dispatch path).
+static char g_test_last_build_path[256] = {0};
+extern "C" const char* zs_test_last_props_build_path() {
+    return g_test_last_build_path;
+}
+#endif
 
 #ifdef ZS_HOST_TEST
 extern "C" void zs_test_set_session_file(const char* path) {
@@ -502,8 +566,15 @@ int zs_module_lazy_daemon_init() {
     if (!g_props_sent.load(std::memory_order_acquire)) {
         if (!g_props_build_attempted) {
             g_props_build_attempted = 1;
+#ifdef ZS_HOST_TEST
+            {
+                const char* p = props_file_path_for_platform();
+                snprintf(g_test_last_build_path, sizeof g_test_last_build_path,
+                         "%s", p);
+            }
+#endif
             g_props_area = zs_build_spoofed_serial_area(
-                "/dev/__properties__/properties_serial",
+                props_file_path_for_platform(),
                 &g_props_area_size);
             if (!g_props_area) {
                 // Feature unavailable on this device — final.
@@ -528,14 +599,20 @@ int zs_module_lazy_daemon_init() {
 }
 
 // Send the 'P' verb: <'P'><u32 LE len><bytes>. The daemon (root side)
-// writes the file into the session dir, relabels it, and replies
-// "1<session_dir>/p\n" — the payload then registers that path with
-// the hide layer, and every hidden child bind-mounts it over
-// /dev/__properties__/properties_serial at hide time.
+// writes the file into the session dir, relabels it with the
+// platform's own label (properties_serial on 7.0+,
+// properties_device on 6.x), and replies "1<session_dir>/p\n" — the
+// payload then registers that path with the hide layer, and every
+// hidden child bind-mounts it over the platform's property file
+// (/dev/__properties__/properties_serial on 7.0+, the single
+// /dev/__properties__ file on 6.x) at hide time.
 // Returns 1 = latched (sent OR feature acknowledged off), 0 = retry
 // later.
 static int send_props_file_to_daemon(const char* area, size_t size) {
-    if (!area || size < 4) return 1;   // nothing sane to send: final
+    // Round 26: the daemon requires the real 16-byte area header
+    // (bytes_used + serial + magic + version); anything shorter is
+    // not a sane image — final, not a retry.
+    if (!area || size < 16) return 1;
     int sock = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (sock < 0) return 0;
     struct sockaddr_un addr{};
@@ -576,8 +653,15 @@ static int send_props_file_to_daemon(const char* area, size_t size) {
     if (nl) *nl = '\0';
     const char* path = reply + 1;
     if (path[0] != '/') return 0;
+    // Round 26 — the self-check magic is the AREA magic (header
+    // offset 8: bytes_used@0, serial@4, magic@8, version@12 —
+    // verified from AOSP bionic at 6.0/7.0/9.0). The daemon rejects
+    // anything shorter than 16 bytes, so a successful reply means a
+    // real-format image; the size guard here is belt-and-braces.
     uint32_t magic = 0;
-    memcpy(&magic, area, sizeof magic);
+    if (size >= 12) {
+        memcpy(&magic, (const char*)area + 8, sizeof magic);
+    }
     hide_props_file_set_source(path, magic);
     ZS_LOGI("modules: spoofed properties file staged at %s", path);
     return 1;

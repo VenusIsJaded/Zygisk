@@ -43,8 +43,10 @@
 #include <link.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
-#include <sys/syscall.h>
+#include <atomic>
+#include <thread>
 #include <unistd.h>
+#include <sys/syscall.h>
 #include <vector>
 #include <map>
 
@@ -1010,6 +1012,70 @@ ZS_TEST(find_prop_mappings_parses_synthetic_maps) {
     ZS_CHECK_EQ(out[0].lo, (uintptr_t)0x7f00a00000ull);
     ZS_CHECK_EQ(out[0].hi, (uintptr_t)0x7f00a01000ull);
     ZS_CHECK_EQ(out[1].lo, (uintptr_t)0x7f00b00000ull);
+}
+
+// ----------------------------------------------------------------------
+// Round 26 — the 6.x single-file property mapping. A Marshmallow
+// process maps ONE file at exactly "/dev/__properties__" (verified
+// from AOSP bionic android-6.0.0_r1: PROP_FILENAME, single 128K
+// area, r--s MAP_SHARED). The version-agnostic 19-byte prefix must
+// catch that line too, without loosening anything else.
+// ----------------------------------------------------------------------
+ZS_TEST(find_prop_mappings_matches_the_6_0_single_file_line) {
+    // The exact 6.x form: the path IS the file, the mapping is
+    // 128K of r--s (shared).
+    std::string maps =
+        "7f00a00000-7f00a20000 r--s 00000000 00:05 1 /dev/__properties__\n"
+        "7f00b00000-7f00b01000 r-xp 00000000 08:02 3 /system/lib64/libc.so\n";
+    PropMapping out[8];
+    size_t n = find_prop_mappings(maps.data(), maps.size(), out, 8);
+    ZS_CHECK_EQ(n, (size_t)1);
+    ZS_CHECK_EQ(out[0].lo, (uintptr_t)0x7f00a00000ull);
+    ZS_CHECK_EQ(out[0].hi, (uintptr_t)0x7f00a20000ull);   // the full 128K
+
+    // A look-alike that is NOT the property path must not match: one
+    // byte short of the prefix ("/dev/__propertie").
+    std::string near_miss =
+        "7f00a00000-7f00a20000 r--s 00000000 00:05 1 /dev/__propertie\n";
+    n = find_prop_mappings(near_miss.data(), near_miss.size(), out, 8);
+    ZS_CHECK_EQ(n, (size_t)0);
+
+    // A writable property mapping (corrupt/mid-write state) is not a
+    // clone candidate: the perms guard holds on the 6.x form too.
+    std::string writable =
+        "7f00a00000-7f00a20000 rw-s 00000000 00:05 1 /dev/__properties__\n";
+    n = find_prop_mappings(writable.data(), writable.size(), out, 8);
+    ZS_CHECK_EQ(n, (size_t)0);
+
+    // Mixed: a 6.x process that ALSO maps the 7.x form (cannot
+    // happen on stock, but the matcher must stay sound): both lines
+    // match, both spans returned.
+    std::string mixed =
+        "7f00a00000-7f00a20000 r--s 00000000 00:05 1 /dev/__properties__\n"
+        "7f00b00000-7f00b01000 r--p 00000000 00:05 2 /dev/__properties__/properties_serial\n";
+    n = find_prop_mappings(mixed.data(), mixed.size(), out, 8);
+    ZS_CHECK_EQ(n, (size_t)2);
+}
+
+// Round 26 — the stock-line capture ALSO sees the 6.x single line,
+// so the Tier B maps restoration covers the legacy clone.
+ZS_TEST(capture_prop_line_restores_sees_the_6_0_single_line) {
+    std::string maps =
+        "7f00a00000-7f00a20000 r--s 00000000 00:05 1 /dev/__properties__\n"
+        "7f00b00000-7f00b01000 r-xp 00000000 08:02 3 /system/lib64/libc.so\n";
+    capture_prop_line_restores(maps.data(), maps.size());
+    ZS_CHECK_EQ(g_prop_line_restore_count, (size_t)1);
+    // The recorded stock line is the 6.x line verbatim.
+    const PropLineRestore* r = prop_line_restore_for(
+        "7f00a00000-7f00a20000 r--s", 27);
+    ZS_CHECK(r != nullptr);
+    ZS_CHECK(strstr(r->line, "/dev/__properties__") != nullptr);
+    // And the merged-VMA containment path finds it too (the 128K
+    // clone covers the whole range).
+    const PropLineRestore* covered[8];
+    size_t n = prop_line_restore_covered(
+        "7f00a00000-7f00a20000 r--p 00000000 00:00 0", 43, covered);
+    ZS_CHECK_EQ(n, (size_t)1);
 }
 
 // ----------------------------------------------------------------------
@@ -4080,6 +4146,130 @@ ZS_TEST(prop_set_reflects_into_clone_round_trip) {
     zs_test_set_real_prop_set(nullptr);
     zs_test_reset_prop_find();
     zs_test_set_props_clone_prot(PROT_READ);
+}
+
+// Round 26 — the set-hook's AREA-SERIAL bump + futex wake (the
+// wait_any half of the set round-trip). Verified platform protocol
+// (AOSP __system_property_update at 6.0 AND 7.0): after a successful
+// write, init stores serial+1 (release) into the containing area's
+// header word (offset 4) and FUTEX_WAKEs it — that is exactly what
+// __system_property_wait_any() sleeps on. The clone never sees
+// init's bump, so before this round a hidden app's wait_any slept
+// forever after its own successful setprop.
+ZS_TEST(prop_set_bumps_clone_area_serial_and_wakes_waiters) {
+    hide_advanced_set_active(1);
+    g_props_cloned.store(1);
+
+    // A REAL mmap'd page carrying a valid area header + one
+    // prop_info (the 6.x single-area shape — one span, everything in
+    // it; on 7.x the serial area has the same layout). One page: the
+    // set hook's mprotect span is derived from the prop_info's
+    // extent, which stays inside the first page.
+    const size_t kSize = 4096;
+    uint8_t* base = (uint8_t*)mmap(nullptr, kSize, PROT_READ | PROT_WRITE,
+                                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ZS_CHECK(base != MAP_FAILED);
+    uint32_t bytes_used = 112, serial = 5, magic = 0x504f5250u,
+             version = 0xfc6ed0abu;
+    memcpy(base + 0, &bytes_used, 4);
+    memcpy(base + 4, &serial, 4);
+    memcpy(base + 8, &magic, 4);
+    memcpy(base + 12, &version, 4);
+    uint8_t* pi = base + 128;                  // inside the area data
+    uint32_t pi_serial = (3u << 24) | 2u;      // value "old"
+    memcpy(pi + 0, &pi_serial, 4);
+    memcpy(pi + 4, "old", 4);
+    memcpy(pi + 96, "persist.sys.test.key", 21);
+
+    // The clone's pages finalize read-only (production shape): the
+    // set hook and the bump must each open their own mprotect window.
+    // (The waiter below starts BEFORE this — see the WaitCtx note.)
+    g_props_clone_prot = PROT_READ;
+
+    // Register the span as the (successfully cloned) area.
+    zs_test_clear_clone_spans();
+    zs_test_register_clone_span((uintptr_t)base, (uintptr_t)base + kSize);
+
+    static uint8_t* pi_slot = nullptr;
+    pi_slot = pi;
+    zs_test_set_prop_find([](const char* k) -> const void* {
+        return strcmp(k, "persist.sys.test.key") ? nullptr
+                                                 : (const void*)pi_slot;
+    });
+    zs_test_set_real_prop_set([](const char*, const char*) -> int {
+        return 0;   // init accepted
+    });
+
+    // A waiter sleeping on the AREA serial (wait_any's futex word,
+    // bionic's plain SHARED FUTEX_WAIT — verified from the 6.0/7.0
+    // sources), with a timeout so a missing wake fails the test
+    // instead of hanging it. NOTE: the waiter runs while the page is
+    // still writable — on THIS sandbox kernel a shared futex WAIT on
+    // a read-only page returns EFAULT instead of sleeping (mainline
+    // 3.10/5.10 both carry the VERIFY_READ read-only GUP fallback —
+    // fetched and verified from kernel sources this round — so real
+    // devices sleep fine; the shared key is (page, offset) either
+    // way, so a wake from inside the mprotect window covers a waiter
+    // keyed from any protection state).
+    struct WaitCtx {
+        std::atomic<int> about_to_sleep{0};
+        int futex_rc = -999;
+    };
+    WaitCtx ctx;
+    uint32_t* area_serial = (uint32_t*)(base + 4);
+    std::thread waiter([&]() {
+        ctx.about_to_sleep.store(1, std::memory_order_seq_cst);
+        struct timespec ts = {5, 0};   // 5s: generous for CI noise
+        ctx.futex_rc = (int)syscall(SYS_futex, area_serial,
+                                    0 /* FUTEX_WAIT */, 5, &ts);
+    });
+    // Let the waiter actually reach the futex (value still 5).
+    while (!ctx.about_to_sleep.load(std::memory_order_seq_cst)) {}
+    usleep(100 * 1000);
+
+    int rc = zygisk_study_hook_prop_set("persist.sys.test.key", "new");
+    ZS_CHECK_EQ(rc, 0);
+    waiter.join();
+
+    // The waiter was WOKEN (not timed out) and the serial moved by
+    // exactly +1 — the platform's own update protocol.
+    ZS_CHECK_EQ(ctx.futex_rc, 0);
+    uint32_t after = 0;
+    memcpy(&after, base + 4, 4);
+    ZS_CHECK_EQ(after, 6u);
+    // The entry patch happened too (the value round trip half).
+    memcpy(&after, pi, 4);
+    ZS_CHECK_EQ(after >> 24, 3u);              // strlen("new")
+    // And the pages went back to read-only (the clone's protection):
+    // find the maps line COVERING the span (the VMA may have merged
+    // with a neighboring identical anon mapping, so the line's start
+    // address is not necessarily ours) and check its perms.
+    {
+        FILE* f = fopen("/proc/self/maps", "r");
+        ZS_CHECK(f != nullptr);
+        char line[512];
+        int found = 0, perms_ok = 0;
+        unsigned long lo = (unsigned long)base;
+        while (found == 0 && fgets(line, sizeof line, f)) {
+            unsigned long a = 0, b = 0;
+            char perms[8] = {};
+            if (sscanf(line, "%lx-%lx %7s", &a, &b, perms) == 3 &&
+                a <= lo && b >= lo + kSize) {
+                found = 1;
+                perms_ok = (strcmp(perms, "r--p") == 0);
+            }
+        }
+        fclose(f);
+        ZS_CHECK_EQ(found, 1);
+        ZS_CHECK_EQ(perms_ok, 1);
+    }
+
+    munmap(base, kSize);
+    g_props_cloned.store(0);
+    zs_test_set_real_prop_set(nullptr);
+    zs_test_reset_prop_find();
+    zs_test_clear_clone_spans();
+    hide_advanced_set_active(0);
 }
 
 // Round 22 — fdopendir(): a DIR* built from a BARE fd (never opened

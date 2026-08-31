@@ -869,3 +869,32 @@ a blank path column.
   Cost: the bridge's file-backed pages stay resident in non-hidden
   children (the same footprint class the payload always had); hidden
   children still lose them to the Tier A unmap.
+
+## Round 26 additions — Android 6.x + the 'P' protocol bug
+
+- **The property layer is form-agnostic.** Android 6.x maps ONE
+  regular file at `/dev/__properties__` (labeled
+  `u:object_r:properties_device:s0`); 7.0+ map `properties_serial`
+  inside the directory (labeled `u:object_r:properties_serial:s0`).
+  One cached stat() picks the image-builder path, the bind-mount
+  target, and the daemon's label; the maps matchers catch the 6.x
+  single-file line and the 7.x directory lines with the same
+  19-byte prefix; the trie/prop_info/serial protocol is
+  byte-identical (verified from 6.0/7.0/9.0 bionic sources), so the
+  clone, the patchers, the deletion walk, the file image, and the
+  stock-line restoration all serve both forms unchanged.
+- **The 'P' image is validated as a real bionic area everywhere.**
+  The daemon (and the fake test daemon) now require the area magic
+  at offset 8 and the version at 12 with a 16-byte floor — the
+  pre-Round-26 offset-0 check read `bytes_used_` and rejected every
+  real image (device-dead execve-proof layer, host-green suite: the
+  e2e fixture matched the bug). The payload's mount self-check and
+  registered magic read offset 8 too.
+- **The set round-trip now wakes waiters.** After a successful
+  app-initiated setprop, the clone's entry serial is bumped (bionic's
+  odd/even protocol, as before) AND the owning area's header serial
+  gets the platform's own update protocol — `+1` release-store plus
+  `FUTEX_WAKE(INT32_MAX)`, run inside the mprotect window (init
+  wakes from its writable mapping; the shared key is (page, offset)
+  either way). `__system_property_wait_any` and per-prop waiters in
+  the hidden app now wake exactly as on a stock device.

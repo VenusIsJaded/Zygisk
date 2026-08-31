@@ -31,37 +31,51 @@ loader can own it.
 The standard way for a Zygisk alternative to land its bootstrap
 library into zygote is:
 
-1. Pick a path that ART will accept as a "native bridge" (it must
-   look like `/system/lib*/*.so`).
-2. Bind-mount the bootstrap library at that path (Magisk does this
-   from `post-fs-data.sh`).
-3. Set `ro.dalvik.vm.native.bridge` to that path using the
-   standard property-set mechanism (only root can set `ro.`
-   properties after init has run, so this happens early).
+1. Install the bootstrap library where the zygote's dlopen can
+   find it (Zygisk Study's `customize.sh` installs systemless
+   copies under `$MODPATH/system/lib[64]/` — the magic mount makes
+   them appear at `/system/lib[64]/libzygisk.so`).
+2. Set `ro.dalvik.vm.native.bridge` to the library's BARE SONAME
+   (`libzygisk.so`) using the standard property-set mechanism
+   (only root can set `ro.` properties after init has run, so this
+   happens early).
 
-Zygisk Study's `post-fs-data.sh` does **not** currently do steps 2
-and 3. The reason is that the bind-mount + property-set dance is
-the most fragile part of the whole pipeline — if you get it
-wrong, you brick the device. The current build leaves this to the
-user (or to a future revision of the project).
+**Round 26 correction (important):** the property value must be the
+BARE SONAME, never a full path. libnativebridge's
+`NativeBridgeNameAcceptable` rejects every filename containing `/`
+(on every version studied — 6.0.0_r1, 6.0.1_r81, 7.0.0_r1,
+7.1.2_r33, 8.0.0_r17, 8.1.0_r81, 9.0.0_r1 and 13.0.0_r1; the
+allowed character set is `[a-zA-Z0-9._-]` with a leading letter).
+A full path is silently rejected and the bridge never loads: the
+zygote comes up without the loader and the module does nothing.
+Because ART dlopen()s the bare soname through the default system
+library path (`/vendor/lib[64]:/system/lib[64]` — and on 6.0 there
+are no linker namespaces to complicate resolution), the magic-
+mounted copy is what the zygote finds.
 
-To enable the swap by hand:
+Zygisk Study's `post-fs-data.sh` performs the swap itself (Round 7):
+it writes `libzygisk.so` into `ro.dalvik.vm.native.bridge` with
+`resetprop`, but ONLY when the property is currently empty —
+devices that already run a real native bridge (x86 ARM translation
+hubs, ChromeOS-style bridges) must never be overridden, since
+breaking translation breaks the whole device. The previous value
+is saved for `uninstall.sh` to restore.
+
+To enable the swap by hand on a device where the module's own
+script did not run (e.g. no `resetprop` in the environment):
 
 ```sh
-# Bind-mount libzygisk.so into /system/lib64
-mkdir -p /system/lib64
-mount --bind /data/adb/modules/zygisk_study/libs/arm64-v8a/libzygisk.so \
-              /system/lib64/libzygisk.so
-
-# Set the property. Use resetprop (Magisk) or ksud (KernelSU) for
-# the actual set.
-resetprop -n ro.dalvik.vm.native.bridge /system/lib64/libzygisk.so
+# The systemless copy is already at /system/lib64/libzygisk.so
+# via the magic mount. Set the property to the BARE SONAME —
+# a full path is rejected by libnativebridge on EVERY Android
+# version studied (see the Round 26 correction above).
+resetprop -n ro.dalvik.vm.native.bridge libzygisk.so
 ```
 
 This is the standard Magisk-style setup and is documented in
 several public Magisk guides. The technique itself is public
 knowledge; the implementation here simply omits the destructive
-part.
+part (overriding a real translation bridge).
 
 ## Per-ABI considerations
 
@@ -117,14 +131,16 @@ This is the standard Magisk-module recovery procedure. The
 Zygisk Study module is no more or less dangerous than any other
 Zygisk alternative — the recovery procedure is the same.
 
-## Android version support (Round 25)
+## Android version support (Round 26)
 
 The loader's Android surface was verified against AOSP sources at
-android-7.0.0_r1, android-7.1.2_r33, android-8.0.0_r17,
-android-8.1.0_r81 (plus 9.0/13.0 for boundary pinning):
+android-6.0.0_r1, android-6.0.1_r81, android-7.0.0_r1,
+android-7.1.2_r33, android-8.0.0_r17, android-8.1.0_r81 (plus
+9.0/13.0 for boundary pinning):
 
 | Android | Status | Verified from source |
 |---|---|---|
+| 6.0 / 6.0.1 | Supported (Round 26) | libnativebridge in system/core: same `NativeBridgeItf` symbol, 8-slot v2 table, VersionCheck asks isCompatibleWith(2) (6.0.1's native_bridge.cc is byte-identical to 6.0.0's, md5-verified); Runtime::Init dlopen + zygote-never-initializes + same-arch-child dlclose (identical lifecycle to 7.x); the SINGLE-FILE property area `/dev/__properties__` (same trie, prop_info, area header, serial protocol as 7.0 — only the PATH and the SELinux label `u:object_r:properties_device:s0` differ); bionic M linker honors DF_1_NODELETE + RTLD_NOLOAD; zygote drop order setgroups→setresgid→setresuid with no seccomp between; `/data/user/0 → /data/data` symlink created by installd at boot; 3.4/3.10 kernels → memfd fallback |
 | 7.0 / 7.1 / 7.1.2 | Supported | nativebridge VersionCheck + isCompatibleWith(2) call; zygote setresgid→setresuid order; the /dev/__properties__/ directory + trie format; kernel floors (memfd fallback for 3.4/3.10) |
 | 8.0 / 8.1 | Supported | LoadNativeBridge isCompatibleWith(3) call; the 15-slot table; same property format; 3.18/4.4 kernels have memfd |
 | 9 – 15 | Supported (as before) | Rounds 7–24 research (9/13/15/main); Round 25 pinned the 9.x bridge lifecycle to the same constructor contract |
@@ -134,17 +150,27 @@ Key version-specific mechanisms and where they are handled:
 - **Bootstrap**: a library constructor runs in the zygote during
   Runtime::Init's dlopen of the native bridge — the only hook point
   that exists on every version (ART never calls `initialize()` in
-  the zygote; same-arch children even `dlclose` the bridge, which the
+  the zygote — verified at 6.0 too, from M's own
+  `ZygoteHooks_nativePostForkChild` + `Runtime::DidForkFromZygote`;
+  same-arch children even `dlclose` the bridge, which the
   payload's self-pin neutralizes).
 - **NativeBridgeCallbacks**: the exact 15-slot AOSP table with
-  `isCompatibleWith` implemented — 7.0–9.x call that slot during
-  `LoadNativeBridge` and a NULL slot is a boot crash.
-- **Properties**: 7.0+ all use the same `/dev/__properties__/`
-  directory + trie (magic 0x504f5250, version 0xfc6ed0ab) and the
-  same `u:object_r:properties_serial:s0` label — the execve-proof
-  file image, the bind-mount, and the in-process clone work
-  unchanged.
-- **Old kernels (3.4/3.10 on 7.x devices)**: no memfd_create — the
-  /proc filter falls back to an unlinked scratch file in the hidden
-  app's own data dir; `PR_SET_VMA`/`statx`/`openat2` absence is
-  handled by the existing best-effort/fallback chains.
+  `isCompatibleWith` implemented — 6.0–9.x call that slot during
+  `LoadNativeBridge` and a NULL slot is a boot crash. M only reads
+  the strict 8-slot prefix and asks `isCompatibleWith(2)`.
+- **Bridge property value**: the BARE SONAME `libzygisk.so` on
+  every version — `NativeBridgeNameAcceptable` (6.0 through 13.0,
+  all fetched and read) rejects any value containing `/`.
+- **Properties**: 6.x map ONE regular file (`/dev/__properties__`,
+  labeled `u:object_r:properties_device:s0` by init's restorecon);
+  7.0+ map the `/dev/__properties__/` directory
+  (`properties_serial` labeled `u:object_r:properties_serial:s0`
+  by bionic's fsetxattr). The trie, prop_info, area-header layouts
+  and the serial protocol are byte-identical across 6.0/7.0/9.0 —
+  the payload detects the form with one stat() and points the
+  image builder, the bind-mount target, and the daemon's label at
+  the platform's own file.
+- **Old kernels (3.4/3.10 on 6.x/7.x devices)**: no memfd_create —
+  the /proc filter falls back to an unlinked scratch file in the
+  hidden app's own data dir; `PR_SET_VMA`/`statx`/`openat2` absence
+  is handled by the existing best-effort/fallback chains.

@@ -251,6 +251,12 @@ void zs_test_set_fd_root_prefix(const char* prefix);
 // plus a fake real __system_property_set.
 void zs_test_set_props_clone_prot(int prot);
 void zs_test_set_real_prop_set(int (*fn)(const char*, const char*));
+
+// Round 26: register/clear clone spans from tests (the set hook's
+// area-serial bump needs them; heap-fake tests do not run the
+// production clone).
+void zs_test_register_clone_span(unsigned long lo, unsigned long hi);
+void zs_test_clear_clone_spans();
 #endif
 
 } // namespace zygisk_study

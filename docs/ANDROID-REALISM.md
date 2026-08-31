@@ -1773,3 +1773,131 @@ forked children exit through `_exit()` — which skips the handlers
 `exit()` would run — and nothing dlclosed the bridge in them; the
 new `self_pin_survives_the_child_side_bridge_dlclose` test drives the
 real dlclose path.
+
+## Round 26 — Android 6.0 / 6.0.1 support, the 'P' magic-offset bug, and the wait_any round trip
+
+### The 6.x fact base (all fetched and READ this round)
+
+| Fact | Android 6.0 / 6.0.1 (verified) | Where it matters |
+|---|---|---|
+| libnativebridge home | `system/core/libnativebridge` (a separate repo only from 7.0; in M it lives in system/core) | none (link-time) |
+| Bridge symbol | `NativeBridgeItf` (same as 7.x) | loader table export |
+| VersionCheck | reject 0; `version >= 2` → `isCompatibleWith(2)`; v1 accepted unqueried — M's `kLibNativeBridgeVersion = 2` | our table (v2, answers true) passes |
+| Callbacks table | strict 8-slot prefix (v1:5 + v2:2) — M never reads past `getSignalHandler` | our 15-slot table is a superset; safe |
+| initialize() arg order | `(runtime_cbs, private_dir, isa)` — DIFFERENT from N+'s `(cb, cache_dir, isa)` | none: ours is a contract-valid no-op |
+| Path check | `NativeBridgeNameAcceptable`: `[a-zA-Z0-9._-]` only — `/` REJECTED (byte-identical check on 6.0→13.0) | the property value must be the BARE soname `libzygisk.so` |
+| ART lifecycle | `Runtime::Init` → `LoadNativeBridge` (dlopen → constructor runs in zygote); zygote `Runtime::Start` never initializes the bridge; same-arch child `DidForkFromZygote(kUnload)` → `UnloadNativeBridge()` → dlclose | identical to the R25 design — no code change needed |
+| Cross-arch child | `ForkCommon` calls `PreInitializeNativeBridge(data_dir, isa)` (creates the code_cache dir path AND bind-mounts `/system/lib[,64]/<isa>/cpuinfo` over `/proc/cpuinfo` in the child) before setresgid | platform-plausible mount (stock M behavior on translation devices); not a loader signature |
+| bionic linker | DF_1_NODELETE honored (`can_unload()` checks RTLD_NODELETE); RTLD_NOLOAD valid; dlclose unmaps at refcount 0 | `-z nodelete` + self-pin both work on M |
+| Properties | ONE regular file `/dev/__properties__` (128K, PA_SIZE); area header `{bytes_used, serial, magic, version, reserved[28]}` — IDENTICAL layout to 7.0; trie nodes (uint8 namelen + reserved[3] + prop/left/right/children, 20 bytes) — identical to 7.x; `prop_info {serial@0, value[92]@4, name@96}` — identical to 7.0 AND 9.0; serial protocol identical (len<<24, dirty bit, +1 counter, area serial +1 + futex wake); NO long values, NO per-context files, NO properties_serial; `__system_property_set` → prop_msg to `/dev/socket/property_service` (same) | the whole property layer works on 6.x by only changing the PATH and the label |
+| Property file label | `u:object_r:properties_device:s0` (external/sepolicy file_contexts line 126; init.cpp:1066 `restorecon("/dev/__properties__")`; domain.te:95 `allow domain properties_device:file r_file_perms`) | the daemon's chcon label on the staged file |
+| fstat validation (bionic map_fd_ro) | uid 0, gid 0, no group/other write, size >= 128 | the staged file (root 0444, full image) passes |
+| Zygote drop order | setgroups → rlimits → [cross-arch PreInit] → setresgid → setresuid → personality → caps → scheduler → selinux ctx — NO seccomp between drops | the setresuid hook point works unchanged |
+| /data/user/0 | symlink to `/data/data` created by `installd` at boot (installd.cpp:441; init.rc only does `mkdir /data/user 0711`) | `hide_data_dir_for_uid`'s `/data/user/<uid>/<pkg>` resolves on M |
+| 6.0.1 | native_bridge.cc byte-identical to 6.0.0 (md5 `f16e0a66…` both) | no separate support matrix entry needed |
+
+### The 6.x support implementation
+
+The bridge/linker/zygote surfaces needed ZERO code changes (the R25
+constructor + 15-slot table + self-pin + NODELETE design was verified
+against M's own sources this round — it loads and survives on 6.0
+as-is). The property layer needed exactly three things:
+
+1. **The maps matchers broadened** from the 7.x directory prefix
+   (`/dev/__properties__/`, 20 bytes) to the 19-byte
+   `/dev/__properties__` prefix — it now catches both the 6.x
+   single-file line (the path IS the file, `r--s`, 128K) and every
+   7.x directory line. The clone, the trie patchers, the deletion
+   walk, and the stock-line restoration all operate on whichever
+   lines exist.
+2. **The file-path / mount-target selection**: one cached `stat()`
+   of `/dev/__properties__` decides the image-builder path, the
+   bind-mount target, and (daemon-side) the chcon label
+   (`properties_device` for a regular file, `properties_serial`
+   otherwise). The mount self-check now reads the area magic at
+   offset 8 (see the bug below).
+3. **The maps stock-line restoration** covers the single 6.x line
+   (Tier B answers the real file's line for the cloned range, same
+   as 7.x's two lines).
+
+### REAL BUG #1 (device-fatal for the execve-proof layer, since Round 19): the 'P' magic-offset check
+
+The Rust daemon's defense-in-depth validation compared bytes 0..4 of
+the received image against the area magic — but the image is the
+VERBATIM property-file content, whose first 4 bytes are
+`prop_area::bytes_used_` (the magic is at offset 8, the version at
+12 — verified from 6.0/7.0/9.0 sources; the layout never moved).
+Every real 'P' request was therefore REJECTED ("0\n"): the staged
+file never existed, the payload retried forever, and fork+exec'd
+helpers kept seeing the REAL property values — the entire R19/R20/
+R22 execve-proof layer was dead on real devices while every host
+test stayed green (the e2e fixture used a fantasy "PROP"@0 format
+that only agreed with the daemon's equally-wrong offset-0 check —
+two wrongs cancelling into a green suite).
+
+Fixed at all three layers: the daemon validates magic@8 + version@
+12 + a 16-byte length floor; the fake daemon in the tests mirrors
+it; the e2e fixtures now build real-format images; the payload's
+send path latches sub-16-byte buffers as "final" (mirroring the
+daemon's floor); the payload's mount self-check and the registered
+`g_props_magic` use the magic@8 too (the old first-4-bytes compare
+actually compared `bytes_used_` — self-consistent but mislabeled
+and weaker).
+
+### REAL BUG #2 (every version): the set round-trip never woke wait_any sleepers
+
+bionic's update path (verified at 6.0 AND 7.0) ends with TWO futex
+wakes: the entry's serial (`__system_property_wait(pi, serial)`
+sleepers) and the AREA's serial (the global `wait_any` word — init
+stores `serial+1` release and `__futex_wake(&pa->serial, INT32_MAX)`).
+The R22 set hook patched the entry but never bumped the clone's area
+serial nor woke anything — a hidden app's `wait_any` slept forever
+after its own successful setprop, and a per-prop waiter slept through
+the value change. The hook now reproduces the platform protocol on
+the clone: entry wake + area-serial +1 (release store, inside the
+mprotect window) + FUTEX_WAKE. On 6.x the single area IS the wait_any
+area, so the round trip is fully closed there; on 7.x it closes for
+props whose area is the serial area (default context) — context-area
+props keep the residual (a context write does not bump the context
+area's header on stock either — emulated faithfully).
+
+Kernel verification for the wake semantics: Linux 3.10's and 5.10's
+`get_futex_key` both carry the read-only GUP fallback for
+`FUTEX_WAIT`/`FUTEX_WAKE` (fetched and read: `get_user_pages_fast(
+address, 1, 1, &page)` first, then `if (err == -EFAULT && rw ==
+VERIFY_READ) get_user_pages_fast(address, 1, 0, &page)`) — shared
+futexes on read-only property pages work on the real kernels. The
+wake still runs INSIDE the mprotect window (init wakes from its own
+writable mapping; a hardened kernel that refuses the RO wake is
+covered by the window, and the shared key — (page, offset) — is
+identical either way). The host sandbox's kernel EFAULTs shared
+futex waits on RO pages (mainline has the fallback; this kernel
+does not honor it) — documented in the test; the test's waiter runs
+in the window-open state.
+
+### Honest residuals (6.x and general)
+
+- The Rust daemon changes remain inspection-verified only (no Rust
+  toolchain in the build environment) — same caveat as R13/R19/R25.
+- On 6.x, exec'd helpers read the spoofed file through M's
+  `map_fd_ro` validation (uid/gid 0, mode 0444, size ≥ 128, magic@8,
+  version@12) — all satisfied by the staged image by construction.
+- M's `PreInitializeNativeBridge` bind-mounts a per-ISA cpuinfo over
+  /proc/cpuinfo in CROSS-ARCH children only (same-arch children —
+  the default — never call it); the extra mount line is stock
+  behavior on translation devices, not a loader signature.
+- The wait residual for 7.x per-context keys (above).
+- The `find_prop_mappings` prefix is one byte shorter than 7.x's
+  (19 vs 20 chars) — nothing else on a stock /dev starts with
+  `/dev/__properties__`, and every downstream consumer validates
+  the area header before walking, so a stray match fails closed.
+- 6.x has no long property values (value[92] fixed) — the long-value
+  code paths simply never trigger on M areas.
+
+Tests 199 → 206 (+7: the 6.x single-file matcher ×3 including
+near-miss/merged forms, the stock-line capture on the 6.x line, the
+area-serial bump + futex wake (real thread, real futex, real
+mprotect windows), the mount-target selection, the mode detection,
+the lazy-init path selection through the dispatch). 0 warnings,
+ASan+UBSan+leaks green, trampoline binary verification green, all
+test binaries exit 0.
