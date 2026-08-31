@@ -1983,7 +1983,7 @@ is byte-identical to refs/heads/main (diff-verified) — main is Android
   keeps the bridge loading (log-and-skip per feature) — the same
   degradation mode every pre-v9 real bridge has.
 
-Tests 206 → 211 (+3 version-compat: the SDK-selection matrix
+Tests 206 → 209 (+3 version-compat: the SDK-selection matrix
 21/22→v1 and 23..37→v8 with a writable-table read-back, the 5.0
 exact-match contract replica incl. the version=2 rejection case, the
 16/17 contract replica incl. the per-feature guards and the v5..v8
@@ -1991,4 +1991,236 @@ contract answers; the 15-slot layout test became the 20-slot test
 with offset static_asserts through isNativeBridgeFunctionPointer@160,
 and the compat matrix grew to 1..8 true / 0,9,100 false). 0 warnings,
 ASan+UBSan+leaks green, trampoline binary verification green (ALL
-CHECKS GREEN), all test binaries exit 0.
+CHECKS GREEN), all test binaries exit 0. (Round 28 correction: the
+R27 commit message and README claimed "211"; the actual per-binary
+totals at that commit were 37+112+20+5+4+2+19+10 = 209 — an
+arithmetic slip, now fixed everywhere.)
+
+## Round 28 — the Android 4.3 question, and the round that made the daemon real
+
+Task: (a) Android 4.3 support "if it's actually possible", (b) more
+bugs, verified online.
+
+### The 4.3 verdict: not possible — and now provable, not assumed
+
+Every fact below was fetched and read from AOSP at
+android-4.3_r1 (with 4.3.1_r1 / 4.4.2_r1 boundary checks):
+
+- **system/core has no `libnativebridge` at 4.3** — the directory
+  listing at android-4.3_r1 (and 4.3.1_r1, and even 4.4.2_r1) does
+  not contain it. The library first appears in the L release. The
+  R27-era "4.x has a differently-named bridge symbol path" guess in
+customize.sh was wrong in the best possible direction: there is no
+  path at all. The comment now states the researched truth.
+- **Dalvik has no bridge-loading path.** The only `dlopen` in the
+  4.3 VM is `dvmLoadNativeCode` in dalvik/vm/Native.cpp — the
+  per-app `System.loadLibrary` loader, invoked after fork, per
+  app, on the app's own libraries. Every other "bridge" in that
+  file is `DalvikBridgeFunc`, the VM's internal JNI call bridge
+  (a function-signature concept, not a translation library).
+- **The property that drives our bootstrap does not exist.**
+  `AndroidRuntime.cpp@4.3` reads the complete `dalvik.vm.*` surface
+  (17 keys: check-dex-sum, checkjni, dexopt-flags,
+  enableassertions, execution-mode, extra-opts, heapgrowthlimit,
+  heapmaxfree, heapminfree, heapsize, heapstartsize,
+  heaptargetutilization, jit.method, jit.op, jniopts,
+  lockprof.threshold, stack-trace-file) — and nothing reads a
+  native-bridge property. (For the record, `ro.dalvik.vm.native.bridge`
+  WAS verified this round at 5.0.0_r1, 6.0.0_r1, 7.1.2_r33,
+  8.1.0_r81, 16.0.0_r1 and main — byte-identical name and
+  empty/"0"/soname semantics on all of them; 16.0 adds a
+  `zygote &&` guard so non-zygote app_process runs never try to
+  load a bridge. Our post-fs-data swap mechanism is correct on
+  every supported version.)
+- **The pre-L property area is a different format.**
+  bionic@4.3's `_system_properties.h`: same file name
+  (`/dev/__properties__`), same magic 0x504f5250 **at the same
+  offset 8** (count@0, serial@4 — a trap for anyone validating on
+  magic alone!) — but version **0x45434f76**, and a flat TOC body:
+  `toc[]` of 32-bit entries (name length in the top 8 bits,
+  24-bit offset), fixed-size `prop_info { char name[32]; unsigned
+  volatile serial; char value[92] }`, per-entry SERIAL_DIRTY
+  protocol, `__system_property_wait(pi)` futex-waits on the
+  ENTRY serial. No trie, no contexts, no area-serial wake
+  broadcast (wait_any could not be supported without an area-serial
+  protocol to mirror). Our daemon's 'P' validation checks both
+  magic AND version — a 4.x-era image is correctly rejected; it
+  would have been accepted on magic alone.
+- **The drop sequence exists but is unreachable.**
+  dalvik/vm/native/dalvik_system_Zygote.cpp@4.3: PR_SET_KEEPCAPS →
+  PR_CAPBSET_DROP loop → setgroups → setresgid → setresuid →
+  capset (and PR_SET_DUMPABLE, PR_SET_KEEPCAPS management). It is
+  the same shape our privilege-drop hook design targets — but with
+  no library-load mechanism there is no hook to reach it from.
+- **What 4.3-era injection actually looked like:** app_process
+  replacement (classic Xposed — writes to /system, a different
+  project architecture) or the per-app `wrap.<package>` invokeWith
+  path (ZygoteConnection.java@4.3:771-793 — root peer required,
+  and init@4.3's `check_perms` lets uid 0 set any property since
+  root bypasses the prefix table entirely; SELinux on 4.3 was not
+  yet enforcing). wrap.* wraps ONE app's launch as a post-drop
+  wrapper process — not zygote injection, not Zygisk, and it is
+  what a Magisk/zygote-context project cannot use.
+
+Conclusion: the API < 21 refusal in customize.sh stays, now backed
+by citations instead of a guess. compatibility.md carries the full
+row.
+
+### The meta-fix: the daemon is now compiled, linted, tested AND run
+
+A Rust toolchain was installed in this environment (rustup,
+1.98.0-stable). Every round since R13 that called the daemon
+"inspection-verified only" was carrying hidden risk, and the risk
+was real:
+
+- **The daemon did not compile.**
+  `libc::inotify_add_watch(inotify_fd, MODULES_ROOT, mask)` passed
+  a `&str` where libc demands a NUL-terminated `*const c_char` —
+  a hard type error at BOTH call sites, in the rescan thread that
+  was written rounds ago. The daemon had never been compiled
+  here, so no round ever saw it. Fixed via an `inotify_watch_root`
+  helper that builds a `CString` (and respects the new test-root
+  remap so the host E2E watches the real temp tree).
+- **The zombie leak.** The accept loop forks one child per client
+  connection and never reaps: SIGCHLD left at default (ignored,
+  not SIG_IGN) means every exited child stays defunct until the
+  parent dies. The live E2E proves it: with the fix reverted, 10
+  short connections leave **17 zombies** (the earlier verb probes
+  count too — every connection leaves one). Fixed with
+  `signal(SIGCHLD, SIG_IGN)` at the top of main (kernel auto-reap;
+  we never need a child's exit status). Hundreds of forks per cold
+  start = hundreds of defunct rows in /proc, each still carrying
+  the cloaked name — a fleet of zombies is itself a signature.
+- **The cloak was half a cloak.** `rewrite_argv` was a documented
+  no-op skeleton ("left as a TODO"), so /proc/self/cmdline kept
+  showing `<path>/zygiskd --workdir /data/system/zygisk_study` —
+  the single most identifying string in the whole process list.
+  Now implemented for real: parse `arg_start`/`arg_end` (fields
+  48/49) out of /proc/self/stat (split at the LAST ')' because
+  comm may contain spaces and parentheses), validate the extent,
+  then write the cloak name into the argv strings area and
+  NUL-blank the rest — the kernel renders /proc/<pid>/cmdline from
+  exactly those bytes. This is the same technique systemd's
+  setproctitle.c uses. Cargo tests drive the parser with crafted
+  stat lines (incl. parens-in-comm) AND run the rewrite on the test
+  process itself, asserting the cmdline afterwards contains the
+  cloak name and no zygiskd/--workdir fragments.
+- **The test-root seam.** The daemon's /data/... paths are
+  constants, and this environment has no /data and no root to make
+  one — so the binary could never be RUN either.
+  `remap_path()` (env `ZS_TEST_ROOT`, unset = byte-identical
+  pass-through) remaps every /data path, `setup_random_socket`'s
+  previous-boot cleanup learned to recognize the remapped prefix
+  (its device-only `/data/system/.` check would have refused to
+  clean the host tree), and `scripts/verify_daemon.py` was added:
+  builds the daemon, runs it against a temp tree, and probes the
+  REAL binary over its REAL socket — 16 checks: the randomized
+  session-file handshake (path + 0700 perms + bind), the comm AND
+  cmdline cloak, 'L' module listing from a fake module tree, 'I'
+  allow → deny after a denylist flip delivered through the
+  (fixed) inotify path, 'C' companion echo, 'P' staging (valid
+  image → file at the right path, 0444, content parity; bad magic
+  → rejected), zero zombie children after 10 connections, and
+  previous-boot random-dir cleanup across a restart. Wired into
+  tests/Makefile as `make verify-daemon` (exit 77 skip without
+  cargo, the keystone convention). The zombie check was
+  regression-proven by reverting the fix (17 zombies, FAIL) and
+  restoring it (green).
+- **Dead code surfaced.** With the compiler finally watching:
+  `ClientVerb::parse()` (read-the-verb-byte wrapper) has been dead
+  since the R19 peek-before-drop redesign — kept as the documented
+  parser entry with an explicit allow(); `parse_verb_from_bytes`
+  is `#[cfg(test)]` (test-only since R19); two clippy suggestions
+  applied (c-string literal, inclusive range). `cargo build`,
+  `cargo build --release`, `cargo clippy` and `cargo test` are all
+  green (20/20, +5 new this round).
+
+### Other bugs fixed this round
+
+- **The public API header did not compile standalone.**
+  `zygisk_study_api.h` used `uid_t`/`gid_t` in
+  `zygisk_study_process_info` while including only
+  `<stdint.h>`/`<stddef.h>` — so the DOCUMENTED usage (a module
+  whose only include is this header) failed to compile in both C
+  and C++ translation units. Any host TU happened to work only
+  because something else included `<sys/types.h>` first. Fixed;
+  `make run` now verifies standalone compilation in BOTH languages
+  (gcc -std=c99 and g++ -std=c++17) before any test runs.
+- **libzn_loader's init-oriented API was dead on devices since
+  R13.** The file hardcoded the legacy fixed socket path
+  (`/data/system/zygisk_study/sock/sock`) while the daemon —
+  since Round 13's randomization — binds a per-boot random path
+  published in the session file. On every normal boot the
+  connect() failed: `should_inject()` answered "no" for every
+  target, `open_companion_fd()` always returned -1, while the host
+  suite stayed green because nothing exercised the path.
+  Fixed with the same session-file handshake the payload uses
+  (read, trim, absolute-path sanity, legacy fallback; resolved
+  per-call rather than cached because the daemon starts AFTER
+  zygote and a cached pre-daemon miss would pin the fallback
+  forever). libzn_loader also gets its FIRST dedicated test binary
+  (13 tests: the resolver matrix incl. missing/relative/blank/
+  overlong rejection, and live end-to-end 'I'/'C' protocol tests
+  through the real API table against a unix socket — the
+  regression test fails against the old code).
+- **Both session-file parsers accepted truncated content.** A
+  120-byte session file was read as its first 95 bytes: the socket
+  became a garbage path (harmless, connects fail closed) but the
+  TRUNCATED garbage was also registered as hide-filter prefixes
+  and a /proc/net/unix substring (module_dispatch.cpp), polluting
+  the filters with junk. Both parsers (libzn_loader resolver and
+  payload `zs_module_load_session_socket`) now read one sentinel
+  byte more than they accept and reject overlong content; two new
+  payload-side tests cover the rejection (and the mirror matrix
+  on the loader side).
+- **uninstall.sh referenced `$MODDIR` without defining it** (the
+  other scripts derive it via `${0%/*}`). In a Magisk environment
+  that does not export MODDIR, the stale-random-dir cleanup
+  silently matched nothing — leaving an orphan `/data/system/.<hex>`
+  directory forever, with no daemon left to clean it at next boot.
+  Fixed the same way the other scripts do it.
+- **uninstall.sh's empty-backup restore re-created a phantom
+  property.** The old sequence ran `--delete` AND THEN set
+  `ro.dalvik.vm.native.bridge` to "" — which re-creates it as an
+  empty-value entry. No stock device has an empty VALUE for this
+  property (stock is absent or "0"; ART treats absent == empty —
+  the same ALOGW path, verified at 5.0 and 16.0 — so behavior is
+  identical either way, but `getprop` output differed from a
+  clean device). Now: delete outright, with the empty-value set
+  only as an old-resetprop compatibility fallback when --delete
+  fails.
+- **The R27 test-count arithmetic slip** (211 vs the real 209) —
+  fixed in the README and in the R27 entry above.
+
+### Honest residuals (Round 28)
+
+- The daemon's device-side behavior is now compile/lint/unit/E2E
+  verified on this host via ZS_TEST_ROOT, but the E2E still runs
+  as the same uid with no SELinux — label-setting (chcon) and the
+  privilege-drop paths are exercised as non-fatal failures, not
+  as their device selves. Device smoke-testing remains the
+  un-closable residual for every host-verified round.
+- Android 4.3 support is closed as not-possible rather than
+  implemented; if someone ever wants a 4.x story it is a different
+  project (app_process replacement, /system writes, pre-L flat-TOC
+  property format — none of this repo's mechanisms apply).
+- The empty-prop ALOGW curiosity: a stock device with no
+  `ro.dalvik.vm.native.bridge` logs "not expected to be empty" at
+  every zygote start; with our swap in place that warning
+  disappears. The only observable difference is a MISSING log
+  line (logcat-only, not /proc-visible) — noted for completeness,
+  not engineered around.
+- libzn_loader's `zygisk_study_loader_entry` (the ptrace-injected
+  entry path) remains a documented stub on the daemon side — no
+  ptrace injector exists in this repo; the API surface around it
+  is now tested, the injector itself is not (unchanged from
+  earlier rounds).
+
+Tests 209 → 224 (+13 test_zn_loader: the resolver matrix and the
+live I/C protocol end-to-end through the real API table; +2
+test_module_dispatch: overlong/relative/blank session-content
+rejection). New verification layers: standalone public-header
+compile (C99 + C++17), `make verify-daemon` (16 live checks),
+cargo test 15 → 20, cargo clippy clean, `cargo build --release`
+green. 0 warnings, ASan+UBSan+leaks green, trampoline binary
+verification green (ALL CHECKS GREEN), perf medians unchanged.

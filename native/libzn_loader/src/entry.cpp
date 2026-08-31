@@ -45,6 +45,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -58,10 +59,90 @@ namespace zygisk_study {
 static constexpr uint32_t kApiMagic = 0x5A535354u; // "ZSST" (Zygisk STudy)
 
 // Socket the loader uses to ask the daemon "should I inject for this
-// process?". Same path libpayload uses. See the comment in
-// libpayload/src/entry.cpp for why we use a generic-looking path.
-static constexpr const char* kDaemonSocket =
+// process?". Round 28 fix: this is only the LEGACY FALLBACK path.
+// Since Round 13 the daemon binds a randomized per-boot socket and
+// publishes the real path in the session file (the same handshake
+// libpayload uses — see module_dispatch.cpp). The previous version
+// of this file hardwired the fixed path, so on every boot where the
+// randomization succeeded the connect() here failed and
+// api_should_inject() silently answered "no" for every target while
+// api_open_companion_fd() always returned -1 — the init-oriented API
+// was dead on real devices while the host tests stayed green (nothing
+// exercised the path).
+static constexpr const char* kDaemonSocketLegacy =
     "/data/system/zygisk_study/sock/sock";
+
+// The session file the daemon writes before binding (root-only
+// directory; see module_dispatch.cpp for the full stealth rationale
+// for why the path is handed over in a file instead of a fixed name).
+static constexpr const char* kSessionFile =
+    "/data/adb/modules/zygisk_study/session.sock";
+
+#ifdef ZS_HOST_TEST
+// Test seam: point the resolver at a temp "session file".
+static const char* g_session_file = kSessionFile;
+extern "C" void zs_test_zn_set_session_file(const char* path) {
+    g_session_file = path ? path : kSessionFile;
+}
+// Test seam: run the resolver directly (the static function below
+// is not otherwise visible outside the TU).
+static int resolve_daemon_socket(char* out, size_t outsz);
+extern "C" int zs_test_zn_resolve_socket(char* out, size_t outsz) {
+    return resolve_daemon_socket(out, outsz);
+}
+#endif
+
+// Resolve the daemon socket for a connection attempt. Reads the
+// session file (daemon up, randomized path); on any failure (daemon
+// not started yet, file missing, malformed content) falls back to
+// the legacy fixed path. Returns 1 when the session file supplied
+// the path, 0 when the legacy fallback is in use — callers may use
+// that to decide whether a retry is worthwhile (the daemon may come
+// up later in the boot; the payload's lazy-init does the same).
+//
+// Called per-connection rather than cached: the calls are per
+// process-injection (rare), the file is 96 bytes, and the daemon
+// starts AFTER zygote (class main) while libzn_loader may be asked
+// from init-context processes at any point — a cached miss from
+// before daemon start would pin the fallback forever.
+static int resolve_daemon_socket(char* out, size_t outsz) {
+    if (!out || outsz == 0) return 0;
+#ifdef ZS_HOST_TEST
+    const char* session = g_session_file;
+#else
+    const char* session = kSessionFile;
+#endif
+    int fd = open(session, O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) {
+        // 96 bytes read into a 97-byte buffer: a path that fills the
+        // full 96 is longer than any legitimate session path (the
+        // daemon's randomized paths are ~50 bytes) AND cannot fit the
+        // callers' 96-byte buffers — it would be silently truncated
+        // into a garbage path. Reject it outright (the earlier
+        // version accepted the first 95 bytes of a 120-byte file).
+        char path[97];
+        ssize_t n = read(fd, path, sizeof path - 1);
+        close(fd);
+        if (n > 0 && n <= (ssize_t)(sizeof path - 2)) {
+            path[n] = '\0';
+            // Trim trailing whitespace (the daemon writes a bare
+            // line; mirror the payload's parser exactly).
+            while (n > 0 && (path[n - 1] == '\n' || path[n - 1] == '\r' ||
+                             path[n - 1] == ' ')) {
+                path[--n] = '\0';
+            }
+            // Sanity: absolute path and it must fit both the output
+            // buffer and sockaddr_un::sun_path (108 on Linux).
+            if (path[0] == '/' && (size_t)n + 1 <= outsz &&
+                (size_t)n + 1 <= sizeof(((struct sockaddr_un*)0)->sun_path)) {
+                memcpy(out, path, (size_t)n + 1);
+                return 1;
+            }
+        }
+    }
+    snprintf(out, outsz, "%s", kDaemonSocketLegacy);
+    return 0;
+}
 
 // Forward decls.
 static uint32_t api_caps(const struct zygisk_study_api* self);
@@ -102,11 +183,14 @@ static int api_should_inject(const struct zygisk_study_api* /*self*/,
                              const struct zygisk_study_process_info* info) {
     if (!info || !info->process_name) return 0;
 
+    char sock_path[96];
+    resolve_daemon_socket(sock_path, sizeof sock_path);
+
     int sock = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (sock < 0) return 0;
     struct sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, kDaemonSocket, sizeof(addr.sun_path) - 1);
+    strncpy(addr.sun_path, sock_path, sizeof(addr.sun_path) - 1);
     if (connect(sock, (struct sockaddr*)&addr, sizeof addr) != 0) {
         close(sock);
         return 0;
@@ -154,11 +238,14 @@ static void api_post_fork(const struct zygisk_study_api* /*self*/,
 
 // Open a per-process fd back to the daemon. Returns the fd or -1.
 static int api_open_companion_fd(const struct zygisk_study_api* /*self*/) {
+    char sock_path[96];
+    resolve_daemon_socket(sock_path, sizeof sock_path);
+
     int sock = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (sock < 0) return -1;
     struct sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, kDaemonSocket, sizeof(addr.sun_path) - 1);
+    strncpy(addr.sun_path, sock_path, sizeof(addr.sun_path) - 1);
     if (connect(sock, (struct sockaddr*)&addr, sizeof addr) != 0) {
         close(sock);
         return -1;

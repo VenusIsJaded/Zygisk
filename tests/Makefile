@@ -7,7 +7,7 @@ INCLUDES  = -I../native/common -I.. -DZS_HOST_TEST
 
 TESTS = test_hide test_hide_advanced test_hide_stealth test_e2e_hide \
 	test_perf test_unmap_trampoline test_module_dispatch \
-	test_version_compat
+	test_version_compat test_zn_loader
 
 # The REAL payload, built as a shared library so the trampoline test
 # can dlopen it and exercise the actual Tier A code path. Named
@@ -81,13 +81,41 @@ test_version_compat: test_version_compat.cpp libzygisk.so \
 	test_framework.h ../native/common/log.h
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -o $@ $< -ldl
 
-run: all
+# Round 28 — libzn_loader (the init-oriented API bridge) gets its
+# first dedicated test binary. Compiles the REAL entry.cpp with
+# -DZS_HOST_TEST (the zs_test_zn_* seams) and exercises the
+# socket-path resolver plus the live I/C protocol against a unix
+# socket. See tests/test_zn_loader.cpp for the regression story.
+test_zn_loader: test_zn_loader.cpp ../native/libzn_loader/src/entry.cpp \
+	../zygisk_study_api.h ../native/common/log.h test_framework.h
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -o $@ $< \
+	../native/libzn_loader/src/entry.cpp -ldl -pthread
+
+run: all verify-public-header
 	@fail=0; \
 	for t in $(TESTS); do \
 	echo "=== $$t ==="; \
 	./$$t || fail=1; \
 	done; \
 	exit $$fail
+
+# Round 28 — the PUBLIC API header must compile standalone in both
+# C and C++ translation units. The header documents
+# `#include "zygisk_study_api.h"` as the only include a module needs;
+# before the sys/types.h fix that contract was broken (uid_t/gid_t
+# undeclared in both languages).
+.PHONY: verify-public-header
+verify-public-header:
+	@printf '#include "zygisk_study_api.h"\nint main(void){return 0;}\n' > /tmp/zs_api_c.c
+	@if ! $(CC) -std=c99 -Wall -Wextra -I.. -fsyntax-only /tmp/zs_api_c.c; then \
+		echo "FAIL: zygisk_study_api.h does not compile standalone (C99)"; exit 1; \
+	fi
+	@printf '#include "zygisk_study_api.h"\nint main(){return 0;}\n' > /tmp/zs_api_cpp.cpp
+	@if ! $(CXX) $(CXXFLAGS) -I.. -fsyntax-only /tmp/zs_api_cpp.cpp; then \
+		echo "FAIL: zygisk_study_api.h does not compile standalone (C++)"; exit 1; \
+	fi
+	@rm -f /tmp/zs_api_c.c /tmp/zs_api_cpp.cpp
+	@echo "public API header: standalone C99 + C++17 compile OK"
 
 # Round 10: sanitized build of the logic suites (ASan + UBSan, leak
 # detection on). This is where the memcmp("/proc/") overread was
@@ -128,6 +156,25 @@ run-sanitize:
 # (keystone-engine assembles every instruction and cross-checks the
 # wrapper-frame/restore-slot contracts register-by-register). Exits 77
 # (skip) when keystone is not installed; 0 = all green.
+# Round 28 — LIVE end-to-end verification of the zygiskd daemon
+# binary: builds it with cargo, runs it against a remapped /data
+# tree, and probes the real socket (session handshake, cloak,
+# L/I/C/P verbs, zombie reaping, restart cleanup). Exits 77 (skip)
+# when no Rust toolchain is installed; 0 = all green.
+.PHONY: verify-daemon
+
+verify-daemon:
+	@if command -v python3 >/dev/null 2>&1; then \
+	python3 ../scripts/verify_daemon.py; \
+	rc=$$?; \
+	if [ $$rc -eq 77 ]; then \
+	echo "NOTE: no Rust toolchain (cargo) — daemon E2E skipped."; \
+	fi; \
+	exit $$rc; \
+	else \
+	echo "python3 unavailable; skipping"; \
+	fi
+
 .PHONY: verify-trampolines
 
 verify-trampolines:

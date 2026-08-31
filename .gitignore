@@ -15,3 +15,4 @@ build/
 target/
 *.o
 *.so.tmp
+tests/test_zn_loader

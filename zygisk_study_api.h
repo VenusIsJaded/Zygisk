@@ -54,6 +54,13 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <sys/types.h>   /* uid_t, gid_t — Round 28: the header
+                          * previously used these in the process-info
+                          * struct without including the header that
+                          * defines them, so the documented
+                          * `#include "zygisk_study_api.h"`-only
+                          * usage failed to compile in both C and
+                          * C++ translation units. */
 
 #ifdef __cplusplus
 extern "C" {

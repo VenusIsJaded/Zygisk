@@ -234,10 +234,16 @@ void zs_module_set_daemon_socket(const char* path) {
 int zs_module_load_session_socket() {
     int fd = open(g_session_file, O_RDONLY | O_CLOEXEC);
     if (fd < 0) return 0;                  // pre-R13 daemon: fallback
-    char path[96];
+    // Round 28: read up to 96 bytes into a 97-byte buffer. A path
+    // that fills the full 96 is longer than any legitimate session
+    // path (the daemon's randomized paths are ~50 bytes) and would
+    // be silently TRUNCATED into a garbage socket path plus garbage
+    // filter prefixes — the earlier version accepted the first 95
+    // bytes of a 120-byte file and registered them. Reject instead.
+    char path[97];
     ssize_t n = read(fd, path, sizeof path - 1);
     close(fd);
-    if (n <= 0) return 0;
+    if (n <= 0 || n > (ssize_t)(sizeof path - 2)) return 0;
     path[n] = '\0';
     // Trim trailing whitespace (the daemon writes a bare line).
     while (n > 0 && (path[n - 1] == '\n' || path[n - 1] == '\r' ||

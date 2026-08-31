@@ -923,3 +923,34 @@ The version research pass verified two hiding-layer facts:
   the app seccomp filter exists; a Tier A child is already gone when
   the filter installs, and a Tier B child only ever uses app-allowed
   syscalls afterward.
+
+## Round 28 additions — filter-input hardening + the loader's dead path
+
+- **The session-file parser no longer accepts truncated paths.**
+  A 120-byte session file used to be read as its first 95 bytes;
+  the socket became a garbage path (harmless — connects fail
+  closed) but the TRUNCATED garbage was also registered as a
+  hide-filter root prefix and a /proc/net/unix substring. The
+  parser now reads one sentinel byte beyond the accepted maximum
+  and rejects overlong content entirely (nothing registered,
+  fallback path in force). Both parsers (payload
+  `zs_module_load_session_socket` and libzn_loader's new
+  resolver) share the rule; the mirror test matrix covers
+  missing/relative/blank/overlong on both sides.
+- **libzn_loader's socket path was a dead path since Round 13.**
+  The init-oriented API table (`zygisk_study_api.h`) connected to
+  the legacy FIXED daemon socket, while the active socket has been
+  per-boot random since R13 — `should_inject()` answered "no" for
+  every target on a real boot. It now performs the same
+  session-file handshake as the payload (with the legacy path as
+  fallback, resolved per call so a pre-daemon miss is not cached).
+  First dedicated test coverage for the library (13 tests,
+  including live 'I'/'C' protocol round-trips).
+- **The daemon's own observable surface shrank.**
+  /proc/<pid>/cmdline no longer exposes
+  `zygiskd --workdir /data/system/zygisk_study` (the rewrite_argv
+  no-op is now a real setproctitle-style rewrite via
+  /proc/self/stat arg_start/arg_end), and forked connection
+  children no longer linger as zombies (SIGCHLD auto-reap) — a
+  fleet of defunct processes carrying the cloak name was itself a
+  signature. Both verified live by `make verify-daemon`.

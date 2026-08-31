@@ -142,6 +142,15 @@ The daemon speaks a tiny one-byte-verb protocol on its Unix socket:
 | 'L'  | client→srv | `L`                             | `<id>;<path>\n` lines until EOF |
 | 'I'  | client→srv | `I<name>\n`                     | `1` or `0` (one byte)          |
 | 'C'  | client→srv | `C`                             | long-lived echo connection    |
+| 'P'  | client→srv | `P` + u32le length + area image | `1<staged-path>\n` or `0\n`   |
+
+The 'P' verb (Round 19, verified live in Round 28) uploads a
+properties-area image; the daemon validates magic@8 + version@12
+(the R26 fix), stages it as a 0444 file inside the root-only
+randomized session directory, and relabels it (chcon,
+properties_serial/properties_device per version) so exec'd helpers
+can read it. It is the only root-handled verb: the connection child
+peeks the verb byte BEFORE its privilege drop.
 
 This protocol is intentionally tiny — small enough that a reverse
 engineer can recognize it from the binary in a few seconds.
@@ -150,13 +159,13 @@ engineer can recognize it from the binary in a few seconds.
 
 | Feature                               | Status     |
 |---------------------------------------|------------|
-| Daemon IPC                             | implemented |
+| Daemon IPC                             | implemented (Round 28: verified LIVE by `make verify-daemon` — the real binary, real socket, all four verbs) |
 | Module enumeration                     | implemented |
 | Hide layer (unmount + scrub + unmap)  | implemented (techniques) |
-| ro.dalvik.vm.native.bridge swap       | stubbed (documented in compatibility.md) |
+| ro.dalvik.vm.native.bridge swap       | implemented in `post-fs-data.sh` (Round 7: resetprop with the empty-value guard + backup for uninstall.sh; the bare-soname requirement documented in compatibility.md) |
 | Per-module companion socket pair      | stubbed (modules use the daemon socket) |
 | JNI hooking                           | stubbed (`hookJniEnv` returns 0) |
-| ptrace injection of libzn_loader      | stubbed (daemon doesn't yet do this) |
+| ptrace injection of libzn_loader      | stubbed (daemon doesn't yet do this; the loader-side entry + API table are implemented and tested — Round 28) |
 | WebUI                                  | not in this repo |
 
 The stubbed pieces are marked with `// TODO:` in the source. They

@@ -14,12 +14,19 @@
 
 set -e
 
-# Round 27: minimum supported Android version gate. The property-area
-# format, the native-bridge interface and the fork hook points were
-# all verified from AOSP sources for 5.0.0_r1/5.1.1_r37 upward; 4.x
-# has a different property area AND a differently-named bridge symbol
-# path, and has never been studied. Refuse cleanly instead of shipping
-# something that would misbehave at boot.
+# Round 27/28: minimum supported Android version gate. The property
+# area (trie format + contexts), the native-bridge interface and the
+# fork hook points were all verified from AOSP sources for
+# 5.0.0_r1/5.1.1_r37 upward. Below 5.0 the load mechanism does not
+# exist AT ALL (Round 28, verified from AOSP at android-4.3_r1,
+# 4.3.1_r1 and 4.4.2_r1): system/core has no libnativebridge (the
+# library first ships in L), Dalvik has no bridge-loading path (the
+# only dlopen in the VM is the per-app System.loadLibrary loader, and
+# AndroidRuntime@4.3's complete dalvik.vm.* property surface carries
+# no native-bridge key), and the pre-L /dev/__properties__ file uses
+# the old flat-TOC format (version 0x45434f76, fixed-size prop_info
+# records, no contexts). Refuse cleanly instead of shipping something
+# that would misbehave at boot.
 if [ -n "$API" ] && [ "$API" -lt 21 ] 2>/dev/null; then
   ui_print "- This Android version (API $API) is below the minimum (21 / Android 5.0)."
   abort "! Zygisk Study requires Android 5.0 or newer."

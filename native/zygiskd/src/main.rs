@@ -86,6 +86,24 @@ use std::time::Duration;
 
 /// Path to the daemon's working directory.
 const WORKDIR:       &str = "/data/system/zygisk_study";
+
+/// Round 28 — host-E2E test seam. On a device the daemon's paths
+/// are the fixed /data/... constants above. This environment has no
+/// /data, so until this round the daemon binary could never be RUN
+/// here (only inspected — see the standing residual in
+/// ANDROID-REALISM.md). When ZS_TEST_ROOT is set, every /data path
+/// is remapped to $ZS_TEST_ROOT/data/... and the daemon runs for
+/// real against a temp tree. Unset (the device case), the remap is
+/// a byte-identical pass-through — no behavior change.
+fn remap_path(p: &str) -> String {
+    match std::env::var("ZS_TEST_ROOT") {
+        Ok(root) if !root.is_empty() => {
+            let root = root.trim_end_matches('/');
+            format!("{}{}", root, p)
+        }
+        _ => p.to_string(),
+    }
+}
 /// Path to the daemon's socket subdirectory (legacy fixed location —
 /// kept as the fallback when randomization fails; see
 /// setup_random_socket()).
@@ -144,6 +162,14 @@ impl ClientVerb {
     /// child (which must peek it BEFORE the privilege drop to decide
     /// whether the connection is a 'P' — the only root-only verb)
     /// and handed to parse_after.
+    ///
+    /// Round 28: this read-the-verb-byte wrapper was dead code after
+    /// the R19 peek-before-drop redesign — every production caller
+    /// reads the first byte itself and enters through parse_after.
+    /// Kept as the documented entry point of the parser pair, with
+    /// an explicit allow() (the daemon is now compiled and linted
+    /// for real; the dead code had been invisible since R13).
+    #[allow(dead_code)]
     fn parse(stream: &mut UnixStream) -> std::io::Result<ClientVerb> {
         let mut buf = [0u8; 1];
         stream.read_exact(&mut buf)?;
@@ -210,7 +236,7 @@ fn chcon(path: &str, context: &str) -> bool {
     let rv = unsafe {
         libc::lsetxattr(
             c_path.as_ptr(),
-            b"security.selinux\0".as_ptr() as *const libc::c_char,
+            c"security.selinux".as_ptr(),
             c_ctx.as_ptr() as *const libc::c_void,
             context.len() + 1,
             0)
@@ -281,7 +307,7 @@ fn try_handle_props_file_root(stream: &mut UnixStream, first: u8,
     let len = u32::from_le_bytes(lenb) as usize;
     // The header is 16 bytes minimum (bytes_used + serial + magic +
     // version); anything shorter cannot be a real area image.
-    if len < 16 || len > PROP_FILE_MAX { fail(stream); return true; }
+    if !(16..=PROP_FILE_MAX).contains(&len) { fail(stream); return true; }
 
     let mut buf = vec![0u8; len];
     if stream.read_exact(&mut buf).is_err() { fail(stream); return true; }
@@ -425,7 +451,7 @@ impl DaemonState {
     fn reload_modules(&self) {
         let mut out = Vec::new();
         let abi = pick_abi();
-        if let Ok(entries) = std::fs::read_dir(MODULES_ROOT) {
+        if let Ok(entries) = std::fs::read_dir(remap_path(MODULES_ROOT)) {
             for entry in entries.flatten() {
                 let p = entry.path();
                 let id = match p.file_name().and_then(|n| n.to_str()) {
@@ -445,7 +471,7 @@ impl DaemonState {
     }
 
     fn reload_denylist(&self) {
-        let text = match std::fs::read_to_string(DENYLIST_FILE) {
+        let text = match std::fs::read_to_string(remap_path(DENYLIST_FILE)) {
             Ok(s) => s,
             Err(_) => return,  // no denylist file yet — leave old value
         };
@@ -481,8 +507,11 @@ impl DaemonState {
 
 /// Pure-logic parser for the wire format we send to clients. Given the
 /// raw bytes of a single client request (verb + optional name + '\n'),
-/// returns the parsed verb. This function is exported so unit tests
-/// can exercise the parser without standing up a Unix socket.
+/// returns the parsed verb. Test-only since R19: production parsing
+/// enters through ClientVerb::parse_after after the connection child
+/// has already consumed the verb byte (it must peek it before the
+/// privilege drop).
+#[cfg(test)]
 fn parse_verb_from_bytes(input: &[u8]) -> ClientVerb {
     if input.is_empty() {
         return ClientVerb::Unknown(0);
@@ -654,50 +683,73 @@ fn cloak_process_name() {
 }
 
 fn rewrite_argv(name: &str) {
-    // Walk /proc/self/cmdline to find the bounds of argv in memory.
-    // We then mmap those pages and overwrite.
+    // Round 28 — the real implementation. The previous version was a
+    // documented no-op skeleton ("left as a TODO"), which left the
+    // daemon's /proc/self/cmdline exposing
+    //   "<full path>/zygiskd --workdir /data/system/zygisk_study"
+    // — the single most identifying string in the whole process list
+    // (both the binary name and the module's data path).
     //
-    // This is a standard technique; see e.g. systemd's
-    // setproctitle.c. For brevity here we just zero argv[0]'s
-    // string and write our cloak name into it, up to the
-    // existing length.
+    // Technique (the same one systemd's setproctitle.c and many
+    // daemons use): the kernel renders /proc/<pid>/cmdline directly
+    // from the argv STRINGS area on the initial stack, whose extent
+    // is published in /proc/self/stat as the arg_start / arg_end
+    // fields (48 and 49, 1-indexed). Rewriting the bytes in that
+    // window changes what every reader of /proc/<pid>/cmdline sees.
+    // The area is ordinary writable stack memory.
     //
-    // Note: we deliberately do NOT extend argv beyond its original
-    // length, because doing so requires careful memory management
-    // and is fragile. The cloak name we use is short enough that
-    // it fits in the space originally occupied by argv[0].
-    let cmdline = match std::fs::read("/proc/self/cmdline") {
-        Ok(c) => c,
+    // Steps:
+    //   1. Read /proc/self/stat.
+    //   2. Skip past "pid (comm)" — comm may contain spaces and
+    //      parentheses, so the split point is the LAST ')' in the
+    //      line.
+    //   3. The remainder starts at field 3 (state); fields 48/49 are
+    //      then rest[45] / rest[46].
+    //   4. Validate the extent (non-degenerate, small), then copy
+    //      `name` into it and NUL-fill the rest.
+    let stat = match std::fs::read_to_string("/proc/self/stat") {
+        Ok(s) => s,
         Err(_) => return,
     };
-    // Find the offset of the first NUL — that's the end of argv[0].
-    let end = cmdline.iter().position(|&b| b == 0).unwrap_or(cmdline.len());
-    if end == 0 { return; }
-    // We need the actual argv pointer in memory. /proc/self/cmdline
-    // gives us the *contents*, not the address. We rely on
-    // /proc/self/auxv having AT_EXECFN at index 0; alternatively
-    // we can use std::env::args().next() to get a pointer into
-    // the argv area via Rust's internal API.
-    //
-    // For simplicity, we just take the address of std::env::args()
-    // by exploiting that Rust's std::env::args_os() returns a
-    // reference into the kernel-provided argv. We use unsafe to
-    // overwrite.
-    let argv0_ptr = std::env::args().next().unwrap();
-    // SAFETY: argv0_ptr is a Rust String that holds the kernel-
-    // provided argv[0]. The String's bytes are a copy; we cannot
-    // mutate through it directly. Instead we need the address.
-    // Rust exposes this via std::os::unix::ffi::OsStrExt but not
-    // the raw argv pointer.
-    //
-    // For an educational skeleton, we accept that the cloak only
-    // works via prctl(PR_SET_NAME). The argv rewrite is left as a
-    // TODO; it's a refinement that doesn't change the
-    // effectiveness of the cloak for typical probes (which read
-    // /proc/self/comm, not /proc/self/cmdline, because comm is
-    // always available).
-    let _ = argv0_ptr;
-    let _ = name;
+    let (start, end) = match parse_arg_extent(&stat) {
+        Some(x) => x,
+        None => return,
+    };
+    let span = end.saturating_sub(start);
+    // Sanity: a real argv strings area is a few hundred bytes to a
+    // few pages. Anything bigger means we misparsed — refuse.
+    if span == 0 || span > 4 * 4096 { return; }
+
+    let bytes = name.as_bytes();
+    let take = bytes.len().min(span.saturating_sub(1).max(1));
+    let base = start as *mut u8;
+    unsafe {
+        // The window is normal stack memory (writable); we stay
+        // inside [start, start + span) by construction.
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), base, take);
+        // NUL-terminate, then blank the remainder so no fragments of
+        // the original "zygiskd --workdir /data/system/..." remain.
+        std::ptr::write_bytes(base.add(take), 0, span - take);
+    }
+}
+
+/// Parse arg_start/arg_end out of a /proc/[pid]/stat line. Pure
+/// function so unit tests can drive it with crafted stat lines
+/// (including comms containing spaces and nested parentheses).
+/// Returns (arg_start, arg_end) as addresses.
+fn parse_arg_extent(stat: &str) -> Option<(usize, usize)> {
+    // The split point after "pid (comm)" is the LAST ')' in the
+    // line — comm is escaped only for '/' and newlines in the
+    // kernel's rendering, so parentheses inside comm are literal.
+    let close = stat.rfind(')')?;
+    let rest: Vec<&str> = stat[close + 1..].split_whitespace().collect();
+    // rest[0] is field 3 (state). Fields 48 (arg_start) and 49
+    // (arg_end) are rest[45] and rest[46].
+    if rest.len() < 47 { return None; }
+    let arg_start: usize = rest[45].parse().ok()?;
+    let arg_end:   usize = rest[46].parse().ok()?;
+    if arg_end <= arg_start { return None; }
+    Some((arg_start, arg_end))
 }
 
 // ----------------------------------------------------------------------
@@ -835,11 +887,22 @@ fn spawn_privileged_child<F>(stream: UnixStream, state: Arc<DaemonState>,
 /// stale session file before overwriting it).
 fn setup_random_socket() -> Option<String> {
     // Clean up the previous boot's random dir, if any.
-    if let Ok(old) = std::fs::read_to_string(SESSION_FILE) {
+    if let Ok(old) = std::fs::read_to_string(remap_path(SESSION_FILE)) {
         let old = old.trim();
         // Only ever remove paths WE created (defense in depth: the
-        // prefix is checked, not trusted).
-        if old.starts_with("/data/system/.") && old.len() > "/data/system/.".len() {
+        // prefix is checked, not trusted). Round 28: the prefix check
+        // accepts both the device path and the ZS_TEST_ROOT-remapped
+        // host form (host E2E runs write the remapped path into the
+        // session file; without this the previous test run's temp
+        // dir was never cleaned).
+        let dev_prefix = "/data/system/.";
+        let host_prefix: String =
+            remap_path(dev_prefix);  // "$ZS_TEST_ROOT/data/system/."
+        let is_ours = old.starts_with(dev_prefix)
+            || (!host_prefix.is_empty()
+                && old.starts_with(&host_prefix)
+                && old.len() > host_prefix.len());
+        if is_ours && old.len() > dev_prefix.len() {
             // Strip the socket file name to get the directory.
             if let Some(dir) = old.rfind('/').map(|i| &old[..i]) {
                 let _ = std::fs::remove_dir_all(dir);
@@ -853,8 +916,8 @@ fn setup_random_socket() -> Option<String> {
         let mut f = std::fs::File::open("/dev/urandom").ok()?;
         f.read_exact(&mut bytes).ok()?;
     }
-    let dir = format!("/data/system/.{:02x}{:02x}{:02x}{:02x}",
-                     bytes[0], bytes[1], bytes[2], bytes[3]);
+    let dir = remap_path(&format!("/data/system/.{:02x}{:02x}{:02x}{:02x}",
+                                  bytes[0], bytes[1], bytes[2], bytes[3]));
     std::fs::create_dir_all(&dir).ok()?;
     {
         use std::os::unix::fs::PermissionsExt;
@@ -865,18 +928,37 @@ fn setup_random_socket() -> Option<String> {
     // Hand the path to the payload BEFORE binding so a fast zygote
     // never races a missing file (worst case it falls back to the
     // fixed path and simply fails to fetch modules this boot).
-    std::fs::write(SESSION_FILE, &path).ok()?;
+    std::fs::write(remap_path(SESSION_FILE), &path).ok()?;
     Some(path)
 }
 
 fn main() {
     // Parse args.
-    let mut workdir = WORKDIR.to_string();
+    let mut workdir = remap_path(WORKDIR);
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         if a == "--workdir" {
             if let Some(v) = args.next() { workdir = v; }
         }
+    }
+
+    // Round 28 — reap connection children. The accept loop forks one
+    // child per client connection (see spawn_privileged_child) and
+    // never wait()s for them: with SIGCHLD left at its default
+    // (ignored-but-not-SIG_IGN) disposition, every exited child stays
+    // as a zombie until the PARENT dies. With hundreds of
+    // should-inject queries per cold start, that is hundreds of
+    // defunct rows in /proc (each still carrying the cloaked name —
+    // a fleet of zombies is itself a signature) and a slow leak of
+    // the pid space on a long-running device.
+    //
+    // SIGCHLD -> SIG_IGN makes the kernel auto-reap children on
+    // Linux (the POSIX.1-2008 / Linux behavior for explicitly
+    // ignored SIGCHLD). We fork no children we ever need a status
+    // from, so discarding exit statuses is correct here. Must be
+    // installed BEFORE the first fork, i.e. here at the top of main.
+    unsafe {
+        libc::signal(libc::SIGCHLD, libc::SIG_IGN);
     }
 
     // STEALTH: cloak the process before we bind the socket, so
@@ -950,7 +1032,7 @@ fn main() {
     // (the session file is written either way so the payload's
     // reader and the daemon agree).
     let sock_path = setup_random_socket()
-        .unwrap_or_else(|| SOCK_PATH.to_string());
+        .unwrap_or_else(|| remap_path(SOCK_PATH));
     let _ = std::fs::remove_file(&sock_path);
     let listener = match UnixListener::bind(&sock_path) {
         Ok(l) => l,
@@ -991,12 +1073,30 @@ fn setup_dirs(workdir: &str) {
     // the fallback location when /dev/urandom fails, and removing it
     // here would break a same-boot downgrade. The ACTIVE socket is
     // normally the randomized per-boot dir (see setup_random_socket).
-    let _ = std::fs::create_dir_all(SOCKDIR);
+    let _ = std::fs::create_dir_all(remap_path(SOCKDIR));
     use std::os::unix::fs::PermissionsExt;
     let _ = std::fs::set_permissions(workdir,
         std::fs::Permissions::from_mode(0o700));
-    let _ = std::fs::set_permissions(SOCKDIR,
+    let _ = std::fs::set_permissions(remap_path(SOCKDIR),
         std::fs::Permissions::from_mode(0o700));
+}
+
+/// Round 28: add an inotify watch on MODULES_ROOT. This tiny wrapper
+/// exists because the previous call sites passed the &str constant
+/// straight to libc::inotify_add_watch, which requires a
+/// NUL-terminated *const c_char — the daemon had NEVER been compiled
+/// in this environment (no Rust toolchain before this round; see
+/// ANDROID-REALISM.md), so the type error survived every round since
+/// the inotify rescan thread was written.
+fn inotify_watch_root(fd: i32, mask: u32) -> i32 {
+    // MODULES_ROOT is a fixed ASCII path with no interior NULs; the
+    // fallback arm is unreachable but keeps the unwrap off the wire.
+    // ZS_TEST_ROOT remap keeps the host E2E watching the real temp
+    // tree (see remap_path).
+    let path = std::ffi::CString::new(remap_path(MODULES_ROOT))
+        .unwrap_or_else(|_| std::ffi::CString::new("/data/adb/modules")
+                                   .expect("fallback path is ASCII"));
+    unsafe { libc::inotify_add_watch(fd, path.as_ptr(), mask) }
 }
 
 // ----------------------------------------------------------------------
@@ -1042,9 +1142,7 @@ fn rescan_thread_main(state: Arc<DaemonState>) {
                  | libc::IN_ATTRIB
                  | libc::IN_DELETE_SELF
                  | libc::IN_MOVE_SELF;
-        inotify_wd = unsafe {
-            libc::inotify_add_watch(inotify_fd, MODULES_ROOT, mask)
-        };
+        inotify_wd = inotify_watch_root(inotify_fd, mask);
         // If inotify_add_watch fails (e.g. MODULES_ROOT doesn't
         // exist yet), we keep inotify_fd valid but no watch —
         // we'll fall through to the polling path below.
@@ -1088,10 +1186,7 @@ fn rescan_thread_main(state: Arc<DaemonState>) {
                              | libc::IN_ATTRIB
                              | libc::IN_DELETE_SELF
                              | libc::IN_MOVE_SELF;
-                    inotify_wd = unsafe {
-                        libc::inotify_add_watch(inotify_fd,
-                                                MODULES_ROOT, mask)
-                    };
+                    inotify_wd = inotify_watch_root(inotify_fd, mask);
                 }
             }
             // Fall through to the mtime checks (defensive — catches
@@ -1106,7 +1201,7 @@ fn rescan_thread_main(state: Arc<DaemonState>) {
         // fallback path (or a defensive re-check after inotify
         // processing) — the directory's mtime bumps on any
         // create/delete inside it.
-        let modules_changed = match std::fs::metadata(MODULES_ROOT) {
+        let modules_changed = match std::fs::metadata(remap_path(MODULES_ROOT)) {
             Ok(m) => {
                 let mt = m.modified().ok();
                 if mt != last_modules_mtime {
@@ -1121,7 +1216,7 @@ fn rescan_thread_main(state: Arc<DaemonState>) {
         }
 
         // Same idea for the denylist file.
-        let denylist_changed = match std::fs::metadata(DENYLIST_FILE) {
+        let denylist_changed = match std::fs::metadata(remap_path(DENYLIST_FILE)) {
             Ok(m) => {
                 let mt = m.modified().ok();
                 if mt != last_denylist_mtime {
@@ -1139,7 +1234,7 @@ fn rescan_thread_main(state: Arc<DaemonState>) {
 
 #[allow(dead_code)]
 fn ensure_workdir_exists_or_exit() {
-    if !Path::new(WORKDIR).exists() {
+    if !Path::new(&remap_path(WORKDIR)).exists() {
         eprintln!("zygiskd: workdir {} missing; did post-fs-data.sh run?",
             WORKDIR);
         process::exit(1);
@@ -1161,6 +1256,89 @@ fn ensure_workdir_exists_or_exit() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---------------- parse_arg_extent (Round 28) ----------------
+
+    #[test]
+    fn parses_arg_extent_from_a_well_formed_stat_line() {
+        // Real shape from a host /proc/self/stat (comm "zygiskd"):
+        // fields after "pid (comm)" start at field 3 (state); we
+        // build the line with the correct count so rest[45]/rest[46]
+        // land on arg_start/arg_end.
+        // rest indices 0..46 correspond to fields 3..49.
+        let mut rest = Vec::new();
+        for i in 0..47 {
+            // Distinct values; fields 48/49 (rest[45]/rest[46]) carry
+            // the extent we assert below.
+            let v = if i == 45 { 0x7ffd0000 } else if i == 46 { 0x7ffd0040 }
+                    else { 1000 + i };
+            rest.push(v.to_string());
+        }
+        let stat_line = format!("4321 (zygiskd) {}",
+                                 rest.join(" "));
+        assert_eq!(parse_arg_extent(&stat_line),
+                   Some((0x7ffd0000, 0x7ffd0040)));
+    }
+
+    #[test]
+    fn parses_arg_extent_when_comm_contains_spaces_and_parens() {
+        // comm "(weird name (2))" — the LAST ')' is the split point.
+        let mut rest = Vec::new();
+        for i in 0..47 {
+            let v = if i == 45 { 0x1000 } else if i == 46 { 0x1080 }
+                    else { 7 + i };
+            rest.push(v.to_string());
+        }
+        let stat_line = format!("99 (weird name (2)) {}",
+                                rest.join(" "));
+        assert_eq!(parse_arg_extent(&stat_line), Some((0x1000, 0x1080)));
+    }
+
+    #[test]
+    fn rejects_degenerate_or_short_stat_lines() {
+        assert_eq!(parse_arg_extent(""), None);
+        assert_eq!(parse_arg_extent("1 (zygiskd) S"), None);
+        // arg_end <= arg_start is refused even with full length.
+        let mut rest = Vec::new();
+        for i in 0..47 {
+            let v = if i == 45 { 0x2000 } else if i == 46 { 0x2000 }
+                    else { 3 + i };
+            rest.push(v.to_string());
+        }
+        let stat_line = format!("1 (zygiskd) {}", rest.join(" "));
+        assert_eq!(parse_arg_extent(&stat_line), None);
+    }
+
+    #[test]
+    fn parses_arg_extent_from_the_real_proc_self_stat() {
+        // End-to-end against this test process's own stat line: the
+        // parser must return a non-degenerate, small window.
+        let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
+        match parse_arg_extent(&stat) {
+            Some((s, e)) => {
+                assert!(e > s, "arg_end must exceed arg_start");
+                assert!(e - s <= 4 * 4096,
+                        "argv strings area unexpectedly large: {}", e - s);
+            }
+            None => panic!("real /proc/self/stat failed to parse"),
+        }
+    }
+
+    #[test]
+    fn rewrite_argv_changes_our_own_cmdline() {
+        // End-to-end: run rewrite_argv on THIS process, then read
+        // /proc/self/cmdline back. It must show the cloak name and
+        // nothing else (no zygiskd, no --workdir fragments).
+        rewrite_argv("cloak_probe_name");
+        let cmdline = std::fs::read("/proc/self/cmdline").unwrap();
+        let s = String::from_utf8_lossy(&cmdline).into_owned();
+        assert!(s.contains("cloak_probe_name"),
+                "cmdline does not contain the cloak name: {:?}", s);
+        assert!(!s.contains("zygiskd"), "cmdline still exposes zygiskd: {:?}",
+                s);
+        assert!(!s.contains("--workdir"),
+                "cmdline still exposes --workdir: {:?}", s);
+    }
 
     // ---------------- parse_verb_from_bytes ----------------
 

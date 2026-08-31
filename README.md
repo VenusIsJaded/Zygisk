@@ -299,7 +299,9 @@ What the tests cover (Round 9):
   FORCE_DENYLIST_UNMOUNT runs its unmount phase only after the
   post callbacks.
 
-(Total: 211 host-side tests, plus the daemon's `cargo test` suite.)
+(Total: 224 host-side tests, the daemon's `cargo test` suite (20
+tests), and `make verify-daemon` — 16 LIVE checks against the real
+zygiskd binary, new in Round 28.)
 
 The logic suites also run clean under **ASan + UBSan with leak
 detection** — `cd tests && make run-sanitize`. That run is where
@@ -320,7 +322,17 @@ construction — the raw-mapping test runs unsanitized).
 - **`cargo test`** — daemon's pure-logic parsers (no I/O
   required): `parse_verb_from_bytes`, `parse_denylist_text`
   (now returns `HashSet` per P1.54), `format_module_list`,
-  `DaemonState.is_on_denylist`.
+  `DaemonState.is_on_denylist`, and (Round 28) the
+  `/proc/self/stat` arg-extent parser behind the cmdline cloak.
+- **`make verify-daemon`** (Round 28) — builds the REAL zygiskd
+  with cargo, runs it against a remapped `/data` tree
+  (`ZS_TEST_ROOT`; see `remap_path` in main.rs) and probes the
+  real socket: the randomized session handshake, the comm+cmdline
+  cloak, the 'L'/'I'/'C'/'P' verbs, zombie reaping, and restart
+  cleanup. Skips (exit 77) when no Rust toolchain is available.
+- **`make run`'s public-header check** (Round 28) — compiles
+  `zygisk_study_api.h` standalone in both C99 and C++17, the way
+  the header's own documentation tells module authors to use it.
 
 What the tests do NOT cover (require Android + root):
 
@@ -1020,10 +1032,94 @@ live) closed three version gaps:
    and read); the payload's page math already used
    `sysconf(_SC_PAGESIZE)` everywhere it matters.
 
-`customize.sh` now refuses installs below API 21 (4.x was never
-studied and differs in both property area and bridge symbol path).
-**211/211 host tests** (37 hide / 112 advanced / 20 stealth / 5 e2e /
-4 perf / 2 trampoline / 19 dispatch / 10 version-compat), 0 warnings,
-ASan+UBSan+leaks green, trampoline binary verification green.
-Android support now spans **5.0 through 17-dev**, every boundary
+`customize.sh` now refuses installs below API 21 (4.x was closed
+out by the Round 28 research: there is NO native bridge in Dalvik —
+see the compatibility table).
+**209/209 host tests** at that commit (37 hide / 112 advanced / 20
+stealth / 5 e2e / 4 perf / 2 trampoline / 19 dispatch / 10
+version-compat; the earlier "211" claim in this README and the R27
+commit message was an arithmetic slip, corrected in Round 28),
+0 warnings, ASan+UBSan+leaks green, trampoline binary verification
+green. Android support spans **5.0 through 17-dev**, every boundary
 verified from AOSP sources.
+
+### Round 28 — the Android 4.3 verdict, and the round that made the daemon real
+
+**Android 4.3/4.x: not possible, and now proven from AOSP rather
+than assumed.** system/core at android-4.3_r1, 4.3.1_r1 and even
+4.4.2_r1 has **no `libnativebridge` at all** (the library first
+ships in L); Dalvik has no bridge-loading path (the VM's only
+dlopen is the per-app `System.loadLibrary` loader, and every
+"bridge" in dalvik/vm/Native.cpp is the VM-internal
+`DalvikBridgeFunc` JNI call bridge, not a translation bridge);
+`AndroidRuntime.cpp@4.3` reads the complete `dalvik.vm.*` surface
+(17 keys) and no native-bridge property exists anywhere in the 4.3
+bootstrap; the pre-L `/dev/__properties__` is the old flat-TOC
+format (magic 0x504f5250 at the SAME offset 8 — a trap for
+magic-only validators! — but version 0x45434f76 and fixed-size
+`prop_info` records, no trie/contexts/wait_any); and the 4.3 zygote
+drop sequence (dalvik_system_Zygote.cpp: PR_SET_KEEPCAPS →
+PR_CAPBSET_DROP → setgroups → setresgid → setresuid → capset)
+exists but is unreachable without a load mechanism. The
+4.3-era alternatives were app_process replacement (Xposed classic,
+/system writes — a different architecture) and the per-app
+`wrap.<package>` root-peer wrapper — neither is zygote injection.
+`customize.sh`'s API<21 refusal now cites all of this; the
+compatibility table carries the full row. As a bonus, the
+`ro.dalvik.vm.native.bridge` swap property was re-verified
+byte-identical at 5.0/6.0/7.1.2/8.1/16/17-dev (16 adds a
+zygote-only guard our swap already satisfies).
+
+**The meta-fix: the daemon is now compiled, linted, tested AND
+run for the first time since R13.** A Rust toolchain was installed
+in this environment, which immediately paid off:
+
+- **The daemon did not compile.**
+  `libc::inotify_add_watch(inotify_fd, MODULES_ROOT, mask)` passed
+  a `&str` where libc demands a `*const c_char` — a hard type error
+  at BOTH call sites in the rescan thread. Invisible while no
+  toolchain existed; fixed with a CString-building helper.
+- **Zombie leak:** the accept loop forks one child per connection
+  and never reaped them — 10 short connections leave 17 defunct
+  rows in /proc (regression-proven by reverting the fix). Fixed
+  with `signal(SIGCHLD, SIG_IGN)` (kernel auto-reap).
+- **The cloak was half a cloak:** `rewrite_argv` was a documented
+  no-op TODO, so `/proc/<pid>/cmdline` kept exposing
+  `zygiskd --workdir /data/system/zygisk_study`. Now implemented
+  for real via /proc/self/stat `arg_start`/`arg_end` (fields 48/49,
+  split at the last ')'), the same setproctitle technique systemd
+  uses; a cargo test runs it on the test process itself and asserts
+  the cmdline afterwards.
+- **`scripts/verify_daemon.py`** (+ `make verify-daemon`): a LIVE
+  E2E — builds the real binary, runs it against a `ZS_TEST_ROOT`
+  remapped tree, and checks 16 things over the real socket: the
+  randomized session handshake, comm+cmdline cloak, 'L'/'I'/'C'/'P'
+  verbs, denylist flip via the inotify path, zombie absence, and
+  restart cleanup. All green; the zombie check was proven to fail
+  with the fix reverted.
+
+**More bugs found and fixed:** the public API header
+`zygisk_study_api.h` did not compile standalone (missing
+`<sys/types.h>` for uid_t/gid_t — the documented module-author
+usage failed in both C and C++; now checked by `make run` in both
+languages); **libzn_loader's init-oriented API was dead on devices
+ever since R13's socket randomization** (it hardcoded the legacy
+fixed path — `should_inject` always answered "no",
+`open_companion_fd` always -1; now uses the session-file handshake,
+with its first dedicated 13-test binary including live protocol
+e2e); **both session-file parsers silently accepted truncated
+overlong paths** and registered the garbage as hide-filter
+prefixes (now rejected; +2 payload tests); **uninstall.sh used an
+undefined `$MODDIR`** so the stale random-dir cleanup never ran,
+and its `--delete`-then-set-`""` sequence re-created an empty
+`ro.dalvik.vm.native.bridge` entry no stock device has (both
+fixed).
+
+**224/224 host tests** (37 hide / 112 advanced / 20 stealth / 5
+e2e / 4 perf / 2 trampoline / 21 dispatch / 13 zn_loader / 10
+version-compat) + the standalone public-header check, 20/20
+cargo tests, clippy clean, `cargo build --release` green,
+`make verify-daemon` 16/16 live checks, 0 warnings,
+ASan+UBSan+leaks green, trampoline binary verification green,
+perf medians unchanged. Android support remains **5.0 through
+17-dev**, now with 4.x closed out as researched-not-possible.

@@ -721,7 +721,59 @@ ZS_TEST(session_file_switches_daemon_socket_end_to_end) {
     rec_reset();
 }
 
-// 
+// Round 28 — the session-file parser must REJECT overlong content
+// instead of silently truncating it. Before the fix, a 120-byte
+// session file was read as its first 95 bytes: the daemon socket
+// became a garbage path (harmless — connects fail — fail-closed)
+// BUT the truncated garbage was also REGISTERED as a hide-filter
+// prefix and a /proc/net/unix substring, polluting the filters with
+// attacker-controlled junk. The parser now returns 0 and registers
+// nothing.
+ZS_TEST(session_file_rejects_overlong_paths_instead_of_truncating) {
+    char sess[] = "/tmp/zs_test_sess_over_XXXXXX";
+    int sfd = mkstemp(sess);
+    ZS_CHECK(sfd >= 0);
+    // 120 bytes, starting with '/' so only the length is invalid.
+    std::string long_path = "/" + std::string(119, 'x');
+    ZS_CHECK(write(sfd, long_path.c_str(), long_path.size()) > 0);
+    close(sfd);
+    fn_set_session_file(sess);
+
+    ZS_CHECK(fn_load_session() == 0);
+
+    // The socket must still be the fallback (not the garbage prefix)
+    // and no filter prefix may start with the junk stem. The public
+    // seam for the active socket: dispatch uses it on the next
+    // connect; the most direct observable here is the loader's
+    // return value (0 = nothing registered/switched).
+    fn_set_session_file(nullptr);
+    unlink(sess);
+}
+
+// Round 28 — the same parser's whitespace/relative/blank rejections
+// on the payload side (mirror of the libzn_loader resolver tests).
+ZS_TEST(session_file_rejects_relative_and_blank_content) {
+    struct Case { const char* content; };
+    Case cases[] = {
+        {"relative/path\n"},
+        {"   \n\r\n"},
+        {"\n"},
+        {"noleadingslash"},
+    };
+    for (const auto& c : cases) {
+        char sess[] = "/tmp/zs_test_sess_bad_XXXXXX";
+        int sfd = mkstemp(sess);
+        ZS_CHECK(sfd >= 0);
+        ZS_CHECK(write(sfd, c.content, strlen(c.content)) > 0);
+        close(sfd);
+        fn_set_session_file(sess);
+        ZS_CHECK(fn_load_session() == 0);
+        unlink(sess);
+    }
+    fn_set_session_file(nullptr);
+}
+
+//
 // ----------------------------------------------------------------------
 // Round 14 — args cache + deny-decision skip
 // ----------------------------------------------------------------------
