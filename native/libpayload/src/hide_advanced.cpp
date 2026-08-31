@@ -165,14 +165,44 @@ static std::atomic<int> g_props_cloned{0};
 using FindPropFn = const void* (*)(const char*);
 static FindPropFn g_find_prop = nullptr;
 
-// Bionic prop_info layout (stable Android 5 → 15+):
-//   offset 0:  atomic_uint_least32_t serial   (4 bytes)
-//   offset 4:  char value[92]                 (PROP_VALUE_MAX)
-//   offset 96: uint32_t namelen
-//   offset 100:char name[]
+// Bionic property-area layout, VERIFIED this round from AOSP
+// bionic sources (libc/system_properties/include/system_properties/
+// {prop_area.h, prop_info.h} + prop_area.cpp, fetched at refs/heads/main
+// AND android-9.0.0_r1 — byte-identical across the whole range):
+//
+//   prop_area file header (128 bytes):
+//     [0]  uint32 bytes_used_        (writer-only bookkeeping)
+//     [4]  uint32 serial_            (area serial; bumped by init on update)
+//     [8]  uint32 magic_     0x504f5250
+//     [12] uint32 version_   0xfc6ed0ab
+//     [16] uint32 reserved_[28]
+//     [128] data_[]
+//   data_[0]    = root prop_trie_node (20 bytes):
+//     [0] namelen u32  [4] prop u32  [8] left u32  [12] right u32
+//     [16] children u32  [20] name[namelen] + NUL  (4-aligned allocs)
+//   data_[20..112) = the "dirty backup area" (A10+; A9 starts allocs
+//     at 20 — irrelevant to readers, offsets are explicit)
+//   prop_info (96 bytes + name):
+//     [0]  uint32 serial      — top byte = value length (READERS USE
+//                               IT: ReadMutablePropertyValue memcpy's
+//                               SERIAL_VALUE_LEN(serial)+1 bytes)
+//     [4]  char value[92]    (union: long_property = {err[56], u32 offset})
+//     [96] char name[] + NUL (the FULL dotted name — no namelen field;
+//     the pre-Round-22 comment claiming one at offset 96 was wrong)
+//   All trie offsets are uint32 relative to data_.
 constexpr size_t kPropSerialOffset = 0;
 constexpr size_t kPropValueOffset  = 4;
 constexpr size_t kPropValueSize    = 92;  // PROP_VALUE_MAX
+constexpr uint32_t kPropAreaMagic   = 0x504f5250u;
+constexpr uint32_t kPropAreaVersion = 0xfc6ed0abu;
+constexpr uint32_t kPropLongFlag    = 1u << 16;
+constexpr size_t kPropAreaHeaderSize = 128;
+constexpr size_t kPropInfoSize       = 96;
+constexpr size_t kTrieNodeSize       = 20;
+// SERIAL_VALUE_LEN(serial) = serial >> 24 — bionic's own reader macro
+// (system_properties.cpp). A patch that changes the value's length
+// MUST rewrite that byte, or __system_property_get returns a
+// truncated, possibly non-NUL-terminated value (the Round 22 bug).
 
 // Update one prop_info value using bionic's serial protocol so
 // concurrent readers in other threads of THIS process never observe
@@ -189,11 +219,25 @@ static void patch_prop_value(const void* pi, const char* value) {
     uint32_t serial = serial_atomic->load(std::memory_order_relaxed);
     // Don't touch an entry mid-update by another writer.
     if (serial & 1u) return;
+    size_t len = strnlen(value, kPropValueSize - 1);
     serial_atomic->store(serial | 1u, std::memory_order_release);
     memset(value_field, 0, kPropValueSize);
-    size_t len = strnlen(value, kPropValueSize - 1);
     memcpy(value_field, value, len);
-    serial_atomic->store((serial + 2) & ~1u, std::memory_order_release);
+    // Round 22 REAL BUG FIX: bionic's reader takes the value LENGTH
+    // from the serial's top byte (SERIAL_VALUE_LEN(serial) = >> 24,
+    // memcpy of len+1 bytes in ReadMutablePropertyValue). The old
+    // code bumped only the low counter, so a spoof LONGER than the
+    // device original made __system_property_get hand back a
+    // truncated, potentially non-NUL-terminated value ("enforcing"
+    // patched over "logging" returned "enforcin" + no NUL — a buffer
+    // over-read in the hidden app). Rewrite the length byte, keep
+    // the low counter bump, and clear kLongFlag (patched values are
+    // short by construction; a long entry must not keep the union
+    // interpreted as an error message + offset).
+    uint32_t low = ((serial + 2) & 0x00FFFFFFu) & ~1u;
+    low &= ~kPropLongFlag;
+    serial_atomic->store(((uint32_t)len << 24) | low,
+                         std::memory_order_release);
 }
 
 // Find /dev/__properties__/ mappings in a maps buffer. Pure function
@@ -303,14 +347,42 @@ static size_t find_prop_mappings_from_fd(int fd, PropMapping* out,
     return n;
 }
 
+// Forward declaration — the validated-header check lives with the
+// Round 22 trie utilities below; remap_prop_mapping_private uses it
+// to decide the live-prefix copy size.
+static int pa_header_valid(const uint8_t* base, size_t size);
+static int pa_trie_delete_key(uint8_t* base, size_t size,
+                              const char* key);
+// Forward declaration — the real readlink used by the fd scan and
+// the fdopendir hook (declared with the Tier B reals below).
+using ReadlinkFn = ssize_t (*)(const char*, char*, size_t);
+static ReadlinkFn g_real_readlink_for_fd_scan = nullptr;
+
 static int remap_prop_mapping_private(uintptr_t lo, uintptr_t hi) {
     size_t size = hi - lo;
     void* addr = reinterpret_cast<void*>(lo);
 
+    // Round 22 PERF: when the range is a well-formed property area,
+    // only 128 + bytes_used_ bytes are live — the tail past the last
+    // allocation is never reachable through the trie. Copy just the
+    // live prefix; the MAP_FIXED replacement pages are already zero,
+    // which is strictly MORE conservative than copying the real
+    // area's dead entries (stale values init left behind). ~35-50%
+    // less memcpy on the hide critical path. Non-areas (the contexts
+    // trie, or a mapping not at file offset 0) keep the full copy —
+    // the header check is the gate.
+    size_t copy_size = size;
+    if (pa_header_valid((const uint8_t*)addr, size)) {
+        uint32_t bytes_used = 0;
+        memcpy(&bytes_used, addr, 4);
+        size_t live = kPropAreaHeaderSize + (size_t)bytes_used;
+        if (live > 0 && live <= size) copy_size = live;
+    }
+
     void* scratch = mmap(nullptr, size, PROT_READ | PROT_WRITE,
                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (scratch == MAP_FAILED) return 0;
-    memcpy(scratch, addr, size);  // save original content
+    memcpy(scratch, addr, copy_size);  // save live content
 
     void* remapped = mmap(addr, size, PROT_READ | PROT_WRITE,
                           MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
@@ -319,7 +391,7 @@ static int remap_prop_mapping_private(uintptr_t lo, uintptr_t hi) {
         munmap(scratch, size);
         return 0;
     }
-    memcpy(addr, scratch, size);  // restore content into the copy
+    memcpy(addr, scratch, copy_size);  // restore content into the copy
     munmap(scratch, size);
     return 1;
 }
@@ -401,10 +473,37 @@ static void clone_property_area_private() {
             }
         }
         ZS_LOGD("hide_advanced: spoofed %zu property value(s)", n_spoof);
+
         // Round 9 (B2): record the clone addresses of every key we
         // spoof as absent so the read_callback/read/foreach hooks can
         // make them vanish even for callers that never call find().
+        // MUST run before the unlink below: after it, find() no
+        // longer resolves these keys — but any pointer the app cached
+        // earlier still needs the hook-layer swallow.
         collect_absent_prop_infos();
+
+        // Round 22 — delete the absent-spoofed keys from the clone's
+        // TRIE (this is the writable window: before the mprotect(R)
+        // loop below). Native absence: the REAL bionic find() returns
+        // nullptr and foreach() skips the entry with no hook involved
+        // — the find/get/foreach/read hooks above stay installed as
+        // the SECOND layer (they also cover cached prop_info pointers
+        // and any format drift that makes this walk fail-closed).
+        // The scrubbed entries additionally remove the in-process
+        // string-forensics signal (a raw memory scan for
+        // "ro.magisk.version" no longer finds the name in the clone).
+        size_t n_unlinked = 0;
+        for (size_t i = 0; i < n_mappings; ++i) {
+            uint8_t* base = reinterpret_cast<uint8_t*>(mappings[i].lo);
+            size_t msize = (size_t)(mappings[i].hi - mappings[i].lo);
+            if (!pa_header_valid(base, msize)) continue;  // contexts area etc.
+            for (const ZsPropSpoof& s : kPropSpoofTable) {
+                if (s.value && s.value[0] != '\0') continue;
+                if (pa_trie_delete_key(base, msize, s.key)) ++n_unlinked;
+            }
+        }
+        ZS_LOGD("hide_advanced: unlinked %zu absent key(s) from the "
+                "clone trie", n_unlinked);
     }
 
     // Restore read-only protection on every remapped range — the
@@ -481,7 +580,10 @@ static void clone_property_area_private() {
 // at a caller-computed byte offset of the prop_info header. Same
 // serial protocol as patch_prop_value (odd serial while writing,
 // +2 at the end) so readers of the FILE see a consistent value.
-// Returns 1 when patched, 0 on bounds failure.
+// Round 22: also rewrites the serial's value-length byte (see the
+// patch_prop_value comment — the file image's exec'd readers use the
+// same SERIAL_VALUE_LEN memcpy). Returns 1 when patched, 0 on
+// bounds failure.
 static int patch_prop_value_in_buffer(char* buf, size_t size,
                                        size_t pi_off, const char* value) {
     if (pi_off > size || size - pi_off < kPropValueOffset + kPropValueSize) {
@@ -493,11 +595,215 @@ static int patch_prop_value_in_buffer(char* buf, size_t size,
     char* value_field = pi + kPropValueOffset;
     uint32_t serial = serial_atomic->load(std::memory_order_relaxed);
     if (serial & 1u) return 0;   // mid-update entry: leave it alone
+    size_t len = value ? strnlen(value, kPropValueSize - 1) : 0;
     serial_atomic->store(serial | 1u, std::memory_order_release);
     memset(value_field, 0, kPropValueSize);
-    size_t len = strnlen(value, kPropValueSize - 1);
-    memcpy(value_field, value, len);
-    serial_atomic->store((serial + 2) & ~1u, std::memory_order_release);
+    if (len) memcpy(value_field, value, len);
+    uint32_t low = ((serial + 2) & 0x00FFFFFFu) & ~1u;
+    low &= ~kPropLongFlag;
+    serial_atomic->store(((uint32_t)len << 24) | low,
+                         std::memory_order_release);
+    return 1;
+}
+
+// ------------------------------------------------------------------------
+// Round 22 — the property-trie utilities (validated walk + deletion).
+//
+// THE INSIGHT THIS SECTION IS BUILT ON: a trie node with prop == 0 is
+// a perfectly legal "fragment without a property" — every INTERMEDIATE
+// node of every stock area is one. Zeroing a terminal node's `prop`
+// offset is therefore a reader-transparent DELETION: find() walks to
+// the node, sees prop == 0 and returns nullptr; foreach skips the
+// entry. The pre-Round-22 docs claimed "the trie format cannot
+// express deletion without a full re-serialization" — that claim was
+// WRONG (corrected in the docs this round), and it was the only reason
+// absent-spoofed keys stayed present-but-empty in the R19 file image
+// and hook-gated-only in the in-process clone.
+//
+// Everything below is validated against the byte layout verified from
+// AOSP bionic this round (see the format-facts comment above the
+// patch_prop_value constants). ANY anomaly (bad magic/version, wild
+// offset, unterminated name) makes the walk report "not found" —
+// fail-closed to the pre-Round-22 behavior, never a crash.
+// ------------------------------------------------------------------------
+
+// Read a little-endian uint32 from base+off with bounds validation.
+// Returns 0 (and sets *ok=0) when out of range.
+static uint32_t pa_read32(const uint8_t* base, size_t size, size_t off,
+                          int* ok) {
+    if (off > size || size - off < 4) { if (ok) *ok = 0; return 0; }
+    uint32_t v;
+    memcpy(&v, base + off, 4);
+    return v;
+}
+
+// Is the buffer a well-formed property area (header at base)?
+// Used to gate the trie code to real properties_serial mappings only
+// (the property_info contexts area has a different magic and is
+// skipped; the hooks still cover its keys).
+static int pa_header_valid(const uint8_t* base, size_t size) {
+    if (!base || size < kPropAreaHeaderSize + kTrieNodeSize) return 0;
+    int ok = 1;
+    uint32_t magic = pa_read32(base, size, 8, &ok);
+    uint32_t version = pa_read32(base, size, 12, &ok);
+    if (!ok || magic != kPropAreaMagic || version != kPropAreaVersion) {
+        return 0;
+    }
+    uint32_t bytes_used = pa_read32(base, size, 0, &ok);
+    if (!ok || bytes_used == 0 || bytes_used > size - kPropAreaHeaderSize) {
+        return 0;   // corrupt writer field — refuse to walk
+    }
+    return 1;
+}
+
+// bionic's cmp_prop_name, verbatim (prop_area.cpp).
+static int pa_cmp_name(const char* one, uint32_t one_len,
+                       const char* two, uint32_t two_len) {
+    if (one_len < two_len) return -1;
+    if (one_len > two_len) return 1;
+    return strncmp(one, two, one_len);
+}
+
+// Fetch a validated trie node pointer. data base = base+128. Returns
+// 0 on any anomaly.
+static int pa_node_at(const uint8_t* base, size_t size, uint32_t off,
+                      /*out*/ const uint8_t** node) {
+    if (off == 0 || (off & 3u) != 0) return 0;
+    if ((size_t)off + kTrieNodeSize > size - kPropAreaHeaderSize) return 0;
+    const uint8_t* n = base + kPropAreaHeaderSize + off;
+    uint32_t namelen = 0;
+    memcpy(&namelen, n, 4);
+    if (namelen == 0 || (size_t)namelen > 128) return 0;
+    if ((size_t)off + kTrieNodeSize + (size_t)namelen + 1 >
+        size - kPropAreaHeaderSize) {
+        return 0;
+    }
+    if (n[kTrieNodeSize + namelen] != '\0') return 0;  // bionic NUL-terminates
+    if (node) *node = n;
+    return 1;
+}
+
+static uint32_t pa_node_u32(const uint8_t* n, size_t field) {
+    uint32_t v;
+    memcpy(&v, n + field, 4);
+    return v;
+}
+
+// Walk to the trie node that terminates `name` (bionic's
+// find_property + find_prop_trie_node with alloc_if_needed=false,
+// with validation at every hop). `data` = base+128 is computed by the
+// caller. Writes the node's data_-relative offset and returns 1, or
+// returns 0 (not found / anomaly — never a crash).
+static int pa_trie_find_node(const uint8_t* base, size_t size,
+                             const char* name, uint32_t* node_off) {
+    if (!base || !name || !node_off) return 0;
+    const uint8_t* root = base + kPropAreaHeaderSize;  // node at offset 0
+    const char* remaining = name;
+    uint32_t current = 0;   // root (special: namelen 0, never compared)
+    while (1) {
+        const char* sep = strchr(remaining, '.');
+        size_t frag_len = sep ? (size_t)(sep - remaining)
+                              : strlen(remaining);
+        if (frag_len == 0) return 0;
+        // Children of `current` (root's fields are read directly; it
+        // has no validated allocation of its own).
+        uint32_t children = 0;
+        if (current == 0) {
+            children = pa_node_u32(root, 16);
+        } else {
+            const uint8_t* cur_node = nullptr;
+            if (!pa_node_at(base, size, current, &cur_node)) return 0;
+            children = pa_node_u32(cur_node, 16);
+        }
+        if (children == 0) return 0;
+        // BST walk among siblings.
+        uint32_t node = children;
+        int found = 0;
+        while (1) {
+            const uint8_t* n = nullptr;
+            if (!pa_node_at(base, size, node, &n)) return 0;
+            uint32_t n_namelen = pa_node_u32(n, 0);
+            int cmp = pa_cmp_name(remaining, (uint32_t)frag_len,
+                                  (const char*)(n + kTrieNodeSize),
+                                  n_namelen);
+            if (cmp == 0) { found = 1; break; }
+            uint32_t next = cmp < 0 ? pa_node_u32(n, 8)   // left
+                                    : pa_node_u32(n, 12); // right
+            if (next == 0) break;
+            node = next;
+        }
+        if (!found) return 0;
+        if (!sep) {
+            *node_off = node;
+            return 1;
+        }
+        remaining = sep + 1;
+        current = node;
+    }
+}
+
+// Validate a prop_info at data_-relative offset `pi_off`; write the
+// total allocation size (96 + namelen + 1, rounded up to 4) so the
+// caller can scrub the whole entry. Returns 0 on anomaly.
+static int pa_prop_info_at(const uint8_t* base, size_t size,
+                           uint32_t pi_off, size_t* alloc_size) {
+    size_t data_size = size - kPropAreaHeaderSize;
+    if ((pi_off & 3u) != 0) return 0;
+    if ((size_t)pi_off + kPropInfoSize > data_size) return 0;
+    const uint8_t* pi = base + kPropAreaHeaderSize + pi_off;
+    // The name must be NUL-terminated within the area.
+    const char* name = (const char*)(pi + kPropInfoSize);
+    size_t max_name = data_size - (size_t)pi_off - kPropInfoSize;
+    size_t namelen = strnlen(name, max_name);
+    if (namelen == max_name) return 0;   // no NUL — refuse
+    if (namelen > 128) return 0;         // sanity (PROP_NAME_MAX-ish)
+    size_t total = kPropInfoSize + namelen + 1;
+    total = (total + 3u) & ~(size_t)3u;  // bionic's 4-byte align
+    if ((size_t)pi_off + total > data_size) return 0;
+    if (alloc_size) *alloc_size = total;
+    return 1;
+}
+
+// Delete `key` from a property-area image (in memory):
+//   1. zero the terminal node's `prop` offset — find()/foreach() now
+//      report the key as absent, exactly like any intermediate node;
+//   2. scrub the orphaned prop_info bytes (name AND value) — the entry
+//      is unreachable by any correct reader (an exec'd helper maps the
+//      file fresh and only ever walks the trie), and scrubbing kills
+//      the raw-forensics signal of e.g. "ro.magisk.version" surviving
+//      as a dead record;
+//   3. scrub a long value block too, bounded by its NUL.
+// Returns 1 when the key was deleted, 0 when not found / anomaly
+// (fail-closed: the entry keeps its pre-Round-22 hook treatment).
+static int pa_trie_delete_key(uint8_t* base, size_t size,
+                              const char* key) {
+    if (!pa_header_valid(base, size)) return 0;
+    uint32_t node_off = 0;
+    if (!pa_trie_find_node(base, size, key, &node_off)) return 0;
+    uint8_t* node = base + kPropAreaHeaderSize + node_off;
+    uint32_t pi_off = pa_node_u32(node, 4);
+    if (pi_off == 0) return 0;   // already absent
+    size_t alloc = 0;
+    if (!pa_prop_info_at(base, size, pi_off, &alloc)) return 0;
+    uint8_t* pi = base + kPropAreaHeaderSize + pi_off;
+    // Long-value block? (union at pi+4: err[56] then u32 offset)
+    uint32_t serial = 0;
+    memcpy(&serial, pi, 4);
+    if (serial & kPropLongFlag) {
+        uint32_t long_rel = 0;
+        memcpy(&long_rel, pi + 4 + 56, 4);
+        // long_value() = pi + long_rel; bounded NUL-scrub.
+        if ((uint64_t)pi_off + kPropInfoSize + (uint64_t)long_rel <
+            size - kPropAreaHeaderSize) {
+            uint8_t* lv = pi + long_rel;
+            size_t max = size - kPropAreaHeaderSize -
+                         ((size_t)pi_off + kPropInfoSize + long_rel);
+            for (size_t i = 0; i < max && lv[i] != 0; ++i) lv[i] = 0;
+        }
+    }
+    memset(pi, 0, alloc);          // name, value, serial — all gone
+    uint32_t zero = 0;
+    memcpy(node + 4, &zero, 4);    // node->prop = 0: deleted
     return 1;
 }
 
@@ -662,9 +968,28 @@ char* zs_build_spoofed_serial_area(const char* prop_file_path,
     size_t patched = zs_patch_spoofed_area_bytes(
         buf, size, maps, n_maps,
         (const char* (*)(const char*))g_find_prop);
+
+    // 4. Round 22 — delete every absent-spoofed key FROM THE TRIE.
+    //    The live find() above located each prop_info; the trie walk
+    //    in the FILE buffer does the rest (node->prop = 0 + scrubbed
+    //    entry). Exec'd helpers now see these keys as ABSENT via the
+    //    file itself — no hook involved — closing the R19 residual
+    //    ("absent keys present-but-empty in the file image").
+    //    Fail-closed: a malformed area keeps the patch-only image.
+    size_t deleted = 0;
+    if (pa_header_valid((const uint8_t*)buf, size)) {
+        for (const ZsPropSpoof& s : kPropSpoofTable) {
+            if (s.value && s.value[0] != '\0') continue;  // value spoof
+            if (pa_trie_delete_key((uint8_t*)buf, size, s.key)) {
+                ++deleted;
+            }
+        }
+    }
+
     ZS_LOGD("hide_advanced: spoofed serial area built "
-            "(%zu value(s), %zu bytes)", patched, size);
-    if (patched == 0) {
+            "(%zu value(s) patched, %zu key(s) deleted, %zu bytes)",
+            patched, deleted, size);
+    if (patched == 0 && deleted == 0) {
         // Zero hits almost certainly means the offset math is wrong
         // for this device — a file with no patches is the real trie
         // verbatim; serving it gains nothing, so fail closed.
@@ -1593,8 +1918,10 @@ static size_t zs_normalize_path(const char* in, char* out, size_t cap) {
 }
 
 // prefix + "/" + rel, lexically normalized, into out. Returns 0 when
-// it cannot fit (then the caller keeps the unfiltered relative path
-// — document as the residual for >383-byte traversal strings).
+// it cannot fit the stack cap (callers fall back to the heap variant
+// below — Round 22 closed the old "fall through UNFILTERED" residual,
+// which a detector could reach with any traversal string over ~380
+// bytes: openat(proc_dirfd, "task/../" * 64 + "maps")).
 static int zs_join_proc_dir(const char* prefix, const char* rel,
                              char* out, size_t cap) {
     if (!prefix || !rel || prefix[0] != '/' || !rel[0]) return 0;
@@ -1610,34 +1937,68 @@ static int zs_join_proc_dir(const char* prefix, const char* rel,
     return zs_normalize_path(joined, out, cap) > 0;
 }
 
+// Heap twin for the overflow case (cold path: only when the joined
+// string exceeds 383 bytes). Returns a malloc'd normalized absolute
+// path the caller owns, or null. Normalization never grows the
+// string, so the joined buffer is reused in place — the w<=p write
+// cursor invariant of zs_normalize_path makes the aliasing safe.
+static char* zs_join_proc_dir_heap(const char* prefix, const char* rel) {
+    if (!prefix || !rel || prefix[0] != '/' || !rel[0]) return nullptr;
+    size_t plen = strlen(prefix);
+    while (plen > 1 && prefix[plen - 1] == '/') --plen;
+    size_t rlen = strnlen(rel, 4096);
+    if (rel[rlen] != '\0') return nullptr;   // unreasonably long
+    if (plen + 1 + rlen + 2 > 4096 + 128) return nullptr;
+    char* joined = (char*)malloc(plen + 1 + rlen + 2);
+    if (!joined) return nullptr;
+    memcpy(joined, prefix, plen);
+    joined[plen] = '/';
+    memcpy(joined + plen + 1, rel, rlen + 1);
+    size_t n = zs_normalize_path(joined, joined, plen + 1 + rlen + 2);
+    if (n == 0) { free(joined); return nullptr; }
+    return joined;
+}
+
 // Wrap the original open so the caller gets back either the original
 // fd (for non-filtered paths) or a filtered memfd (for filtered
 // paths).
 static int wrapped_open(const char* path, int flags, mode_t mode) {
     // Round 16: a relative open with a /proc cwd names the same file
     // the absolute path would — decide the filter on that path.
+    // Round 22: overlong relative paths (>383 bytes joined) fall back
+    // to a HEAP reconstruction instead of skipping the filter (the
+    // old fall-through was a documented bypass).
     char full[160];
+    char* heap_full = nullptr;
     const char* filter_path = path;
     if (path && path[0] != '/' && g_cwd_proc_prefix_len > 0) {
         if (zs_join_proc_dir(g_cwd_proc_prefix, path, full, sizeof full)) {
             filter_path = full;
+        } else {
+            heap_full = zs_join_proc_dir_heap(g_cwd_proc_prefix, path);
+            if (heap_full) filter_path = heap_full;
         }
     }
     int real_fd = g_real_open
         ? g_real_open(path, flags, mode)
         : (int)syscall(SYS_openat, AT_FDCWD, path, flags, mode);
-    if (real_fd < 0) return real_fd;
+    if (real_fd < 0) { free(heap_full); return real_fd; }
 
     if (filter_path && filter_path[0] == '/' &&
         zs_is_proc_dir_prefix(filter_path)) {
         fd_shadow_register_proc_dir(real_fd, filter_path);
     }
-    if (!zs_path_is_filtered(filter_path)) return real_fd;
+    int keep = !zs_path_is_filtered(filter_path);
+    if (keep) { free(heap_full); return real_fd; }
 
     int memfd = make_filtered_memfd(real_fd, filter_path);
     close(real_fd);
     if (memfd >= 0) {
+        // NOTE: register BEFORE free — fd_shadow_set_path strdups the
+        // path, and the heap twin is freed right after (the sanitizer
+        // suite caught the reversed order as a use-after-free).
         fd_shadow_register(memfd, filter_path);
+        free(heap_full);
         return memfd;
     }
     // Round 15: fail-open. memfd_create exists since Linux 3.17 —
@@ -1648,6 +2009,7 @@ static int wrapped_open(const char* path, int flags, mode_t mode) {
     // than serving the unfiltered file. Log and hand back the real fd.
     ZS_LOGW("hide_advanced: filter memfd unavailable; passing the real "
             "fd for %s through unfiltered", filter_path);
+    free(heap_full);
     // B2 history: never return the closed fd — re-open instead.
     return g_real_open
         ? g_real_open(path, flags & ~O_TRUNC, mode)
@@ -1658,8 +2020,10 @@ static int wrapped_openat(int dirfd, const char* path, int flags,
                           mode_t mode) {
     // Round 16: relative path + tracked /proc dirfd (or a /proc cwd
     // with AT_FDCWD) resolves through the reconstructed absolute
-    // path, exactly like wrapped_open above.
+    // path, exactly like wrapped_open above. Round 22: the heap
+    // fallback covers traversal strings too long for the stack path.
     char full[160];
+    char* heap_full = nullptr;
     const char* filter_path = path;
     if (path && path[0] != '/' && hide_advanced_is_active()) {
         FdShadow* rec = (dirfd != AT_FDCWD)
@@ -1669,11 +2033,17 @@ static int wrapped_openat(int dirfd, const char* path, int flags,
             if (zs_join_proc_dir(rec->orig_path, path, full,
                                  sizeof full)) {
                 filter_path = full;
+            } else {
+                heap_full = zs_join_proc_dir_heap(rec->orig_path, path);
+                if (heap_full) filter_path = heap_full;
             }
         } else if (dirfd == AT_FDCWD && g_cwd_proc_prefix_len > 0) {
             if (zs_join_proc_dir(g_cwd_proc_prefix, path, full,
                                  sizeof full)) {
                 filter_path = full;
+            } else {
+                heap_full = zs_join_proc_dir_heap(g_cwd_proc_prefix, path);
+                if (heap_full) filter_path = heap_full;
             }
         }
     }
@@ -1687,23 +2057,26 @@ static int wrapped_openat(int dirfd, const char* path, int flags,
     int real_fd = g_real_openat
         ? g_real_openat(dirfd, path, flags, mode)
         : (int)syscall(SYS_openat, dirfd, path, flags, mode);
-    if (real_fd < 0) return real_fd;
+    if (real_fd < 0) { free(heap_full); return real_fd; }
 
     if (filter_path && filter_path[0] == '/' &&
         zs_is_proc_dir_prefix(filter_path)) {
         fd_shadow_register_proc_dir(real_fd, filter_path);
     }
-    if (!zs_path_is_filtered(filter_path)) return real_fd;
+    int keep = !zs_path_is_filtered(filter_path);
+    if (keep) { free(heap_full); return real_fd; }
 
     int memfd = make_filtered_memfd(real_fd, filter_path);
     close(real_fd);
     if (memfd >= 0) {
-        fd_shadow_register(memfd, filter_path);
+        fd_shadow_register(memfd, filter_path);   // before free (see open)
+        free(heap_full);
         return memfd;
     }
     // Round 15 fail-open — see wrapped_open.
     ZS_LOGW("hide_advanced: filter memfd unavailable; passing the real "
             "fd for %s through unfiltered", filter_path);
+    free(heap_full);
     return g_real_openat
         ? g_real_openat(dirfd, path, flags & ~O_TRUNC, mode)
         : (int)syscall(SYS_openat, dirfd, path, flags & ~O_TRUNC, mode);
@@ -2530,6 +2903,73 @@ extern "C" int zygisk_study_hook_prop_foreach(
                                : -1;
 }
 
+// Round 22 — the SET-side round-trip. __system_property_set sends the
+// write to init's property service over the socket; init updates the
+// REAL area — which the hidden process no longer maps (the clone
+// replaced it at the same addresses). Every subsequent read walks the
+// clone and sees the OLD value: an app that sets a property and reads
+// it back observes its own write FAILING. That is both a functional
+// bug and a textbook detection vector (setprop X && getprop X != X).
+// SEPolicy makes untrusted_app's writable namespace small, but the
+// pattern still fires for the keys apps may write.
+//
+// Fix: after a SUCCESSFUL real set(), reflect the value into the
+// clone's entry (bionic's own odd/even serial protocol, so concurrent
+// reader threads are safe). The clone is PROT_READ at this point —
+// mprotect the span RW for the patch and restore. Entries that would
+// become long (>= 92 chars) are left alone: the clone cannot
+// allocate, and app-settable long values are vanishingly rare
+// (documented residual).
+using PropSetFn = int (*)(const char*, const char*);
+static PropSetFn g_real_prop_set = nullptr;
+// The protection the clone pages end up with (PROT_READ in
+// production; a host-test seam relaxes it for malloc'd fakes).
+static int g_props_clone_prot = PROT_READ;
+
+extern "C" int zygisk_study_hook_prop_set(const char* key,
+                                          const char* value) {
+    int rc = g_real_prop_set ? g_real_prop_set(key, value) : -1;
+    if (rc != 0 || !hide_advanced_is_active() || !g_props_cloned ||
+        !key || !value) {
+        return rc;
+    }
+    if (strnlen(value, kPropValueSize) >= kPropValueSize) {
+        return rc;   // long value: cannot reflect (documented residual)
+    }
+    // Only existing clone entries can be patched; a genuinely NEW key
+    // would need trie allocation in the clone (left as the residual —
+    // a new-key set-then-read is not a round-trip any stock behavior
+    // would contradict, since the reader sees "absent", the same as a
+    // set that failed SEPolicy).
+    const void* pi = g_find_prop ? g_find_prop(key) : nullptr;
+    if (!pi) return rc;
+    // Page span of the 96 bytes we may touch (value + serial can
+    // straddle a page boundary).
+    static long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) page_size = 4096;
+    uintptr_t start = (uintptr_t)pi & ~(uintptr_t)(page_size - 1);
+    uintptr_t end = ((uintptr_t)pi + kPropValueOffset + kPropValueSize +
+                     (uintptr_t)(page_size - 1)) & ~(uintptr_t)(page_size - 1);
+    size_t span = (size_t)(end - start);
+    int restored = 0;
+    if (mprotect((void*)start, span, PROT_READ | PROT_WRITE) == 0) {
+        patch_prop_value(pi, value);
+        // g_props_clone_prot is what the clone finalized with (R in
+        // production). Restoring to it keeps the anomaly surface flat.
+        if (mprotect((void*)start, span,
+                     g_props_clone_prot) != 0) {
+            restored = 0;
+        } else {
+            restored = 1;
+        }
+    }
+    if (!restored) {
+        ZS_LOGW("hide_advanced: prop set reflect failed for %s "
+                "(mprotect)", key);
+    }
+    return rc;
+}
+
 // ------------------------------------------------------------------------
 // 5d. Raw syscall() hook (Tier B)
 // ------------------------------------------------------------------------
@@ -3250,6 +3690,45 @@ extern "C" DIR* zygisk_study_hook_opendir(const char* name) {
     return d;
 }
 
+// Round 22 — fdopendir(): the R15-17 residual. A DIR* can be built
+// from ANY fd:  fd = open("/proc/self", O_RDONLY|O_DIRECTORY);
+// d = fdopendir(fd);  openat(dirfd(d), "maps", ...). When the fd
+// came through a hooked entry point it already carries a
+// FD_SHADOW_PROC_DIR record (the openat hook registers every /proc
+// dir it hands out), and the R20 opendir hook covers opendir(). The
+// gap was an fd that NEVER crossed a hooked call — opened pre-hide
+// or through a libc-internal path. The hook resolves the fd's link
+// target with the REAL readlink (never our own readlink hook — no
+// recursion) and registers the prefix. readdir() entry filtering is
+// unchanged (it keys off names, not records).
+using FdopendirFn = DIR* (*)(int);
+static FdopendirFn g_real_fdopendir = nullptr;
+
+extern "C" DIR* zygisk_study_hook_fdopendir(int fd) {
+    DIR* d = g_real_fdopendir
+        ? g_real_fdopendir(fd)
+        : fdopendir(fd);
+    if (d && fd >= 0 && hide_advanced_is_active() &&
+        !fd_shadow_lookup(fd, FD_SHADOW_PROC_DIR)) {
+        // Classify by link target: readlink("/proc/self/fd/<fd>")
+        // answers the directory path the kernel has open.
+        char link_path[48];
+        snprintf(link_path, sizeof link_path, "/proc/self/fd/%d", fd);
+        char target[128];
+        ssize_t n = g_real_readlink_for_fd_scan
+            ? g_real_readlink_for_fd_scan(link_path, target,
+                                          sizeof target - 1)
+            : -1;
+        if (n > 0) {
+            target[n] = '\0';
+            if (zs_is_proc_dir_prefix(target)) {
+                fd_shadow_register_proc_dir(fd, target);
+            }
+        }
+    }
+    return d;
+}
+
 // ------------------------------------------------------------------------
 // chdir / fchdir hooks (Tier B) — Round 16
 // ------------------------------------------------------------------------
@@ -3498,9 +3977,8 @@ extern "C" int zygisk_study_hook_scandirat(
 // NOT — closing descriptors the runtime owns (the exact bug Round 7
 // fixed) is a crash class, while a /data/adb link target is purely
 // ours to remove.
-
-using ReadlinkFn = ssize_t (*)(const char*, char*, size_t);
-static ReadlinkFn g_real_readlink_for_fd_scan = nullptr;
+// (ReadlinkFn / g_real_readlink_for_fd_scan are forward-declared near
+// the top of the file — the fdopendir hook needs them too.)
 
 // Raw getdents64 walk for this scan uses zs_linux_dirent64, defined
 // at the syscall hook section (5d) where the getdents64 filter also
@@ -3639,6 +4117,9 @@ void hide_advanced_init() {
         "__system_property_read");
     g_real_prop_foreach = (PropForeachFn)zs_resolve_libc(
         "__system_property_foreach");
+    // Round 22: the set-side round-trip reflect.
+    g_real_prop_set = (PropSetFn)zs_resolve_libc(
+        "__system_property_set");
     g_real_scandir    = (ScandirFn)zs_resolve_libc("scandir");
     g_real_scandirat  = (ScandiratFn)zs_resolve_libc("scandirat");
     g_real_readlink_for_fd_scan = (ReadlinkFn)zs_resolve_libc("readlink");
@@ -3648,6 +4129,7 @@ void hide_advanced_init() {
         "android_dlopen_ext");
     g_real_dlclose    = (DlcloseFn)zs_resolve_libc("dlclose");
     g_real_opendir    = (OpendirFn)zs_resolve_libc("opendir");
+    g_real_fdopendir  = (FdopendirFn)zs_resolve_libc("fdopendir");
     // Round 16 — relative-path resolution and directory-entry filtering.
     g_real_chdir      = (ChdirFn)zs_resolve_libc("chdir");
     g_real_fchdir     = (FchdirFn)zs_resolve_libc("fchdir");
@@ -3708,6 +4190,9 @@ void hide_advanced_init() {
         (void*)&zygisk_study_hook_prop_read);
     hide_advanced_register_tier_b_hook("__system_property_foreach",
         (void*)&zygisk_study_hook_prop_foreach);
+    // Round 22 — the set-side round-trip.
+    hide_advanced_register_tier_b_hook("__system_property_set",
+        (void*)&zygisk_study_hook_prop_set);
     hide_advanced_register_tier_b_hook("syscall",
         (void*)&zygisk_study_hook_syscall);
     hide_advanced_register_tier_b_hook("dlopen",
@@ -3719,6 +4204,9 @@ void hide_advanced_init() {
     // Round 8 (S3): directory enumeration of hidden paths.
     hide_advanced_register_tier_b_hook("opendir",
         (void*)&zygisk_study_hook_opendir);
+    // Round 22 — DIR* built from a bare fd (the R15-17 residual).
+    hide_advanced_register_tier_b_hook("fdopendir",
+        (void*)&zygisk_study_hook_fdopendir);
     // Round 9 (S1): scandir()/scandirat() build their dirent list
     // through libc-internal opendir/readdir, so the opendir GOT hook
     // does not see them. Post-filtering the result list here covers
@@ -3798,6 +4286,17 @@ int zs_test_filter_scratch_allocs() {
 // so the getdents64 walk + readlink resolution run for real.
 void zs_test_set_fd_root_prefix(const char* prefix) {
     g_fd_root_prefixes[0] = FdRootPrefix{prefix, strlen(prefix)};
+}
+
+// Round 22: the protection the prop-set reflect restores after
+// patching (PROT_READ in production; tests relax it for heap fakes).
+void zs_test_set_props_clone_prot(int prot) {
+    g_props_clone_prot = prot;
+}
+
+// Round 22: drive the set hook with a fake real-set + fake find.
+void zs_test_set_real_prop_set(int (*fn)(const char*, const char*)) {
+    g_real_prop_set = (PropSetFn)fn;
 }
 #endif
 

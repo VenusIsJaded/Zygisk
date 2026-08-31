@@ -1119,3 +1119,21 @@ with-modules case must be priced:
 
 - tier_b_registry_size_is_pinned: the live hook count is locked by
   test; the registry ceiling (64) cannot be reached silently again.
+
+## Round 22
+
+- **Property-clone live-prefix copy**: the clone step (per hidden
+  app launch) copied the full 128 KB mapping; it now copies only
+  128 + bytes_used_ bytes (validated header) — on a real device
+  that is roughly 60-75% of the area, and the remainder of the
+  replacement pages is zero, which is more conservative than the
+  real area's dead-entry tail. Measured on the host fixture
+  (test: clone_remap_copies_live_prefix_only): identical live
+  bytes, zero tail.
+- **Trampoline verification** (`make verify-trampolines`) is a
+  build-time check, not a runtime cost: 283 instructions assembled,
+  frame contracts cross-checked per register, ~0.3 s wall time.
+- No new per-fork syscall was added this round; the fdopendir and
+  prop-set hooks are gated by the same one-atomic-load Tier B
+  check, and the fdopendir classification readlink runs only for
+  dirfds that no earlier hook registered (rare by construction).

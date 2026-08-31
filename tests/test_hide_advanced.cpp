@@ -2964,14 +2964,15 @@ ZS_TEST(chdir_hook_passes_null_and_bad_paths) {
 // old 48-slot limit. Pin the arithmetic so a future hook that fails
 // to register shows up HERE, not as a stealth hole.
 ZS_TEST(tier_b_registry_size_is_pinned) {
-    // This TU's registry: 40 production names + 1 legacy test symbol
+    // This TU's registry: 42 production names + 1 legacy test symbol
     // registered by an older test ("zs_test_never_a_real_symbol").
     // The full payload adds readlink/readlinkat (2, from
     // hide_stealth.cpp) and promotes the 5 zygote-time hooks
-    // (setresgid/setresuid/setgid/setuid/fork) for 47 live entries —
-    // exactly what the dispatch e2e walk logs. The old cap was 48:
-    // ONE slot from silently refusing new hooks.
-    ZS_CHECK_EQ(g_tier_b_hook_count, (size_t)41);
+    // (setresgid/setresuid/setgid/setuid/fork) for 49 live entries.
+    // Round 22 added __system_property_set + fdopendir (43 here).
+    // The old cap was 48: ONE slot from silently refusing new hooks —
+    // capacity is 64 now; the pin keeps the arithmetic honest.
+    ZS_CHECK_EQ(g_tier_b_hook_count, (size_t)43);
 
     size_t before = g_got_hook_count;
     hide_advanced_install_tier_b();
@@ -3130,10 +3131,14 @@ ZS_TEST(spoofed_serial_area_builder_patches_values_at_offsets) {
     if (built) {
         // Magic passthrough.
         ZS_CHECK(memcmp(built, "PROP", 4) == 0);
-        // Entry at 0x100: spoofed to "green", serial advanced by 2.
+        // Entry at 0x100: spoofed to "green". Round 22: the serial's
+        // top byte now carries the NEW value length (5) — the reader
+        // takes its memcpy length from it (SERIAL_VALUE_LEN), so the
+        // old behavior (top byte left at the original 0) was the
+        // truncation bug. Low counter still advances by 2.
         uint32_t serial = 0;
         memcpy(&serial, built + 0x100, 4);
-        ZS_CHECK_EQ(serial, 4u);
+        ZS_CHECK_EQ(serial, 0x05000004u);
         ZS_CHECK(strcmp(built + 0x100 + 4, "green") == 0);
         // Entry at 0x200: spoofed to empty (absent-style).
         memcpy(&serial, built + 0x200, 4);
@@ -3364,4 +3369,883 @@ ZS_TEST(props_stat_fiction_answers_real_identity) {
     zs_test_set_prop_serial_target(nullptr);
     zs_test_props_source_clear();
     hide_advanced_set_active(0);
+}
+
+#include <functional>
+
+// ======================================================================
+// Round 22 — the property-trie layer.
+//
+// The fixtures below are a SECOND, INDEPENDENT implementation of the
+// bionic property-area format (writer = init's prop_area discipline:
+// header, root node, dirty area, 4-aligned bump allocations, BST-
+// ordered sibling inserts, long-value blocks; reader = find_property
+// + foreach_property + the SERIAL_VALUE_LEN memcpy of get()). The
+// production code under test (pa_trie_find_node / pa_trie_delete_key /
+// the file-image builder / the clone unlink) was written against the
+// same AOSP sources this round — the fixtures cross-check it: two
+// implementations agreeing is evidence the format handling is right,
+// not just self-consistent.
+// ======================================================================
+namespace {
+
+class PropAreaFixture {
+public:
+    explicit PropAreaFixture(size_t total = 64 * 1024)
+        : buf_((uint8_t*)calloc(1, total)), size_(total) {
+        ZS_CHECK(buf_ != nullptr);
+        put32(0, 112);            // bytes_used_: root(20) + dirty(92)
+        put32(4, 7);              // area serial (arbitrary nonzero)
+        put32(8, 0x504f5250u);    // PROP_AREA_MAGIC
+        put32(12, 0xfc6ed0abu);   // PROP_AREA_VERSION
+    }
+    ~PropAreaFixture() { free(buf_); }
+
+    uint8_t* buf() { return buf_; }
+    const uint8_t* buf() const { return buf_; }
+    size_t size() const { return size_; }
+    uint8_t* data() { return buf_ + 128; }
+    const uint8_t* data() const { return buf_ + 128; }
+
+    void add(const char* name, const char* value) {
+        uint32_t node = find_or_create_node(name);
+        size_t vlen = strlen(value);
+        uint32_t namelen = (uint32_t)strlen(name);
+        uint32_t pi_off = alloc(96 + namelen + 1);
+        uint8_t* pi = data() + pi_off;
+        if (vlen >= 92) {
+            uint32_t lv_off = alloc(vlen + 1);
+            memcpy(data() + lv_off, value, vlen + 1);
+            uint32_t rel = lv_off - pi_off;
+            uint32_t serial = (55u << 24) | (1u << 16);  // bionic's ctor
+            memcpy(pi, &serial, 4);
+            memset(pi + 4, 'E', 56);          // error_message
+            memcpy(pi + 4 + 56, &rel, 4);
+        } else {
+            uint32_t serial = (uint32_t)vlen << 24;
+            memcpy(pi, &serial, 4);
+            memcpy(pi + 4, value, vlen + 1);  // 92-byte field, NUL padded
+        }
+        memcpy(pi + 96, name, namelen + 1);
+        uint32_t pi_link = pi_off;
+        memcpy(data() + node + 4, &pi_link, 4);
+    }
+
+    // ---- reader: bionic find_property ----
+    const uint8_t* find(const char* name) const {
+        uint32_t current = 0;
+        const char* remaining = name;
+        while (true) {
+            const char* sep = strchr(remaining, '.');
+            size_t flen = sep ? (size_t)(sep - remaining)
+                              : strlen(remaining);
+            uint32_t children;
+            memcpy(&children, data() + (current ? current + 16 : 16), 4);
+            if (children == 0) return nullptr;
+            // BST walk
+            uint32_t node = children;
+            int found = 0;
+            while (true) {
+                const uint8_t* n = data() + node;
+                uint32_t nlen;
+                memcpy(&nlen, n, 4);
+                int cmp = cmp_name(remaining, (uint32_t)flen,
+                                   (const char*)(n + 20), nlen);
+                if (cmp == 0) { found = 1; break; }
+                uint32_t next;
+                memcpy(&next, n + (cmp < 0 ? 8 : 12), 4);
+                if (next == 0) break;
+                node = next;
+            }
+            if (!found) return nullptr;
+            if (!sep) {
+                uint32_t prop;
+                memcpy(&prop, data() + node + 4, 4);
+                if (prop == 0) return nullptr;   // deleted / none
+                return data() + prop;
+            }
+            remaining = sep + 1;
+            current = node;
+        }
+    }
+
+    // ---- reader: __system_property_get (SERIAL_VALUE_LEN memcpy) ----
+    int get(const char* name, char* out) const {
+        const uint8_t* pi = find(name);
+        if (!pi) { out[0] = 0; return 0; }
+        uint32_t serial;
+        memcpy(&serial, pi, 4);
+        if (serial & (1u << 16)) {
+            // Long: ReadCallback passes long_value directly; Get()
+            // returns the error-message length. For the test we only
+            // need short entries through get().
+            uint32_t len = serial >> 24;
+            memcpy(out, pi + 4, len + 1);
+            return (int)len;
+        }
+        uint32_t len = serial >> 24;
+        memcpy(out, pi + 4, len + 1);
+        return (int)len;
+    }
+
+    // ---- reader: the value via the callback path (long-aware) ----
+    std::string value_of(const uint8_t* pi) const {
+        uint32_t serial;
+        memcpy(&serial, pi, 4);
+        if (serial & (1u << 16)) {
+            uint32_t rel;
+            memcpy(&rel, pi + 4 + 56, 4);
+            return std::string((const char*)(pi + rel));
+        }
+        return std::string((const char*)(pi + 4));
+    }
+
+    // ---- reader: foreach (left, prop, children, right) ----
+    template <typename F>
+    void foreach_prop(F&& f) const {
+        walk(0, "", f);
+    }
+
+    size_t pi_offset(const char* name) const {
+        const uint8_t* pi = find(name);
+        ZS_CHECK(pi != nullptr);
+        return (size_t)(pi - buf_);
+    }
+
+    // Buffer offset of the terminal NODE for a key (test introspection).
+    uint32_t node_offset(const char* name) const {
+        uint32_t current = 0;
+        const char* remaining = name;
+        while (true) {
+            const char* sep = strchr(remaining, '.');
+            size_t flen = sep ? (size_t)(sep - remaining)
+                              : strlen(remaining);
+            uint32_t children;
+            memcpy(&children, data() + (current ? current + 16 : 16), 4);
+            uint32_t node = children;
+            while (true) {
+                const uint8_t* n = data() + node;
+                uint32_t nlen;
+                memcpy(&nlen, n, 4);
+                int cmp = cmp_name(remaining, (uint32_t)flen,
+                                   (const char*)(n + 20), nlen);
+                if (cmp == 0) break;
+                uint32_t next;
+                memcpy(&next, n + (cmp < 0 ? 8 : 12), 4);
+                node = next;
+            }
+            if (!sep) return node;
+            remaining = sep + 1;
+            current = node;
+        }
+    }
+
+    // Round-trip check: every add() is findable with its value.
+    void self_check(const std::map<std::string, std::string>& expect) const {
+        for (const auto& kv : expect) {
+            const uint8_t* pi = find(kv.first.c_str());
+            ZS_CHECK(pi != nullptr);
+            ZS_CHECK(value_of(pi) == kv.second);
+        }
+    }
+
+private:
+    static int cmp_name(const char* one, uint32_t one_len,
+                        const char* two, uint32_t two_len) {
+        if (one_len < two_len) return -1;
+        if (one_len > two_len) return 1;
+        return strncmp(one, two, one_len);
+    }
+
+    uint32_t alloc(size_t n) {
+        uint32_t used;
+        memcpy(&used, buf_, 4);
+        size_t aligned = (n + 3) & ~(size_t)3;
+        ZS_CHECK((size_t)used + 128 + aligned <= size_);
+        uint32_t off = used;
+        put32(0, (uint32_t)(used + aligned));
+        return off;
+    }
+
+    uint32_t new_node(const char* frag, size_t flen) {
+        uint32_t off = alloc(20 + flen + 1);
+        uint8_t* n = data() + off;
+        uint32_t l = (uint32_t)flen;
+        memcpy(n, &l, 4);
+        memcpy(n + 20, frag, flen);
+        n[20 + flen] = '\0';
+        return off;
+    }
+
+    uint32_t find_or_create_node(const char* name) {
+        uint32_t current = 0;
+        const char* remaining = name;
+        while (true) {
+            const char* sep = strchr(remaining, '.');
+            size_t flen = sep ? (size_t)(sep - remaining)
+                              : strlen(remaining);
+            uint32_t child_root;
+            memcpy(&child_root, data() + (current ? current + 16 : 16), 4);
+            if (child_root == 0) {
+                child_root = new_node(remaining, flen);
+                memcpy(data() + (current ? current + 16 : 16),
+                       &child_root, 4);
+            }
+            // BST insert (bionic find_prop_trie_node alloc mode).
+            uint32_t node = child_root;
+            while (true) {
+                uint8_t* n = data() + node;
+                uint32_t nlen;
+                memcpy(&nlen, n, 4);
+                int cmp = cmp_name(remaining, (uint32_t)flen,
+                                   (const char*)(n + 20), nlen);
+                if (cmp == 0) break;
+                uint8_t* slot = n + (cmp < 0 ? 8 : 12);
+                uint32_t next;
+                memcpy(&next, slot, 4);
+                if (next != 0) { node = next; continue; }
+                next = new_node(remaining, flen);
+                memcpy(slot, &next, 4);
+                node = next;
+                break;
+            }
+            if (!sep) return node;
+            remaining = sep + 1;
+            current = node;
+        }
+    }
+
+    void put32(size_t off, uint32_t v) { memcpy(buf_ + off, &v, 4); }
+    void put32(size_t off, int v) { put32(off, (uint32_t)v); }
+
+    template <typename F>
+    void walk(uint32_t node, const std::string& prefix, F&& f) const {
+        uint32_t left;
+        memcpy(&left, data() + node + 8, 4);
+        if (left != 0) walk(left, prefix, f);
+        uint32_t prop;
+        memcpy(&prop, data() + node + 4, 4);
+        if (prop != 0) f(data() + prop);
+        uint32_t children;
+        memcpy(&children, data() + node + 16, 4);
+        if (children != 0) {
+            uint32_t nlen;
+            memcpy(&nlen, data() + node, 4);
+            std::string frag((const char*)(data() + node + 20), nlen);
+            walk(children, prefix + frag + ".", f);
+        }
+        uint32_t right;
+        memcpy(&right, data() + node + 12, 4);
+        if (right != 0) walk(right, prefix, f);
+    }
+
+    uint8_t* buf_;
+    size_t size_;
+};
+
+} // namespace
+
+// The production trie walk finds everything the fixture wrote —
+// including deep paths, BST siblings on both sides, and long values.
+ZS_TEST(production_trie_walk_matches_independent_reader) {
+    PropAreaFixture area;
+    std::map<std::string, std::string> expect = {
+        {"ro.boot.verifiedbootstate", "orange"},
+        {"ro.boot.veritymode", "logging"},
+        {"ro.boot.flash.locked", "0"},
+        {"ro.build.tags", "release-keys"},
+        {"ro.build.type", "userdebug"},
+        {"ro.secure", "1"},
+        {"persist.sys.long.value",
+         std::string(140, 'L')},           // long value block
+    };
+    for (const auto& kv : expect) area.add(kv.first.c_str(), kv.second.c_str());
+    area.self_check(expect);
+
+    // The production walk must land on the same nodes.
+    for (const auto& kv : expect) {
+        uint32_t node = 0;
+        ZS_CHECK_EQ(pa_trie_find_node(area.buf(), area.size(),
+                                      kv.first.c_str(), &node), 1);
+        ZS_CHECK_EQ(node, area.node_offset(kv.first.c_str()));
+    }
+    // Not-present keys are absent (not a crash, not a false hit).
+    uint32_t node = 1;
+    ZS_CHECK_EQ(pa_trie_find_node(area.buf(), area.size(),
+                                  "ro.magisk.version", &node), 0);
+    ZS_CHECK_EQ(pa_trie_find_node(area.buf(), area.size(),
+                                  "no.such.key", &node), 0);
+    ZS_CHECK_EQ(pa_trie_find_node(area.buf(), area.size(),
+                                 "ro.build.tags", &node), 1);
+}
+
+// Deleting a key removes it from find() AND foreach() — through the
+// INDEPENDENT reader — while neighbors on both BST sides survive.
+ZS_TEST(trie_delete_removes_key_and_keeps_neighbors) {
+    PropAreaFixture area;
+    area.add("ro.magisk.version", "27007");
+    area.add("ro.magisk.versioncode", "27007");   // shares the parent
+    area.add("ro.build.tags", "release-keys");
+    area.add("ro.secure", "1");
+
+    ZS_CHECK(pa_trie_delete_key(area.buf(), area.size(),
+                                "ro.magisk.version") == 1);
+
+    // find: deleted key gone, everything else intact.
+    ZS_CHECK(area.find("ro.magisk.version") == nullptr);
+    ZS_CHECK(area.find("ro.magisk.versioncode") != nullptr);
+    ZS_CHECK(area.find("ro.build.tags") != nullptr);
+    ZS_CHECK(area.find("ro.secure") != nullptr);
+
+    // foreach: exactly the three survivors.
+    std::vector<std::string> names;
+    area.foreach_prop([&](const uint8_t* pi) {
+        names.push_back(std::string((const char*)(pi + 96)));
+    });
+    ZS_CHECK_EQ(names.size(), (size_t)3);
+    int saw_v = 0, saw_t = 0, saw_s = 0;
+    for (const auto& n : names) {
+        if (n == "ro.magisk.versioncode") saw_v = 1;
+        if (n == "ro.build.tags") saw_t = 1;
+        if (n == "ro.secure") saw_s = 1;
+        ZS_CHECK(n != "ro.magisk.version");   // never enumerated
+    }
+    ZS_CHECK(saw_v && saw_t && saw_s);
+
+    // Deleting an already-deleted key is a no-op (prop == 0 path).
+    ZS_CHECK(pa_trie_delete_key(area.buf(), area.size(),
+                                "ro.magisk.version") == 0);
+}
+
+// The scrubbed entry leaves NO trace of the name or value anywhere in
+// the image — a raw-forensics scan (memmem for the strings) comes up
+// empty, and the long-value block of a deleted LONG entry is gone too.
+ZS_TEST(trie_delete_scrubs_entry_bytes_and_long_values) {
+    PropAreaFixture area;
+    area.add("ro.dalvik.vm.native.bridge", "libzygisk.so");
+    area.add("persist.sys.long.gone",
+             std::string(150, 'X').c_str());     // long value block
+    area.add("ro.keep.me", "kept");
+
+    ZS_CHECK(pa_trie_delete_key(area.buf(), area.size(),
+                                "ro.dalvik.vm.native.bridge") == 1);
+    ZS_CHECK(pa_trie_delete_key(area.buf(), area.size(),
+                                "persist.sys.long.gone") == 1);
+
+    const char* needles[] = {
+        "ro.dalvik.vm.native.bridge", "libzygisk.so",
+        "persist.sys.long.gone",
+    };
+    for (const char* nd : needles) {
+        size_t nl = strlen(nd);
+        const uint8_t* hit = (const uint8_t*)memmem(
+            area.buf(), area.size(), nd, nl);
+        ZS_CHECK(hit == nullptr);
+    }
+    // The long VALUE (150 'X's) is scrubbed: no run of 90+ X remains.
+    int run = 0, best = 0;
+    for (size_t i = 128; i < area.size(); ++i) {
+        run = area.buf()[i] == 'X' ? run + 1 : 0;
+        if (run > best) best = run;
+    }
+    ZS_CHECK(best < 90);
+
+    // And the survivor is still fully intact.
+    const uint8_t* pi = area.find("ro.keep.me");
+    ZS_CHECK(pi != nullptr);
+    ZS_CHECK(area.value_of(pi) == "kept");
+}
+
+// A deleted key's get() (the SERIAL_VALUE_LEN memcpy path) reports
+// not-found — the same answer a stock device gives.
+ZS_TEST(trie_delete_get_reports_absent) {
+    PropAreaFixture area;
+    area.add("persist.sys.rootdir", "/data/adb");
+    char out[96];
+    ZS_CHECK_EQ(area.get("persist.sys.rootdir", out), 9);
+    ZS_CHECK(strcmp(out, "/data/adb") == 0);
+
+    ZS_CHECK(pa_trie_delete_key(area.buf(), area.size(),
+                                "persist.sys.rootdir") == 1);
+    ZS_CHECK_EQ(area.get("persist.sys.rootdir", out), 0);
+    ZS_CHECK(out[0] == '\0');
+}
+
+// Corrupt areas must fail CLOSED (no deletion, no crash) — the fuzz
+// loop drives random corruptions under the test binary (ASan covers
+// the suite in the sanitizer run).
+ZS_TEST(trie_walk_fails_closed_on_corruption) {
+    PropAreaFixture area;
+    area.add("ro.magisk.version", "27007");
+    area.add("ro.build.tags", "release-keys");
+
+    // Bad magic / version / bytes_used.
+    {
+        PropAreaFixture a;
+        a.add("ro.magisk.version", "27007");
+        uint32_t bad = 0xdeadbeef;
+        memcpy(a.buf() + 8, &bad, 4);
+        ZS_CHECK(pa_trie_delete_key(a.buf(), a.size(),
+                                    "ro.magisk.version") == 0);
+    }
+    {
+        PropAreaFixture a;
+        a.add("ro.magisk.version", "27007");
+        uint32_t bad = 0xdeadbeef;
+        memcpy(a.buf() + 12, &bad, 4);
+        ZS_CHECK(pa_trie_delete_key(a.buf(), a.size(),
+                                    "ro.magisk.version") == 0);
+    }
+    {
+        PropAreaFixture a;
+        a.add("ro.magisk.version", "27007");
+        uint32_t wild = 0x7ffffff0;
+        memcpy(a.buf(), &wild, 4);      // bytes_used_ beyond the area
+        ZS_CHECK(pa_trie_delete_key(a.buf(), a.size(),
+                                    "ro.magisk.version") == 0);
+    }
+    // Wild node offsets: children pointing out of the area.
+    {
+        PropAreaFixture a;
+        a.add("ro.magisk.version", "27007");
+        // Root's children offset -> wild.
+        uint32_t wild = (uint32_t)(a.size() - 4);
+        memcpy(a.data() + 16, &wild, 4);
+        ZS_CHECK(pa_trie_delete_key(a.buf(), a.size(),
+                                    "ro.magisk.version") == 0);
+    }
+    {
+        PropAreaFixture a;
+        a.add("ro.magisk.version", "27007");
+        // Unaligned + odd offset.
+        uint32_t wild = 0x101;
+        memcpy(a.data() + 16, &wild, 4);
+        ZS_CHECK(pa_trie_delete_key(a.buf(), a.size(),
+                                    "ro.magisk.version") == 0);
+    }
+    // Truncated area: header claims more than the buffer holds.
+    {
+        PropAreaFixture a;
+        a.add("ro.magisk.version", "27007");
+        ZS_CHECK(pa_trie_delete_key(a.buf(), 200,   // tiny size
+                                    "ro.magisk.version") == 0);
+    }
+
+    // Deterministic pseudo-random corruption fuzz (bounded, seeded).
+    uint32_t seed = 0x22446688u;
+    for (int iter = 0; iter < 400; ++iter) {
+        PropAreaFixture a;
+        a.add("ro.magisk.version", "27007");
+        a.add("ro.build.tags", "release-keys");
+        a.add("persist.sys.x", "y");
+        seed = seed * 1664525u + 1013904223u;
+        size_t pos = 128 + (seed % (a.size() - 128 - 4));
+        uint32_t v = seed >> 8;
+        memcpy(a.buf() + pos, &v, 4);
+        // Either it fails closed (0) or it deletes (1); both must
+        // leave the OTHER keys' entries either intact or absent —
+        // and it must NEVER crash (this test completing is the
+        // assertion; ASan tightens it).
+        (void)pa_trie_delete_key(a.buf(), a.size(), "ro.magisk.version");
+    }
+}
+
+// The real version of the above (the lambda-table dance above was a
+// scaffold; this is the working test).
+ZS_TEST(spoofed_file_image_builder_full_round_trip) {
+    PropAreaFixture area;
+    area.add("ro.boot.verifiedbootstate", "orange");
+    area.add("ro.boot.veritymode", "logging");
+    area.add("ro.boot.flash.locked", "0");
+    area.add("ro.magisk.version", "27007");
+    area.add("ro.dalvik.vm.native.bridge", "libzygisk.so");
+    area.add("persist.sys.rootdir", "/data/adb");
+    area.add("ro.build.tags", "release-keys");
+    area.add("ro.build.type", "userdebug");
+
+    char path[] = "/tmp/zs_area22b_XXXXXX";
+    int fd = mkstemp(path);
+    ZS_CHECK(fd >= 0);
+    ZS_CHECK(write(fd, area.buf(), 4096) == 4096);
+    close(fd);
+    fd = open(path, O_RDONLY);
+    ZS_CHECK(fd >= 0);
+    void* map = mmap(nullptr, 4096, PROT_READ, MAP_PRIVATE, fd, 0);
+    ZS_CHECK(map != MAP_FAILED);
+    close(fd);
+
+    static std::map<std::string, size_t> offs;
+    static void* map22 = nullptr;
+    offs.clear();
+    map22 = map;
+    const char* keys[] = {
+        "ro.boot.verifiedbootstate", "ro.boot.veritymode",
+        "ro.boot.flash.locked", "ro.magisk.version",
+        "ro.dalvik.vm.native.bridge", "persist.sys.rootdir",
+        "ro.build.tags", "ro.build.type",
+    };
+    for (const char* k : keys) offs[k] = area.pi_offset(k);
+
+    zs_test_set_prop_find([](const char* key) -> const void* {
+        auto it = offs.find(key);
+        return it == offs.end() ? nullptr
+                                : (const void*)((char*)map22 + it->second);
+    });
+
+    size_t size = 0;
+    char* built = zs_build_spoofed_serial_area(path, &size);
+    ZS_CHECK(built != nullptr);
+    if (built) {
+        // Read the BUILT image with the INDEPENDENT reader.
+        PropAreaFixture view;   // only used for its reader helpers
+        const uint8_t* b = (const uint8_t*)built;
+
+        // Deleted keys: find() == null AND not in foreach AND the
+        // name does not survive anywhere in the raw bytes.
+        const char* absent[] = {
+            "ro.magisk.version", "ro.dalvik.vm.native.bridge",
+            "persist.sys.rootdir",
+        };
+        for (const char* k : absent) {
+            // The NODE still exists (fragments are shared); the prop
+            // field must be 0 — the reader's find() then reports
+            // "not found", exactly like a stock device.
+            uint32_t node = 0;
+            uint32_t prop = 1;
+            int have_node = pa_trie_find_node(b, size, k, &node);
+            ZS_CHECK(have_node == 0 || have_node == 1);
+            if (have_node) {
+                memcpy(&prop, b + 128 + node + 4, 4);
+            }
+            ZS_CHECK_EQ(prop, 0u);
+            ZS_CHECK(memmem(built, size, k, strlen(k)) == nullptr);
+        }
+
+        // Value-spoofed keys: the serial's LENGTH byte matches the new
+        // value — get() returns exactly "enforcing" (9) and "green" (5)
+        // where the OLD code returned the ORIGINAL length (the
+        // truncation bug — "logging" is 7, so "enforcin" + no NUL).
+        auto find_pi = [&](const char* k) -> const uint8_t* {
+            uint32_t node = 0;
+            if (!pa_trie_find_node(b, size, k, &node)) return nullptr;
+            uint32_t prop = 0;
+            memcpy(&prop, b + 128 + node + 4, 4);
+            if (prop == 0) return nullptr;
+            return b + 128 + prop;
+        };
+        const uint8_t* pi = find_pi("ro.boot.veritymode");
+        ZS_CHECK(pi != nullptr);
+        uint32_t serial = 0;
+        memcpy(&serial, pi, 4);
+        ZS_CHECK_EQ(serial >> 24, 9u);   // "enforcing"
+        ZS_CHECK(strcmp((const char*)(pi + 4), "enforcing") == 0);
+
+        pi = find_pi("ro.boot.verifiedbootstate");
+        ZS_CHECK(pi != nullptr);
+        memcpy(&serial, pi, 4);
+        ZS_CHECK_EQ(serial >> 24, 5u);   // "green"
+        ZS_CHECK(strcmp((const char*)(pi + 4), "green") == 0);
+
+        // Neighbors untouched: value AND serial byte-identical to the
+        // fixture's originals.
+        pi = find_pi("ro.build.tags");
+        ZS_CHECK(pi != nullptr);
+        ZS_CHECK(strcmp((const char*)(pi + 4), "release-keys") == 0);
+        uint32_t orig_serial = 0;
+        memcpy(&orig_serial, area.buf() + area.pi_offset("ro.build.tags"), 4);
+        memcpy(&serial, pi, 4);
+        ZS_CHECK_EQ(serial, orig_serial);
+
+        // foreach over the built image: exactly the 5 survivors.
+        size_t count = 0, absent_count = 0;
+        std::function<void(uint32_t, const std::string&)> walk;
+        walk = [&](uint32_t node, const std::string& prefix) {
+            uint32_t l, r, ch, prop;
+            memcpy(&l, b + 128 + node + 8, 4);
+            if (l) walk(l, prefix);
+            memcpy(&prop, b + 128 + node + 4, 4);
+            if (prop) {
+                ++count;
+                const char* nm = (const char*)(b + 128 + prop + 96);
+                for (const char* k : absent) {
+                    if (strcmp(nm, k) == 0) ++absent_count;
+                }
+            }
+            memcpy(&ch, b + 128 + node + 16, 4);
+            if (ch) {
+                uint32_t nlen;
+                memcpy(&nlen, b + 128 + node, 4);
+                std::string frag((const char*)(b + 128 + node + 20), nlen);
+                walk(ch, prefix + frag + ".");
+            }
+            memcpy(&r, b + 128 + node + 12, 4);
+            if (r) walk(r, prefix);
+        };
+        walk(0, "");
+        ZS_CHECK_EQ(count, (size_t)5);
+        ZS_CHECK_EQ(absent_count, (size_t)0);
+
+        free(built);
+    }
+
+    munmap(map, 4096);
+    unlink(path);
+    offs.clear();
+    zs_test_reset_prop_find();
+}
+
+// Round 22 — the set-side round-trip: a successful __system_property_set
+// is reflected into the clone, so a following get() (which walks the
+// clone) returns what the app just wrote — with the correct length byte.
+ZS_TEST(prop_set_reflects_into_clone_round_trip) {
+    hide_advanced_set_active(1);
+    zs_test_set_props_clone_prot(PROT_READ | PROT_WRITE);  // heap fake
+
+    // A synthetic prop_info: value "old" (serial len 3, counter 2).
+    uint8_t* pi = (uint8_t*)calloc(1, 96 + 32);
+    ZS_CHECK(pi != nullptr);
+    uint32_t serial = (3u << 24) | 2u;
+    memcpy(pi, &serial, 4);
+    memcpy(pi + 4, "old", 4);
+    memcpy(pi + 96, "persist.sys.test.key", 21);
+
+    g_find_prop = [](const char* k) -> const void* {
+        return strcmp(k, "persist.sys.test.key") ? nullptr : (const void*)1;
+    };
+    // The find seam returns a token; point it at our pi via the
+    // production global instead of the test-only table:
+    // (g_find_prop is the production resolver the hook uses.)
+    // Simplest: rebind through zs_test_set_prop_find.
+    static uint8_t* pi_slot = nullptr;
+    pi_slot = pi;
+    zs_test_set_prop_find([](const char* k) -> const void* {
+        return strcmp(k, "persist.sys.test.key") ? nullptr
+                                                 : (const void*)pi_slot;
+    });
+
+    static int calls = 0;
+    zs_test_set_real_prop_set([](const char* k, const char* v) -> int {
+        ++calls;
+        ZS_CHECK(strcmp(k, "persist.sys.test.key") == 0);
+        ZS_CHECK(strcmp(v, "hello world") == 0);
+        return 0;   // init accepted
+    });
+
+    g_props_cloned.store(1);
+
+    int rc = zygisk_study_hook_prop_set("persist.sys.test.key",
+                                        "hello world");
+    ZS_CHECK_EQ(rc, 0);
+    ZS_CHECK_EQ(calls, 1);
+
+    // The clone entry now holds the new value AND the new length byte.
+    uint32_t after = 0;
+    memcpy(&after, pi, 4);
+    ZS_CHECK_EQ(after >> 24, 11u);              // strlen("hello world")
+    ZS_CHECK_EQ(after & 1u, 0u);                // settled (even)
+    ZS_CHECK(strcmp((const char*)(pi + 4), "hello world") == 0);
+
+    // A FAILED set must NOT touch the clone (init rejected the write).
+    calls = 0;
+    zs_test_set_real_prop_set([](const char*, const char*) -> int {
+        ++calls;
+        return -1;
+    });
+    rc = zygisk_study_hook_prop_set("persist.sys.test.key", "nope");
+    ZS_CHECK_EQ(rc, -1);
+    ZS_CHECK_EQ(calls, 1);   // the real set ran (and was rejected)
+    memcpy(&after, pi, 4);
+    ZS_CHECK_EQ(after >> 24, 11u);              // unchanged
+    ZS_CHECK(strcmp((const char*)(pi + 4), "hello world") == 0);
+
+    // A LONG value (>= 92) is refused — the residual, verified.
+    std::string big(200, 'B');
+    zs_test_set_real_prop_set([](const char*, const char*) -> int {
+        return 0;
+    });
+    rc = zygisk_study_hook_prop_set("persist.sys.test.key", big.c_str());
+    ZS_CHECK_EQ(rc, 0);
+    memcpy(&after, pi, 4);
+    ZS_CHECK_EQ(after >> 24, 11u);              // NOT 200: untouched
+
+    // Gate off: sets in non-hidden processes are pure passthrough.
+    hide_advanced_set_active(0);
+    rc = zygisk_study_hook_prop_set("persist.sys.test.key", "x");
+    ZS_CHECK_EQ(rc, 0);
+    memcpy(&after, pi, 4);
+    ZS_CHECK_EQ(after >> 24, 11u);              // untouched
+
+    free(pi);
+    g_props_cloned.store(0);
+    zs_test_set_real_prop_set(nullptr);
+    zs_test_reset_prop_find();
+    zs_test_set_props_clone_prot(PROT_READ);
+}
+
+// Round 22 — fdopendir(): a DIR* built from a BARE fd (never opened
+// through a hooked entry point) now registers its /proc prefix, so
+// openat(dirfd, "maps") filters instead of leaking the real file.
+ZS_TEST(fdopendir_registers_bare_proc_dirfds) {
+    hide_advanced_set_active(1);
+
+    // The bypass: fd obtained with a RAW open (simulating a pre-hide
+    // or libc-internal open), then fdopendir.
+    int fd = (int)syscall(SYS_openat, AT_FDCWD, "/proc/self",
+                          O_RDONLY | O_DIRECTORY, 0);
+    ZS_CHECK(fd >= 0);
+    DIR* d = zygisk_study_hook_fdopendir(fd);
+    ZS_CHECK(d != nullptr);
+    if (d) {
+        int dfd = dirfd(d);
+        ZS_CHECK_EQ(dfd, fd);
+        // The record exists now: openat through this dirfd filters.
+        int got = zygisk_study_hook_openat(dfd, "maps", O_RDONLY, 0);
+        ZS_CHECK(got >= 0);
+        struct stat st;
+        ZS_CHECK_EQ(zygisk_study_hook_fstat(got, &st), 0);
+        ZS_CHECK_EQ(st.st_size, (off_t)0);   // filtered fiction, not real
+        close(got);
+        closedir(d);
+    }
+    close(fd);
+
+    // Non-proc dirfds are untouched (no record created).
+    int tfd = (int)syscall(SYS_openat, AT_FDCWD, "/tmp",
+                           O_RDONLY | O_DIRECTORY, 0);
+    ZS_CHECK(tfd >= 0);
+    DIR* td = zygisk_study_hook_fdopendir(tfd);
+    ZS_CHECK(td != nullptr);
+    if (td) {
+        // No proc-dir record -> openat falls through normally.
+        int got = zygisk_study_hook_openat(dirfd(td), ".", O_RDONLY, 0);
+        ZS_CHECK(got >= 0);
+        close(got);
+        closedir(td);
+    }
+    close(tfd);
+
+    hide_advanced_set_active(0);
+}
+
+// Round 22 — the >383-byte traversal heap fallback: a long relative
+// path from a tracked proc dirfd still resolves through the filter
+// (the old code fell through UNFILTERED — the documented bypass).
+ZS_TEST(long_traversal_resolves_through_heap_fallback) {
+    hide_advanced_set_active(1);
+
+    DIR* d = zygisk_study_hook_opendir("/proc/self");
+    ZS_CHECK(d != nullptr);
+    if (d) {
+        int dfd = dirfd(d);
+        // 48 * "task/../" = 384 bytes + "maps" — over the 383 limit.
+        std::string rel;
+        for (int i = 0; i < 48; ++i) rel += "task/../";
+        rel += "maps";
+        ZS_CHECK(rel.size() > 383);
+
+        int got = zygisk_study_hook_openat(dfd, rel.c_str(),
+                                           O_RDONLY, 0);
+        ZS_CHECK(got >= 0);
+        struct stat st;
+        ZS_CHECK_EQ(zygisk_study_hook_fstat(got, &st), 0);
+        ZS_CHECK_EQ(st.st_size, (off_t)0);   // filtered, not the real file
+        close(got);
+        closedir(d);
+    }
+
+    // The stack path still handles normal-size traversals.
+    d = zygisk_study_hook_opendir("/proc/self");
+    ZS_CHECK(d != nullptr);
+    if (d) {
+        int got = zygisk_study_hook_openat(dirfd(d),
+                                           "task/../task/../maps",
+                                           O_RDONLY, 0);
+        ZS_CHECK(got >= 0);
+        struct stat st;
+        ZS_CHECK_EQ(zygisk_study_hook_fstat(got, &st), 0);
+        ZS_CHECK_EQ(st.st_size, (off_t)0);
+        close(got);
+        closedir(d);
+    }
+
+    hide_advanced_set_active(0);
+}
+
+// Round 22 PERF — the clone's live-prefix copy: a well-formed area
+// copies only 128 + bytes_used_ bytes and the tail stays zero, while
+// every live entry is byte-identical to the original.
+ZS_TEST(clone_remap_copies_live_prefix_only) {
+    PropAreaFixture area;
+    area.add("ro.build.tags", "release-keys");
+    area.add("ro.secure", "1");
+    area.add("persist.sys.z", "v");
+
+    uint32_t bytes_used = 0;
+    memcpy(&bytes_used, area.buf(), 4);
+    size_t live = 128 + bytes_used;
+    ZS_CHECK(live < 4096);   // tail exists in this fixture
+
+    // Map the fixture file-backed (like bionic maps properties_serial),
+    // then run the production remap — it MAP_FIXEDs over the mapping.
+    char path[] = "/tmp/zs_area22c_XXXXXX";
+    int fd = mkstemp(path);
+    ZS_CHECK(fd >= 0);
+    ZS_CHECK(write(fd, area.buf(), 4096) == 4096);
+    close(fd);
+    fd = open(path, O_RDONLY);
+    ZS_CHECK(fd >= 0);
+    // MAP_PRIVATE + PROT_WRITE: the poison below is a COW write that
+    // never touches the file — it emulates the dead-entry bytes the
+    // REAL area's tail carries. (The production remap replaces the
+    // mapping wholesale, so the original protection is irrelevant.)
+    void* map = mmap(nullptr, 4096, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE, fd, 0);
+    ZS_CHECK(map != MAP_FAILED);
+    close(fd);
+    unlink(path);
+
+    // Poison the tail (dead-entry bytes the REAL area would carry) —
+    // the clone must NOT copy it (zero tail is the conservative copy).
+    memset((char*)map + live, 0xAB, 4096 - live);
+
+    uintptr_t lo = (uintptr_t)map;
+    ZS_CHECK_EQ(remap_prop_mapping_private(lo, lo + 4096), 1);
+
+    // Live prefix byte-identical.
+    ZS_CHECK(memcmp(map, area.buf(), live) == 0);
+    // Tail zeroed (not copied, not poisoned).
+    int nonzero = 0;
+    for (size_t i = live; i < 4096; ++i) {
+        if (((const uint8_t*)map)[i] != 0) { nonzero = 1; break; }
+    }
+    ZS_CHECK_EQ(nonzero, 0);
+
+    munmap(map, 4096);
+}
+
+// Round 22 — a non-area mapping (bad header) still gets the FULL copy.
+ZS_TEST(clone_remap_full_copy_for_non_areas) {
+    char path[] = "/tmp/zs_area22d_XXXXXX";
+    int fd = mkstemp(path);
+    ZS_CHECK(fd >= 0);
+    char page[4096];
+    memset(page, 0, sizeof page);
+    memcpy(page, "NOTPROP", 8);   // wrong magic
+    for (size_t i = 128; i < sizeof page; i += 64) {
+        memcpy(page + i, &i, sizeof i);   // distinctive content everywhere
+    }
+    ZS_CHECK(write(fd, page, sizeof page) == (ssize_t)sizeof page);
+    close(fd);
+    fd = open(path, O_RDONLY);
+    ZS_CHECK(fd >= 0);
+    void* map = mmap(nullptr, sizeof page, PROT_READ, MAP_PRIVATE, fd, 0);
+    ZS_CHECK(map != MAP_FAILED);
+    close(fd);
+    unlink(path);
+
+    uintptr_t lo = (uintptr_t)map;
+    ZS_CHECK_EQ(remap_prop_mapping_private(lo, lo + sizeof page), 1);
+    // FULL copy: the poisoned content is preserved byte-for-byte.
+    ZS_CHECK(memcmp(map, page, sizeof page) == 0);
+    munmap(map, sizeof page);
 }

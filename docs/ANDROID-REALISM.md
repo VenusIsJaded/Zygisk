@@ -1370,3 +1370,143 @@ observable set now matches a stock device.
   nothing to bypass yet.
 
 171 host tests (169 → 171), 0 warnings, ASan+UBSan+leaks green.
+
+## Round 22 — the property trie read from bionic source, deletion, and the set-side round trip
+
+### Version research actually performed this round
+
+Per the standing instruction to look up how Android versions work
+before writing version-sensitive code, this round fetched and read
+AOSP bionic's `libc/system_properties/` at **refs/heads/main AND
+android-9.0.0_r1** (the two extremes of the supported range):
+`include/system_properties/{prop_area.h, prop_info.h}`,
+`prop_area.cpp`, `prop_info.cpp`, and `system_properties.cpp`.
+The serialized format is **byte-identical across the whole range**:
+
+| Fact | Verified from | Consequence taken |
+|---|---|---|
+| `prop_area` header: 128 bytes — bytes_used_@0, area serial_@4, magic 0x504f5250@8, version 0xfc6ed0ab@12, reserved[28], data_@128 | prop_area.h @ main + 9 | the trie code validates the header before touching anything |
+| `prop_trie_node` (a9 name: `prop_bt`): namelen@0, prop@4, left@8, right@12, children@16, name[]+NUL; every allocation 4-aligned; all offsets uint32 relative to data_ | both | the walk + delete implementation, with bounds validation at every hop |
+| `prop_info`: serial@0, value[92]@4, name[]+NUL@96 — **there is NO namelen field**; `static_assert(sizeof(prop_info)==96)` | prop_info.h @ both | the pre-R22 in-file comment claiming a namelen@96 was wrong (corrected); the name is read NUL-bounded |
+| `SERIAL_VALUE_LEN(serial) = serial >> 24`; `ReadMutablePropertyValue` memcpy's `len+1` bytes for __system_property_get | system_properties.cpp | **the Round 22 crash-class bug** — value patches must rewrite that byte |
+| a node with `prop == 0` is a legal fragment-only node (every intermediate node is one); find() returns nullptr, foreach skips | prop_area.cpp find_property/foreach_property | deletion = zero the terminal node's prop; the earlier "the trie cannot express deletion" claim in these docs was WRONG and is corrected |
+| long props: `kLongFlag = 1<<16` in the serial; value block at `pi + long_property.offset` (relative to the prop_info, allocated after it) | prop_info.h/prop_area.cpp | long-value scrubbing is bounded by its NUL; long entries copy verbatim |
+| A9's constructor reserves no dirty-backup area (allocs start at 20); A10+ reserve 92 bytes (allocs at 112) | prop_area.h diff | irrelevant to readers (offsets are explicit); the rebuilt/patched images keep whatever the source had |
+| __system_property_set writes via the property service socket; init updates the REAL area | system_properties.cpp | the set-side round-trip hook (below) — the clone is not updated by init |
+
+### The serial length-byte bug (REAL, verified from the reader source)
+
+`__system_property_get` → `Read` → `ReadMutablePropertyValue`:
+`len = SERIAL_VALUE_LEN(serial); memcpy(value, pi->value, len + 1)`.
+The Round 8 in-process patcher and the Round 19 file-image patcher
+both left the length byte at the ORIGINAL value's length. Spoofing
+`ro.boot.veritymode` to "enforcing" (9) over a device's "logging"
+(7) handed back "enforcin" with NO NUL — `strlen` on the caller's
+buffer reads past it. Both patchers now write the new length into
+the top byte (keeping the low counter bump and clearing kLongFlag),
+locked in by tests that read the patched entries through a
+bionic-faithful READER (a second, independent implementation of the
+format — see below).
+
+### Native deletion of absent keys (closes the R19 file-image residual)
+
+`pa_trie_delete_key`: walk the trie (find_property's exact
+fragment + BST semantics, validated at every hop), zero the
+terminal node's `prop`, and scrub the orphaned prop_info (name,
+value, serial — and a bounded scrub of a long value block when the
+serial carries kLongFlag). The entry becomes unreachable by any
+correct reader: an exec'd helper maps the file fresh and only ever
+walks the trie. Zeroing also kills the raw-forensics signal —
+`memmem("ro.magisk.version")` over the served 128 KB image (or a
+memory scan of the process's clone) now finds nothing. Applied to
+BOTH the R19 file image (exec'd helpers see absence with no hook
+involved) and the in-process clone (during the pre-mprotect
+writable window; the find/get/foreach/read hooks stay installed as
+the second layer — they still cover cached prop_info pointers and
+any format drift that makes the walk fail closed).
+
+The R15-17 "trie re-serialization = possible future round"
+residual is closed — by realizing it was never needed.
+
+### The set-side round trip (REAL detection vector closed)
+
+A hidden app's `__system_property_set` writes to init via the
+socket; init updates the REAL area — which the process no longer
+maps (the clone replaced it at the same addresses). Every
+subsequent read walked the clone and saw the OLD value: the app's
+own write appeared to FAIL, and a setprop-then-getprop mismatch is
+a textbook root-detection probe. The new hook reflects successful
+writes into the clone's entry with bionic's own odd/even serial
+protocol (concurrent reader threads retry, exactly as they would
+against init). Scope, honestly: only EXISTING keys can be patched
+(a genuinely new key needs trie allocation in the clone — residual,
+and a new-key set-then-read reads "absent", indistinguishable from
+a set that SEPolicy rejected); values ≥ 92 chars are skipped (the
+clone cannot allocate a long block; residual). SEPolicy makes
+untrusted_app's writable namespace small, but the pattern fires
+for every key it CAN write.
+
+### Residual closures
+
+- **fdopendir() (R15-17 residual)**: a DIR* built from a bare fd —
+  `fd = open("/proc/self", O_DIRECTORY); d = fdopendir(fd);
+  openat(dirfd(d), "maps")` — now registers the proc-dir record in
+  the fdopendir hook (classified via the REAL readlink, never our
+  own). The open-family hooks and the R20 opendir hook cover every
+  other path.
+- **>383-byte traversal strings (R16 residual)**: the joined path
+  now falls back to a heap reconstruction instead of falling
+  through UNFILTERED. The sanitizer suite caught the first version
+  freeing the heap path BEFORE `fd_shadow_register` strdup'd it —
+  a use-after-free found and fixed pre-ship, exactly what the
+  sanitize target is for.
+
+### The aarch64 blob finally verified by a real assembler
+
+`scripts/verify_trampolines.py` (keystone-engine, pip-installable,
+aarch64-capable): assembles EVERY instruction of both trampoline
+.S files (161 aarch64 + 122 x86-64 — no illegal or unencodable
+instruction survives), derives the wrapper frame's callee-save
+slot map from the push sequences and the blob's restore map from
+its load offsets, and asserts they agree REGISTER BY REGISTER —
+the exact bug class that shipped in Round 7's x86_64 blob (r13
+loaded from the r12 slot). `__NR_munmap` is verified from the
+assembled encoding (215 aarch64 / 11 x86-64), as is the 16-byte
+record stride. `make verify-trampolines` runs it (exit 77 = the
+keystone package is missing, treated as skip). The "aarch64
+verified by parity/inspection only" residual that stood since
+Round 7 is closed.
+
+### Performance
+
+- The property-area clone copies only the live prefix
+  (128 + bytes_used_ bytes — validated by the header check) instead
+  of the full 128 KB mapping. The MAP_FIXED replacement pages are
+  zero, which is strictly more conservative than copying the real
+  area's dead entries. Non-area mappings keep the full copy.
+
+### Honest residuals (Round 22)
+
+- A genuinely NEW key set by a hidden app is not reflected into the
+  clone (trie allocation) — reads see "absent", which is exactly
+  what a SEPolicy-rejected set looks like, so no stock behavior is
+  contradicted; documented rather than implemented.
+- Long (≥ 92 char) values set by a hidden app are not reflected;
+  the read sees the pre-set value. Same narrow scope.
+- The clone and the served file are FORK-TIME/BOOT-TIME snapshots:
+  properties that INIT changes later (init.svc.* service restarts,
+  persist.* written by other processes) read stale in hidden
+  processes — the pre-R22 behavior, unchanged, now explicitly
+  documented. A full live-refresh design (area-serial watch via the
+  pre-bind fd + atomic re-clone) was evaluated and REJECTED this
+  round: bionic's own readers make a safe mid-life trie refresh
+  require per-entry serial choreography plus offset-atomic relinks
+  — a crash-class risk for a low-frequency anomaly. Revisit only
+  with an on-device harness.
+- The keystone verification assembles the instructions and checks
+  the frame contract; it is not an execution test (the x86_64 blob
+  remains execution-tested by test_unmap_trampoline; the aarch64
+  blob still needs a device or an emulator to be execution-proven).
+
+182 host tests (171 → 182), 0 warnings, ASan+UBSan+leaks green,
+trampoline binary verification green, all test binaries exit 0.

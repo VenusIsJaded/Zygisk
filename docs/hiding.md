@@ -792,3 +792,36 @@ prints the stock device's story.
 Still open (see ANDROID-REALISM residuals): dup'd memfd fstat size,
 >383-byte traversal strings, present-but-empty absent keys in the
 file image, on-device chcon validation.
+
+## Round 22 — absent keys are GONE, not empty
+
+The largest property-hiding gap left standing after Round 19 was
+cosmetic-but-real: keys spoofed as absent were present-but-empty
+in the exec'd-helper file image, and present-but-hook-gated in the
+in-process clone. Reading bionic's actual trie sources settled it:
+a node with `prop == 0` is a legal fragment-only node — zeroing a
+terminal node's prop offset is a deletion every bionic reader
+already understands. Both layers now do exactly that, plus a scrub
+of the orphaned entry bytes, so neither the served 128 KB file
+image nor the process's own memory contains the strings
+"ro.magisk.version" / "libzygisk.so" / "ro.dalvik.vm.native.bridge"
+in dead records.
+
+Observable table (post-R22):
+
+| Detector probe | Stock device | Hidden process (R22) |
+|---|---|---|
+| getprop ro.magisk.version (exec'd) | not listed | not listed (trie: node->prop = 0) |
+| __system_property_find("ro.magisk.version") | NULL | NULL (native, no hook needed) |
+| __system_property_foreach | key absent | key absent (native) |
+| raw scan of the properties_serial image | no match | no match (entry scrubbed) |
+| in-process memory scan for the key name | no match | no match (clone entry scrubbed) |
+| setprop X && getprop X | round-trips | round-trips (set hook reflects into the clone) |
+
+Also closed this round: the serial length-byte bug (spoofed values
+longer than the device original returned truncated, potentially
+non-NUL-terminated strings through __system_property_get — a
+crash class in the hidden app itself); fdopendir()-built DIR*
+handles from bare fds (the last directory-fd registration gap);
+and over-383-byte relative-path traversals (now heap-reconstructed
+and filtered, previously an explicit unfiltered fall-through).

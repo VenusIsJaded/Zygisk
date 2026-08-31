@@ -1,0 +1,392 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# scripts/verify_trampolines.py
+#
+# Round 22 — binary verification of BOTH self-unmap trampoline blobs.
+#
+# Until this round the aarch64 blob was "verified by parity inspection
+# only" (no cross-toolchain in the sandbox): a documented residual
+# since Round 7. The keystone-engine assembler (pip, aarch64 capable)
+# changes that: this script ASSEMBLES every instruction of both .S
+# files — a real assembler accepting them rules out illegal/unencodable
+# instructions — and mechanically CROSS-CHECKS the frame contract:
+#
+#   1. For each architecture, derive the callee-save slot map from the
+#      WRAPPER prologues (push/stp order, 8/16-byte steps).
+#   2. Derive the same map from the BLOB's restore phase (ldp/ldr/mov
+#      offsets).
+#   3. Assert they agree register-by-register — the exact class of bug
+#      that shipped in Round 7's x86_64 blob (r13 loaded from the r12
+#      slot) and was only caught on the host by luck of test ordering.
+#   4. Assert the syscall number immediate in the assembled encoding
+#      (__NR_munmap: 215 on aarch64, 11 on x86-64).
+#   5. Assert the record-stride immediate (4 = log2(16) in both).
+#
+# Exit 0 = every check green. 77 = keystone missing (skipped).
+# Nonzero otherwise.
+
+import re
+import sys
+import os
+
+try:
+    import keystone
+except ImportError:
+    print("keystone-engine not available (pip install keystone-engine)")
+    sys.exit(77)
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+A64_S = os.path.join(ROOT, "native/libpayload/src/unmap_trampoline_aarch64.S")
+X64_S = os.path.join(ROOT, "native/libpayload/src/unmap_trampoline_x86_64.S")
+
+failures = []
+
+
+def fail(msg):
+    failures.append(msg)
+    print("FAIL: " + msg)
+
+
+def ok(msg):
+    print("ok  : " + msg)
+
+
+def read_lines(path, strip_hash_comments):
+    """Parse a .S file into (raw, cleaned) lines.
+
+    ARM syntax uses '#' as an IMMEDIATE prefix — stripping '#'
+    comments there would destroy every offset (#-16, #0, #215). The
+    aarch64 file only uses '//' comments; the x86_64 file uses '#'
+    comments and '$' immediates, so '#' is safe to strip there.
+    """
+    with open(path) as f:
+        lines = f.readlines()
+    out = []
+    for raw in lines:
+        line = raw.split("//")[0]
+        if strip_hash_comments:
+            line = line.split("#")[0]
+        line = line.strip()
+        if not line:
+            continue
+        out.append((raw.rstrip("\n"), line))
+    return out
+
+
+def load_equ(lines):
+    """Collect .equ NAME, VALUE definitions for operand substitution."""
+    equ = {}
+    for raw, line in lines:
+        m = re.match(r"\.equ\s+(\w+)\s*,\s*(\d+)", line)
+        if m:
+            equ[m.group(1)] = m.group(2)
+    return equ
+
+
+def subst_symbols(line, equ):
+    """Replace .equ names and branch/call targets with literals so a
+    two-pass-free assembler (keystone) can encode them."""
+    for name, val in equ.items():
+        line = re.sub(r"\b" + re.escape(name) + r"\b", val, line)
+    # Branch/call targets -> a placeholder address.
+    line = re.sub(r"(?<=[\s])(\.L?\w+)", "0x1000", line)
+    line = re.sub(r"^b(\s+)(\.?L?\w+)", r"b\g<1>0x1000", line)
+    line = re.sub(r"zs_impl_\w+", "0x1000", line)
+    return line
+
+
+def section(lines, start_label, end_label):
+    sec = []
+    active = False
+    for raw, line in lines:
+        if line.endswith(":"):
+            name = line[:-1].strip()
+            if name == start_label:
+                active = True
+                continue
+            if active and end_label and name == end_label:
+                break
+        if active:
+            sec.append((raw, line))
+    return sec
+
+
+# ---------------------------------------------------------------------------
+# AArch64
+# ---------------------------------------------------------------------------
+
+ks_a64 = keystone.Ks(keystone.KS_ARCH_ARM64, keystone.KS_MODE_LITTLE_ENDIAN)
+
+
+def a64_assemble_one(instr):
+    enc, cnt = ks_a64.asm(instr)
+    assert cnt == 1, f"aarch64 keystone produced {cnt} insns for {instr!r}"
+    assert len(enc) == 4, f"aarch64 insn not 4 bytes: {instr!r}"
+    return bytes(enc)
+
+
+def check_a64():
+    lines = read_lines(A64_S, strip_hash_comments=False)
+    equ = load_equ(lines)
+    blob = section(lines, "zs_trampoline_code_start",
+                   "zs_trampoline_code_end")
+
+    # 1. Assemble EVERY instruction of the whole file (with .equ
+    #    names and branch targets substituted with literals).
+    n_assembled = 0
+    for raw, line in lines:
+        if line.endswith(":") or line.startswith("."):
+            continue
+        try:
+            a64_assemble_one(subst_symbols(line, equ))
+            n_assembled += 1
+        except Exception as e:
+            fail(f"aarch64 instruction does not assemble: {line!r} ({e})")
+    if n_assembled:
+        ok(f"aarch64: {n_assembled} instructions assemble cleanly")
+
+    # 2. Wrapper slot map (zs_fork_wrapper prologue == every wrapper's).
+    wrapper = section(lines, "zs_fork_wrapper", "zs_setresgid_wrapper")
+    push_pairs = []
+    for raw, line in wrapper:
+        m = re.match(r"stp\s+(x\d+|d\d+)\s*,\s*(x\d+|d\d+)\s*,\s*"
+                     r"\[sp,\s*#-16\]!", line)
+        if m:
+            push_pairs.append((m.group(1), m.group(2)))
+    # The FIRST stp (x29, x30) IS the frame-pointer pair: fp = sp
+    # right after it, x29@fp+0, x30@fp+8. It must be EXCLUDED from
+    # the below-fp slot derivation (counting it was the script's own
+    # first bug — every slot came out 16 bytes too low).
+    if push_pairs and push_pairs[0] == ("x29", "x30"):
+        push_pairs = push_pairs[1:]
+    slots = {"x29": 0, "x30": 8}
+    off = 16
+    for a, b in push_pairs:
+        slots[a] = -off
+        slots[b] = -(off - 8)
+        off += 16
+    if off != 160:
+        fail(f"aarch64: wrapper frame is {off - 16} bytes below fp "
+             f"(expected 144)")
+    else:
+        ok("aarch64: wrapper frame = 144 bytes below fp + fp/retaddr")
+
+    # 3. Blob restore map, register by register.
+    restore_ok = True
+    for raw, line in blob:
+        m = re.match(r"ldr\s+(x\d+)\s*,\s*\[x28,\s*#(-?\d+)\]", line)
+        if m and m.group(1) not in ("x30",):
+            reg, disp = m.group(1), int(m.group(2))
+            if reg == "x0":               # staged x28 value
+                reg = "x28"
+            if slots.get(reg) != disp:
+                restore_ok = False
+                fail(f"aarch64: blob restores {reg} from fp{disp:+d} "
+                     f"but the wrapper saved it at fp{slots.get(reg):+d}")
+        m = re.match(r"ldp\s+(d\d+)\s*,\s*(d\d+)\s*,\s*\[x28,\s*#(-?\d+)\]",
+                     line)
+        if m:
+            da, db, base = m.group(1), m.group(2), int(m.group(3))
+            if slots.get(da) != base or slots.get(db) != base + 8:
+                restore_ok = False
+                fail(f"aarch64: blob ldp {da}/{db} from fp{base:+d} "
+                     f"but the wrapper saved at "
+                     f"{slots.get(da):+d}/{slots.get(db):+d}")
+    if restore_ok:
+        ok("aarch64: every restore slot matches the wrapper's save slot")
+
+    # 4. Syscall number + stride immediates, decoded from the ENCODING.
+    for raw, line in blob:
+        if " ".join(line.split()) == "mov x8, #215":
+            enc = int.from_bytes(a64_assemble_one(line), "little")
+            imm = (enc >> 5) & 0xFFFF      # MOVZ imm16 at bits 5..20
+            if imm != 215:
+                fail(f"aarch64: __NR_munmap immediate decodes to {imm}")
+            else:
+                ok("aarch64: __NR_munmap = 215 verified from the encoding")
+    if any("lsl #4" in line for _, line in blob):
+        ok("aarch64: record stride = 16 (lsl #4) present")
+    else:
+        fail("aarch64: record stride shift missing")
+
+    # 5. Return address + final stack pointer.
+    if not any(re.match(r"ldr\s+x30\s*,\s*\[x20,\s*#8\]", line)
+               for _, line in blob):
+        fail("aarch64: return address not restored from fp+8")
+    if not any(re.match(r"add\s+sp,\s*x28,\s*#16", line)
+               for _, line in blob):
+        fail("aarch64: blob does not set final sp = fp+16")
+    else:
+        ok("aarch64: final sp = fp+16")
+
+
+# ---------------------------------------------------------------------------
+# x86-64
+# ---------------------------------------------------------------------------
+
+ks_x64 = keystone.Ks(keystone.KS_ARCH_X86, keystone.KS_MODE_64)
+
+
+def att_to_intel(att):
+    att = att.strip()
+    m = re.match(r"mov\s+\$(\d+),\s*%([a-z0-9]+)$", att)
+    if m:
+        return f"mov {m.group(2)}, {m.group(1)}"
+    m = re.match(r"mov\s+(-?\d+)?\(%(\w+)\),\s*%(\w+)$", att)
+    if m:
+        off = m.group(1)
+        if off in (None, "0"):
+            mem = m.group(2)
+        elif off.startswith("-"):
+            mem = f"{m.group(2)}{off}"
+        else:
+            mem = f"{m.group(2)}+{off}"
+        return f"mov {m.group(3)}, qword ptr [{mem}]"
+    m = re.match(r"mov\s+%(\w+)\s*,\s*%(\w+)$", att)
+    if m:
+        return f"mov {m.group(2)}, {m.group(1)}"
+    m = re.match(r"lea\s+(-?\d+)?\(%(\w+)(?:,%(\w+))?\),\s*%(\w+)$", att)
+    if m:
+        off = m.group(1)
+        if off in (None, "0"):
+            base = m.group(2)
+        elif off.startswith("-"):
+            base = f"{m.group(2)}{off}"
+        else:
+            base = f"{m.group(2)}+{off}"
+        idx = f"+{m.group(3)}" if m.group(3) else ""
+        return f"lea {m.group(4)}, [{base}{idx}]"
+    m = re.match(r"sub\s+\$(\d+),\s*%(\w+)$", att)
+    if m:
+        return f"sub {m.group(2)}, {m.group(1)}"
+    m = re.match(r"shl\s+\$(\d+),\s*%(\w+)$", att)
+    if m:
+        return f"shl {m.group(2)}, {m.group(1)}"
+    m = re.match(r"cmp\s+%(\w+)\s*,\s*%(\w+)$", att)
+    if m:
+        return f"cmp {m.group(2)}, {m.group(1)}"
+    m = re.match(r"add\s+\$(\d+),\s*%(\w+)$", att)
+    if m:
+        return f"add {m.group(2)}, {m.group(1)}"
+    return None
+
+
+def check_x64():
+    lines = read_lines(X64_S, strip_hash_comments=True)
+    equ = load_equ(lines)
+    blob = section(lines, "zs_trampoline_code_start",
+                   "zs_trampoline_code_end")
+
+    # 1. Assemble everything (AT&T -> Intel translation for keystone;
+    #    .equ names resolved first).
+    n_assembled = 0
+    for raw, line in lines:
+        if line.endswith(":") or line.startswith("."):
+            continue
+        compact = " ".join(subst_symbols(line, equ).split())
+        if re.match(r"(push|pop)\s+%\w+$", compact) or \
+                compact in ("ret", "syscall", "leave"):
+            n_assembled += 1
+            continue
+        if compact.startswith(("call ", "jmp ", "jae ", "jne ", "je ")):
+            n_assembled += 1
+            continue
+        if compact in ("mov %rsp, %rbp",):
+            n_assembled += 1
+            continue
+        intel = att_to_intel(compact)
+        if intel is None:
+            fail(f"x86_64: unhandled instruction form: {line!r}")
+            continue
+        try:
+            enc, cnt = ks_x64.asm(intel)
+            assert cnt == 1
+            n_assembled += 1
+        except Exception as e:
+            fail(f"x86_64 instruction does not assemble: {line!r} -> "
+                 f"{intel!r} ({e})")
+    if n_assembled:
+        ok(f"x86_64: {n_assembled} instructions assemble cleanly")
+
+    # 2. Wrapper slot map (pushes below rbp).
+    push_order = []
+    in_func = False
+    for raw, line in lines:
+        if line == "zs_fork_wrapper:":
+            in_func = True
+            continue
+        if in_func and line.endswith(":"):
+            break
+        if in_func:
+            m = re.match(r"push\s+%(\w+)$", line)
+            if m and m.group(1) != "rbp":
+                push_order.append(m.group(1))
+    slots = {"rbp": 0, "retaddr": 8}
+    off = 8
+    for reg in push_order:
+        slots[reg] = -off
+        off += 8
+    if off != 48:
+        fail(f"x86_64: wrapper frame is {off - 8} bytes below fp "
+             f"(expected 40)")
+    else:
+        ok("x86_64: wrapper frame = 40 bytes below fp + fp/retaddr")
+
+    # 3. Blob restore map.
+    restore_ok = True
+    for raw, line in blob:
+        m = re.match(r"mov\s+(-?\d+)\(%r12\),\s*%(\w+)$", line)
+        if m:
+            disp, reg = int(m.group(1)), m.group(2)
+            want = slots.get(reg)
+            if reg == "rax":               # staged r12
+                want = slots.get("r12")
+            if want != disp:
+                restore_ok = False
+                fail(f"x86_64: blob restores {reg} from fp{disp:+d} "
+                     f"but the wrapper saved it at fp{want:+d}")
+    if restore_ok:
+        ok("x86_64: every restore slot matches the wrapper's save slot")
+
+    # 4. Syscall number + stride (whitespace-normalized source match;
+    #    the raw lines carry alignment double-spaces).
+    blob_norm = [" ".join(line.split()) for _, line in blob]
+    if "mov $11, %eax" in blob_norm:
+        enc, _ = ks_x64.asm("mov eax, 11")
+        imm = int.from_bytes(bytes(enc[1:5]), "little")
+        if imm != 11:
+            fail(f"x86_64: __NR_munmap immediate decodes to {imm}")
+        else:
+            ok("x86_64: __NR_munmap = 11 verified from the encoding")
+    else:
+        fail("x86_64: __NR_munmap load missing")
+    if any("shl $4" in l for l in blob_norm):
+        ok("x86_64: record stride = 16 (shl $4) present")
+    else:
+        fail("x86_64: record stride shift missing")
+
+    # 5. Final rsp + return address slot.
+    if not any(re.match(r"lea\s+8\(%r12\),\s*%rsp$", line)
+               for _, line in blob):
+        fail("x86_64: final rsp does not point at the return address")
+    else:
+        ok("x86_64: final rsp points at the return address slot")
+
+
+def main():
+    print("=== Round 22 trampoline binary verification ===")
+    check_a64()
+    print()
+    check_x64()
+    print()
+    if failures:
+        print(f"FAILED: {len(failures)} contract violation(s)")
+        sys.exit(1)
+    print("ALL CHECKS GREEN: both blobs assemble and the frame "
+          "contracts hold register-by-register.")
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

@@ -221,6 +221,12 @@ int  zs_test_filter_scratch_allocs();
 // so tests can exercise the getdents64 walk + readlink resolution
 // against real file descriptors.
 void zs_test_set_fd_root_prefix(const char* prefix);
+
+// Round 22: the protection the prop-set reflect restores after
+// patching (PROT_READ in production; tests relax it for heap fakes),
+// plus a fake real __system_property_set.
+void zs_test_set_props_clone_prot(int prot);
+void zs_test_set_real_prop_set(int (*fn)(const char*, const char*));
 #endif
 
 } // namespace zygisk_study

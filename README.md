@@ -744,3 +744,57 @@ Round 19.
 **171/171 host tests** (35 hide / 91 advanced / 18 stealth / 5 e2e /
 4 perf / 2 trampoline / 16 dispatch), 0 warnings, ASan+UBSan+leaks
 green, every test binary exits 0.
+
+### Round 22 — the property trie, read from bionic source this round
+
+The round started by FETCHING and reading bionic's actual property
+area sources (prop_area.h, prop_info.h, prop_area.cpp at
+refs/heads/main AND android-9.0.0_r1 — byte-identical), and that
+immediately paid for itself twice:
+
+- **A REAL crash-class bug, shipped since Round 8**: bionic's
+  reader takes the property value's LENGTH from the serial's top
+  byte (`SERIAL_VALUE_LEN`, memcpy of len+1 bytes). The value
+  patchers never updated that byte, so spoofing a LONGER value over
+  a shorter device original (e.g. "enforcing" over "logging") made
+  `__system_property_get` return a truncated, non-NUL-terminated
+  string — a buffer over-read inside the hidden app. Both patchers
+  (in-process clone and file image) now rewrite the length byte
+  with the same odd/even serial protocol bionic's own writer uses.
+- **The "trie cannot express deletion" claim was wrong** — the docs
+  had it since Round 19, and it was the only reason absent-spoofed
+  keys (`ro.magisk.version` etc.) stayed present-but-empty in the
+  file image and hook-gated-only in the clone. A trie node with
+  `prop == 0` is a legal "fragment without a property" (every
+  intermediate node is one): zeroing a terminal node's prop offset
+  is a deletion every bionic reader already understands. Both the
+  exec'd-helper file image AND the in-process clone now delete the
+  keys natively — find()/foreach()/get() report absence with NO
+  hook involved — and the orphaned entries are scrubbed to zero, so
+  a raw-forensics scan of the 128 KB image (or the process's
+  memory) no longer finds "ro.magisk.version" as a dead record.
+
+More this round: `__system_property_set` is now hooked to reflect
+successful writes back into the clone (a hidden app that sets a
+property and reads it back used to see its own write FAIL —
+simultaneously a functional bug and a setprop/getprop mismatch
+detector); fdopendir() registers bare /proc dirfds (the R15-17
+residual — a DIR* built from an fd that never crossed a hooked
+entry point); over-383-byte traversal strings now resolve through
+a heap fallback instead of falling through UNFILTERED (the
+documented R16 bypass — ASan caught a use-after-free in the first
+version of exactly that code before it shipped); the clone copies
+only the live prefix of the property area (~35-50% less memcpy on
+the hide critical path, and the zeroed tail is strictly more
+conservative than copying init's dead entries); and the aarch64
+self-unmap blob — "verified by inspection only" since Round 7 — is
+now ASSEMBLED and contract-checked by a real assembler
+(`scripts/verify_trampolines.py`, keystone-engine: 161 aarch64 +
+122 x86-64 instructions assemble, every restore slot matches the
+wrapper's save slot register-by-register, __NR_munmap verified
+from the encoding).
+
+**182/182 host tests** (35 hide / 102 advanced / 18 stealth / 5
+e2e / 4 perf / 2 trampoline / 16 dispatch), 0 warnings,
+ASan+UBSan+leaks green, trampoline binary verification green,
+every test binary exits 0.

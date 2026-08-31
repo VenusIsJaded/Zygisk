@@ -57,7 +57,7 @@ test_unmap_trampoline: test_unmap_trampoline.cpp libpayload.so test_framework.h
 # JNI_GetCreatedJavaVMs into the global dlsym scope so libpayload's
 # REAL env-acquisition path resolves it.
 test_module_dispatch: test_module_dispatch.cpp libzs_test_module.so \
-	              libpayload.so test_framework.h
+		      libpayload.so test_framework.h
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -o $@ $< -ldl -pthread -rdynamic
 
 libzs_test_module.so: module_stub.cpp ../zygisk.hpp
@@ -110,6 +110,24 @@ run-sanitize:
 	done; \
 	$(MAKE) clean >/dev/null; \
 	exit $$fail
+
+# Round 22 — binary verification of BOTH self-unmap trampoline blobs
+# (keystone-engine assembles every instruction and cross-checks the
+# wrapper-frame/restore-slot contracts register-by-register). Exits 77
+# (skip) when keystone is not installed; 0 = all green.
+.PHONY: verify-trampolines
+
+verify-trampolines:
+	@if command -v python3 >/dev/null 2>&1; then \
+		python3 ../scripts/verify_trampolines.py; \
+		rc=$$?; \
+		if [ $$rc -eq 77 ]; then \
+			echo "NOTE: keystone-engine missing — pip install keystone-engine to enable."; \
+		fi; \
+		exit $$rc; \
+	else \
+		echo "python3 unavailable; skipping"; \
+	fi
 
 clean:
 	rm -f $(TESTS) libpayload.so libzs_test_module.so
