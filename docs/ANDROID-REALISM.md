@@ -1901,3 +1901,94 @@ mprotect windows), the mount-target selection, the mode detection,
 the lazy-init path selection through the dispatch). 0 warnings,
 ASan+UBSan+leaks green, trampoline binary verification green, all
 test binaries exit 0.
+
+## Round 27 — Android 5.0/5.1.1 + Android 16/17 + 16 KB pages
+
+### Where libnativebridge lives (a research finding in itself)
+
+system/core/libnativebridge exists through Android 10 (probed: 200 OK
+at 9.0.0_r1, 404 at 13.0.0_r1); since Android 11 the code — and the
+`nativebridge/native_bridge.h` interface header — moved into the ART
+repo at `art/libnativebridge/`. All 13/16/17 facts below were read
+there. The Android 16 release tag exists
+(`android-16.0.0_r1`, bionic stdlib.h probe 200), and
+`art/libnativebridge/include/nativebridge/native_bridge.h` at that tag
+is byte-identical to refs/heads/main (diff-verified) — main is Android
+17 development, so 16 and 17-dev share one interface.
+
+### The 5.x fact base (all fetched and READ this round)
+
+| Fact | Android 5.0 / 5.1.1 (verified) | Where it matters |
+|---|---|---|
+| Bridge table | `NativeBridgeCallbacks` = version field + FIVE v1 slots (initialize, loadLibrary, getTrampoline, isSupported, getAppEnv) — the 5.0.0_r1 header in system/core/include/nativebridge | our 20-slot table is a superset; only the version field needs care |
+| VersionCheck | `kNativeBridgeCallbackVersion = 1`; `cb->version == 1` EXACTLY — no isCompatibleWith negotiation exists on 5.x (5.0.0_r1 and 5.1.1_r37 native_bridge.cc) | **device-fatal gap closed this round**: version=2 would be rejected, dlclosed in the zygote, warning-spamming every boot |
+| Version choice | constructor rewrites the field: 1 on SDK 21/22, 8 otherwise; SDK read through dlsym("__system_property_get") (absent on host glibc → null → modern default) | select_table_version() in libzygisk entry.cpp |
+| Table storage | non-const `.data` (symbol type D, readelf-verified) — a const struct of function pointers relocates into `.data.rel.ro` and RELRO seals it read-only before constructors run | the rewrite is a plain store; no mprotect |
+| ART lifecycle | `Runtime::Init` → `LoadNativeBridge` (dlopen → our constructor runs in the zygote); return value IGNORED by Init; `Runtime::Start` (zygote) never touches the bridge; child `DidForkFromZygote(kUnload)` → `UnloadNativeBridge` → dlclose (from 5.0's art/runtime/native/dalvik_system_ZygoteHooks.cc — found at that path, not the M+ location) | the R25 constructor bootstrap works on 5.x as-is |
+| 5.x fork path | com_android_internal_os_Zygote.cpp ForkAndSpecializeCommon: fork → DetachDescriptors → keepcaps/capbset → MountEmulatedStorage → createProcessGroup → SetGids (setgroups) → SetRLimits → [PreInitializeNativeBridge if foreign ISA] → **setresgid → setresuid** → personality → SetCapabilities → SetSchedulerPolicy → selinux context → Java callPostForkChildHooks | the gid-drop hook point fires first, same as 6.0+; NO app seccomp exists on 5.x at all |
+| Property area | bionic 5.0.0_r1 system_properties.cpp: prop_bt trie (namelen uint8 + reserved[3], prop@4, left@8, right@12, children@16, name@20), prop_area {bytes_used@0, serial@4, magic@8, version@12, reserved[28], data@128}, prop_info {serial@0, value[92]@4, name@96} — **byte-identical to 6.x**; 5.1.1 differs only by SOCK_CLOEXEC on the property socket | the R19-R26 property layer works on 5.x unchanged; the 19-byte maps prefix already catches the single-file line |
+| Property constants | `_system_properties.h` at 5.0.0_r1 AND 5.1.1_r37: PROP_AREA_MAGIC 0x504f5250, PROP_AREA_VERSION 0xfc6ed0ab, PROP_FILENAME "/dev/__properties__", PA_SIZE 128K, PROP_NAME_MAX 32, PROP_VALUE_MAX 92 — identical to 6.x | the magic@8/version@12 validation and the daemon 'P' protocol accept 5.x areas as-is |
+| Update protocol | 5.0's `__system_property_update`: serial |= 1 → memcpy value → serial = (len<<24)|((serial+1)&0xffffff) → `__futex_wake(&pi->serial)` → **`pa->serial++` + `__futex_wake(&pa->serial)`** — identical to 6.0/7.0 | the R26 area-serial bump + wake fix covers 5.x |
+| wait_any | 5.0: `__futex_wait(&pa->serial, serial)` loop on the AREA serial — same protocol as 6.x | covered |
+| Area creation | init's `init_property_area()` → `__system_property_area_init()` → bionic `map_prop_area_rw` (O_CREAT|O_EXCL 0444, ftruncate PA_SIZE, MAP_SHARED) — init creates the file, same as M | the execve-proof layer's assumptions hold |
+| SELinux label | external/sepolicy/file_contexts at 5.0.0_r1 and 5.1.1_r37 line 121: `/dev/__properties__ u:object_r:properties_device:s0` — IDENTICAL to 6.0 | the R26 label selection needs no 5.x branch |
+| L linker | RTLD_NOLOAD exists (dlfcn.cpp + linker.cpp: the already-loaded match precedes the NOLOAD bail) and `find_library` ALWAYS bumps ref_count; `soinfo_unload` only unloads at ref_count == 1; `add_child` is called ONLY from DT_NEEDED resolution — a runtime dlopen does NOT create a parent-child edge; DF_1_NODELETE is NOT honored (soinfo_unload has no flag check) | the payload self-pin (dlopen(dladdr(self), RTLD_NOLOAD) → refcount 2) is the load-bearing protection on 5.x — libpayload survives the child-side dlclose even though NODELETE is a no-op; libzygisk unloads (by design, hook-free, state kClosed gates every accessor, CloseNativeBridge leaves callbacks dangling but unread) |
+| dladdr / dl_iterate_phdr | both exported from bionic/linker/dlfcn.cpp at 5.0.0_r1 (the dlfcn symbol table lists them) | the R15 enumeration hooks and the self-pin's dladdr work on 5.x |
+| installd | 5.0's frameworks/native/cmds/installd/installd.c (C, not yet C++) creates /data/user, /data/data and the /data/user/0 → /data/data symlink at boot (lines 373-395) | the R26 memfd-fallback data dir exists on 5.x |
+| Kernels | L devices run 3.4/3.10 (no memfd_create) | the R25/R26 unlinked-file fallback is the default path on 5.x |
+
+### The 16/17 fact base
+
+| Fact | Android 16.0.0_r1 == refs/heads/main (verified) | Where it matters |
+|---|---|---|
+| Interface | 20 slots: v1(5) + v2(2) + v3(6) + v4(2) + v5 getExportedNamespace + v6 preZygoteFork + v7 getTrampolineWithJNICallType + getTrampolineForFunctionPointer + v8 isNativeBridgeFunctionPointer. 13.0.0_r1 has 17 slots (through preZygoteFork). 16 renamed the v3 slot 11 to unused_initAnonymousNamespace (position unchanged) | the table extended from 15 to 20 slots; every slot implemented |
+| JNICallType | `enum JNICallType { kJNICallTypeRegular = 1, kJNICallTypeCriticalNative = 2 }` — passed by value | ABI-matched in our v7 slot signatures |
+| LoadNativeBridge | `isCompatibleWith(NAMESPACE_VERSION = 3)` — the loader-side helper delegates to the bridge's slot when our version >= 2 | our version=8 + true-for-1..8 is accepted |
+| Feature guards | every v5..v8 entry point checks `isCompatibleWith(<5|6|7|8>)` first; a false answer logs `ALOGE`/`ALOGW("not compatible ...")` and skips the feature — pre-R27, that was per-fork log noise in every bridge-initialized process (app-zygote children) plus disabled features | claiming 1..8 and implementing the slots removes both |
+| preZygoteFork call site | `PreZygoteForkNativeBridge()` from `Runtime::PreZygoteFork()` ← `ZygoteHooks_nativePreFork` (per fork); the runtime only calls it in kInitialized processes (the zygote itself stays kOpened) | our slot is a cheap no-op / forward |
+| Child lifecycle | `InitNonZygoteOrPostFork(kUnload)` → `UnloadNativeBridge()` → dlclose, unchanged | the NODELETE + self-pin design holds |
+| Drop order | setresgid → **SetUpSeccompFilter** → SetSchedulerPolicy → setresuid (16 AND main; the only 16↔main diff in Zygote.cpp is the MountInitOverride tmpfs) | benign: the hide pipeline runs at the gid-drop hook (before the app seccomp filter exists), and Tier A children jump out before any of it |
+| App seccomp | `SetUpSeccompFilter` installs the standard app policy (set_app_seccomp_filter); `install_setuidgid_seccomp_filter` (USAP path) blocks setuid/setgid — both coexist with the platform's own drops, which our relay reproduces 1:1 | no interaction with our hooks |
+| 16 KB pages | developer.android.com/guide/practices/page-sizes: `-Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384` for NDK r27-; Android 15+ supports 16 KB kernels; Pixel 9a ships one with Android 16; 16 KB backcompat mode exists but is a package-manager concession, not for bridge libraries | all three CMake targets now carry the flags; payload page math already uses sysconf(_SC_PAGESIZE) |
+
+### Honest residuals (5.x / 16-17)
+
+- On 5.x, `NativeBridgeNameAcceptable`'s character rules were read
+  from 5.1.1's source comments (first char [a-zA-Z], rest
+  [a-zA-Z0-9._-]) — 5.0.0_r1's native_bridge.cc is the shorter file
+  and the check is behavioral-identical (the same reject-'/' logic);
+  the bare soname we set satisfies both.
+- The 5.x-era `getenv("ANDROID_PROPERTY_WORKSPACE")` legacy fallback
+  (bionic system_properties.cpp) only triggers when the property
+  file is missing entirely (ENOENT) — a state no booted device is
+  in; we do not model it.
+- `select_table_version` reads ro.build.version.sdk once, at
+  constructor time. A device whose property service is broken at
+  zygote start has bigger problems; the fallback (unknown → 8) is
+  the safe modern default.
+- The L linker does not honor DF_1_NODELETE, so the `-z nodelete`
+  link flag is dead weight there (harmless) — documented, and the
+  self-pin + the hook-free design are the actual protections. On
+  Tier A hidden children the trampoline's raw munmap never consults
+  the linker either way.
+- The 16/17 `MountInitOverride` (16-only tmpfs over /system/etc/init)
+  is a stock mount in the system_server child — not a signature, not
+  touched by us.
+- The Rust daemon needed no changes this round (the 'P' protocol
+  validation already accepts the 5.x format byte-for-byte), but
+  remains inspection-verified only — no Rust toolchain in this
+  environment (standing residual since R13).
+- Android 17 is pinned to refs/heads/main as of 2026-09; if AOSP
+  adds a v9 slot before release, our isCompatibleWith(9) = false
+  keeps the bridge loading (log-and-skip per feature) — the same
+  degradation mode every pre-v9 real bridge has.
+
+Tests 206 → 211 (+3 version-compat: the SDK-selection matrix
+21/22→v1 and 23..37→v8 with a writable-table read-back, the 5.0
+exact-match contract replica incl. the version=2 rejection case, the
+16/17 contract replica incl. the per-feature guards and the v5..v8
+contract answers; the 15-slot layout test became the 20-slot test
+with offset static_asserts through isNativeBridgeFunctionPointer@160,
+and the compat matrix grew to 1..8 true / 0,9,100 false). 0 warnings,
+ASan+UBSan+leaks green, trampoline binary verification green (ALL
+CHECKS GREEN), all test binaries exit 0.

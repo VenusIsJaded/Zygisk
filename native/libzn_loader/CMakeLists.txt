@@ -31,3 +31,12 @@ target_link_libraries(zn_loader
     dl
     log
 )
+
+# Round 27: 16 KB page-size alignment for the same reason as the
+# other two libraries (Android 15+/16+ 16 KB-kernel devices; see
+# native/libzygisk/CMakeLists.txt for the full rationale).
+if(ANDROID)
+    target_link_options(zn_loader PRIVATE
+        "-Wl,-z,max-page-size=16384"
+        "-Wl,-z,common-page-size=16384")
+endif()

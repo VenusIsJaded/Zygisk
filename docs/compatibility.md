@@ -131,46 +131,76 @@ This is the standard Magisk-module recovery procedure. The
 Zygisk Study module is no more or less dangerous than any other
 Zygisk alternative — the recovery procedure is the same.
 
-## Android version support (Round 26)
+## Android version support (Round 27)
 
 The loader's Android surface was verified against AOSP sources at
-android-6.0.0_r1, android-6.0.1_r81, android-7.0.0_r1,
-android-7.1.2_r33, android-8.0.0_r17, android-8.1.0_r81 (plus
-9.0/13.0 for boundary pinning):
+android-5.0.0_r1, android-5.1.1_r37, android-6.0.0_r1,
+android-6.0.1_r81, android-7.0.0_r1, android-7.1.2_r33,
+android-8.0.0_r17, android-8.1.0_r81, android-13.0.0_r1,
+android-16.0.0_r1 and refs/heads/main (= Android 17 development —
+the bridge interface is byte-identical to 16's). Note: since Android
+11, libnativebridge lives in the **art** repo
+(`art/libnativebridge`), not system/core.
 
 | Android | Status | Verified from source |
 |---|---|---|
+| 5.0 / 5.0.x / 5.1 / 5.1.1 | Supported (Round 27) | system/core/libnativebridge at 5.0.0_r1 + 5.1.1_r37: `NativeBridgeItf` symbol, version field + FIVE v1 slots (initialize/loadLibrary/getTrampoline/isSupported/getAppEnv), `kNativeBridgeCallbackVersion = 1`, VersionCheck demands `cb->version == 1` EXACTLY (no negotiation) — handled by the constructor-time version rewrite; Runtime::Init dlopens the bridge (constructor bootstrap works); `DidForkFromZygote(kUnload)` → `UnloadNativeBridge` → dlclose in same-arch children (from 5.0's `art/runtime/native/dalvik_system_ZygoteHooks.cc`); `ForkAndSpecializeCommon` drop order setgroups→setresgid→setresuid with NO app seccomp (introduced later); the SINGLE-FILE property area `/dev/__properties__` with the SAME 128K trie/prop_info/area-header/magic 0x504f5250@8/version 0xfc6ed0ab@12/serial+futex protocol as 6.x (the trie landed in L, not M — verified from bionic at 5.0.0_r1, 5.1.1 differs only by SOCK_CLOEXEC on the property socket); `__system_property_update` bumps the area serial + futex-wakes (identical protocol — the R26 wake fix covers 5.x); SELinux label `u:object_r:properties_device:s0` (verified in 5.0/5.1.1 external/sepolicy file_contexts, same as 6.x); bionic L linker: RTLD_NOLOAD exists and bumps the refcount, `soinfo_unload` gates on `ref_count == 1`, `add_child` only happens for DT_NEEDED (the self-pin holds even though DF_1_NODELETE is NOT honored — libzygisk is hook-free and vanishes by design); `dladdr`/`dl_iterate_phdr` exported since 5.0; installd.c creates `/data/user/0 → /data/data` at boot; 3.4/3.10 kernels → memfd fallback |
 | 6.0 / 6.0.1 | Supported (Round 26) | libnativebridge in system/core: same `NativeBridgeItf` symbol, 8-slot v2 table, VersionCheck asks isCompatibleWith(2) (6.0.1's native_bridge.cc is byte-identical to 6.0.0's, md5-verified); Runtime::Init dlopen + zygote-never-initializes + same-arch-child dlclose (identical lifecycle to 7.x); the SINGLE-FILE property area `/dev/__properties__` (same trie, prop_info, area header, serial protocol as 7.0 — only the PATH and the SELinux label `u:object_r:properties_device:s0` differ); bionic M linker honors DF_1_NODELETE + RTLD_NOLOAD; zygote drop order setgroups→setresgid→setresuid with no seccomp between; `/data/user/0 → /data/data` symlink created by installd at boot; 3.4/3.10 kernels → memfd fallback |
 | 7.0 / 7.1 / 7.1.2 | Supported | nativebridge VersionCheck + isCompatibleWith(2) call; zygote setresgid→setresuid order; the /dev/__properties__/ directory + trie format; kernel floors (memfd fallback for 3.4/3.10) |
 | 8.0 / 8.1 | Supported | LoadNativeBridge isCompatibleWith(3) call; the 15-slot table; same property format; 3.18/4.4 kernels have memfd |
 | 9 – 15 | Supported (as before) | Rounds 7–24 research (9/13/15/main); Round 25 pinned the 9.x bridge lifecycle to the same constructor contract |
+| 16 / 17-dev | Supported (Round 27) | art/libnativebridge at android-16.0.0_r1 == refs/heads/main (byte-identical, diff-verified): the 20-slot table (13.0 added v5 getExportedNamespace + v6 preZygoteFork; 16/main add v7 getTrampolineWithJNICallType + getTrampolineForFunctionPointer and v8 isNativeBridgeFunctionPointer; the v3 initAnonymousNamespace slot was renamed unused_initAnonymousNamespace — same position, ABI-stable); LoadNativeBridge asks isCompatibleWith(3) — accepts our table; every v5..v8 entry point is isCompatibleWith-guarded (RUNTIME_NAMESPACE=5, PRE_ZYGOTE_FORK=6, CRITICAL_NATIVE=7, IDENTIFY_NATIVELY_BRIDGED=8) and our table implements every slot so the guards pass; `InitNonZygoteOrPostFork(kUnload)` → dlclose lifecycle unchanged; Zygote.cpp drop order setresgid → **SetUpSeccompFilter + SetSchedulerPolicy BETWEEN the drops** → setresuid (16/main) — verified harmless: the hide pipeline runs at the gid-drop hook, before the app seccomp filter exists; 16 KB-kernel devices (Pixel 9a+) require `-Wl,-z,max-page-size=16384` ELF alignment — now set on all three CMake targets |
 
 Key version-specific mechanisms and where they are handled:
 
 - **Bootstrap**: a library constructor runs in the zygote during
   Runtime::Init's dlopen of the native bridge — the only hook point
   that exists on every version (ART never calls `initialize()` in
-  the zygote — verified at 6.0 too, from M's own
-  `ZygoteHooks_nativePostForkChild` + `Runtime::DidForkFromZygote`;
+  the zygote — verified at 5.0, 6.0, 7.x, 8.x, 9.0, 13.0 and 16.0
+  from each version's own `ZygoteHooks_nativePostForkChild` +
+  `Runtime::DidForkFromZygote`/`InitNonZygoteOrPostFork`;
   same-arch children even `dlclose` the bridge, which the
-  payload's self-pin neutralizes).
-- **NativeBridgeCallbacks**: the exact 15-slot AOSP table with
-  `isCompatibleWith` implemented — 6.0–9.x call that slot during
-  `LoadNativeBridge` and a NULL slot is a boot crash. M only reads
-  the strict 8-slot prefix and asks `isCompatibleWith(2)`.
+  payload's self-pin neutralizes — on 5.x the pin is the ONLY
+  protection, since the L linker ignores DF_1_NODELETE).
+- **NativeBridgeCallbacks**: the exact 20-slot AOSP table (16 ==
+  17-dev) with every slot implemented — 6.0+ call
+  `isCompatibleWith` during LoadNativeBridge and a NULL slot is a
+  boot crash; 16/17 index the v5..v8 slots once we claim those
+  versions. The table's version FIELD is chosen at runtime:
+  1 on SDK 21/22 (the 5.x loader demands `version == 1` exactly,
+  no negotiation), 8 elsewhere (every 6.0+ loader negotiates). The
+  table lives in writable `.data` so the constructor can rewrite
+  the field before ART's dlsym/VersionCheck observes it.
 - **Bridge property value**: the BARE SONAME `libzygisk.so` on
-  every version — `NativeBridgeNameAcceptable` (6.0 through 13.0,
-  all fetched and read) rejects any value containing `/`.
-- **Properties**: 6.x map ONE regular file (`/dev/__properties__`,
-  labeled `u:object_r:properties_device:s0` by init's restorecon);
+  every version — `NativeBridgeNameAcceptable` (5.0 through 13.0,
+  all fetched and read; the character rules are in 5.1.1's own
+  source comments) rejects any value containing `/`.
+- **Properties**: 5.x/6.x map ONE regular file
+  (`/dev/__properties__`, labeled
+  `u:object_r:properties_device:s0` — same label on 5.x and 6.x,
+  verified in each version's file_contexts);
   7.0+ map the `/dev/__properties__/` directory
   (`properties_serial` labeled `u:object_r:properties_serial:s0`
   by bionic's fsetxattr). The trie, prop_info, area-header layouts
-  and the serial protocol are byte-identical across 6.0/7.0/9.0 —
-  the payload detects the form with one stat() and points the
-  image builder, the bind-mount target, and the daemon's label at
-  the platform's own file.
-- **Old kernels (3.4/3.10 on 6.x/7.x devices)**: no memfd_create —
+  and the serial protocol are byte-identical across
+  5.0/6.0/7.0/9.0 (the trie landed in Lollipop — bionic at
+  5.0.0_r1 has prop_bt, the PORP magic at offset 8, the
+  0xfc6ed0ab version at 12, and the same
+  area-serial-bump+futex-wake update protocol) — the payload
+  detects the form with one stat() and points the image builder,
+  the bind-mount target, and the daemon's label at the platform's
+  own file.
+- **Old kernels (3.4/3.10 on 5.x/6.x/7.x devices)**: no memfd_create —
   the /proc filter falls back to an unlinked scratch file in the
   hidden app's own data dir; `PR_SET_VMA`/`statx`/`openat2` absence
   is handled by the existing best-effort/fallback chains.
+- **16 KB page kernels (Android 15+ optional, 16+ shipping)**: all
+  three CMake targets link with
+  `-Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384` (the
+  official NDK guidance) — a 4 KB-aligned bridge fails to dlopen
+  in the zygote on a 16 KB device. The payload's page math already
+  used `sysconf(_SC_PAGESIZE)` at every spot that matters, and the
+  daemon's cargo build needs the same link flags (see README).
+- **Install gate**: `customize.sh` refuses API < 21 — Android 4.x
+  has a different property area generation and a different bridge
+  symbol surface, and was never studied.

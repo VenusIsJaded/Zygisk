@@ -29,9 +29,11 @@ Android "Zygisk" loader pattern:
                   │  (loaded by)
                   │
         ┌─────────┴────────────┐
-        │  libzygisk.so         │  C++ .so, the NativeBridge2 entry
-        │  - JNI_OnLoad         │  Loaded by ART via
-        │  - NativeBridge2Itf   │  ro.dalvik.vm.native.bridge
+        │  libzygisk.so         │  C++ .so, the native-bridge
+        │  - JNI_OnLoad         │  entry. Loaded by ART via
+        │  - NativeBridgeItf    │  ro.dalvik.vm.native.bridge
+        │    (NativeBridge2Itf  │  (the historical alias is kept
+        │     kept as alias)    │  exported alongside it)
         └──────────────────────┘
                   │
                   │
@@ -45,45 +47,67 @@ Android "Zygisk" loader pattern:
 
 ## Boot sequence
 
-1. `post-fs-data.sh` runs. It makes `/data/adb/zygisk_study` and
-   `/data/adb/zygisk_study/sock` with mode 0700. It also creates
-   the empty `denylist` and `modules` files the daemon will read.
+1. `post-fs-data.sh` runs. It makes `/data/system/zygisk_study`
+   and `/data/system/zygisk_study/sock` with mode 0700
+   (deliberately NOT under `/data/adb/` — that path is a known
+   Zygisk signature). It also creates the empty `denylist` and
+   `modules` files the daemon will read, saves the previous
+   native-bridge property value, and — if `ro.dalvik.vm.native.bridge`
+   is currently EMPTY — sets it to the BARE SONAME `libzygisk.so`
+   (Round 7; the bare name is mandatory:
+   `NativeBridgeNameAcceptable` rejects a path with `/` on every
+   studied Android version). Devices that already run a real
+   translation bridge are never overridden.
 
 2. `service.sh` runs (post-boot). It launches the `zygiskd` binary
    in its own session (setsid) and waits one second for the socket
    to come up.
 
-3. `zygiskd` opens its Unix socket at
-   `/data/adb/zygisk_study/sock/zygisk_study.sock` and starts
+3. `zygiskd` opens a Unix socket in a per-boot RANDOMIZED,
+   root-only directory (Round 13 — the legacy fixed path
+   `/data/system/zygisk_study/sock/sock` remains the fallback),
+   registers the real path with its own filters, and starts
    accepting connections. It also spawns a background thread that
    rescans `/data/adb/modules/<id>/zygisk/<abi>/libzygisk-module.so`
    every 15 seconds so newly-installed modules show up without
    restarting.
 
-4. The system property `ro.dalvik.vm.native.bridge` is set to
-   `/system/lib64/libzygisk.so` by the daemon (this part is NOT
-   implemented in the current study build; the property swap is
-   documented in `compatibility.md`). The next time ART starts the
-   zygote, it dlopens `libzygisk.so` and calls
-   `NativeBridge2Itf.initialize`.
+4. The next time ART starts the zygote, `Runtime::Init` dlopens
+   the library named by `ro.dalvik.vm.native.bridge` —
+   `/system/lib[64]/libzygisk.so`, the systemless copy customize.sh
+   installed. ART looks up `NativeBridgeItf` and version-checks it;
+   it NEVER calls `initialize()` in the zygote (verified from AOSP
+   5.0 through 16: same-arch children even `dlclose` the bridge).
 
-5. `libzygisk.so`'s `initialize` hook runs. It dlopens the *real*
-   native bridge if one is present (so the device's bridge still
-   works) and then dlopens `libpayload.so` and calls its
+5. Our library CONSTRUCTOR (Round 25 — the only hook point that
+   runs in the zygote on every Android version) runs inside that
+   same dlopen: it dlopens the *real* native bridge if one is
+   present (so the device's translation bridge still works), then
+   dlopens `libpayload.so` and calls its
    `zygisk_study_payload_init` entry point.
 
 6. `libpayload.so` initializes:
      - Snapshots `/proc/self/maps` to remember what was there
        before any of *us* was mapped. (Used by the hide layer.)
-     - Resolves the real libc `fork()` via `dlsym(RTLD_NEXT, ...)`.
+     - Resolves the real libc `setresgid`/`setresuid` (plus the
+       legacy `setgid`/`setuid`) via `dlsym`.
+     - Self-pins with `dlopen(dladdr(self), RTLD_NOLOAD)` so no
+       child-side `dlclose` chain can ever unload it.
      - Connects to the daemon, requests the module list, dlopens
        every module's .so, and calls each module's `onLoad`.
 
-7. Subsequent forks inside zygote go through our `fork()` hook.
-   Pre-fork: we run each module's `preAppSpecialize` /
-   `preServerSpecialize`. Post-fork (in the child): we run the hide
-   layer (if the target is on the denylist) and then each module's
-   `postAppSpecialize` / `postServerSpecialize`.
+7. Every fork inside the zygote reaches our hooks through the
+   PRIVILEGE-DROP calls of the specialization sequence
+   (`setresgid` → `setresuid`, with the legacy `setgid`/`setuid`
+   pair covered — Round 7; a `fork()` hook was the pre-Round-7
+   design and never actually existed). The gid hook fires first,
+   still root: it resolves the target uid against the DenyList,
+   and denylisted children run the hide pipeline (unshare +
+   unmounts, property clone, Tier A vanish / Tier B hook install)
+   right there. Non-denylisted children dispatch the module
+   `preAppSpecialize` / `preServerSpecialize` callbacks before the
+   real drop and `postAppSpecialize` / `postServerSpecialize`
+   after it.
 
 ## Module contract
 

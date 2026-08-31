@@ -14,6 +14,17 @@
 
 set -e
 
+# Round 27: minimum supported Android version gate. The property-area
+# format, the native-bridge interface and the fork hook points were
+# all verified from AOSP sources for 5.0.0_r1/5.1.1_r37 upward; 4.x
+# has a different property area AND a differently-named bridge symbol
+# path, and has never been studied. Refuse cleanly instead of shipping
+# something that would misbehave at boot.
+if [ -n "$API" ] && [ "$API" -lt 21 ] 2>/dev/null; then
+  ui_print "- This Android version (API $API) is below the minimum (21 / Android 5.0)."
+  abort "! Zygisk Study requires Android 5.0 or newer."
+fi
+
 # Pick the right subdirectory for our prebuilt .so files. The user is
 # expected to build these themselves from the source in this repo (see
 # README.md) and place them under libs/<abi>/ before packaging the

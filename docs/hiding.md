@@ -898,3 +898,28 @@ a blank path column.
   wakes from its writable mapping; the shared key is (page, offset)
   either way). `__system_property_wait_any` and per-prop waiters in
   the hidden app now wake exactly as on a stock device.
+
+## Round 27 additions — 5.x property layer + the 16/17 seccomp ordering
+
+The version research pass verified two hiding-layer facts:
+
+- **The property spoof works on Android 5.0/5.1.1 unchanged.** The
+  Lollipop property area is already the modern trie format (bionic at
+  5.0.0_r1: prop_bt, prop_area with magic 0x504f5250@8 / version
+  0xfc6ed0ab@12, prop_info with inline value + name@96) —
+  byte-identical to the 6.x single-file layout, including the
+  area-serial bump + futex-wake update protocol that the Round 26
+  set-hook fix reproduces. The 19-byte `/dev/__properties__` maps
+  prefix, the magic/version validation, the daemon 'P' protocol, and
+  the `u:object_r:properties_device:s0` label selection all accept
+  5.x as-is; the only code change 5.x needed was the bridge table's
+  version field (see compatibility.md).
+- **The Android 16/17 drop order interleaves seccomp** —
+  `SetUpSeccompFilter` + `SetSchedulerPolicy` now run BETWEEN
+  setresgid and setresuid. Verified harmless for every tier: the
+  whole hide pipeline (unshare + unmounts at the mount phase, the
+  property clone, the Tier B hook install, the Tier A record prep +
+  trampoline jump) runs at the FIRST drop hook (setresgid), before
+  the app seccomp filter exists; a Tier A child is already gone when
+  the filter installs, and a Tier B child only ever uses app-allowed
+  syscalls afterward.

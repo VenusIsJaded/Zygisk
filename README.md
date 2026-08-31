@@ -162,6 +162,22 @@ cargo build --release --target aarch64-linux-android
 The CMake build will produce `libzygisk.so`, `libpayload.so`, and
 `libzn_loader.so`. The Cargo build will produce the `zygiskd` daemon.
 
+**16 KB page sizes (Round 27).** The CMake targets now link with
+`-Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384`, so the
+three `.so` files load on 16 KB-kernel devices (Android 15+ optional,
+Android 16+ shipping — Pixel 9a onward) exactly as on 4 KB devices
+(verified against the official guidance:
+developer.android.com/guide/practices/page-sizes). Rust's `cargo`
+build of the daemon needs the same alignment on those devices — pass
+it through your target linker config, e.g. in
+`~/.cargo/config.toml`:
+
+```toml
+[target.aarch64-linux-android]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384",
+             "-C", "link-arg=-Wl,-z,common-page-size=16384"]
+```
+
 These artifacts are **yours** — they were produced from this source on
 your machine, with your toolchain. They are not derived from any other
 project.
@@ -283,7 +299,7 @@ What the tests cover (Round 9):
   FORCE_DENYLIST_UNMOUNT runs its unmount phase only after the
   post callbacks.
 
-(Total: 133 host-side tests, plus the daemon's `cargo test` suite.)
+(Total: 211 host-side tests, plus the daemon's `cargo test` suite.)
 
 The logic suites also run clean under **ASan + UBSan with leak
 detection** — `cd tests && make run-sanitize`. That run is where
@@ -939,3 +955,75 @@ The same research caught **two device-fatal bugs on ALL versions**:
 ASan+UBSan+leaks green, trampoline binary verification green.
 Android support now spans **6.0 through 15**, all boundary-verified
 from AOSP sources.
+
+### Round 27 — Android 5.0/5.1.1 support, Android 16/17 completion, and the 16 KB page-size fix
+
+The research pass (AOSP fetched and READ at android-5.0.0_r1 /
+android-5.1.1_r37 / android-6.0.0_r1 / android-7.0.0_r1 /
+android-8.1.0_r81 / android-13.0.0_r1 / android-16.0.0_r1 and
+refs/heads/main — note libnativebridge moved from system/core into
+the **art** repo at Android 11, which is where 13/16/17 sources
+live) closed three version gaps:
+
+1. **Android 5.0/5.1.1 (Lollipop).** The 5.x loader is the ONLY
+   exact-match generation: `kNativeBridgeCallbackVersion = 1` and
+   `VersionCheck` demands `cb->version == 1` with no
+   isCompatibleWith negotiation — our version=2 table would have
+   been rejected with a boot warning and an immediate zygote-side
+   dlclose. The constructor now rewrites the exported table's
+   version field to 1 on SDK 21/22 (and 8 elsewhere) before ART's
+   dlsym/VersionCheck runs; the table itself moved to writable
+   `.data` (a const struct of function pointers lands in RELRO'd
+   `.data.rel.ro`, where the rewrite would fault). Everything else
+   on 5.x was verified identical from source: the property area is
+   the SAME single file `/dev/__properties__` (128K, trie, prop_info,
+   area header, serial+futex protocol byte-identical to 6.x — the
+   trie landed in L, not M), same SELinux label
+   (`u:object_r:properties_device:s0`, verified in 5.0/5.1.1
+   file_contexts), same `map_prop_area_rw` creation in init, same
+   ForkAndSpecializeCommon drop order (setgroups → setresgid →
+   setresuid, no seccomp — app seccomp does not exist on 5.x), same
+   child-side kUnload → dlclose lifecycle, `dladdr`/`dl_iterate_phdr`
+   exported since 5.0, RTLD_NOLOAD bumps the refcount and
+   `soinfo_unload` gates on `ref_count == 1` (the self-pin holds even
+   though the 5.x linker does NOT honor DF_1_NODELETE — libzygisk is
+   hook-free and disappears by design), installd creates
+   `/data/user/0 → /data/data` at boot, and the 19-byte
+   `/dev/__properties__` maps prefix already covers the single-file
+   line.
+2. **Android 16/17.** The bridge interface grew past our table: 13
+   added v5 `getExportedNamespace` + v6 `preZygoteFork`, 16/main
+   (= 17-dev, byte-identical) add v7 `getTrampolineWithJNICallType`
+   + `getTrampolineForFunctionPointer` and v8
+   `isNativeBridgeFunctionPointer` — 20 slots total. All v5-v8 entry
+   points are isCompatibleWith-guarded, but answering false (the
+   pre-R27 behavior) disables the features AND logs
+   `ALOGE("not compatible ...")` on every fork in every bridge-
+   initialized process (app-zygote children on real devices). The
+   table is now the full 20-slot layout, isCompatibleWith answers
+   1..8 true (0 and 9+ refused), and every new slot is implemented
+   with the loader's own documented fallback (e.g.
+   getTrampolineWithJNICallType falls back to the plain
+   getTrampoline, exactly what the 16 loader itself does for
+   pre-v7 bridges). The 16/17 drop order gained
+   `SetUpSeccompFilter` + `SetSchedulerPolicy` BETWEEN the gid/uid
+   drops — verified harmless: the whole hide pipeline runs at the
+   gid-drop hook, i.e. before the app seccomp filter exists, and a
+   Tier A child jumps out before any of it.
+3. **16 KB page sizes (device-fatal on Android 16+ hardware).** The
+   dynamic linker on a 16 KB-kernel device (Pixel 9a with Android
+   16 onward) refuses ELF LOAD segments aligned below the kernel
+   page size — a 4 KB-aligned `libzygisk.so` fails to dlopen **in
+   the zygote**, killing injection entirely. All three CMake
+   targets now link with `-Wl,-z,max-page-size=16384
+   -Wl,-z,common-page-size=16384` (official NDK guidance, fetched
+   and read); the payload's page math already used
+   `sysconf(_SC_PAGESIZE)` everywhere it matters.
+
+`customize.sh` now refuses installs below API 21 (4.x was never
+studied and differs in both property area and bridge symbol path).
+**211/211 host tests** (37 hide / 112 advanced / 20 stealth / 5 e2e /
+4 perf / 2 trampoline / 19 dispatch / 10 version-compat), 0 warnings,
+ASan+UBSan+leaks green, trampoline binary verification green.
+Android support now spans **5.0 through 17-dev**, every boundary
+verified from AOSP sources.

@@ -7,7 +7,8 @@
 #
 # Public ABI: exactly two symbols.
 #   - JNI_OnLoad (called by libart.so when libzygisk.so is dlopen-ed)
-#   - NativeBridge2Itf (Android's native bridge function table)
+#   - NativeBridgeItf (Android's native bridge function table; the
+#     historical NativeBridge2Itf alias is exported alongside it)
 #
 # Everything else is hidden. A reverse engineer can `readelf -a` this
 # .so and see only those two exports + the standard C++ runtime stuff
@@ -50,3 +51,21 @@ target_link_libraries(zygisk
 # composes with Tier A: our unmap is a raw munmap and never consults
 # the linker's bookkeeping.
 target_link_options(zygisk PRIVATE "-Wl,-z,nodelete")
+
+# Round 27: 16 KB page-size alignment (Android 15+ supports 16 KB
+# kernels; Pixel 9a and later ship them with Android 16+). The
+# dynamic linker on a 16 KB device refuses ELF LOAD segments aligned
+# below the kernel page size, so a 4 KB-aligned libzygisk.so fails
+# to dlopen in the ZYGOTE — total injection failure, not just a
+# warning (the "16 KB backcompat" loading mode is a package-manager
+# concession for apps, not something to rely on for a bridge).
+# max-page-size=16384 pads the LOAD segments to 16 KB alignment and
+# is fully compatible with every 4 KB device ever shipped (the
+# official NDK guidance: developer.android.com/guide/practices/
+# page-sizes, fetched and read this round). common-page-size follows
+# the same guidance.
+if(ANDROID)
+    target_link_options(zygisk PRIVATE
+        "-Wl,-z,max-page-size=16384"
+        "-Wl,-z,common-page-size=16384")
+endif()

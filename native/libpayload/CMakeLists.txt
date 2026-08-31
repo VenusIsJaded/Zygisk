@@ -57,4 +57,15 @@ target_link_libraries(payload
 # top of the runtime self-pin in zygisk_study_payload_init): no
 # dlclose chain anywhere may ever reach DT_FINI, because Tier A
 # children no longer have that code mapped.
+#
+# Round 27: 16 KB page-size alignment — same rationale as libzygisk
+# (Android 15+/16+ 16 KB-kernel devices; see the comment there). The
+# payload's own page math already uses sysconf(_SC_PAGESIZE) at every
+# spot that matters (trampoline page, prop_info page roundings), so
+# only the ELF alignment needed fixing.
 target_link_options(payload PRIVATE "-Wl,-z,nodelete")
+if(ANDROID)
+    target_link_options(payload PRIVATE
+        "-Wl,-z,max-page-size=16384"
+        "-Wl,-z,common-page-size=16384")
+endif()

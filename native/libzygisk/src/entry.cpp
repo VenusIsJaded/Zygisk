@@ -79,19 +79,28 @@
 //       createNamespace, linkNamespaces
 //   v4: loadLibraryExt, getVendorNamespace
 //
-//   15 slots (5+2+6+2), ending at getVendorNamespace — the final
-//   layout (versions past 9 kept it; later additions go through
-//   isCompatibleWith negotiation, which we answer honestly).
+//   15 slots (5+2+6+2), ending at getVendorNamespace — and (Round 27)
+//   now extended to the current 20-slot AOSP layout: v5
+//   getExportedNamespace, v6 preZygoteFork (both verified from
+//   android-13.0.0_r1, art/libnativebridge — libnativebridge moved
+//   into the art repo at Android 11), v7 getTrampolineWithJNICallType +
+//   getTrampolineForFunctionPointer and v8 isNativeBridgeFunctionPointer
+//   (android-16.0.0_r1 and refs/heads/main, byte-identical; 16 renamed
+//   the v3 initAnonymousNamespace slot to unused_initAnonymousNamespace —
+//   same position, ABI-stable). Every v5..v8 entry point in the 16/17
+//   loader guards the slot with an isCompatibleWith(<v>) check (verified
+//   from the loader source), so the slots must exist and be valid once
+//   we claim those versions.
 //
-// TWO device-fatal Round 25 fixes baked into this table:
+// THREE device-fatal fixes baked into this table (R25 + R27):
 //
 //   (a) libnativebridge 7.0–9.x CALLS callbacks->isCompatibleWith()
 //       during LoadNativeBridge whenever version >= 2 (7.x asks about
 //       version 2, 8.x/9.x about version 3). A NULL slot there is a
 //       NULL CALL — zygote death at boot. Ours is implemented: true
-//       for versions 1..4 (every slot we declare is a contract-valid
-//       no-op or a forward to the real bridge), false above (we do
-//       not promise v5+ slots we do not have).
+//       for versions 1..8 (every slot we declare is a contract-valid
+//       no-op or a forward to the real bridge), false for 0 and 9+
+//       (we do not promise v9+ slots we do not have).
 //
 //   (b) Every slot the runtime can index is IMPLEMENTED — no NULLs.
 //       NULL is only contract-valid for slots the runtime guards with
@@ -101,10 +110,24 @@
 //       answer, and each forwards to the real bridge (ndk_translation /
 // houdini / libnativebridge) when one is present, gated on the real
 //       table's version so we never index past its layout.
+//
+//   (c) R27, Android 5.x: the 5.0/5.1.1 loader (sources fetched and
+//       read this round: system/core/libnativebridge at 5.0.0_r1 and
+//       5.1.1_r37) has kNativeBridgeCallbackVersion = 1 and a
+//       VersionCheck that demands cb->version == 1 EXACTLY — no
+//       isCompatibleWith negotiation exists on 5.x. A version=2 table
+//       is rejected ("Unsupported native bridge interface"), the
+//       handle is dlclosed in the zygote, and every boot logs the
+//       warning. select_table_version() therefore rewrites the version
+//       field to 1 on SDK 21/22 before ART's dlsym/VersionCheck ever
+//       runs (the constructor executes inside the same dlopen). The
+//       5.x struct stops at getAppEnv — our 20-slot table is a
+//       harmless superset (the loader only ever reads its five).
 
 #include <dlfcn.h>
 #include <signal.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -131,6 +154,15 @@ struct native_bridge_namespace_t;
 // (declared with the exact parameter types so the slot is ABI-correct
 // even if a runtime ever hands it to the signal chain).
 typedef bool (*NativeBridgeSignalHandlerFn)(int, siginfo_t*, void*);
+
+// AOSP art/libnativebridge (android-16.0.0_r1 == refs/heads/main):
+//   enum JNICallType { kJNICallTypeRegular = 1,
+//                      kJNICallTypeCriticalNative = 2 };
+// (v7 slots take it by value; the values are ABI.)
+enum JNICallType {
+    kJNICallTypeRegular       = 1,
+    kJNICallTypeCriticalNative = 2,
+};
 
 struct NativeBridgeCallbacks {
     uint32_t version;
@@ -164,6 +196,21 @@ struct NativeBridgeCallbacks {
     void* (*loadLibraryExt)(const char* libpath, int flag,
                             struct native_bridge_namespace_t* ns);
     struct native_bridge_namespace_t* (*getVendorNamespace)();
+    // v5 (verified from android-13.0.0_r1 and 16.0.0_r1/main):
+    struct native_bridge_namespace_t* (*getExportedNamespace)(
+        const char* name);
+    // v6:
+    void (*preZygoteFork)();
+    // v7:
+    void* (*getTrampolineWithJNICallType)(void* handle, const char* name,
+                                          const char* shorty, uint32_t len,
+                                          enum JNICallType jni_call_type);
+    void* (*getTrampolineForFunctionPointer)(const void* method,
+                                              const char* shorty,
+                                              uint32_t len,
+                                              enum JNICallType jni_call_type);
+    // v8:
+    bool (*isNativeBridgeFunctionPointer)(const void* method);
 };
 
 // Symbols we look up in the *real* native bridge (if present).
@@ -244,15 +291,41 @@ static void try_load_payload() {
     }
 }
 
-// Idempotent bootstrap: constructor (zygote, at dlopen) AND initialize
-// (kept for the rare foreign-arch child that actually receives the
-// kInitialize action — and for any future runtime that changes the
-// lifecycle again). Whichever runs first wins; the payload's own init
-// is CAS-guarded, so a second entry is a no-op there.
+// ---------------------------------------------------------------------------
+// Round 27: runtime table-version selection.
+//
+// The single exported table must satisfy EVERY loader generation:
+//
+//   5.0/5.1.1 (kNativeBridgeCallbackVersion = 1): VersionCheck demands
+//       cb->version == 1 exactly — no negotiation (sources read at
+//       android-5.0.0_r1 / android-5.1.1_r37 this round).
+//   6.0+ (every version through 16.0.0_r1 and main, sources read):
+//       VersionCheck/isCompatibleWith accepts any version >= 2 as long
+//       as our isCompatibleWith(their version) says true — and 16/17
+//       only expose their v5..v8 features when we claim those versions.
+//
+// So the version field is 1 on SDK 21/22 and 8 (the newest layout we
+// implement) everywhere else. The write happens inside the constructor
+// — the same dlopen the loader performs — i.e. strictly before ART's
+// dlsym/VersionCheck can observe the field. The table lives in .data
+// (deliberately non-const: a const struct of function pointers is
+// relocated into .data.rel.ro and RELRO'd read-only; a non-const one
+// is plain writable .data), so the rewrite needs no mprotect.
+//
+// __system_property_get is resolved through dlsym: it exists in every
+// bionic since 1.0 but NOT on a host glibc, where the lookup cleanly
+// returns null and we default to the modern layout.
+// ---------------------------------------------------------------------------
+
+// Round 27: picks the exported table's version field (defined after
+// the table itself, below).
+static void select_table_version();
+
 static void bootstrap() {
     if (g_initialized) return;
     g_initialized = 1;
     ZS_LOGI("libzygisk: bootstrap (pid %d)", (int)getpid());
+    select_table_version();
     try_load_real_native_bridge();
     try_load_payload();
 }
@@ -290,11 +363,15 @@ static bool native_bridge_initialize(const struct NativeBridgeCallbacks* cb,
 // ---------------------------------------------------------------------------
 
 static bool native_bridge_is_compatible(uint32_t bridge_version) {
-    // We implement every slot of versions 1..4 as a valid no-op (or a
-    // forward). Versions above 4 would need slots we do not have —
-    // answer false so the runtime logs-and-skips the feature instead
-    // of calling a slot past our table.
-    return bridge_version >= 1 && bridge_version <= 4;
+    // We implement every slot of versions 1..8 as a valid no-op (or a
+    // forward) — the full 20-slot AOSP table through
+    // isNativeBridgeFunctionPointer (verified byte-identical at
+    // android-16.0.0_r1 and refs/heads/main = Android 17 dev; the
+    // v5/v6 slots exist since 13.0.0_r1, v7/v8 are new in 16).
+    // Versions above 8 would need slots we do not have — answer false
+    // so the runtime logs-and-skips the feature instead of calling a
+    // slot past our table.
+    return bridge_version >= 1 && bridge_version <= 8;
 }
 
 // v1 slots — called UNGUARDED by the runtime once a foreign-arch app
@@ -426,21 +503,104 @@ static struct native_bridge_namespace_t* native_bridge_get_vendor_namespace() {
     return nullptr;  // documented: no bridged vendor namespace
 }
 
+// v5 slots (RUNTIME_NAMESPACE_VERSION = 5, verified from the 16/main
+// loader: NativeBridgeGetExportedNamespace asks the bridge for a
+// named exported namespace; sphal falls back to getVendorNamespace
+// when the bridge predates v5 — a same-arch device with no real
+// bridge simply has no bridged namespaces at all).
+static struct native_bridge_namespace_t* native_bridge_get_exported_namespace(
+        const char* name) {
+    if (g_real_table && g_real_table->version >= 5 &&
+        g_real_table->getExportedNamespace) {
+        return g_real_table->getExportedNamespace(name);
+    }
+    return nullptr;  // "no such namespace" — the caller's documented
+                     // fallback answer (nativeloader then resolves the
+                     // library in its own namespaces)
+}
+
+// v6 slot (PRE_ZYGOTE_FORK_VERSION = 6). Called by
+// PreZygoteForkNativeBridge() from Runtime::PreZygoteFork() — once per
+// zygote fork, and in kInitialized processes only (app-zygote children
+// on 10+). A bridge that needs no pre-fork work does nothing here;
+// the real bridge's slot is forwarded so translation devices keep
+// their behavior. Must stay cheap and idempotent.
+static void native_bridge_pre_zygote_fork() {
+    if (g_real_table && g_real_table->version >= 6 &&
+        g_real_table->preZygoteFork) {
+        g_real_table->preZygoteFork();
+    }
+    // else: nothing to prepare — forks are transparent to us.
+}
+
+// v7 slots (CRITICAL_NATIVE_SUPPORT_VERSION = 7, added in 16; both
+// verified from the 16/main loader source). The loader itself falls
+// back to the plain getTrampoline when the bridge predates v7 — our
+// no-bridge path mirrors exactly that fallback.
+static void* native_bridge_get_trampoline_with_jni_call_type(
+        void* handle, const char* name, const char* shorty, uint32_t len,
+        enum JNICallType jni_call_type) {
+    (void)jni_call_type;   // a non-critical-aware bridge is the loader's
+                           // own documented fallback case
+    if (g_real_table && g_real_table->version >= 7 &&
+        g_real_table->getTrampolineWithJNICallType) {
+        return g_real_table->getTrampolineWithJNICallType(
+            handle, name, shorty, len, jni_call_type);
+    }
+    return native_bridge_get_trampoline(handle, name, shorty, len);
+}
+
+static void* native_bridge_get_trampoline_for_function_pointer(
+        const void* method, const char* shorty, uint32_t len,
+        enum JNICallType jni_call_type) {
+    if (g_real_table && g_real_table->version >= 7 &&
+        g_real_table->getTrampolineForFunctionPointer) {
+        return g_real_table->getTrampolineForFunctionPointer(
+            method, shorty, len, jni_call_type);
+    }
+    return nullptr;  // no function-pointer trampolines without a real
+                     // translation bridge
+}
+
+// v8 slot (IDENTIFY_NATIVELY_BRIDGED_FUNCTION_POINTERS_VERSION = 8,
+// added in 16): "is this code pointer a bridge-generated trampoline?"
+// Without a real bridge nothing in this process is one.
+static bool native_bridge_is_native_bridge_function_pointer(
+        const void* method) {
+    if (g_real_table && g_real_table->version >= 8 &&
+        g_real_table->isNativeBridgeFunctionPointer) {
+        return g_real_table->isNativeBridgeFunctionPointer(method);
+    }
+    return false;
+}
+
 // ---------------------------------------------------------------------------
 // NativeBridgeItf — the table ART dlsym()s. ART's loader (AOSP
-// system/core/libnativebridge nativebridge.cc / native_bridge.cc)
-// looks up NATIVE_BRIDGE_SYMBOL == "NativeBridgeItf" and, on every
-// studied version, either requires version >= 2 (modern) or asks
-// isCompatibleWith(...) (7.x–9.x) — both answered by our table.
+// libnativebridge: system/core/libnativebridge through 10, then
+// art/libnativebridge from 11 on) looks up NATIVE_BRIDGE_SYMBOL ==
+// "NativeBridgeItf" and, on every version studied (5.0 through
+// 16.0.0_r1 and main), either demands version == 1 exactly (5.x),
+// requires version >= 2, or asks isCompatibleWith(...) — all answered
+// by our table after select_table_version() picks the field.
 //
-// extern is required: a const object at namespace scope has internal
-// linkage in C++ by default, which would silently NOT export the
-// symbol ART dlsym()s.
+// Round 27: the object is deliberately NON-CONST. A const struct of
+// function pointers is relocated into .data.rel.ro, which the linker
+// seals read-only (RELRO) — a runtime version rewrite would then need
+// an mprotect that could also hit unrelated data sharing the page. A
+// plain non-const definition lives in writable .data, so the
+// constructor-time rewrite of the version field is a plain store.
+// Visibility("default") + extern "C" still export the symbol for
+// dlsym exactly as before (the symbol type changes from R to D, which
+// no loader inspects).
 // ---------------------------------------------------------------------------
-extern "C" __attribute__((visibility("default")))
-const struct NativeBridgeCallbacks NativeBridgeItf = {
-    .version = 2,   // satisfies the >= 2 minimum on every version;
-                    // isCompatibleWith() negotiates the rest honestly
+extern "C" {
+__attribute__((visibility("default")))
+struct NativeBridgeCallbacks NativeBridgeItf = {
+    .version = 8,   // the newest layout we implement (see
+                    // select_table_version(): rewritten to 1 on
+                    // Android 5.x, where the loader demands an exact
+                    // match; every 6.0+ loader negotiates through
+                    // isCompatibleWith, which we answer honestly)
     .initialize = &native_bridge_initialize,
     .loadLibrary = &native_bridge_load_library,
     .getTrampoline = &native_bridge_get_trampoline,
@@ -456,12 +616,98 @@ const struct NativeBridgeCallbacks NativeBridgeItf = {
     .linkNamespaces = &native_bridge_link_namespaces,
     .loadLibraryExt = &native_bridge_load_library_ext,
     .getVendorNamespace = &native_bridge_get_vendor_namespace,
-};
+    // v5..v8 (Round 27: the 16/17 extension slots; 13 knows through
+    // preZygoteFork, 16/main through isNativeBridgeFunctionPointer)
+    .getExportedNamespace = &native_bridge_get_exported_namespace,
+    .preZygoteFork = &native_bridge_pre_zygote_fork,
+    .getTrampolineWithJNICallType =
+        &native_bridge_get_trampoline_with_jni_call_type,
+    .getTrampolineForFunctionPointer =
+        &native_bridge_get_trampoline_for_function_pointer,
+    .isNativeBridgeFunctionPointer =
+        &native_bridge_is_native_bridge_function_pointer,
+};  // NativeBridgeItf
+}   // extern "C"
 
 // Historical alias: the pre-Round-7 code exported this (wrong) name.
-// Kept so old documentation/references still resolve.
-extern "C" __attribute__((visibility("default")))
-const struct NativeBridgeCallbacks NativeBridge2Itf = NativeBridgeItf;
+// Kept so old documentation/references still resolve. Deliberately a
+// SEPARATE SNAPSHOT (a copy of the initial values, version pinned to
+// 2): nobody dlsym()s it, and it must not alias the live table whose
+// version field now rewrites at runtime. Non-const for the same
+// reason as the live table (const would give it internal linkage and
+// silently un-export the symbol).
+extern "C" {
+__attribute__((visibility("default")))
+struct NativeBridgeCallbacks NativeBridge2Itf = {
+    .version = 2,
+    .initialize = &native_bridge_initialize,
+    .loadLibrary = &native_bridge_load_library,
+    .getTrampoline = &native_bridge_get_trampoline,
+    .isSupported = &native_bridge_is_supported,
+    .getAppEnv = &native_bridge_get_app_env,
+    .isCompatibleWith = &native_bridge_is_compatible,
+    .getSignalHandler = &native_bridge_get_signal_handler,
+    .unloadLibrary = &native_bridge_unload_library,
+    .getError = &native_bridge_get_error,
+    .isPathSupported = &native_bridge_is_path_supported,
+    .initAnonymousNamespace = &native_bridge_init_anon_namespace,
+    .createNamespace = &native_bridge_create_namespace,
+    .linkNamespaces = &native_bridge_link_namespaces,
+    .loadLibraryExt = &native_bridge_load_library_ext,
+    .getVendorNamespace = &native_bridge_get_vendor_namespace,
+    .getExportedNamespace = &native_bridge_get_exported_namespace,
+    .preZygoteFork = &native_bridge_pre_zygote_fork,
+    .getTrampolineWithJNICallType =
+        &native_bridge_get_trampoline_with_jni_call_type,
+    .getTrampolineForFunctionPointer =
+        &native_bridge_get_trampoline_for_function_pointer,
+    .isNativeBridgeFunctionPointer =
+        &native_bridge_is_native_bridge_function_pointer,
+};  // NativeBridge2Itf
+}   // extern "C"
+
+#ifdef ZS_HOST_TEST
+// Test seam: when non-negative, overrides the SDK detection. (Brace-
+// form extern "C": a storage-class extern together with an initializer
+// is the one spelling -Wall flags.)
+extern "C" {
+int zs_test_libzygisk_sdk_override = -1;
+}
+#endif
+
+// PROP_VALUE_MAX is 92 on every Android release (verified in the 5.x
+// and 16 headers this round); glibc hosts lack the header, so spell
+// the bound locally instead of pulling in <sys/system_properties.h>.
+static constexpr int kPropValueMax = 92;
+
+static int detect_android_sdk() {
+#ifdef ZS_HOST_TEST
+    if (zs_test_libzygisk_sdk_override >= 0)
+        return zs_test_libzygisk_sdk_override;
+#endif
+    using PropGetFn = int (*)(const char*, char*);
+    auto prop_get = (PropGetFn)dlsym(RTLD_DEFAULT, "__system_property_get");
+    if (!prop_get) return -1;   // host / unknown: modern default
+    char v[kPropValueMax] = {0};
+    // __system_property_get returns the value LENGTH (0 = not found);
+    // an sdk string is 2+ chars ("21".."37"+), never negative.
+    if (prop_get("ro.build.version.sdk", v) <= 0 || !v[0]) return -1;
+    return atoi(v);
+}
+
+static void select_table_version() {
+    int sdk = detect_android_sdk();
+    // 5.x (API 21/22) is the only exact-match loader: serve v1.
+    // Everything else negotiates and can use the full 20-slot table.
+    uint32_t v = (sdk == 21 || sdk == 22) ? 1u : 8u;
+    if (NativeBridgeItf.version != v) {
+        ZS_LOGI("libzygisk: table version %u (sdk %d)",
+                (unsigned)v, sdk);
+        NativeBridgeItf.version = v;
+    }
+}
+
+
 
 // ---------------------------------------------------------------------------
 // Test-only exports (host). The version-compat tests build this file,
@@ -477,7 +723,8 @@ extern "C" __attribute__((visibility("default")))
 int zs_test_libzygisk_table_slots() {
     // Every slot the runtime of ANY studied version can index must be
     // non-NULL (the Round 25 crash class: NULL slots that 7.x–9.x
-    // call during LoadNativeBridge / foreign-arch forks).
+    // call during LoadNativeBridge / foreign-arch forks; Round 27
+    // extended the same invariant to the 16/17 v5–v8 slots).
     const struct NativeBridgeCallbacks* t = &NativeBridgeItf;
     if (!t->initialize) return 0;
     if (!t->loadLibrary) return 0;
@@ -494,7 +741,24 @@ int zs_test_libzygisk_table_slots() {
     if (!t->linkNamespaces) return 0;
     if (!t->loadLibraryExt) return 0;
     if (!t->getVendorNamespace) return 0;
+    if (!t->getExportedNamespace) return 0;
+    if (!t->preZygoteFork) return 0;
+    if (!t->getTrampolineWithJNICallType) return 0;
+    if (!t->getTrampolineForFunctionPointer) return 0;
+    if (!t->isNativeBridgeFunctionPointer) return 0;
     return 1;
+}
+
+// Round 27: expose the LIVE version field (post-constructor) and the
+// SDK seam so tests can drive the 5.x/16/17 selection matrix.
+extern "C" __attribute__((visibility("default")))
+uint32_t zs_test_libzygisk_table_version() {
+    return NativeBridgeItf.version;
+}
+
+extern "C" __attribute__((visibility("default")))
+void zs_test_libzygisk_rescan_sdk() {
+    select_table_version();
 }
 
 extern "C" __attribute__((visibility("default")))
