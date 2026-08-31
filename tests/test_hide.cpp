@@ -832,3 +832,92 @@ int main() {
     std::fprintf(stderr, "=== Zygisk Study hide layer tests ===\n");
     return zstest::run_all();
 }
+
+// ----------------------------------------------------------------------
+// Round 13
+// ----------------------------------------------------------------------
+
+// Runtime root-path prefixes: the daemon's randomized per-boot socket
+// directory must be matched by the mount unmounter without being a
+// compile-time constant.
+ZS_TEST(runtime_root_path_prefix_matches_random_socket_dir) {
+    // Nothing registered yet: the random dir is not a root path.
+    ZS_CHECK(field_is_root_path("/data/system/.feedface/s",
+                                strlen("/data/system/.feedface/s")) == 0);
+
+    hide_register_root_path_prefix("/data/system/.feedface/");
+    ZS_CHECK(field_is_root_path("/data/system/.feedface/s",
+                                strlen("/data/system/.feedface/s")) == 1);
+    ZS_CHECK(field_is_root_path("/data/system/.feedface/deep/x",
+                                strlen("/data/system/.feedface/deep/x")) == 1);
+    // The trailing slash in the registration prevents stem collisions:
+    // a sibling sharing the stem is NOT swallowed.
+    ZS_CHECK(field_is_root_path("/data/system/.feedface2/s",
+                                strlen("/data/system/.feedface2/s")) == 0);
+    // And the stock table still stands.
+    ZS_CHECK(field_is_root_path("/data/adb/modules/x",
+                                strlen("/data/adb/modules/x")) == 1);
+
+    // Registration guards: empty/oversize are ignored without crash,
+    // and the table saturates at 4 (the 5th is dropped, the first 4
+    // still match).
+    hide_register_root_path_prefix(nullptr);
+    hide_register_root_path_prefix("");
+    char big[128];
+    memset(big, 'a', sizeof big - 1);
+    big[sizeof big - 1] = '\0';
+    big[0] = '/';
+    hide_register_root_path_prefix(big);
+    hide_register_root_path_prefix("/data/system/.aaaa/");
+    hide_register_root_path_prefix("/data/system/.bbbb/");
+    hide_register_root_path_prefix("/data/system/.cccc/");
+    hide_register_root_path_prefix("/data/system/.dddd/");  // 5th: dropped
+    ZS_CHECK(field_is_root_path("/data/system/.cccc/s",
+                                strlen("/data/system/.cccc/s")) == 1);
+    ZS_CHECK(field_is_root_path("/data/system/.dddd/s",
+                                strlen("/data/system/.dddd/s")) == 0);
+    ZS_CHECK(field_is_root_path("/data/system/.feedface/s",
+                                strlen("/data/system/.feedface/s")) == 1);
+}
+
+// Round 13 staleness fix: an edited packages.list reloads the
+// module-args map through the SAME throttled mtime check as the
+// denylist (previously only a denylist edit reloaded it, so an app
+// installed after zygote start had no package_name in its specialize
+// args until the next denylist edit).
+ZS_TEST(packages_list_mtime_change_refreshes_module_args_map) {
+    std::string pkg_path = make_temp_denylist(
+        "com.first.app 10234 0 /data/data/com.first.app seinfo 0\n");
+    hide_test_set_packages_list_path(pkg_path.c_str());
+
+    char out[256] = {0};
+    hide_lookup_package_for_uid(10234, out, sizeof out);
+    ZS_CHECK_STR_EQ(out, "com.first.app");
+    int count_after_first = hide_test_denylist_reload_count();
+
+    // Rewrite with a second package and force a distinct mtime.
+    {
+        FILE* fp = fopen(pkg_path.c_str(), "w");
+        ZS_CHECK(fp != nullptr);
+        fputs("com.first.app 10234 0 / x 0\n"
+              "com.second.app 10345 0 / x 0\n", fp);
+        fclose(fp);
+        struct timespec times[2];
+        times[0].tv_sec = time(nullptr) + 10;
+        times[0].tv_nsec = 0;
+        times[1] = times[0];
+        utimensat(AT_FDCWD, pkg_path.c_str(), times, 0);
+    }
+
+    // DenyList content did NOT change — the reload must still happen
+    // because packages.list did (the Round 13 fix).
+    hide_test_reset_refresh();
+    ZS_CHECK_EQ(hide_setup_for_target("com.nothing.here"), 0);
+    ZS_CHECK(hide_test_denylist_reload_count() > count_after_first);
+    memset(out, 0, sizeof out);
+    hide_lookup_package_for_uid(10345, out, sizeof out);
+    ZS_CHECK_STR_EQ(out, "com.second.app");
+
+    remove_temp(pkg_path);
+    hide_test_set_packages_list_path("/data/system/packages.list");
+}

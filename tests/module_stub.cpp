@@ -126,6 +126,13 @@ public:
             // see tests/test_module_dispatch.cpp).
             g_api->setOption(zygisk::Api::FORCE_DENYLIST_UNMOUNT);
         }
+        // Round 13: exercise connectCompanion from the pre callback
+        // too — recorded so the session-switch test can prove the
+        // payload talks to the daemon at its NEW (randomized) path.
+        if (p && p->count >= 1 && p->count <= 32 && g_api) {
+            p->entries[p->count - 1].companion_fd =
+                g_api->connectCompanion();
+        }
     }
 
     void postAppSpecialize(const zygisk::AppSpecializeArgs* args) override {

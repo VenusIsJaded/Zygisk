@@ -1004,3 +1004,67 @@ trampoline suite covers Tier A separately), and the real-ART
 behavior of the env (a fake table stands in).
 
 123 host tests (113 → 123), all green, sanitizer run green.
+
+## Round 13 — randomized daemon socket + staleness/re-entrancy fixes
+
+### What actually runs on device
+
+- **The daemon's socket path is randomized per boot.** The Rust
+  daemon reads 4 bytes of /dev/urandom, creates
+  `/data/system/.<8hex>` (0700), binds `<dir>/s` (0600), and writes
+  the path to `/data/adb/modules/zygisk_study/session.sock` BEFORE
+  binding (so a fast zygote never races a half-written file; worst
+  case it falls back to the fixed path and misses the module list
+  for that boot). The payload reads the session file at init (as
+  root, before any fork), switches its client paths, and registers
+  the random directory with:
+    - the mount unmounter (hide.cpp runtime prefix, trailing slash
+      so sibling stems cannot collide),
+    - the fd-link scanner (hide_advanced runtime slots),
+    - the /proc/net/unix line filter (runtime substring).
+- **Why randomize**: /proc/net/unix is world-readable and prints the
+  PATH STRING of every filesystem unix socket regardless of
+  directory permissions — a fixed `/data/system/zygisk_study/...`
+  entry is a system-wide, exec-proof identifier. The random name
+  carries no zygisk/magisk string, so the listing is clean for ALL
+  readers, including exec'd helpers where our hooks cannot follow.
+- The previous boot's random dir is removed at daemon startup (read
+  from the stale session file; the removal prefix is VERIFIED
+  against `/data/system/.`, never trusted). uninstall.sh removes it
+  too (pattern-checked `/data/system/.????????/*`).
+
+### Honest residuals
+
+- The session handoff file lives inside our module directory
+  (/data/adb/...) — root-only, but the file NAME is fixed. It never
+  appears in a world-readable proc listing (it is not a socket and
+  is not mounted), so it is not equivalent to the leak it replaces.
+- Rust daemon changes are verified by inspection only (no Rust
+  toolchain in the sandbox — same caveat as every prior round that
+  touched main.rs).
+- connectCompanion still only works from the zygote (onLoad / pre
+  while still root): the socket dir is 0700 root, so an app-uid
+  connect fails — the module sees -1. This is unchanged from before
+  Round 13; making the companion reachable from app children would
+  require a world-connectable socket location (a NEW visibility
+  trade) — deferred deliberately.
+- The unix-filter runtime substring over-matches siblings sharing
+  the random stem (substring vs prefix semantics). Harmless: these
+  directories only exist for our socket.
+- exec'd helpers still see EVERYTHING ELSE a fresh address space
+  exposes (e.g. properties revert to real values after exec — the
+  MAP_PRIVATE clone dies with the address space; only the unshared
+  mount namespace and the now-random socket name survive). The
+  round closes the loudest exec-proof identifier, not the class.
+
+### Bugs the new tests caught before they shipped
+
+1. The socket-path setter stored a pointer to the session reader's
+   stack buffer (use-after-return) — the session e2e test failed
+   immediately; now copied into durable static storage.
+2. The first staleness fix returned early when the denylist stat()
+   failed, so a missing denylist file skipped the packages.list
+   check entirely (restoring the staleness it was fixing) — the new
+   mtime test failed; each file is now checked independently.
+
+126 host tests (123 → 126), all green, sanitizer run green.

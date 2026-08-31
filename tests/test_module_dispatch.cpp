@@ -130,13 +130,23 @@ int JNI_GetCreatedJavaVMs(void** vms, int /*size*/, int* count) {
 static std::string g_sock_path;
 static volatile int g_companion_hits = 0;
 
-static void* daemon_thread(void*) {
+// Round 13: the daemon thread is parameterized so a SECOND fake
+// daemon can serve a "randomized" session-path socket.
+struct DaemonCfg {
+    std::string path;
+    int         max_serve;
+    volatile int* companion_hits;
+};
+static DaemonCfg g_main_daemon_cfg;
+
+static void* daemon_thread(void* arg) {
+    DaemonCfg* cfg = (DaemonCfg*)arg;
     int listen_fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (listen_fd < 0) return nullptr;
     struct sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, g_sock_path.c_str(), sizeof(addr.sun_path) - 1);
-    unlink(g_sock_path.c_str());
+    strncpy(addr.sun_path, cfg->path.c_str(), sizeof(addr.sun_path) - 1);
+    unlink(cfg->path.c_str());
     if (bind(listen_fd, (struct sockaddr*)&addr, sizeof addr) != 0 ||
         listen(listen_fd, 4) != 0) {
         std::fprintf(stderr, "fake-daemon: bind/listen failed: %s\n",
@@ -145,7 +155,7 @@ static void* daemon_thread(void*) {
         return nullptr;
     }
 
-    for (int served = 0; served < 4; ++served) {
+    for (int served = 0; served < cfg->max_serve; ++served) {
         int c = accept(listen_fd, nullptr, nullptr);
         if (c < 0) break;
         char verb = 0;
@@ -164,7 +174,7 @@ static void* daemon_thread(void*) {
                 std::string line = "stub;" + dir + "libzs_test_module.so\n";
                 (void)write(c, line.c_str(), line.size());
             } else if (verb == 'C') {
-                ++g_companion_hits;
+                ++*cfg->companion_hits;
                 // Hold the connection open (the real daemon's
                 // companion channel); the client owns its fd.
                 usleep(50 * 1000);
@@ -218,6 +228,8 @@ typedef void  (*Fn_set_denylist)(const char*);
 typedef void  (*Fn_force_deny)(int);
 typedef int   (*Fn_dispatch_wanted)();
 typedef int   (*Fn_onload_done)();
+typedef void  (*Fn_set_session_file)(const char*);
+typedef int   (*Fn_load_session)();
 
 static Fn_init            fn_init;
 static Fn_set_sock        fn_set_sock;
@@ -233,6 +245,8 @@ static Fn_set_denylist    fn_set_denylist;
 static Fn_force_deny      fn_force_deny;
 static Fn_dispatch_wanted fn_dispatch_wanted;
 static Fn_onload_done     fn_onload_done;
+static Fn_set_session_file fn_set_session_file;
+static Fn_load_session     fn_load_session;
 
 static void* sym(const char* name) {
     void* p = dlsym(g_payload, name);
@@ -280,7 +294,11 @@ static void setup_payload() {
     close(fd);
 
     pthread_t th;
-    ZS_CHECK(pthread_create(&th, nullptr, daemon_thread, nullptr) == 0);
+    g_main_daemon_cfg.path = g_sock_path;
+    g_main_daemon_cfg.max_serve = 16;
+    g_main_daemon_cfg.companion_hits = &g_companion_hits;
+    ZS_CHECK(pthread_create(&th, nullptr, daemon_thread,
+                            &g_main_daemon_cfg) == 0);
     pthread_detach(th);
     // Give the listener a moment to bind (the payload connect is
     // blocking; the socket must exist).
@@ -307,6 +325,8 @@ static void setup_payload() {
     fn_force_deny      = (Fn_force_deny)sym("zs_test_force_deny_uid");
     fn_dispatch_wanted = (Fn_dispatch_wanted)sym("zs_module_dispatch_wanted");
     fn_onload_done     = (Fn_onload_done)sym("zs_module_onload_done");
+    fn_set_session_file = (Fn_set_session_file)sym("zs_test_set_session_file");
+    fn_load_session     = (Fn_load_session)sym("zs_test_load_session");
 
     // Point the REAL hide layer at the fake files BEFORE init (init
     // loads the denylist), and the module fetch at the fake daemon.
@@ -580,7 +600,64 @@ ZS_TEST(forced_unmount_runs_after_post_callbacks) {
     rec_reset();
 }
 
+
 // ----------------------------------------------------------------------
+// Round 13 — the randomized daemon socket session handoff.
+// ----------------------------------------------------------------------
+ZS_TEST(session_file_switches_daemon_socket_end_to_end) {
+    // 1. A second fake daemon at a "randomized" neutral path (what
+    //    the real daemon now creates per boot under /data/system/.<hex>).
+    std::string rand_dir = "/tmp/zstest_randdir_XXXXXX";
+    char* d = mkdtemp(&rand_dir[0]);
+    ZS_CHECK(d != nullptr);
+    std::string sock2 = rand_dir + "/s";
+    static volatile int session_hits = 0;
+    static DaemonCfg cfg2;
+    cfg2.path = sock2;
+    cfg2.max_serve = 4;
+    cfg2.companion_hits = &session_hits;
+    pthread_t th2;
+    ZS_CHECK(pthread_create(&th2, nullptr, daemon_thread, &cfg2) == 0);
+    pthread_detach(th2);
+    usleep(100 * 1000);
+
+    // 2. The session file (what the daemon writes before binding).
+    char sess[] = "/tmp/zs_test_session_XXXXXX";
+    int sfd = mkstemp(sess);
+    ZS_CHECK(sfd >= 0);
+    std::string line = sock2 + "\n";
+    ZS_CHECK(write(sfd, line.c_str(), line.size()) > 0);
+    close(sfd);
+    fn_set_session_file(sess);
+
+    // 3. The REAL reader: switches the socket and registers the
+    //    random dir with the hide filters.
+    ZS_CHECK(fn_load_session() == 1);
+
+    // 4. End-to-end: a dispatch child's pre callback calls
+    //    connectCompanion — through the NEW path (the old daemon
+    //    thread is still up, so a stale path would also hit; the
+    //    session_hits counter on the NEW daemon is the discriminator).
+    //    (uid 10195: com.other.app — never denied by the earlier
+    //    deny test.)
+    int st = drive_child(10195, 10195);
+    ZS_CHECK(st == 0);
+    ZS_CHECK(rec_count() == 2);
+    ZS_CHECK(rec(0)->cb == ZS_CB_PRE_APP);
+    ZS_CHECK(rec(0)->companion_fd >= 0);
+    usleep(100 * 1000);
+    ZS_CHECK(session_hits >= 1);
+
+    // 5. Absent session file -> fallback, no registration.
+    fn_set_session_file("/tmp/zs_test_session_nonexistent");
+    ZS_CHECK(fn_load_session() == 0);
+    fn_set_session_file(nullptr);
+    unlink(sess);
+    rmdir(rand_dir.c_str());
+    rec_reset();
+}
+
+// // ----------------------------------------------------------------------
 // main
 // ----------------------------------------------------------------------
 int main() {

@@ -1051,3 +1051,22 @@ with-modules case must be priced:
 - g_pkg_map doubles the memory of the packages.list parse in the
   zygote (a few hundred small strings; tens of KB class). Children
   inherit it copy-on-write — zero marginal cost per fork.
+
+## Round 13 — costs
+
+| Path | Cost | Confidence | Notes |
+| --- | --- | --- | --- |
+| Session file read | one open+read+close at payload init (zygote, root) | High | Zero per-fork cost. |
+| Refresh check with packages.list mtime | +1 stat() per 2 s throttle window (was 1, now 2) | High | Still zero per-fork syscalls in steady state (the vDSO clock gate comes first). Host-verified by the mtime tests. |
+| Runtime prefix checks (mounts / fd scan / unix filter) | up to 4 extra memcmp per matched line/candidate | High | Only evaluated after the static tables miss; memcmp on a 26-30 byte prefix is nanosecond class. |
+| Daemon randomization | 4 bytes from /dev/urandom + one mkdir + one file write per boot | High | One-shot at daemon startup. |
+
+### Round 13 honest negatives
+
+- The denylist refresh now stats two files when the throttle window
+  opens (every 2 s, in the zygote). Both stats are page-cache hits
+  in practice; measured host impact of the extra stat is below the
+  noise floor of the existing throttle tests.
+- The randomized socket adds one directory in /data/system per boot
+  (cleaned at the next boot). Negligible storage; only visible to
+  root.

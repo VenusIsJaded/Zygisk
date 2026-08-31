@@ -87,6 +87,17 @@ int  hide_advanced_is_active();
 // inherited from the zygote.
 void hide_advanced_track_fd(int fd);
 
+// Round 13 — runtime registrations for the daemon's randomized
+// per-boot socket directory (the path is only known at runtime; the
+// session-file reader in module_dispatch.cpp calls these at payload
+// init):
+//   - root-path prefix: matched by the fd-link scan (closes leaked
+//     descriptors whose target lives under it).
+//   - unix hidden substring: matched by the /proc/net/unix filter
+//     (drops the socket's line even under its new random name).
+void hide_advanced_register_root_path_prefix(const char* prefix);
+void hide_advanced_register_unix_hidden_substring(const char* s);
+
 // One-time init: resolve real libc symbols and register this layer's
 // Tier B hooks into the registry. Does NOT walk yet.
 void hide_advanced_init();

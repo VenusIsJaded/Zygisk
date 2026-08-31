@@ -125,6 +125,9 @@ static std::unordered_map<uid_t, std::string> g_pkg_map;
 // actually changed — user edits still show up, the steady-state cost
 // per fork is one stat.
 static std::atomic<time_t> g_denylist_mtime{-1};
+// Round 13 — packages.list mtime for the module-args staleness fix
+// (see maybe_refresh_denylist).
+static std::atomic<time_t> g_pkg_list_mtime{-1};
 
 // Round 8 (P2): the mtime check itself is throttled. The pre-Round-8
 // code stat()ed the denylist on EVERY fork of EVERY app (~1 µs of
@@ -467,11 +470,23 @@ static void load_denylist() {
     if (stat(denylist_path(), &st) == 0) {
         g_denylist_mtime.store(st.st_mtime, std::memory_order_relaxed);
     }
+    struct stat pst{};
+    if (stat(packages_list_path(), &pst) == 0) {
+        g_pkg_list_mtime.store(pst.st_mtime, std::memory_order_relaxed);
+    }
 }
 
-// Reload only when the file's mtime moved, and only check the mtime
-// when the throttle interval has elapsed. Steady-state per-fork cost:
-// one vDSO clock read.
+// Reload only when a tracked file's mtime moved, and only check the
+// mtimes when the throttle interval has elapsed. Steady-state per-fork
+// cost: one vDSO clock read.
+//
+// Round 13: packages.list is tracked TOO. The Round 12 module-args
+// map is filled by the same parse as the DenyList uid map, but the
+// reload used to trigger only on DENYLIST mtime changes — an app
+// installed after zygote start had no package_name/app_data_dir in
+// its specialize args until the next denylist edit. Now either
+// file's change reloads both (one extra stat() per throttle
+// interval, i.e. per 2 s at most, zero per-fork cost change).
 static void maybe_refresh_denylist() {
     struct timespec now{};
     clock_gettime(CLOCK_MONOTONIC_COARSE, &now);   // vDSO, ~20 ns
@@ -480,11 +495,23 @@ static void maybe_refresh_denylist() {
     }
     g_next_refresh_check.store(now.tv_sec + kDenylistRefreshIntervalSec,
                                std::memory_order_relaxed);
+    // Round 13: each tracked file is checked INDEPENDENTLY. The
+    // first version of this fix returned early when the denylist
+    // stat() failed — which meant a device (or host) without a
+    // denylist file never checked packages.list at all, restoring
+    // the staleness the fix was for. Caught by the new test.
+    int changed = 0;
     struct stat st{};
-    if (stat(denylist_path(), &st) != 0) return;
-    time_t known = g_denylist_mtime.load(std::memory_order_relaxed);
-    if (st.st_mtime == known) return;
-    load_denylist();
+    if (stat(denylist_path(), &st) == 0 &&
+        st.st_mtime != g_denylist_mtime.load(std::memory_order_relaxed)) {
+        changed = 1;
+    }
+    struct stat pst{};
+    if (stat(packages_list_path(), &pst) == 0 &&
+        pst.st_mtime != g_pkg_list_mtime.load(std::memory_order_relaxed)) {
+        changed = 1;
+    }
+    if (changed) load_denylist();
 }
 
 // ------------------------------------------------------------------------
@@ -517,6 +544,25 @@ int hide_parse_mounts_line(char* line_start, char* line_end,
     return out->source_len > 0 && out->mnt_point_len > 0;
 }
 
+// Round 13 — runtime root-path prefixes. The daemon's socket moved
+// to a randomized per-boot directory (see module_dispatch.cpp's
+// session-file reader); its path must be matched by the unmount/fd
+// filters but cannot be a compile-time constant. Registered once at
+// payload init, before any fork.
+static char g_rt_prefixes[4][96];
+static size_t g_rt_prefix_lens[4];
+static int g_rt_prefix_count = 0;
+
+void hide_register_root_path_prefix(const char* prefix) {
+    if (!prefix || !*prefix) return;
+    size_t n = strlen(prefix);
+    if (n >= sizeof g_rt_prefixes[0]) return;
+    if (g_rt_prefix_count >= 4) return;
+    memcpy(g_rt_prefixes[g_rt_prefix_count], prefix, n + 1);
+    g_rt_prefix_lens[g_rt_prefix_count] = n;
+    ++g_rt_prefix_count;
+}
+
 // Does this field reference a root-framework path we should detach?
 // Round 7 (S6): we match BOTH the mount point AND the source field.
 // Magisk "magic mounts" bind-mount module files at their *target*
@@ -533,6 +579,10 @@ static int field_is_root_path(const char* f, size_t len) {
     };
     for (const auto& pre : kPrefixes) {
         if (len >= pre.n && memcmp(f, pre.p, pre.n) == 0) return 1;
+    }
+    for (int i = 0; i < g_rt_prefix_count; ++i) {
+        if (len >= g_rt_prefix_lens[i] &&
+            memcmp(f, g_rt_prefixes[i], g_rt_prefix_lens[i]) == 0) return 1;
     }
     // /sbin/.magisk mirror mount (source "magisk" style entries name
     // the block device; the mount point carries the marker instead).

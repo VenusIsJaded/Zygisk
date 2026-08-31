@@ -283,7 +283,7 @@ What the tests cover (Round 9):
   FORCE_DENYLIST_UNMOUNT runs its unmount phase only after the
   post callbacks.
 
-(Total: 123 host-side tests, plus the daemon's `cargo test` suite.)
+(Total: 126 host-side tests, plus the daemon's `cargo test` suite.)
 
 The logic suites also run clean under **ASan + UBSan with leak
 detection** — `cd tests && make run-sanitize`. That run is where
@@ -545,6 +545,40 @@ Now (`native/libpayload/src/module_dispatch.{h,cpp}`):
 - API version bumped to 2 (zygisk.hpp) with the args structs;
   see the header for the honest deviation from upstream v4 (only
   the arguments this hook point can source are exposed).
+
+### Round 13 — randomized daemon socket, stale-args fix, re-entrancy
+
+- **The /proc/net/unix tell is gone for exec'd helpers.** That file
+  is WORLD-READABLE and lists the path string of every filesystem
+  unix socket — directory permissions are irrelevant to the listing.
+  Our fixed `/data/system/zygisk_study/sock/sock` was therefore a
+  system-wide identifier, and (unlike every other /proc file we
+  filter) it stayed readable in anything the app EXECVEs — an exec
+  replaces the address space, so no userspace hook can follow it
+  there. The daemon now creates a per-boot socket directory with a
+  neutral random name (`/data/system/.<8 hex>`), hands the actual
+  path to the payload through a session file inside our own module
+  directory (root-only, never in any world-readable listing), and
+  cleans the previous boot's directory at startup. The payload
+  registers the random directory with the mount-unmount, fd-close,
+  and /proc/net/unix filters at init — hidden children drop every
+  trace of it, and the name itself carries no identifier. The legacy
+  fixed path remains the fallback when /dev/urandom fails.
+- **packages.list staleness fixed** (a Round 12 residual): the
+  appId -> package map now reloads when packages.list's OWN mtime
+  changes, not only on denylist edits — an app installed after
+  zygote start gets real specialize args within the 2 s throttle
+  window. The first version of this fix aborted the check when the
+  denylist file was missing; the new test caught it (each file is
+  now checked independently).
+- **The session e2e test caught a real use-after-return**: the
+  socket-path setter stored a pointer to the session reader's stack
+  buffer. Now copied into durable storage.
+- **The R9 bionic re-entrancy residual is closed** with a nested-
+  enumeration test: a property callback that itself calls
+  __system_property_foreach re-enters the hook, which stays correct
+  (each nesting level gets a fresh stack-local context; the hook
+  holds no lock of its own).
 
 ### Host-side perf microbenchmarks
 

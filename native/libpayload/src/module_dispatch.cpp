@@ -16,6 +16,7 @@
 #include "module_dispatch.h"
 
 #include "hide.h"
+#include "hide_advanced.h"
 #include "log.h"
 #include "resolve_libc.h"
 
@@ -50,15 +51,92 @@ struct LoadedModule {
 static std::vector<LoadedModule> g_modules;
 static std::atomic<int>          g_modules_loaded{0};
 
-// Production socket path (under the daemon's data dir). Overridable
-// in host tests — the production path is not writable there.
-static constexpr const char* kDaemonSocketDefault =
+// Round 13: durable storage for a runtime-set socket path — the
+// session reader parses into a stack buffer, so the setter must COPY
+// (the first version of this code stored the stack pointer itself:
+// a use-after-return the session e2e test caught immediately).
+static char g_daemon_socket_buf[96];
+static const char* kDaemonSocketDefault =
     "/data/system/zygisk_study/sock/sock";
 static const char* g_daemon_socket = kDaemonSocketDefault;
 
+// Round 13 — the daemon's socket lives in a randomized per-boot
+// directory (neutral name, so /proc/net/unix — a WORLD-READABLE file
+// that lists every unix socket's path string regardless of directory
+// permissions — carries no "zygisk_study" identifier). The daemon
+// hands the actual path to the payload through a session file inside
+// our own module directory (root-only, never listed in any
+// world-readable proc file).
+static constexpr const char* kSessionFile =
+    "/data/adb/modules/zygisk_study/session.sock";
+static const char* g_session_file = kSessionFile;
+
+#ifdef ZS_HOST_TEST
+extern "C" void zs_test_set_session_file(const char* path) {
+    g_session_file = path ? path : kSessionFile;
+}
+extern "C" int zs_test_load_session() {
+    return zs_module_load_session_socket();
+}
+#endif
+
+void zs_module_set_daemon_socket(const char* path) {
+    if (path && *path) {
+        strncpy(g_daemon_socket_buf, path, sizeof g_daemon_socket_buf - 1);
+        g_daemon_socket_buf[sizeof g_daemon_socket_buf - 1] = '\0';
+        g_daemon_socket = g_daemon_socket_buf;
+    }
+}
+
+// Read the session file and register the random dir with every
+// filter that matches paths: the mount unmounter, the fd-link
+// scanner, and the /proc/net/unix line filter. Returns 1 when a
+// session path was loaded.
+int zs_module_load_session_socket() {
+    int fd = open(g_session_file, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 0;                  // pre-R13 daemon: fallback
+    char path[96];
+    ssize_t n = read(fd, path, sizeof path - 1);
+    close(fd);
+    if (n <= 0) return 0;
+    path[n] = '\0';
+    // Trim trailing whitespace (the daemon writes a bare line).
+    while (n > 0 && (path[n - 1] == '\n' || path[n - 1] == '\r' ||
+                     path[n - 1] == ' ')) {
+        path[--n] = '\0';
+    }
+    if (path[0] != '/') return 0;          // sanity: absolute path
+
+    zs_module_set_daemon_socket(path);
+
+    // Derive the directory (everything before the last '/').
+    char dir[96];
+    size_t len = (size_t)n;
+    size_t slash = len;
+    while (slash > 0 && path[slash - 1] != '/') --slash;
+    if (slash <= 1) return 1;              // "/sock": no dir to trim
+    memcpy(dir, path, slash - 1);
+    dir[slash - 1] = '\0';
+
+    // Register with a trailing slash so prefix matching cannot
+    // swallow sibling names sharing a stem.
+    char prefix[112];
+    snprintf(prefix, sizeof prefix, "%.94s/", dir);
+    hide_register_root_path_prefix(prefix);
+    hide_advanced_register_root_path_prefix(prefix);
+    hide_advanced_register_unix_hidden_substring(dir);
+    return 1;
+}
+
 #ifdef ZS_HOST_TEST
 extern "C" void zs_test_set_daemon_socket(const char* path) {
-    g_daemon_socket = path ? path : kDaemonSocketDefault;
+    if (path) {
+        strncpy(g_daemon_socket_buf, path, sizeof g_daemon_socket_buf - 1);
+        g_daemon_socket_buf[sizeof g_daemon_socket_buf - 1] = '\0';
+        g_daemon_socket = g_daemon_socket_buf;
+    } else {
+        g_daemon_socket = kDaemonSocketDefault;
+    }
 }
 #endif
 
@@ -250,6 +328,10 @@ static JNIEnv* zs_module_ensure_env() {
 // ------------------------------------------------------------------------
 
 void zs_module_init() {
+    // Round 13: learn the daemon's randomized socket path first —
+    // the module fetch below connects through it.
+    zs_module_load_session_socket();
+
     auto list = fetch_module_list_from_daemon();
     g_modules.reserve(list.size());
     g_modules.clear();

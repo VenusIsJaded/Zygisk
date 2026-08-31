@@ -26,9 +26,20 @@ fi
 setsid "$DAEMON" --workdir "$WORKDIR" >/dev/null 2>&1 &
 echo $! > "$WORKDIR/zygiskd.pid"
 
-# Give it a moment to come up, then sanity-check the socket.
+# Give it a moment to come up, then sanity-check the socket. Round 13:
+# the socket path is randomized per boot — the daemon hands it to the
+# payload via the session file inside our module dir, so the check
+# reads that file (falling back to the legacy fixed path).
+SESSION=$MODDIR/session.sock
+SOCK=""
+if [ -f "$SESSION" ]; then
+  SOCK=$(cat "$SESSION" 2>/dev/null | tr -d ' \r\n')
+fi
+if [ -z "$SOCK" ]; then
+  SOCK=$WORKDIR/sock/sock
+fi
 sleep 1
-if [ -S "$WORKDIR/sock/sock" ]; then
+if [ -S "$SOCK" ]; then
   log -t ZygiskStudy "daemon ready"
 else
   log -t ZygiskStudy "daemon did not open socket; check logcat for errors"

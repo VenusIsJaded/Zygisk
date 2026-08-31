@@ -43,8 +43,22 @@ namespace zygisk_study {
 
 // One-time: load modules from the daemon list (dlopen + factory) and
 // register their .so paths with the hide layer's unmap set. Called
-// from payload init (native-bridge initialize time, zygote).
+// from payload init (native-bridge initialize time, zygote). Reads
+// the daemon's session file first (Round 13) so the module fetch
+// connects through the randomized per-boot socket path.
 void zs_module_init();
+
+// Round 13 — read /data/adb/modules/zygisk_study/session.sock (the
+// daemon's randomized per-boot socket path handoff; root-only
+// location). On success: switches the module-fetch/companion socket
+// to it and registers the random directory with the mount-unmount,
+// fd-close, and /proc/net/unix filters. Returns 1 when loaded, 0
+// when the file is absent (pre-R13 daemon: fixed path stands).
+int  zs_module_load_session_socket();
+
+// Override the daemon socket path (used by the session reader; also
+// the hook for test seams).
+void zs_module_set_daemon_socket(const char* path);
 
 // Capture the zygote's own argv[0] so the nice-name fallback in
 // fill_app_args can recognize "name not rewritten yet" children.
@@ -129,6 +143,11 @@ extern "C" ZsDropSeam* zs_test_drop_seam();   // entry.cpp consults this
 // Test seam: reset the per-child dispatch state between test cases
 // (production children get fresh copy-on-write statics for free).
 extern "C" void zs_test_reset_child_state();
+
+// Test seam (Round 13): point the session-file reader at a host-
+// writable path and drive it directly.
+extern "C" void zs_test_set_session_file(const char* path);
+extern "C" int  zs_test_load_session();
 #endif // ZS_HOST_TEST
 
 } // namespace zygisk_study

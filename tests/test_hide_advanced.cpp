@@ -1574,6 +1574,64 @@ ZS_TEST(prop_foreach_drops_absent_keys_from_enumeration) {
     zs_test_set_absent_prop_infos(nullptr, 0);
 }
 
+// Round 13 — the R9 residual: what happens when a callback re-enters
+// the property API (bionic's __system_property_foreach takes a global
+// lock; a callback that itself enumerates re-enters our hook, which
+// must stay correct without any lock of its own — the nested call
+// gets a fresh ForeachCtx on its own stack).
+ZS_TEST(prop_foreach_reentrant_nested_enumeration) {
+    // Mark two of the four synthetic keys absent.
+    const void* arr[2] = {g_fake_prop_pis[0], g_fake_prop_pis[1]};
+    zs_test_set_absent_prop_infos(arr, 2);
+    zs_test_set_real_prop_foreach(fake_foreach_driver);
+
+    hide_advanced_set_active(1);
+    int outer_seen = 0;
+    int nested_seen = 0;
+
+    auto user_cb = [](const void* pi, void* cookie) {
+        // A "bionic-like" callback that re-enters the enumeration
+        // API (through the SAME hooked entry point).
+        struct Ctx { int outer; int nested; };
+        Ctx* c = static_cast<Ctx*>(cookie);
+        ++c->outer;
+        int inner = 0;
+        zygisk_study_hook_prop_foreach(
+            [](const void* p2, void* ck) {
+                ++*static_cast<int*>(ck);
+                (void)p2;
+            }, &inner);
+        c->nested += inner;
+        (void)pi;
+    };
+    struct Ctx { int outer; int nested; } counts{0, 0};
+    int rv = zygisk_study_hook_prop_foreach(
+        (void (*)(const void*, void*))user_cb, &counts);
+    ZS_CHECK_EQ(rv, 0);
+    // Outer enumeration: 4 keys, 2 absent dropped -> 2 callbacks.
+    ZS_CHECK_EQ(counts.outer, 2);
+    // Each nested enumeration saw the same 4-with-2-dropped table.
+    ZS_CHECK_EQ(counts.nested, 4);
+
+    // And the outer call's own state was not corrupted by nesting
+    // (a fresh outer enumeration still sees exactly 2).
+    nested_seen = 0;
+    (void)nested_seen;
+    outer_seen = 0;
+    int seen = 0;
+    zygisk_study_hook_prop_foreach(
+        (void (*)(const void*, void*))[](const void* pi, void* cookie) {
+            ++*static_cast<int*>(cookie);
+            (void)pi;
+        }, &seen);
+    ZS_CHECK_EQ(seen, 2);
+    (void)outer_seen; (void)nested_seen;
+
+    hide_advanced_set_active(0);
+    zs_test_set_real_prop_foreach(nullptr);
+    zs_test_set_absent_prop_infos(nullptr, 0);
+}
+
 ZS_TEST(prop_foreach_table_size_covers_spoof_table) {
     // g_absent_prop_infos is sized 32; the absent portion of the
     // spoof table must fit or keys silently leak (documented
@@ -1933,4 +1991,93 @@ ZS_TEST(filter_scratch_is_allocated_once_per_thread) {
 int main() {
     std::fprintf(stderr, "=== Zygisk Study advanced hide layer tests ===\n");
     return zstest::run_all();
+}
+
+// ----------------------------------------------------------------------
+// Round 13
+// ----------------------------------------------------------------------
+
+// Runtime unix-substring registration: the daemon's randomized
+// per-boot socket directory must vanish from /proc/net/unix reads
+// even though its name is only known at runtime.
+ZS_TEST(filter_record_unix_drops_runtime_registered_socket_dir) {
+    char dst[256];
+    // Before registration: the neutral random name is NOT hidden.
+    const char* neutral =
+        "    0000000000000001: 00000002 00000000 00010000 0001 01 10001 "
+        "/data/system/.feedface/s";
+    ZS_CHECK(zs_filter_record(dst, sizeof dst, neutral, strlen(neutral),
+                              ZS_FILTER_NET_UNIX) > 0);
+
+    hide_advanced_register_unix_hidden_substring("/data/system/.feedface");
+    ZS_CHECK_EQ(zs_filter_record(dst, sizeof dst, neutral, strlen(neutral),
+                                 ZS_FILTER_NET_UNIX), (ssize_t)-1);
+
+    // A sibling sharing the stem is substring-matched too — harmless
+    // over-match by design (these random dirs only exist for our
+    // socket; documented difference from the mount table's
+    // prefix-with-slash semantics).
+    const char* sibling =
+        "    0000000000000002: 00000002 00000000 00010000 0001 01 10002 "
+        "/data/system/.feedface77/s";
+    ZS_CHECK_EQ(zs_filter_record(dst, sizeof dst, sibling, strlen(sibling),
+                                 ZS_FILTER_NET_UNIX), (ssize_t)-1);
+
+    // Ordinary sockets survive.
+    const char* clean =
+        "    0000000000000000: 00000002 00000000 00010000 0001 01 10000 "
+        "/dev/socket/thermal";
+    ZS_CHECK(zs_filter_record(dst, sizeof dst, clean, strlen(clean),
+                              ZS_FILTER_NET_UNIX) > 0);
+
+    // Guards: empty/oversize ignored without crash; saturation at 4.
+    hide_advanced_register_unix_hidden_substring(nullptr);
+    hide_advanced_register_unix_hidden_substring("");
+    hide_advanced_register_unix_hidden_substring("/tmp/x");
+    hide_advanced_register_unix_hidden_substring("/tmp/y");
+    hide_advanced_register_unix_hidden_substring("/tmp/z");
+    hide_advanced_register_unix_hidden_substring("/tmp/dropped");
+    const char* dropped_dir =
+        "    0000000000000003: 00000002 00000000 00010000 0001 01 10003 "
+        "/tmp/dropped/s";
+    ZS_CHECK(zs_filter_record(dst, sizeof dst, dropped_dir,
+                              strlen(dropped_dir),
+                              ZS_FILTER_NET_UNIX) > 0);
+}
+
+// Runtime fd-prefix registration: leaked descriptors targeting the
+// randomized socket directory are closed (slots 4..7 of the table,
+// not the test seam's slot 0).
+ZS_TEST(fd_scan_runtime_prefix_closes_random_dir_fds) {
+    std::string dir = "/tmp/zstest_rtfd_XXXXXX";
+    char* d = mkdtemp(&dir[0]);
+    ZS_CHECK(d != nullptr);
+    std::string file = dir + "/sock";
+    FILE* f = fopen(file.c_str(), "w");
+    ZS_CHECK(f != nullptr);
+    fputs("x", f);
+    fflush(f);
+    int fd_leak = open(file.c_str(), O_RDONLY);
+    ZS_CHECK(fd_leak >= 0);
+    int fd_keep = open("/etc/hostname", O_RDONLY);
+    if (fd_keep < 0) fd_keep = open("/proc/self/status", O_RDONLY);
+    ZS_CHECK(fd_keep >= 0);
+
+    // Restore the production slot 0 first (earlier tests override
+    // it), then register the random dir through the RUNTIME API.
+    zs_test_set_fd_root_prefix("/data/adb/");
+    hide_advanced_register_root_path_prefix((dir + "/").c_str());
+
+    g_advanced_initialized.store(0);
+    hide_advanced_init();
+    close_leaked_root_fds();
+
+    struct stat st;
+    ZS_CHECK(fstat(fd_leak, &st) != 0);
+    ZS_CHECK_EQ(errno, EBADF);
+    ZS_CHECK(fstat(fd_keep, &st) == 0);
+
+    fclose(f);
+    close(fd_keep);
+    rmdir(d);
 }

@@ -67,10 +67,17 @@ use std::time::Duration;
 
 /// Path to the daemon's working directory.
 const WORKDIR:       &str = "/data/system/zygisk_study";
-/// Path to the daemon's socket subdirectory.
+/// Path to the daemon's socket subdirectory (legacy fixed location —
+/// kept as the fallback when randomization fails; see
+/// setup_random_socket()).
 const SOCKDIR:       &str = "/data/system/zygisk_study/sock";
-/// Path to the daemon's listening socket.
+/// Path to the daemon's listening socket (legacy fixed fallback).
 const SOCK_PATH:     &str = "/data/system/zygisk_study/sock/sock";
+/// Round 13 — where the daemon hands its ACTUAL (randomized per-boot)
+/// socket path to the payload. Inside our own module directory:
+/// root-only, and never listed in any world-readable proc file (the
+/// thing that made the fixed socket path a detection vector).
+const SESSION_FILE:  &str = "/data/adb/modules/zygisk_study/session.sock";
 /// Where to look for installed Zygisk modules.
 const MODULES_ROOT:  &str = "/data/adb/modules";
 /// The denylist file.
@@ -576,6 +583,62 @@ fn spawn_privileged_child<F>(stream: UnixStream, state: Arc<DaemonState>, handle
     }
 }
 
+/// Round 13 — randomize the daemon's socket directory.
+///
+/// WHY: /proc/net/unix is world-readable and lists the PATH STRING
+/// of every filesystem unix socket on the device — directory
+/// permissions do not matter for that listing. A fixed
+/// "/data/system/zygisk_study/sock/sock" entry is therefore a
+/// system-wide identifier, readable by any app (and, unlike every
+/// other /proc file we filter, also by any helper the app EXECVEs —
+/// an exec replaces the address space, so no userspace hook can
+/// filter it there).
+///
+/// The fix: a per-boot directory with a neutral, random name
+/// ("/data/system/.<8 hex>") — the string in /proc/net/unix carries
+/// no zygisk/magisk identifier, and the payload still finds the
+/// socket through the session file (root-only handoff). The payload
+/// registers the random directory with its mount/fd/unix filters
+/// so hidden children drop any trace of it.
+///
+/// Also cleans the PREVIOUS boot's random directory (read from the
+/// stale session file before overwriting it).
+fn setup_random_socket() -> Option<String> {
+    // Clean up the previous boot's random dir, if any.
+    if let Ok(old) = std::fs::read_to_string(SESSION_FILE) {
+        let old = old.trim();
+        // Only ever remove paths WE created (defense in depth: the
+        // prefix is checked, not trusted).
+        if old.starts_with("/data/system/.") && old.len() > "/data/system/.".len() {
+            // Strip the socket file name to get the directory.
+            if let Some(dir) = old.rfind('/').map(|i| &old[..i]) {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        }
+    }
+
+    // 4 bytes from /dev/urandom -> 8 hex chars.
+    let mut bytes = [0u8; 4];
+    {
+        let mut f = std::fs::File::open("/dev/urandom").ok()?;
+        f.read_exact(&mut bytes).ok()?;
+    }
+    let dir = format!("/data/system/.{:02x}{:02x}{:02x}{:02x}",
+                     bytes[0], bytes[1], bytes[2], bytes[3]);
+    std::fs::create_dir_all(&dir).ok()?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(
+            &dir, std::fs::Permissions::from_mode(0o700));
+    }
+    let path = format!("{}/s", dir);
+    // Hand the path to the payload BEFORE binding so a fast zygote
+    // never races a missing file (worst case it falls back to the
+    // fixed path and simply fails to fetch modules this boot).
+    std::fs::write(SESSION_FILE, &path).ok()?;
+    Some(path)
+}
+
 fn main() {
     // Parse args.
     let mut workdir = WORKDIR.to_string();
@@ -651,21 +714,27 @@ fn main() {
         });
     }
 
-    // Remove any stale socket, then bind a new one.
-    let _ = std::fs::remove_file(SOCK_PATH);
-    let listener = match UnixListener::bind(SOCK_PATH) {
+    // Remove any stale socket, then bind a new one. Round 13: the
+    // socket lives in a randomized per-boot directory when
+    // /dev/urandom cooperates; the legacy fixed path is the fallback
+    // (the session file is written either way so the payload's
+    // reader and the daemon agree).
+    let sock_path = setup_random_socket()
+        .unwrap_or_else(|| SOCK_PATH.to_string());
+    let _ = std::fs::remove_file(&sock_path);
+    let listener = match UnixListener::bind(&sock_path) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("zygiskd: bind({}) failed: {}", SOCK_PATH, e);
+            eprintln!("zygiskd: bind({}) failed: {}", sock_path, e);
             process::exit(1);
         }
     };
     // Set restrictive perms on the socket itself.
     use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(SOCK_PATH,
+    let _ = std::fs::set_permissions(&sock_path,
         std::fs::Permissions::from_mode(0o600));
 
-    eprintln!("zygiskd: listening on {}", SOCK_PATH);
+    eprintln!("zygiskd: listening on {}", sock_path);
 
     // Accept loop. The parent stays as root and accepts; each
     // connection is handed off to a privileged child.
@@ -681,6 +750,10 @@ fn main() {
 
 fn setup_dirs(workdir: &str) {
     let _ = std::fs::create_dir_all(workdir);
+    // Round 13: the legacy fixed sock dir is still created — it is
+    // the fallback location when /dev/urandom fails, and removing it
+    // here would break a same-boot downgrade. The ACTIVE socket is
+    // normally the randomized per-boot dir (see setup_random_socket).
     let _ = std::fs::create_dir_all(SOCKDIR);
     use std::os::unix::fs::PermissionsExt;
     let _ = std::fs::set_permissions(workdir,

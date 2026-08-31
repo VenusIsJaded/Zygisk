@@ -480,12 +480,29 @@ static constexpr HiddenSubstring kHiddenSubstrings[] = {
     "/data/system/zygisk_study",
 };
 
+// Round 13 — runtime hidden substrings for the unix-socket filter:
+// the daemon's randomized per-boot socket directory. Registered at
+// payload init (module_dispatch.cpp reads the session file).
+static char g_rt_unix_subs[4][96];
+static size_t g_rt_unix_sub_lens[4];
+static int g_rt_unix_sub_count = 0;
+
+void hide_advanced_register_unix_hidden_substring(const char* s) {
+    if (!s || !*s) return;
+    size_t n = strlen(s);
+    if (n >= sizeof g_rt_unix_subs[0]) return;
+    if (g_rt_unix_sub_count >= 4) return;
+    memcpy(g_rt_unix_subs[g_rt_unix_sub_count], s, n + 1);
+    g_rt_unix_sub_lens[g_rt_unix_sub_count] = n;
+    ++g_rt_unix_sub_count;
+}
+
 // Round 8 (S1): /proc/net/unix is a GLOBAL socket table — every
 // filesystem-path unix socket on the device appears there, including
-// our daemon's /data/system/zygisk_study/sock/sock (an app can read
-// the file; perms do not help). We drop lines naming root-framework
-// sockets. Bare "magisk"/"zygisk" matter here because socket names
-// (abstract or path) are the actual thing detectors grep for.
+// our daemon's socket (an app can read the file; perms do not help).
+// We drop lines naming root-framework sockets. Bare "magisk"/
+// "zygisk" matter here because socket names (abstract or path) are
+// the actual thing detectors grep for.
 static const HiddenSubstring kUnixHiddenSubstrings[] = {
     "/data/system/zygisk_study",
     "/data/adb/",
@@ -683,6 +700,12 @@ ssize_t zs_filter_record(char* dst, size_t dst_cap,
         for (const HiddenSubstring& sub : kUnixHiddenSubstrings) {
             if (sub.len == 0 || sub.len > rec_len) continue;
             if (memmem(rec, rec_len, sub.data, sub.len)) return -1;
+        }
+        for (int i = 0; i < g_rt_unix_sub_count; ++i) {
+            if (g_rt_unix_sub_lens[i] == 0 ||
+                g_rt_unix_sub_lens[i] > rec_len) continue;
+            if (memmem(rec, rec_len, g_rt_unix_subs[i],
+                       g_rt_unix_sub_lens[i])) return -1;
         }
         break;
     }
@@ -2060,17 +2083,35 @@ struct zs_linux_dirent64 {
 // Root-path prefixes for the fd-link scan. File-scope (not a local
 // constant) so host tests can point the scanner at a directory they
 // can actually create — the getdents64 walk and readlink resolution
-// then run for real against the host kernel.
+// then run for real against the host kernel. Slots 4..7 are runtime
+// registrations (Round 13: the randomized daemon socket dir).
 struct FdRootPrefix { const char* p; size_t n; };
+static char g_fd_rt_prefix_store[4][96];
 static FdRootPrefix g_fd_root_prefixes[] = {
     {"/data/adb/",                 10},
     {"/sbin/",                      6},
     {"/debug_ramdisk/",            15},
     {"/data/system/zygisk_study/", 26},
+    {nullptr, 0}, {nullptr, 0}, {nullptr, 0}, {nullptr, 0},
 };
+
+void hide_advanced_register_root_path_prefix(const char* prefix) {
+    if (!prefix || !*prefix) return;
+    size_t n = strlen(prefix);
+    if (n >= sizeof g_fd_rt_prefix_store[0]) return;
+    for (size_t i = 4; i < 8; ++i) {
+        if (g_fd_root_prefixes[i].p == nullptr) {
+            memcpy(g_fd_rt_prefix_store[i - 4], prefix, n + 1);
+            g_fd_root_prefixes[i] =
+                FdRootPrefix{g_fd_rt_prefix_store[i - 4], n};
+            return;
+        }
+    }
+}
 
 static int fd_target_is_root_path(const char* t, size_t len) {
     for (const auto& pre : g_fd_root_prefixes) {
+        if (pre.n == 0 || pre.p == nullptr) continue;
         if (len >= pre.n && memcmp(t, pre.p, pre.n) == 0) return 1;
     }
     return 0;

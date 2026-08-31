@@ -96,6 +96,13 @@ int  hide_setup_for_target_uid(uid_t uid);
 // specialize arguments.
 void hide_lookup_package_for_uid(uid_t uid, char* out, size_t cap);
 
+// Round 13 — register a runtime root-path prefix (matched by the
+// unmount table's source/mount-point filter in addition to the
+// compile-time table). Used for the daemon's randomized per-boot
+// socket directory; call once at payload init. Max 4 prefixes, each
+// < 96 bytes; extras are ignored.
+void hide_register_root_path_prefix(const char* prefix);
+
 // Apply the mount unmount + property clone/spoof actions. Only
 // meaningful if hide_setup_for_target*() returned 1. Must be called
 // while the child is still root (before the real privilege drop).
