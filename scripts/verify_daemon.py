@@ -9,7 +9,9 @@ script builds the daemon, runs it against a remapped /data tree
 (ZS_TEST_ROOT; see remap_path in main.rs), and probes the REAL
 binary over its REAL socket:
 
-  1. randomized session-file socket handshake (R13)
+  1. randomized session-file socket handshake (R13) — BOTH session
+     records since Round 29 (module dir + the /data/system workdir
+     copy, including content parity)
   2. process cloak: comm AND cmdline (the R28 rewrite_argv fix)
   3. 'L' module listing from a fake module tree
   4. 'I' should-inject: allow, then deny after a denylist flip
@@ -20,6 +22,8 @@ binary over its REAL socket:
   7. zombie reaping: connection children must NOT accumulate
      (the R28 SIGCHLD fix)
   8. previous-boot random-dir cleanup across a restart
+  9. (Round 29) the same cleanup when ONLY the workdir session
+     record survives (module tree unreadable/removed)
 
 Exits 0 when every check passes, 1 on any failure, 77 when no Rust
 toolchain is available (same skip convention as verify_trampolines).
@@ -81,6 +85,8 @@ class Tree:
         self.sockdir = os.path.join(self.workdir, "sock")
         self.session_file = os.path.join(
             root, "data/adb/modules/zygisk_study/session.sock")
+        # Round 29 — the daemon's SECOND session record (workdir).
+        self.session_file_alt = os.path.join(self.workdir, "session.sock")
         self.modules_root = os.path.join(root, "data/adb/modules")
         os.makedirs(self.workdir, exist_ok=True)
         os.makedirs(self.sockdir, exist_ok=True)
@@ -198,6 +204,16 @@ def run_checks(binary, tree, env, proc):
     check("session file points inside the remapped tree",
           sock_path.startswith(os.path.join(tree.root, "data/system/.")),
           sock_path)
+    # Round 29: the daemon writes the SAME record into its workdir —
+    # the fallback for the Samsung /data/adb/modules-block class.
+    alt_exists = os.path.exists(tree.session_file_alt)
+    check("workdir session record written", alt_exists,
+          tree.session_file_alt)
+    if alt_exists:
+        with open(tree.session_file_alt) as f:
+            alt_path = f.read().strip()
+        check("workdir session record matches the module-dir one",
+              alt_path == sock_path, alt_path)
     check("randomized socket dir has 0700 perms",
           oct(os.stat(os.path.dirname(sock_path)).st_mode & 0o777) == "0o700",
           oct(os.stat(os.path.dirname(sock_path)).st_mode & 0o777))
@@ -311,6 +327,31 @@ def run_checks(binary, tree, env, proc):
             proc2.wait(timeout=3)
         except subprocess.TimeoutExpired:
             proc2.kill()
+
+    # 9. Round 29 — the cleanup also works when ONLY the workdir
+    # record survives (module tree removed/unreadable — the Samsung
+    # /data/adb/modules-block class, or a half-uninstalled module).
+    # Simulate: a random dir from a "previous boot", named ONLY in
+    # the workdir session record; the module-dir record is absent.
+    orphan = os.path.join(tree.root, "data/system/.feedface")
+    os.makedirs(orphan, exist_ok=True)
+    with open(tree.session_file_alt, "w") as f:
+        f.write(os.path.join(orphan, "s") + "\n")
+    try:
+        os.unlink(tree.session_file)
+    except FileNotFoundError:
+        pass
+    proc3 = start_daemon(binary, tree, env)
+    try:
+        time.sleep(0.3)
+        check("workdir-only record still cleans the old random dir",
+              not os.path.isdir(orphan))
+    finally:
+        proc3.send_signal(signal.SIGTERM)
+        try:
+            proc3.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc3.kill()
 
 
 if __name__ == "__main__":

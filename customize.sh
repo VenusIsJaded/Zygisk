@@ -106,6 +106,18 @@ cp "$LIBPAYLOAD" "$SYS_LIB_DIR/libpayload.so"
 chmod 0644 "$SYS_LIB_DIR/libzygisk.so" "$SYS_LIB_DIR/libpayload.so"
 ui_print "- Systemless bridge layout at $SYS_LIB_DIR"
 
+# Round 29: service.sh launches the daemon from $MODPATH/zygiskd.
+# Before this round NOBODY created that path — customize.sh only
+# ever placed the binary at libs/<abi>/zygiskd, so service.sh's
+# [ -x "$MODDIR/zygiskd" ] failed on EVERY real install ("daemon not
+# found", exit 0) and the daemon never started: no socket, no
+# session file, no 'P'/'I'/'C' handlers. Host tests never caught it
+# because the fake daemon there is started by the test harness, not
+# by service.sh. Create the expected symlink (relative, so it stays
+# valid wherever Magisk mounts the module dir).
+ln -sfn "libs/$ARCH/zygiskd" "$MODPATH/zygiskd"
+ui_print "- Daemon launcher: $MODPATH/zygiskd -> libs/$ARCH/zygiskd"
+
 # Pick the right libzygisk.so for the system property trick (see
 # service.sh). Magisk's standard pattern is to swap ro.dalvik.vm.native.bridge
 # to point at libzygisk.so on platforms where that property is honored.

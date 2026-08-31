@@ -77,12 +77,24 @@ static constexpr const char* kDaemonSocketLegacy =
 // for why the path is handed over in a file instead of a fixed name).
 static constexpr const char* kSessionFile =
     "/data/adb/modules/zygisk_study/session.sock";
+// Round 29 — the daemon's second session record (in the /data/system
+// workdir). Fallback when the module tree cannot be opened from this
+// process (the ReZygisk #380 Samsung class: kernel path rules
+// blocking app_process64's /data/adb/modules opens). See
+// module_dispatch.cpp's kSessionFileAlt — same content, same parser.
+static constexpr const char* kSessionFileAlt =
+    "/data/system/zygisk_study/session.sock";
 
 #ifdef ZS_HOST_TEST
-// Test seam: point the resolver at a temp "session file".
+// Test seam: point the resolver at temp "session files".
 static const char* g_session_file = kSessionFile;
+static const char* g_session_file_alt = kSessionFileAlt;
 extern "C" void zs_test_zn_set_session_file(const char* path) {
     g_session_file = path ? path : kSessionFile;
+}
+// Round 29: pin the ALTERNATE record for tests.
+extern "C" void zs_test_zn_set_session_file_alt(const char* path) {
+    g_session_file_alt = path ? path : kSessionFileAlt;
 }
 // Test seam: run the resolver directly (the static function below
 // is not otherwise visible outside the TU).
@@ -109,10 +121,17 @@ static int resolve_daemon_socket(char* out, size_t outsz) {
     if (!out || outsz == 0) return 0;
 #ifdef ZS_HOST_TEST
     const char* session = g_session_file;
+    const char* session_alt = g_session_file_alt;
 #else
     const char* session = kSessionFile;
+    const char* session_alt = kSessionFileAlt;
 #endif
     int fd = open(session, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        // Round 29: the module tree is unreadable from here — the
+        // daemon also writes its record into the /data/system workdir.
+        fd = open(session_alt, O_RDONLY | O_CLOEXEC);
+    }
     if (fd >= 0) {
         // 96 bytes read into a 97-byte buffer: a path that fills the
         // full 96 is longer than any legitimate session path (the

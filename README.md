@@ -299,9 +299,14 @@ What the tests cover (Round 9):
   FORCE_DENYLIST_UNMOUNT runs its unmount phase only after the
   post callbacks.
 
-(Total: 224 host-side tests, the daemon's `cargo test` suite (20
-tests), and `make verify-daemon` — 16 LIVE checks against the real
-zygiskd binary, new in Round 28.)
+(Total: 231 host-side tests, the daemon's `cargo test` suite (24
+tests), `make verify-daemon` — 19 LIVE checks against the real
+zygiskd binary — and `make verify-scripts` (Round 29) — 45 LIVE
+checks that run the module's actual shell scripts against a fake
+Magisk environment. That last layer is the one that finally
+executes post-fs-data.sh/service.sh/customize.sh/uninstall.sh on
+the host, closing the "host tests green, device dead" gap for the
+install chain.)
 
 The logic suites also run clean under **ASan + UBSan with leak
 detection** — `cd tests && make run-sanitize`. That run is where
@@ -327,9 +332,18 @@ construction — the raw-mapping test runs unsanitized).
 - **`make verify-daemon`** (Round 28) — builds the REAL zygiskd
   with cargo, runs it against a remapped `/data` tree
   (`ZS_TEST_ROOT`; see `remap_path` in main.rs) and probes the
-  real socket: the randomized session handshake, the comm+cmdline
-  cloak, the 'L'/'I'/'C'/'P' verbs, zombie reaping, and restart
-  cleanup. Skips (exit 77) when no Rust toolchain is available.
+  real socket: the randomized session handshake (both session
+  records since Round 29), the comm+cmdline cloak, the
+  'L'/'I'/'C'/'P' verbs, zombie reaping, and restart cleanup
+  (including the workdir-record-only variant). Skips (exit 77)
+  when no Rust toolchain is available.
+- **`make verify-scripts`** (Round 29) — runs the module's REAL
+  shell scripts against a fake Magisk environment (temp module
+  dir, PATH-injected fake `resetprop`/`log`, the `ZS_TEST_ROOT`
+  `/data/system` remap): the native-bridge swap decision matrix
+  ("" / "0" / real bridges), backup semantics, customize.sh's
+  launcher symlink and API/ABI gates, service.sh's three launch
+  paths, and the full uninstall restore matrix.
 - **`make run`'s public-header check** (Round 28) — compiles
   `zygisk_study_api.h` standalone in both C99 and C++17, the way
   the header's own documentation tells module authors to use it.
@@ -1123,3 +1137,46 @@ cargo tests, clippy clean, `cargo build --release` green,
 ASan+UBSan+leaks green, trampoline binary verification green,
 perf medians unchanged. Android support remains **5.0 through
 17-dev**, now with 4.x closed out as researched-not-possible.
+
+### Round 29 — OEM firmware compatibility, verified the no-guessing way
+
+Commissioned as "guarantee compatibility with all Samsung firmware
+from Android 5 and Xiaomi, and others — do not ever guess." The
+research pass mined real firmware, not assumptions: **173
+physical-device getprop dumps** (Samsung OneUI 1.0-8.0, MIUI 9-14,
+HyperOS, ColorOS, EMUI, HarmonyOS, OriginOS, Flyme, ...) showed
+`ro.dalvik.vm.native.bridge` ships as `"0"` on 169 devices, absent
+on 4, and a real bridge on zero — while ART (verified at
+5.0.0_r1 and 16.0.0_r1) treats `""` AND `"0"` as no-bridge. The
+two device-fatal bugs that fell out of that mismatch:
+
+- **The module was dead on ~98% of real devices**: the swap guard
+  only accepted an EMPTY value. Now both free values swap; real
+  bridges are still refused.
+- **The daemon never started on any install**: service.sh expected
+  `$MODDIR/zygiskd`, which no script ever created. customize.sh
+  now creates the launcher symlink; service.sh also falls back to
+  scanning `libs/<abi>/`.
+
+More from the same pass: the Samsung DEFEX kernel analysis
+(unlocked-bootloader kill switch read from three kernel-source
+generations — S7/S21/S24-era), OneUI/MIUI firmware-dump proof that
+the property-area SELinux labels are stock (plus the daemon now
+COPIES the live label instead of assuming it), the ReZygisk #380
+Samsung path-block report answered with a dual session record
+(module dir + the /data/system workdir) so the payload survives a
+blocked `/data/adb/modules` tree, the frozen-deny-map retry fix
+(a denied fopen used to latch empty maps for the whole boot), and
+`make verify-scripts` — 45 live checks that finally EXECUTE the
+module's shell scripts on the host against a fake Magisk
+environment. Full fact table and honest residuals:
+`docs/compatibility.md` (OEM section) and `docs/ANDROID-REALISM.md`
+(Round 29).
+
+**231/231 host tests** (39 hide / 112 advanced / 20 stealth / 5
+e2e / 4 perf / 2 trampoline / 23 dispatch / 16 zn_loader / 10
+version-compat) + the public-header check, 24/24 cargo tests,
+`make verify-daemon` 19/19 live checks, `make verify-scripts`
+45/45 live checks, 0 warnings, ASan+UBSan+leaks green, trampoline
+verification green, perf medians unchanged (0 us / 0 us / 41 ns —
+already at the measurement floor; no forced optimizations).

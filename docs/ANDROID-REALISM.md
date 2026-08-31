@@ -2224,3 +2224,134 @@ compile (C99 + C++17), `make verify-daemon` (16 live checks),
 cargo test 15 → 20, cargo clippy clean, `cargo build --release`
 green. 0 warnings, ASan+UBSan+leaks green, trampoline binary
 verification green (ALL CHECKS GREEN), perf medians unchanged.
+
+## Round 29 — OEM firmware compatibility (Samsung from Android 5, Xiaomi, and the rest), verified the no-guessing way
+
+The round was commissioned with an explicit constraint: "Do not make
+guesses, look at the actual code of these firmwares or look
+extensively online for information to know." Every fact below was
+fetched and READ this round (AOSP tags, real firmware dumps, real
+Samsung kernel source, physical-device getprop captures, and the
+ReZygisk/ZygiskNext trackers).
+
+### The research base
+
+- **173 real devices** (getActivity/AndroidSystemPropertyCollect —
+  real getprop dumps from physical phones across Samsung OneUI
+  1.0-8.0, Xiaomi MIUI 9.2-14 + HyperOS 1-2, OPPO/OnePlus ColorOS,
+  Huawei EMUI + HarmonyOS + NEXT, vivo, Meizu, realme, ZUI, nubia,
+  custom ROMs): `ro.dalvik.vm.native.bridge` is `0` on 169, absent
+  on 4, a real bridge on ZERO. Plus a real TouchWiz-era Galaxy S7
+  capture (pytorch/cpuinfo galaxy-s7-global fixture) and an S6-era
+  kernel default.prop, both `0`.
+- **ART's loading decision** re-read at android-5.0.0_r1 and
+  android-16.0.0_r1 (AndroidRuntime.cpp): "" logs a warning and
+  loads nothing; "0" is documented disabled; anything else is
+  dlopen()ed (16: zygote only).
+- **Real OneUI 5.1 (A53) + MIUI 14 (marble) firmware dumps**:
+  plat_file_contexts carry the stock property labels;
+  Samsung's vendor_file_contexts touches only its radio/GPU/modem
+  /dev nodes. bionic 13.0 hard-codes the serial-file label itself
+  (contexts_split.cpp:204, contexts_serialized.cpp:78).
+- **Samsung kernel source** (sm8650/S24-era, sm7325/S21-era,
+  universal8890/S7-era mirrors): DEFEX's task_defex_enforce()
+  returns ALLOW on unlocked bootloaders (modern kernels disable it
+  outright: "Device is unlocked and DEFEX will be disabled"); open/
+  openat carry err_code=0 in every catch list read (never checked);
+  PED fires only on credential GAIN; SafePlace only restricts root
+  execve targets.
+- **packages.list at android-16.0.0_r1** (Settings.java:721 +
+  writePackageListLPrInternal): still written, 11-field format;
+  our parser reads only the first two fields.
+- **ReZygisk issue #380**: field report that Samsung blocks
+  app_process64's opens of /data/adb/modules paths (their ptrace
+  flow loads the .so from there — ours loads from the magic-mounted
+  /system/lib64, but the session file lived there too).
+- OEM clone user IDs: Xiaomi Dual Apps = user 999, Samsung Secure
+  Folder = user 150 (community/Tasker-doc verified).
+
+### What the research exposed (the bugs)
+
+1. **THE "0" GUARD (device-fatal since Round 7, ~98% of real
+   devices):** post-fs-data.sh only swapped an EMPTY value; every
+   Samsung/Xiaomi/OPPO/... device ships "0", so the loader was
+   never installed and the entire module was dead on real
+   firmware while 224 host tests stayed green. Fixed: the guard
+   accepts both free values ("" and "0", exactly ART's own
+   distinction) and still refuses real bridges.
+2. **THE DAEMON THAT NEVER STARTED (device-fatal since Round 8):**
+   service.sh launched $MODDIR/zygiskd — a path NO script ever
+   created (customize.sh only placed libs/<abi>/zygiskd). "daemon
+   not found", exit 0, every boot. Fixed: customize.sh creates the
+   $MODPATH/zygiskd symlink (relative), service.sh falls back to
+   scanning libs/<abi>/ for legacy layouts.
+3. **THE FROZEN DENY MAP (fail-dead, all versions):** a load whose
+   fopen() was DENIED (file exists — SELinux/path-block, the #380
+   class) latched "loaded" AND stored the current mtime, so the
+   mtime-based refresh never fired again: empty deny set + empty
+   uid map for the whole boot, silently. Fixed: an
+   exists-but-unreadable latch makes the refresh retry (one fopen
+   per 2 s worst case; a merely-missing file still latches normally
+   — the mtime path already handles late appearance).
+4. **THE SINGLE-RECORD SESSION HANDOFF (OEM fragility):** the
+   randomized socket path was only published under
+   /data/adb/modules — exactly the tree the #380 report says some
+   Samsung builds block. Fixed: the daemon writes a second record
+   into its /data/system workdir; the payload and libzn_loader
+   read the primary first and fall back to the second (identical
+   parser hygiene on both records; zero cost in the healthy case).
+   The daemon's previous-boot cleanup and uninstall.sh also read
+   the fallback record (and uninstall now reads it BEFORE removing
+   the workdir that contains it).
+5. **Hardcoded label selection (robustness, not a bug):** the
+   staged property file's SELinux label is now COPIED from the
+   live file (lgetxattr, sanitized) with the verified AOSP
+   constants as fallback — an OEM/future custom type is handled
+   for free.
+
+### The verification layer added
+
+`scripts/verify_scripts.py` + `make verify-scripts` (wired into
+`make run`): the module's shell scripts finally RUN on the host —
+against a fake Magisk environment (temp module dir, PATH-injected
+fake resetprop/log, ZS_TEST_ROOT remap of /data/system — the same
+seam the daemon uses). 45 checks across 20 scenarios: the "0"
+swap matrix ("", "0", libhoudini, ndk_translation), backup
+semantics, missing-resetprop survival, customize.sh's symlink +
+API/ABI gates, service.sh's three launch paths, and
+uninstall.sh's restore matrix incl. the workdir-record fallback.
+This is the harness that would have caught bugs 1 and 2 at Round 7
+— the entire class of "host tests green, device dead" install bugs
+is now closed for the scripts.
+
+### Honest residuals (unchanged scope, stated plainly)
+
+- The 4 absent-prop devices are all Android 15-era builds
+  (HyperOS 2.0, OriginOS 5, Flyme 10.5): absent is handled
+  identically to empty (the guard's first branch), so no action
+  was needed — noted here because the shift from "0" to absent is
+  a real firmware trend worth tracking.
+- Samsung's userspace is not published; TouchWiz-era (5.x-8.x)
+  per-model deltas cannot be diffed from here. The evidence chain
+  (S7 capture + AOSP base + the version-compat layer) covers the
+  mechanism; per-model certainty would require the hardware.
+- The #380 report is a field report; the kernel sources I read
+  give open/openat err_code=0 and an unlock-time kill switch —
+  the blocking component on those devices is not identifiable
+  from here. The hardening treats the report as authoritative for
+  its scenario (fail-closed + fallback record), which is the
+  correct posture either way.
+- No genuine performance work this round: the perf medians were
+  already at the measurement floor (0 us / 0 us / 41 ns) and
+  remain identical after the changes (re-run post-fix). The
+  user's brief explicitly allowed not forcing it.
+
+Tests 224 → 231 (+2 test_hide: the failed-open retry for both
+tracked files incl. the multi-user uid math; +2
+test_module_dispatch: session fallback + fallback hygiene; +3
+test_zn_loader: workdir-record fallback, primary-wins, overlong
+rejection on the fallback). cargo test 20 → 24 (label
+sanitization, AOSP fallback, target-path resolution).
+verify_scripts.py 45 checks, verify_daemon.py 16 → 19 (dual
+session record + workdir-record cleanup). 0 warnings, sanitizers
+green, trampoline verification green, perf medians unchanged.

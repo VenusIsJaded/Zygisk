@@ -866,6 +866,111 @@ ZS_TEST(denylist_refresh_is_throttled) {
     hide_test_set_denylist_path("/data/system/zygisk_study/denylist");
 }
 
+// Round 29 (failed-open retry): the load path used to latch
+// "loaded" even when fopen() was DENIED while the file existed
+// (SELinux, a kernel-side path block on the zygote's exe — the
+// ReZygisk #380 class, or any transient EACCES). The stored mtime
+// then equaled the file's real mtime, so the refresh path never
+// reloaded and the empty deny map stayed for the whole boot. The
+// failure latch must retry the load. chmod(2) changes ctime but NOT
+// mtime — exactly the scenario the old code froze on.
+ZS_TEST(denylist_failed_open_is_retried_until_it_succeeds) {
+    if (geteuid() == 0) {
+        // Root bypasses permission bits; the failure injection would
+        // not work. The CI/test user is unprivileged, which is the
+        // environment this regression targets.
+        return;
+    }
+    std::string path = make_temp_denylist("com.denied.app\n");
+    hide_test_set_denylist_path(path.c_str());
+
+    // Make it unreadable (exists, stat() succeeds, fopen() fails).
+    ZS_CHECK_EQ(chmod(path.c_str(), 0000), 0);
+
+    // First load: fopen denied -> the deny map stays empty. The
+    // latch must be set after this failure.
+    ZS_CHECK_EQ(hide_setup_for_target("com.denied.app"), 0);
+    int count_after_fail = hide_test_denylist_reload_count();
+    ZS_CHECK(count_after_fail >= 1);
+
+    // Heal WITHOUT touching mtime: chmod back to readable. The old
+    // code compares mtimes only — unchanged — and would never retry.
+    ZS_CHECK_EQ(chmod(path.c_str(), 0644), 0);
+
+    // Open the throttle gate and re-check: the retry must fire and
+    // the deny decision must flip to hidden.
+    hide_test_reset_refresh();
+    ZS_CHECK_EQ(hide_setup_for_target("com.denied.app"), 1);
+    ZS_CHECK(hide_test_denylist_reload_count() > count_after_fail);
+
+    // Steady state: the successful load cleared the latch; a second
+    // refresh window must NOT burn another reload when nothing
+    // changed (mtime unchanged, latch clear).
+    int count_after_heal = hide_test_denylist_reload_count();
+    hide_test_reset_refresh();
+    ZS_CHECK_EQ(hide_setup_for_target("com.denied.app"), 1);
+    ZS_CHECK_EQ(hide_test_denylist_reload_count(), count_after_heal);
+
+    remove_temp(path);
+    hide_test_set_denylist_path("/data/system/zygisk_study/denylist");
+}
+
+// Round 29 (failed-open retry, packages.list side): same freeze, but
+// for the uid->package map — the map the module dispatch layer and
+// the data-dir derivation both depend on.
+ZS_TEST(packages_list_failed_open_is_retried_until_it_succeeds) {
+    if (geteuid() == 0) {
+        return;  // permission-bit failure injection needs !root
+    }
+    std::string path;
+    {
+        char tmpl[] = "/tmp/zstest_pkgslist_XXXXXX";
+        int fd = mkstemp(tmpl);
+        ZS_CHECK(fd >= 0);
+        // Modern 11-field format (verified at android-16.0.0_r1
+        // Settings.java writePackageListLPrInternal) — the parser
+        // only reads the first two fields.
+        const char* line =
+            "com.example.app 10123 0 /data/user/0/com.example.app "
+            "default:targetSdk=33 0 1032,3003 0 123 0 @system\n";
+        ZS_CHECK(write(fd, line, strlen(line)) == (ssize_t)strlen(line));
+        close(fd);
+        path = tmpl;
+    }
+    hide_test_set_packages_list_path(path.c_str());
+    // A working denylist so the shared parse runs cleanly.
+    std::string dl = make_temp_denylist("com.example.app\n");
+    hide_test_set_denylist_path(dl.c_str());
+
+    // Denied open: uid map empty.
+    ZS_CHECK_EQ(chmod(path.c_str(), 0000), 0);
+    char out[256] = {};
+    hide_lookup_package_for_uid(10123, out, sizeof out);
+    ZS_CHECK(std::string(out).empty());
+
+    // Heal (chmod changes ctime only) and retry through an open
+    // throttle gate. The refresh runs inside the fork-path entry
+    // points (hide_setup_for_target), not inside the bare lookup —
+    // same as production, where the gid/uid-drop hooks call setup
+    // first.
+    ZS_CHECK_EQ(chmod(path.c_str(), 0644), 0);
+    hide_test_reset_refresh();
+    ZS_CHECK_EQ(hide_setup_for_target("com.example.app"), 1);
+    hide_lookup_package_for_uid(10123, out, sizeof out);
+    ZS_CHECK(std::string(out) == "com.example.app");
+
+    // The multi-user form of the same appId resolves too (user 999 =
+    // Xiaomi dual apps, user 150 = Samsung Secure Folder — uid
+    // math verified from AOSP UserHandle.getUid).
+    hide_lookup_package_for_uid(999 * 100000 + 10123, out, sizeof out);
+    ZS_CHECK(std::string(out) == "com.example.app");
+
+    remove_temp(path);
+    remove_temp(dl);
+    hide_test_set_denylist_path("/data/system/zygisk_study/denylist");
+    hide_test_set_packages_list_path("/data/system/packages.list");
+}
+
 // Round 8 (B9): the maps scanner must NEVER claim app-bundled
 // libraries as ours, even when the file name collides with ours
 // (an app shipping its own "libpayload.so" was enough to make the

@@ -41,6 +41,7 @@ extern "C" const struct zygisk_study_api zygisk_study_api_v1;
 
 // Seams from entry.cpp (ZS_HOST_TEST).
 extern "C" void zs_test_zn_set_session_file(const char* path);
+extern "C" void zs_test_zn_set_session_file_alt(const char* path);
 extern "C" int  zs_test_zn_resolve_socket(char* out, size_t outsz);
 
 static const char* kLegacyPath =
@@ -135,6 +136,54 @@ ZS_TEST(resolver_rejects_overlong_paths) {
     int from_session = zs_test_zn_resolve_socket(out, sizeof out);
     ZS_CHECK_EQ(from_session, 0);
     ZS_CHECK_STR_EQ(out, kLegacyPath);
+}
+
+// Round 29 — the SECOND session record (the daemon's /data/system
+// workdir copy). When the module-dir record is unreadable (the
+// ReZygisk #380 Samsung class: kernel path rules blocking
+// app_process64's /data/adb/modules opens), the resolver must fall
+// back to the workdir record instead of the legacy fixed path.
+ZS_TEST(resolver_uses_the_workdir_record_when_module_dir_is_blocked) {
+    std::string alt = session_file_with("/data/system/.1a2b3c4d/s\n");
+    zs_test_zn_set_session_file(session_file_gone().c_str());
+    zs_test_zn_set_session_file_alt(alt.c_str());
+    char out[96];
+    int from_session = zs_test_zn_resolve_socket(out, sizeof out);
+    ZS_CHECK_EQ(from_session, 1);
+    ZS_CHECK_STR_EQ(out, "/data/system/.1a2b3c4d/s");
+    zs_test_zn_set_session_file(nullptr);
+    zs_test_zn_set_session_file_alt(nullptr);
+}
+
+// Round 29 — the PRIMARY record still wins when both are readable.
+ZS_TEST(resolver_prefers_the_primary_record_over_the_workdir_copy) {
+    std::string sf = session_file_with("/data/system/.primary99/s\n");
+    std::string alt = session_file_with("/data/system/.altcopy77/s\n");
+    zs_test_zn_set_session_file(sf.c_str());
+    zs_test_zn_set_session_file_alt(alt.c_str());
+    char out[96];
+    int from_session = zs_test_zn_resolve_socket(out, sizeof out);
+    ZS_CHECK_EQ(from_session, 1);
+    ZS_CHECK_STR_EQ(out, "/data/system/.primary99/s");
+    zs_test_zn_set_session_file(nullptr);
+    zs_test_zn_set_session_file_alt(nullptr);
+}
+
+// Round 29 — a garbage workdir record must not defeat a VALID
+// primary, and a garbage primary falls through to the workdir copy
+// (both records get the same parser hygiene).
+ZS_TEST(resolver_rejects_overlong_content_in_the_workdir_record) {
+    std::string long_path(120, 'a');
+    long_path[0] = '/';
+    std::string alt = session_file_with(long_path.c_str());
+    zs_test_zn_set_session_file(session_file_gone().c_str());
+    zs_test_zn_set_session_file_alt(alt.c_str());
+    char out[96];
+    int from_session = zs_test_zn_resolve_socket(out, sizeof out);
+    ZS_CHECK_EQ(from_session, 0);
+    ZS_CHECK_STR_EQ(out, kLegacyPath);
+    zs_test_zn_set_session_file(nullptr);
+    zs_test_zn_set_session_file_alt(nullptr);
 }
 
 // ---------------------------------------------------------------------------

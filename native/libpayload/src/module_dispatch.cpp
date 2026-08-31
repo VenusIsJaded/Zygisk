@@ -159,7 +159,15 @@ static const char* g_daemon_socket = kDaemonSocketDefault;
 // world-readable proc file).
 static constexpr const char* kSessionFile =
     "/data/adb/modules/zygisk_study/session.sock";
+// Round 29 — the daemon's SECOND session record, in the /data/system
+// workdir. Fallback when the module tree cannot be opened from the
+// zygote (ReZygisk #380: Samsung kernel path rules blocking
+// app_process64's /data/adb/modules opens). Same 0700 root-only dir
+// as packages.list/denylist, which the hide pipeline already reads.
+static constexpr const char* kSessionFileAlt =
+    "/data/system/zygisk_study/session.sock";
 static const char* g_session_file = kSessionFile;
+static const char* g_session_file_alt = kSessionFileAlt;
 
 #ifdef ZS_HOST_TEST
 // Round 26: pin the platform form for tests (-1 = restore auto).
@@ -188,6 +196,10 @@ extern "C" const char* zs_test_last_props_build_path() {
 #ifdef ZS_HOST_TEST
 extern "C" void zs_test_set_session_file(const char* path) {
     g_session_file = path ? path : kSessionFile;
+}
+// Round 29: pin the ALTERNATE session record for tests.
+extern "C" void zs_test_set_session_file_alt(const char* path) {
+    g_session_file_alt = path ? path : kSessionFileAlt;
 }
 extern "C" int zs_test_load_session() {
     return zs_module_load_session_socket();
@@ -231,8 +243,20 @@ void zs_module_set_daemon_socket(const char* path) {
 // filter that matches paths: the mount unmounter, the fd-link
 // scanner, and the /proc/net/unix line filter. Returns 1 when a
 // session path was loaded.
+//
+// Round 29: the module-dir record is tried FIRST; only when its
+// open() fails does the workdir record (kSessionFileAlt) run. A
+// device that can read the primary never touches the alt path
+// (zero extra syscalls in the healthy case); a device where the
+// module tree is blocked falls back transparently. The parser
+// (96-byte cap, absolute-path check, trim) is shared by both.
 int zs_module_load_session_socket() {
     int fd = open(g_session_file, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        // Round 29: the module tree is unreadable from here — try
+        // the daemon's workdir record before giving up.
+        fd = open(g_session_file_alt, O_RDONLY | O_CLOEXEC);
+    }
     if (fd < 0) return 0;                  // pre-R13 daemon: fallback
     // Round 28: read up to 96 bytes into a 97-byte buffer. A path
     // that fills the full 96 is longer than any legitimate session

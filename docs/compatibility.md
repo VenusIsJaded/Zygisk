@@ -55,11 +55,38 @@ mounted copy is what the zygote finds.
 
 Zygisk Study's `post-fs-data.sh` performs the swap itself (Round 7):
 it writes `libzygisk.so` into `ro.dalvik.vm.native.bridge` with
-`resetprop`, but ONLY when the property is currently empty —
-devices that already run a real native bridge (x86 ARM translation
+`resetprop`, but ONLY when the property currently means "no bridge"
+— devices that already run a real native bridge (x86 ARM translation
 hubs, ChromeOS-style bridges) must never be overridden, since
 breaking translation breaks the whole device. The previous value
 is saved for `uninstall.sh` to restore.
+
+**Round 29 correction (the biggest device-side bug this module ever
+had):** "no bridge" is BOTH the empty value AND `"0"`. ART's own
+loading decision (frameworks/base `core/jni/AndroidRuntime.cpp`,
+verified at `android-5.0.0_r1:862-871` and
+`android-16.0.0_r1:1109-1117`) is:
+
+```cpp
+property_get("ro.dalvik.vm.native.bridge", propBuf, "");
+if (propBuf[0] == '\0') {
+    ALOGW("ro.dalvik.vm.native.bridge is not expected to be empty");
+} else if (strcmp(propBuf, "0") != 0) {
+    // pass "-XX:NativeBridge=<value>" -> the runtime dlopen()s it
+}
+```
+
+and a 173-device real-firmware collection
+([getActivity/AndroidSystemPropertyCollect](https://github.com/getActivity/AndroidSystemPropertyCollect)
+— Samsung OneUI 1.0-8.0, Xiaomi MIUI 10-14 + HyperOS 1-2, OPPO/OnePlus
+ColorOS, Huawei EMUI + HarmonyOS(+NEXT), vivo OriginOS + FuntouchOS,
+Meizu Flyme, realme, ZUI, RedMagic, and more) shows the split
+directly: **169 devices ship `ro.dalvik.vm.native.bridge=0`, 4 ship
+it absent, and zero ship a real bridge.** The pre-Round-29 guard
+only accepted the empty value, so the module never installed its
+loader on ~98% of real devices while every host test stayed green.
+The guard now swaps on both free values and refuses anything else
+(a real bridge soname) exactly as before.
 
 To enable the swap by hand on a device where the module's own
 script did not run (e.g. no `resetprop` in the environment):
@@ -206,3 +233,156 @@ Key version-specific mechanisms and where they are handled:
 - **Install gate**: `customize.sh` refuses API < 21 — Android 4.x
   has a different property area generation and a different bridge
   symbol surface, and was never studied.
+
+## OEM firmware compatibility (Round 29)
+
+This section answers "does it work on Samsung / Xiaomi / other OEM
+firmware?" with the same standard as the rest of the document:
+every claim below is backed by a named source — real firmware dumps,
+kernel source, or AOSP code — and the places we could NOT verify are
+listed as residuals, not smoothed over. Nothing here is a guess.
+
+### What every OEM has in common (verified from 173 real devices)
+
+The load mechanism the module depends on — ART reading
+`ro.dalvik.vm.native.bridge` and dlopen()ing the bare soname from
+`/system/lib[64]` — is stock AOSP behavior that no phone OEM removes
+(some x86 tablets and ChromeOS-style devices ship a REAL bridge;
+the install guard refuses those devices rather than breaking them).
+The evidence, from
+[getActivity/AndroidSystemPropertyCollect](https://github.com/getActivity/AndroidSystemPropertyCollect)
+(a collection of real getprop dumps taken from physical devices):
+
+| OEM skin | devices sampled | value shipped |
+|---|---|---|
+| Samsung OneUI 1.0-8.0 (S8 to Z Fold7, A51-A55, Tabs) | 8 | all `0` |
+| Xiaomi MIUI 9.2-14 (MI 5s to Mi 9, Redmi 5A to Note 7) | 26 | all `0` |
+| Xiaomi HyperOS 1.0-2.0 (Android 13-15) | 14 | 12x `0`, 2x absent |
+| OPPO/OnePlus ColorOS 11.1-15 (Reno, Find X, OnePlus 8/9) | 18 | all `0` |
+| Huawei EMUI (P-series, Mate) | 11 | all `0` |
+| Huawei HarmonyOS + NEXT | 15 | all `0` |
+| vivo OriginOS 3-5 / FuntouchOS 9-12 | 9 | 8x `0`, 1x absent |
+| Meizu Flyme 8-10.5 | 10 | 9x `0`, 1x absent |
+| realmeUI 2-5, ZUI, RedMagicOS, MYUI, MagicOS, H2OS, 360UI, ... | 30+ | all `0` |
+| LineageOS / PixelExperience (custom ROMs) | 4 | all `0` |
+
+**169 of 173 devices ship `0`; the 4 newest builds ship the property
+absent; zero ship a real bridge.** TouchWiz-era evidence matches: a
+real Samsung Galaxy S7 (SM-G930F, G930FXXU1DQJ8, Android 7.0)
+getprop capture (pytorch/cpuinfo's galaxy-s7-global fixture, taken
+from a physical device) and an S6-era kernel's default.prop both
+carry `ro.dalvik.vm.native.bridge=0`.
+
+### Samsung specifics
+
+**Property-area labels — verified from a real OneUI 5.1 (Galaxy A53,
+Android 13) firmware dump** (`SelynCatto/samsung_a53x_dump`,
+`system/system/etc/selinux/plat_file_contexts`): Samsung carries the
+stock entries — `/dev/__properties__` (the directory) is labeled
+`u:object_r:properties_device:s0` and nothing in Samsung's
+`vendor_file_contexts` overrides it (checked: the vendor file's
+`/dev` entries are Samsung's radio/GPU/modem nodes only). bionic —
+which every OEM ships, it is the libc — sets the serial file's
+`u:object_r:properties_serial:s0` label itself at creation
+(`contexts_split.cpp:204` / `contexts_serialized.cpp:78` at
+android-13.0.0_r1). Round 29 additionally made the daemon copy the
+live label off the real file (`lgetxattr security.selinux`) and only
+fall back to the hard-coded AOSP strings, so a future/custom OEM
+type is handled automatically.
+
+**Kernel-side (DEFEX / Knox)** — read from Samsung kernel source
+mirrors (sm8650 = Galaxy S24 era, sm7325 = S20FE/S21 era,
+universal8890 = S7 era):
+
+- Modern Samsung kernels gate DEFEX on the bootloader state:
+  `task_defex_enforce()` opens with `if (is_boot_state_unlocked())
+  return DEFEX_ALLOW;` and the init log literally says
+  "Device is unlocked and DEFEX will be disabled" — the module
+  requires an unlocked bootloader (it is a Magisk module), so DEFEX
+  is inert in exactly the configuration we run in.
+- In both eras' syscall catch lists, `open`/`openat` carry
+  `err_code = 0` — a zero err_code means DEFEX never inspects the
+  call at all.
+- PED (the credential-escalation killer) only fires when a process
+  GAINS credentials; our payload only ever drops privileges (it
+  hooks the setresgid/setresuid descent), and it runs inside
+  app_process64, which is in the safeplace rules list.
+- SafePlace only restricts which binaries a ROOT process may
+  execve; the payload never execs, and the daemon is exec'd by
+  Magisk's own service runner (which demonstrably runs on Samsung).
+
+**The one real-world report against the pattern:**
+[ReZygisk issue #380](https://github.com/PerformanC/ReZygisk/issues/380)
+("Samsung DEFEX blocks app_process64 from open()ing /data/adb/modules
+paths") — a field report from ReZygisk's ptrace injection flow, which
+loads its library from the module directory. Zygisk Study does NOT:
+its loader .so is magic-mounted at `/system/lib64/libzygisk.so` and
+dlopen'd from there. But the session handoff file DID live only under
+`/data/adb/modules/`, so Round 29 hardened exactly this class:
+
+- The daemon now writes its session record TWICE — the module-dir
+  file and `$WORKDIR/session.sock` inside its own
+  `/data/system/zygisk_study` tree — and the payload (and
+  libzn_loader) fall back to the second record when the module tree
+  is unreadable. A device in the #380 state loses nothing; a healthy
+  device pays zero extra syscalls (the fallback is opened only after
+  the primary open fails).
+- The denylist/packages.list loader now RETRIES after a failed
+  fopen (the old code latched "loaded" and stored the current mtime,
+  so one EACCES froze an empty deny map for the whole boot); a
+  permanently-failing open costs one fopen attempt per 2 s.
+
+**Dual Messenger / Secure Folder:** cloned and containerized apps
+are separate Android users (Secure Folder is userId 150 — Samsung's
+own support ecosystem describes it as "basically another Android
+user"; Dual Messenger uses the same mechanism). The payload's
+denylist matching is BY PACKAGE NAME, and its uid math
+(`uid % 100000` to the appId family, `uid / 100000` to the user) is
+user-ID-agnostic — verified against AOSP `UserHandle.getUid` — so a
+Secure Folder copy of a denylisted app resolves the same package
+name and hides the same way. `/data/user/<id>/<pkg>` paths follow
+the real user id per fork.
+
+**Knox warranty bit / RKP / TIMA:** the warranty bit trips on
+bootloader unlock (prerequisite of any Magisk module on Samsung) —
+documented, unavoidable, and orthogonal to this module. RKP/TIMA are
+kernel-integrity features aimed at kernel-level root; a userspace
+Magisk module is outside their threat model and Magisk has run on
+unlocked Samsung devices for years.
+
+**Honest residual:** Samsung does not publish its userspace, so
+TouchWiz-era (5.x-8.x) per-model ART/sepolicy deltas can't be
+diffed from here; those builds are AOSP 5.x/6.x/7.x-based (the real
+S7@7.0 capture above proves the bridge path exists on TouchWiz),
+the version-compat layer already handles their bridge tables, and
+the kernel-source analysis above covers their DEFEX generation.
+Per-model stock kernel configs are also not individually fetchable
+(Samsung's OSS portal distributes per-model zip archives); the three
+generations read above (S7 / S21 / S24-era) bracket the range.
+
+### Xiaomi (MIUI / HyperOS)
+
+All 40 MIUI + HyperOS dumps in the collection ship `0` (or absent on
+the two newest HyperOS 2.0 builds). Xiaomi does not fork bionic, and
+the package list the hide pipeline consumes
+(`/data/system/packages.list`) is still written by stock
+PackageManagerService on current Android — verified at
+`android-16.0.0_r1` `services/.../pm/Settings.java:721`
+(`mPackageListFilename = new File(mSystemDir, "packages.list")`) with
+the parser reading only the first two fields of the 11-field modern
+format, so MIUI's extra packages parse identically. Xiaomi Dual Apps
+are Android user 999 (community-documented, and consistent with the
+uid math above); no MIUI-specific native-bridge problems appear in
+the ReZygisk/ZygiskNext issue-tracker sweeps (their OEM-specific
+reports center on Samsung's kernel rules, not MIUI's userspace).
+
+### What this is, and what it is not
+
+This is a **mechanism-level compatibility statement backed by
+cited firmware/kernel/AOSP sources plus fail-closed hardening for
+the reported OEM failure modes** — not a per-model guarantee (nobody
+can honestly give one without testing on the hardware). Every
+residual unknown above degrades closed: a blocked path means "no
+injection" or "no hide" for that feature, never a crash, and the
+module refuses (rather than breaks) the only device class that
+would actually malfunction (real-bridge x86 translation devices).

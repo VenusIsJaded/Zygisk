@@ -91,7 +91,7 @@ test_zn_loader: test_zn_loader.cpp ../native/libzn_loader/src/entry.cpp \
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -o $@ $< \
 	../native/libzn_loader/src/entry.cpp -ldl -pthread
 
-run: all verify-public-header
+run: all verify-public-header verify-scripts
 	@fail=0; \
 	for t in $(TESTS); do \
 	echo "=== $$t ==="; \
@@ -184,6 +184,20 @@ verify-trampolines:
 	if [ $$rc -eq 77 ]; then \
 	echo "NOTE: keystone-engine missing — pip install keystone-engine to enable."; \
 	fi; \
+	exit $$rc; \
+	else \
+	echo "python3 unavailable; skipping"; \
+	fi
+
+# Round 29 - the module's shell scripts run for real against a fake
+# Magisk environment (fake resetprop/log, ZS_TEST_ROOT remap). This is
+# the harness that would have caught the "0"-only swap guard and the
+# never-created $MODPATH/zygiskd launcher.
+.PHONY: verify-scripts
+verify-scripts:
+	@if command -v python3 >/dev/null 2>&1; then \
+	python3 ../scripts/verify_scripts.py; \
+	rc=$$?; \
 	exit $$rc; \
 	else \
 	echo "python3 unavailable; skipping"; \

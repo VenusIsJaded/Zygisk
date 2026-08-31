@@ -110,6 +110,13 @@ static std::atomic<int> g_will_hide{0};
 // Cached DenyList (package names) + the uid family map.
 static std::unordered_set<std::string> g_denylist_cache;
 static std::atomic<int>                g_denylist_loaded{0};
+// Round 29 — 1 while the LAST load_denylist() could not open one of
+// the two tracked files. The refresh path retries the load every
+// throttle interval while this is set (a permanently-failing open
+// costs one fopen attempt per 2 s — nothing), so a transient EACCES
+// at zygote start no longer freezes an empty deny/uid map for the
+// entire boot.
+static std::atomic<int>                g_last_load_open_fail{0};
 static std::unordered_set<uid_t>       g_deny_app_ids;   // uid % 100000
 static std::atomic<int>                g_uid_map_loaded{0};
 // Round 12 — appId -> package name for EVERY package (not just
@@ -426,7 +433,14 @@ static constexpr const char* kPackagesListPath =
 static const char* g_packages_list_path = kPackagesListPath;
 static const char* packages_list_path() { return g_packages_list_path; }
 
-static void load_denylist_locked_state() {
+// Round 29: returns a bitmask of the files that actually OPENED
+// (bit 0 = denylist, bit 1 = packages.list; 3 = both), plus bits for
+// files that EXIST but refused the open (bit 2 = denylist, bit 3 =
+// packages.list — the EACCES/path-block case worth retrying). A file
+// that is simply MISSING (ENOENT — host tests, first boot before PMS
+// writes packages.list) is NOT a failure: the mtime path already
+// picks the file up when it appears.
+static int load_denylist_locked_state() {
     // Round 8 (caught by the new reload tests): the cache must be
     // rebuilt from scratch. The old code merged every reload into the
     // existing set — once a package was denylisted, REMOVING it from
@@ -435,7 +449,10 @@ static void load_denylist_locked_state() {
     g_denylist_cache.clear();
     ++g_pkg_map_gen;
     FILE* fp = fopen(denylist_path(), "r");
+    int opened = 0;   // opened bits; blocked bits computed below
+    int blocked = 0;
     if (fp) {
+        opened |= 1;
         char line[256];
         while (fgets(line, sizeof line, fp)) {
             char* nl = strpbrk(line, "\r\n");
@@ -449,6 +466,10 @@ static void load_denylist_locked_state() {
     }
     g_denylist_loaded.store(1);
     ++g_denylist_reload_count;
+    if (!fp) {
+        struct stat probe{};
+        if (stat(denylist_path(), &probe) == 0) blocked |= 4;
+    }
 
     // uid map: denylist package names -> appIds.
     g_deny_app_ids.clear();
@@ -456,6 +477,7 @@ static void load_denylist_locked_state() {
     g_pkg_map.clear();
     fp = fopen(packages_list_path(), "r");
     if (fp) {
+        opened |= 2;
         char line[1024];
         while (fgets(line, sizeof line, fp)) {
             char pkg[256] = "";
@@ -473,10 +495,28 @@ static void load_denylist_locked_state() {
         fclose(fp);
     }
     g_uid_map_loaded.store(1);
+    if (!fp) {
+        struct stat probe{};
+        if (stat(packages_list_path(), &probe) == 0) blocked |= 8;
+    }
+    return opened | blocked;
 }
 
 static void load_denylist() {
-    load_denylist_locked_state();
+    int opens_ok = load_denylist_locked_state();
+    // Round 29: latch the EXISTS-BUT-UNREADABLE case (blocked bits
+    // 4/8). The old code latched g_*_loaded=1 no matter what, and the
+    // refresh path only reloaded on an mtime CHANGE — so a load whose
+    // fopen() was DENIED while the file existed (SELinux denial, a
+    // kernel-side path block on the zygote's exe — the exact class
+    // ReZygisk issue #380 documents on Samsung, or any other
+    // transient EACCES) stored the CURRENT mtime and then never
+    // reloaded: the empty deny map and the empty uid map stayed for
+    // the whole boot, silently. A merely-missing file is NOT latched
+    // (the mtime path picks it up when it appears; latching it would
+    // burn one pointless fopen() per interval on hosts/early boot).
+    g_last_load_open_fail.store((opens_ok & 0b1100) != 0,
+                                std::memory_order_relaxed);
     struct stat st{};
     if (stat(denylist_path(), &st) == 0) {
         g_denylist_mtime.store(st.st_mtime, std::memory_order_relaxed);
@@ -512,6 +552,15 @@ static void maybe_refresh_denylist() {
     // denylist file never checked packages.list at all, restoring
     // the staleness the fix was for. Caught by the new test.
     int changed = 0;
+    // Round 29: a load that failed to OPEN one of the files (they
+    // existed but fopen() was denied) stored their CURRENT mtimes —
+    // the mtime comparison below then sees "unchanged" and never
+    // retries. While the failure latch is set, retry every interval:
+    // a permanently failing open costs one fopen() per 2 s, a
+    // transient one heals within 2 s instead of never.
+    if (g_last_load_open_fail.load(std::memory_order_relaxed)) {
+        changed = 1;
+    }
     struct stat st{};
     if (stat(denylist_path(), &st) == 0 &&
         st.st_mtime != g_denylist_mtime.load(std::memory_order_relaxed)) {

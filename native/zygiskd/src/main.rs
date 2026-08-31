@@ -115,6 +115,15 @@ const SOCK_PATH:     &str = "/data/system/zygisk_study/sock/sock";
 /// root-only, and never listed in any world-readable proc file (the
 /// thing that made the fixed socket path a detection vector).
 const SESSION_FILE:  &str = "/data/adb/modules/zygisk_study/session.sock";
+/// Round 29 — SECOND session record, inside the /data/system workdir
+/// the daemon already owns. The payload's fallback when the module
+/// tree is unreadable from the zygote: ReZygisk issue #380 documents
+/// Samsung devices where kernel-side path rules block app_process64
+/// from opening /data/adb/modules paths. Our loader .so comes from
+/// the systemless /system/lib64 magic mount (unaffected), but the
+/// session file under /data/adb/modules would be — the workdir copy
+/// keeps the whole dispatch layer alive on those devices.
+const SESSION_FILE_ALT: &str = "/data/system/zygisk_study/session.sock";
 /// Where to look for installed Zygisk modules.
 const MODULES_ROOT:  &str = "/data/adb/modules";
 /// The denylist file.
@@ -269,26 +278,96 @@ const PROP_FILE_MAX: usize = 8 * 1024 * 1024;
 /// file_contexts — verified from AOSP android-6.0.0_r1 external/
 /// sepolicy and init/init.cpp); 7.0+ map properties_serial inside
 /// the /dev/__properties__/ directory (labeled
-/// u:object_r:properties_serial:s0 by bionic's fsetxattr). The
-/// staged file must carry the label the PLATFORM gave the real
+/// u:object_r:properties_serial:s0 by bionic's fsetxattr — verified
+/// at android-13.0.0_r1 contexts_split.cpp:204 and
+/// contexts_serialized.cpp:78, which hard-code that exact string).
+/// The staged file must carry the label the PLATFORM gave the real
 /// file, or exec'd helpers in untrusted_app get EACCES on the
 /// bind-mounted replacement.
-fn props_file_label() -> &'static str {
+///
+/// ROUND 29 — OEM-PROOFING: the label is now read from the LIVE file
+/// first (lgetxattr security.selinux on the actual target) and the
+/// hard-coded AOSP strings are only the fallback. Real-firmware
+/// verification: Samsung OneUI 5.1 (A53, android-13) and Xiaomi
+/// MIUI 14 (marble, android-13) plat_file_contexts dumps both carry
+/// `/dev/__properties__ u:object_r:properties_device:s0` for the
+/// directory and no OEM override for the serial file, and bionic
+/// (which every OEM ships) sets the serial-file label itself — so
+/// the fallback equals the live value on those builds. But an OEM
+/// (or a future Android) is free to use a custom type: copying the
+/// observed context verbatim makes the staged file match whatever
+/// the platform actually did, and if the xattr read fails (any
+/// reason) we degrade to exactly the old behavior.
+fn props_file_target_path() -> &'static str {
+    // 6.x: the single-file area IS the target. 7.0+ (or unknown):
+    // the serial file inside the directory.
+    match std::fs::symlink_metadata("/dev/__properties__") {
+        Ok(md) if md.file_type().is_file() => "/dev/__properties__",
+        _ => "/dev/__properties__/properties_serial",
+    }
+}
+
+/// Sanitize a raw `security.selinux` xattr value into a context
+/// string usable for lsetxattr. The kernel convention stores the
+/// context with a trailing NUL; values that are empty, contain
+/// control bytes, or exceed a sane length (Android contexts are
+/// "u:object_r:TYPE:s0...", well under 128 bytes) are rejected.
+fn sanitize_selinux_context(bytes: &[u8]) -> Option<String> {
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    let ctx = &bytes[..end];
+    if ctx.is_empty() || ctx.len() > 120 {
+        return None;
+    }
+    if !ctx.iter().all(|&b| (0x20..=0x7e).contains(&b)) {
+        return None;
+    }
+    // An Android SELinux context has at least the four "u:r:s" colons.
+    if ctx.iter().filter(|&&b| b == b':').count() < 3 {
+        return None;
+    }
+    std::str::from_utf8(ctx).ok().map(|s| s.to_string())
+}
+
+/// Read the live file's own SELinux label. Best-effort: any failure
+/// (no xattr support, EPERM, file missing) returns None and the
+/// caller falls back to the AOSP constants.
+fn read_live_selinux_context(path: &str) -> Option<String> {
+    use std::ffi::CString;
+    let c_path = CString::new(path).ok()?;
+    let mut buf = [0u8; 128];
+    let rv = unsafe {
+        libc::lgetxattr(
+            c_path.as_ptr(),
+            c"security.selinux".as_ptr(),
+            buf.as_mut_ptr() as *mut libc::c_void,
+            buf.len())
+    };
+    if rv <= 0 {
+        return None;
+    }
+    sanitize_selinux_context(&buf[..rv as usize])
+}
+
+fn props_file_label() -> String {
+    // Round 29: prefer the exact context the platform gave the real
+    // file (OEM-proof); fall back to the verified AOSP constants.
+    if let Some(ctx) = read_live_selinux_context(props_file_target_path()) {
+        return ctx;
+    }
     match std::fs::symlink_metadata("/dev/__properties__") {
         Ok(md) => {
             if md.file_type().is_file() {
                 // Android 6.x: the single-file property area.
-                "u:object_r:properties_device:s0"
+                "u:object_r:properties_device:s0".to_string()
             } else {
                 // Android 7.0+: the directory form.
-                "u:object_r:properties_serial:s0"
+                "u:object_r:properties_serial:s0".to_string()
             }
         }
         Err(_) => {
-            // Cannot stat (should not happen — the daemon runs after
-            // /dev is populated): default to the modern label, which
-            // is also the more common case.
-            "u:object_r:properties_serial:s0"
+            // Cannot stat (host tests / very early boot): default to
+            // the modern label, which is also the more common case.
+            "u:object_r:properties_serial:s0".to_string()
         }
     }
 }
@@ -349,7 +428,7 @@ fn try_handle_props_file_root(stream: &mut UnixStream, first: u8,
     };
     if f.write_all(&buf).is_err() { fail(stream); return true; }
     let label = props_file_label();
-    if !chcon(&path, label) {
+    if !chcon(&path, &label) {
         // Non-fatal, same as ReZygisk: the mount still serves the
         // bytes to root/zygote-domain readers; exec'd helpers may be
         // denied by their own domain (documented residual).
@@ -886,8 +965,15 @@ fn spawn_privileged_child<F>(stream: UnixStream, state: Arc<DaemonState>,
 /// Also cleans the PREVIOUS boot's random directory (read from the
 /// stale session file before overwriting it).
 fn setup_random_socket() -> Option<String> {
-    // Clean up the previous boot's random dir, if any.
-    if let Ok(old) = std::fs::read_to_string(remap_path(SESSION_FILE)) {
+    // Clean up the previous boot's random dir, if any. Round 29: try
+    // BOTH session records (the module-dir one first; if the module
+    // tree is gone/unreadable, the workdir copy still names the
+    // previous random dir — closing a small leak where a module-dir
+    // loss orphaned /data/system/.<hex> forever).
+    let old = std::fs::read_to_string(remap_path(SESSION_FILE))
+        .or_else(|_| std::fs::read_to_string(remap_path(SESSION_FILE_ALT)))
+        .ok();
+    if let Some(old) = old {
         let old = old.trim();
         // Only ever remove paths WE created (defense in depth: the
         // prefix is checked, not trusted). Round 28: the prefix check
@@ -928,7 +1014,11 @@ fn setup_random_socket() -> Option<String> {
     // Hand the path to the payload BEFORE binding so a fast zygote
     // never races a missing file (worst case it falls back to the
     // fixed path and simply fails to fetch modules this boot).
+    // Round 29: write BOTH records — the module-dir file and the
+    // workdir fallback (see SESSION_FILE_ALT).
     std::fs::write(remap_path(SESSION_FILE), &path).ok()?;
+    std::fs::create_dir_all(remap_path(WORKDIR)).ok()?;
+    std::fs::write(remap_path(SESSION_FILE_ALT), &path).ok()?;
     Some(path)
 }
 
@@ -1488,6 +1578,64 @@ mod tests {
             let abi = pick_abi();
             assert!(!abi.is_empty());
         }
+    }
+
+    // ---------------- Round 29: SELinux label resolution ----------------
+
+    #[test]
+    fn sanitize_selinux_context_accepts_real_android_contexts() {
+        // The exact string bionic hard-codes for properties_serial
+        // (android-13.0.0_r1 contexts_split.cpp:204), with the kernel's
+        // trailing-NUL convention included.
+        assert_eq!(
+            sanitize_selinux_context(b"u:object_r:properties_serial:s0\0"),
+            Some("u:object_r:properties_serial:s0".to_string()));
+        assert_eq!(
+            sanitize_selinux_context(b"u:object_r:properties_device:s0\0"),
+            Some("u:object_r:properties_device:s0".to_string()));
+        // A hypothetical OEM-custom type is passed through verbatim.
+        assert_eq!(
+            sanitize_selinux_context(b"u:object_r:oem_prop_serial:s0:c512\0"),
+            Some("u:object_r:oem_prop_serial:s0:c512".to_string()));
+        // No trailing NUL (raw len returned by lgetxattr) also fine.
+        assert_eq!(
+            sanitize_selinux_context(b"u:object_r:properties_serial:s0"),
+            Some("u:object_r:properties_serial:s0".to_string()));
+    }
+
+    #[test]
+    fn sanitize_selinux_context_rejects_garbage() {
+        assert_eq!(sanitize_selinux_context(b""), None);                 // empty
+        assert_eq!(sanitize_selinux_context(b"\0"), None);               // NUL only
+        assert_eq!(sanitize_selinux_context(b"nocolons"), None);         // not a context
+        assert_eq!(sanitize_selinux_context(b"a:b"), None);              // < 3 colons
+        // Control bytes are refused.
+        assert_eq!(sanitize_selinux_context(b"u:o\x01b:r:t:s0\0"), None);
+        // Overlong (the buffer is 128; > 120 content is refused even
+        // though it "fits").
+        let long = format!("u:object_r:{}:s0", "A".repeat(200));
+        assert_eq!(sanitize_selinux_context(long.as_bytes()), None);
+    }
+
+    #[test]
+    fn props_file_label_falls_back_to_the_aosp_constant_on_this_host() {
+        // This host has no /dev/__properties__ and no permission to
+        // read security.* xattrs, so the runtime-copy path fails and
+        // the verified AOSP fallback must apply — the modern serial
+        // label (same behavior as before Round 29).
+        let label = props_file_label();
+        assert!(
+            label == "u:object_r:properties_serial:s0"
+                || label == "u:object_r:properties_device:s0",
+            "unexpected label: {}", label);
+    }
+
+    #[test]
+    fn props_file_target_path_is_the_6x_file_or_the_7x_serial() {
+        // On this host /dev/__properties__ does not exist: the path
+        // must resolve to the 7.0+ serial file.
+        assert_eq!(props_file_target_path(),
+                   "/dev/__properties__/properties_serial");
     }
 
     // ---------------- DaemonState reloads ----------------

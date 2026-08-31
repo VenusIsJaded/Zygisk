@@ -284,6 +284,7 @@ typedef void  (*Fn_force_deny)(int);
 typedef int   (*Fn_dispatch_wanted)();
 typedef int   (*Fn_onload_done)();
 typedef void  (*Fn_set_session_file)(const char*);
+typedef void  (*Fn_set_session_file_alt)(const char*);
 typedef int   (*Fn_load_session)();
 typedef void  (*Fn_reset_refresh)();
 
@@ -302,6 +303,7 @@ static Fn_force_deny      fn_force_deny;
 static Fn_dispatch_wanted fn_dispatch_wanted;
 static Fn_onload_done     fn_onload_done;
 static Fn_set_session_file fn_set_session_file;
+static Fn_set_session_file_alt fn_set_session_file_alt;
 static Fn_load_session     fn_load_session;
 static Fn_reset_refresh    fn_reset_refresh;
 
@@ -389,6 +391,7 @@ static void setup_payload() {
     fn_dispatch_wanted = (Fn_dispatch_wanted)sym("zs_module_dispatch_wanted");
     fn_onload_done     = (Fn_onload_done)sym("zs_module_onload_done");
     fn_set_session_file = (Fn_set_session_file)sym("zs_test_set_session_file");
+    fn_set_session_file_alt = (Fn_set_session_file_alt)sym("zs_test_set_session_file_alt");
     fn_load_session     = (Fn_load_session)sym("zs_test_load_session");
     fn_reset_refresh    = (Fn_reset_refresh)sym("hide_test_reset_refresh");
 
@@ -774,6 +777,85 @@ ZS_TEST(session_file_rejects_relative_and_blank_content) {
 }
 
 //
+// ----------------------------------------------------------------------
+// Round 29 — the SECOND session record (the /data/system workdir
+// copy). ReZygisk issue #380 documents Samsung devices where kernel
+// path rules block app_process64 from opening /data/adb/modules
+// paths; our loader .so loads from the systemless /system/lib64
+// magic mount, but the module-dir session file would be unreadable.
+// The daemon now writes the same record into its workdir and the
+// payload falls back to it.
+// ----------------------------------------------------------------------
+ZS_TEST(session_fallback_record_used_when_module_dir_is_unreadable) {
+    // A fake daemon at a "randomized" neutral path (as the real
+    // daemon creates per boot under /data/system/.<hex>).
+    std::string rand_dir = "/tmp/zstest_randdir2_XXXXXX";
+    char* d = mkdtemp(&rand_dir[0]);
+    ZS_CHECK(d != nullptr);
+    std::string sock2 = rand_dir + "/s";
+    static volatile int alt_hits = 0;
+    static DaemonCfg cfg2;
+    cfg2.path = sock2;
+    cfg2.max_serve = 4;
+    cfg2.companion_hits = &alt_hits;
+    pthread_t th2;
+    ZS_CHECK(pthread_create(&th2, nullptr, daemon_thread, &cfg2) == 0);
+    pthread_detach(th2);
+    usleep(100 * 1000);
+
+    // The module-dir record is UNREADABLE (the Samsung block), the
+    // workdir record carries the path.
+    char alt_sess[] = "/tmp/zs_test_sess_alt_XXXXXX";
+    int afd = mkstemp(alt_sess);
+    ZS_CHECK(afd >= 0);
+    std::string line = sock2 + "\n";
+    ZS_CHECK(write(afd, line.c_str(), line.size()) > 0);
+    close(afd);
+    fn_set_session_file("/tmp/zs_test_session_blocked_by_kernel");
+    fn_set_session_file_alt(alt_sess);
+
+    // The fallback record must switch the socket + register filters.
+    ZS_CHECK(fn_load_session() == 1);
+
+    // End-to-end: the dispatch child reaches the daemon through the
+    // alt record's path (alt_hits is the discriminator).
+    int st = drive_child(10195, 10195);
+    ZS_CHECK(st == 0);
+    ZS_CHECK(rec_count() == 2);
+    ZS_CHECK(rec(0)->companion_fd >= 0);
+    usleep(100 * 1000);
+    ZS_CHECK(alt_hits >= 1);
+
+    // Cleanup + the healthy case pays nothing: with BOTH records
+    // readable and equal, the PRIMARY wins (already covered by the
+    // Round 13 test); with both missing, load fails closed.
+    fn_set_session_file(nullptr);
+    fn_set_session_file_alt(nullptr);
+    unlink(alt_sess);
+    rmdir(rand_dir.c_str());
+    rec_reset();
+}
+
+// Round 29 — the fallback parser gets the SAME hygiene as the
+// primary (the R28 overlong/truncation fix applies to both records:
+// garbage in the workdir record must not register filter prefixes).
+ZS_TEST(session_fallback_record_rejects_overlong_content) {
+    char alt_sess[] = "/tmp/zs_test_sess_alto_XXXXXX";
+    int afd = mkstemp(alt_sess);
+    ZS_CHECK(afd >= 0);
+    std::string long_path = "/" + std::string(119, 'x');
+    ZS_CHECK(write(afd, long_path.c_str(), long_path.size()) > 0);
+    close(afd);
+    fn_set_session_file("/tmp/zs_test_session_blocked_by_kernel");
+    fn_set_session_file_alt(alt_sess);
+
+    ZS_CHECK(fn_load_session() == 0);
+
+    fn_set_session_file(nullptr);
+    fn_set_session_file_alt(nullptr);
+    unlink(alt_sess);
+}
+
 // ----------------------------------------------------------------------
 // Round 14 — args cache + deny-decision skip
 // ----------------------------------------------------------------------
