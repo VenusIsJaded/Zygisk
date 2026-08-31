@@ -1005,6 +1005,473 @@ ZS_TEST(tier_b_registry_defers_installation) {
 // main()
 // ----------------------------------------------------------------------
 
+// ----------------------------------------------------------------------
+// Round 8 tests
+// ----------------------------------------------------------------------
+
+// Round 8 (B2/B3/S1/S2): the filter kind resolver covers every
+// documented path form — including the ones the Round 7 matcher
+// missed (/proc/mounts, per-thread task/<tid>/ files, /proc/net/unix,
+// /proc/self/environ).
+ZS_TEST(filter_kind_resolves_all_documented_variants) {
+    char pidpath[64], tidpath[80], netpath[64];
+    snprintf(pidpath, sizeof pidpath, "/proc/%d/maps", (int)getpid());
+    snprintf(netpath, sizeof netpath, "/proc/%d/net/unix", (int)getpid());
+
+    // PROC_LINE kinds.
+    ZS_CHECK_EQ(zs_filter_kind_for_path("/proc/self/maps"),
+                ZS_FILTER_PROC_LINE);
+    ZS_CHECK_EQ(zs_filter_kind_for_path("/proc/mounts"),
+                ZS_FILTER_PROC_LINE);   // B2: the classic alias
+    ZS_CHECK_EQ(zs_filter_kind_for_path(pidpath), ZS_FILTER_PROC_LINE);
+    ZS_CHECK_EQ(zs_filter_kind_for_path("/proc/thread-self/mountinfo"),
+                ZS_FILTER_PROC_LINE);
+    ZS_CHECK_EQ(zs_filter_kind_for_path("/proc/self/task/123/smaps"),
+                ZS_FILTER_PROC_LINE);   // B3: per-thread variant
+    ZS_CHECK_EQ(zs_filter_kind_for_path("/proc/self/smaps_rollup"),
+                ZS_FILTER_PROC_LINE);
+
+    // STATUS.
+    ZS_CHECK_EQ(zs_filter_kind_for_path("/proc/self/status"),
+                ZS_FILTER_STATUS);
+    ZS_CHECK_EQ(zs_filter_kind_for_path("/proc/thread-self/status"),
+                ZS_FILTER_STATUS);
+    ZS_CHECK_EQ(zs_filter_kind_for_path("/proc/self/task/9/status"),
+                ZS_FILTER_STATUS);
+
+    // ENVIRON (S2).
+    ZS_CHECK_EQ(zs_filter_kind_for_path("/proc/self/environ"),
+                ZS_FILTER_ENVIRON);
+    ZS_CHECK_EQ(zs_filter_kind_for_path("/proc/self/task/9/environ"),
+                ZS_FILTER_ENVIRON);
+    snprintf(tidpath, sizeof tidpath, "/proc/%d/task/%d/environ",
+             (int)getpid(), (int)getpid());
+    ZS_CHECK_EQ(zs_filter_kind_for_path(tidpath), ZS_FILTER_ENVIRON);
+
+    // NET_UNIX (S1).
+    ZS_CHECK_EQ(zs_filter_kind_for_path("/proc/net/unix"),
+                ZS_FILTER_NET_UNIX);
+    ZS_CHECK_EQ(zs_filter_kind_for_path("/proc/self/net/unix"),
+                ZS_FILTER_NET_UNIX);
+    ZS_CHECK_EQ(zs_filter_kind_for_path(netpath), ZS_FILTER_NET_UNIX);
+
+    // NOT filtered.
+    ZS_CHECK_EQ(zs_filter_kind_for_path("/proc/net/tcp"), ZS_FILTER_NONE);
+    ZS_CHECK_EQ(zs_filter_kind_for_path("/proc/self/net/tcp"),
+                ZS_FILTER_NONE);
+    ZS_CHECK_EQ(zs_filter_kind_for_path("/proc/self/cmdline"),
+                ZS_FILTER_NONE);
+    ZS_CHECK_EQ(zs_filter_kind_for_path("/proc/self/exe"),
+                ZS_FILTER_NONE);
+    ZS_CHECK_EQ(zs_filter_kind_for_path("/proc/1/maps"),
+                ZS_FILTER_NONE);   // a foreign pid — never touched
+    ZS_CHECK_EQ(zs_filter_kind_for_path(nullptr), ZS_FILTER_NONE);
+    ZS_CHECK_EQ(zs_filter_kind_for_path(""), ZS_FILTER_NONE);
+    ZS_CHECK_EQ(zs_filter_kind_for_path("/data/adb/magisk"),
+                ZS_FILTER_NONE);
+}
+
+// Round 8: zs_filter_record — PROC_LINE semantics.
+ZS_TEST(filter_record_proc_line_drops_hidden_paths) {
+    char dst[256];
+    const char* hidden =
+        "700000000000-7000001000 r-xp 00000000 00:00 1  "
+        "/data/adb/modules/x/libdetector.so";
+    ZS_CHECK_EQ(zs_filter_record(dst, sizeof dst, hidden,
+                                 strlen(hidden), ZS_FILTER_PROC_LINE),
+                (ssize_t)-1);
+
+    const char* hidden_sbin =
+        "700000000000-7000001000 r-xp 00000000 00:00 1  /sbin/magisk";
+    ZS_CHECK_EQ(zs_filter_record(dst, sizeof dst, hidden_sbin,
+                                 strlen(hidden_sbin), ZS_FILTER_PROC_LINE),
+                (ssize_t)-1);
+
+    const char* clean =
+        "700000000000-7000001000 r--p 00000000 00:00 1  "
+        "/system/lib64/libc.so";
+    ssize_t kept = zs_filter_record(dst, sizeof dst, clean,
+                                    strlen(clean), ZS_FILTER_PROC_LINE);
+    ZS_CHECK_EQ(kept, (ssize_t)strlen(clean));
+    ZS_CHECK(memcmp(dst, clean, (size_t)kept) == 0);
+
+    // In-place aliasing must work (the streaming loop relies on it).
+    char inbuf[256];
+    memcpy(inbuf, clean, strlen(clean) + 1);
+    kept = zs_filter_record(inbuf, sizeof inbuf, inbuf, strlen(clean),
+                            ZS_FILTER_PROC_LINE);
+    ZS_CHECK_EQ(kept, (ssize_t)strlen(clean));
+    ZS_CHECK(memcmp(inbuf, clean, (size_t)kept) == 0);
+}
+
+// Round 8: zs_filter_record — STATUS semantics.
+ZS_TEST(filter_record_status_rewrites_tracerpid) {
+    char dst[64];
+    const char* tracer = "TracerPid:\t12345";
+    ssize_t kept = zs_filter_record(dst, sizeof dst, tracer,
+                                    strlen(tracer), ZS_FILTER_STATUS);
+    ZS_CHECK_EQ(kept, (ssize_t)12);
+    ZS_CHECK(memcmp(dst, "TracerPid:\t0", 12) == 0);
+
+    // Non-TracerPid lines pass through verbatim.
+    const char* pid = "Pid:\t1234";
+    kept = zs_filter_record(dst, sizeof dst, pid, strlen(pid),
+                            ZS_FILTER_STATUS);
+    ZS_CHECK_EQ(kept, (ssize_t)strlen(pid));
+    ZS_CHECK(memcmp(dst, pid, (size_t)kept) == 0);
+
+    // A too-short TracerPid line is passed through unchanged (the
+    // fixed replacement would not fit in place).
+    const char* shortline = "TracerPid:0";
+    kept = zs_filter_record(dst, sizeof dst, shortline,
+                            strlen(shortline), ZS_FILTER_STATUS);
+    ZS_CHECK_EQ(kept, (ssize_t)strlen(shortline));
+    ZS_CHECK(memcmp(dst, shortline, (size_t)kept) == 0);
+}
+
+// Round 8 (S2): zs_filter_record — ENVIRON semantics.
+ZS_TEST(filter_record_environ_drops_our_vars) {
+    char dst[64];
+    const char* ours = "ZYGISK_STUDY_DEBUG=1";
+    ZS_CHECK_EQ(zs_filter_record(dst, sizeof dst, ours, strlen(ours),
+                                 ZS_FILTER_ENVIRON), (ssize_t)-1);
+    const char* ours2 = "ZYGISK_STUDY_WORKDIR=/x";
+    ZS_CHECK_EQ(zs_filter_record(dst, sizeof dst, ours2, strlen(ours2),
+                                 ZS_FILTER_ENVIRON), (ssize_t)-1);
+    // Similar-but-not-ours entries must survive.
+    const char* theirs = "ZYGISK_STUDY_X=1";   // not a real var name
+    ZS_CHECK(zs_filter_record(dst, sizeof dst, theirs, strlen(theirs),
+                              ZS_FILTER_ENVIRON) > 0);
+    const char* path = "PATH=/system/bin";
+    ZS_CHECK(zs_filter_record(dst, sizeof dst, path, strlen(path),
+                              ZS_FILTER_ENVIRON) > 0);
+}
+
+// Round 8 (S1): zs_filter_record — /proc/net/unix semantics.
+ZS_TEST(filter_record_unix_drops_framework_sockets) {
+    char dst[256];
+    const char* ours =
+        "    0000000000000001: 00000002 00000000 00010000 0001 01 10001 "
+        "/data/system/zygisk_study/sock/sock";
+    ZS_CHECK_EQ(zs_filter_record(dst, sizeof dst, ours, strlen(ours),
+                                 ZS_FILTER_NET_UNIX), (ssize_t)-1);
+    const char* magisk =
+        "    0000000000000002: 00000002 00000000 00010000 0001 01 10002 "
+        "/dev/socket/magisk";
+    ZS_CHECK_EQ(zs_filter_record(dst, sizeof dst, magisk,
+                                 strlen(magisk), ZS_FILTER_NET_UNIX),
+                (ssize_t)-1);
+    const char* clean =
+        "    0000000000000000: 00000002 00000000 00010000 0001 01 10000 "
+        "/dev/socket/thermal";
+    ZS_CHECK(zs_filter_record(dst, sizeof dst, clean, strlen(clean),
+                              ZS_FILTER_NET_UNIX) > 0);
+}
+
+// Round 8 (B4): the streaming filter handles inputs far larger than
+// the old 256 KB cap, with hidden lines at the very end (exactly what
+// the Round 7 code silently truncated away).
+ZS_TEST(make_filtered_memfd_streams_arbitrarily_large_files) {
+    std::string input, expected;
+    input.reserve(420 * 1024);
+    expected.reserve(420 * 1024);
+    char line[200];
+    int lineno = 0;
+    while (input.size() < 400 * 1024) {
+        bool hidden = (lineno % 97 == 0);
+        snprintf(line, sizeof line,
+                 "%012lx-%012lx r-%cp 00000000 00:00 %d  %s\n",
+                 0x700000000000UL + (unsigned long)lineno * 0x1000UL,
+                 0x700000000000UL + (unsigned long)(lineno + 1) * 0x1000UL,
+                 hidden ? 'x' : '-', lineno,
+                 hidden ? "/data/adb/modules/evil/libdetector.so"
+                        : "/system/lib64/libc.so");
+        input += line;
+        if (!hidden) expected += line;
+        ++lineno;
+    }
+    // A hidden line as the VERY LAST line of the file.
+    input += "700000100000-700000101000 r-xp 00000000 00:00 999  "
+             "/data/adb/modules/evil/last_line.so\n";
+    // And a clean trailing line.
+    input += "700000200000-700000201000 r--p 00000000 00:00 998  "
+             "/system/lib64/libtail.so\n";
+    expected += "700000200000-700000201000 r--p 00000000 00:00 998  "
+                "/system/lib64/libtail.so\n";
+
+    int input_fd = write_text_to_memfd(input);
+    ZS_CHECK(input_fd >= 0);
+    int filtered_fd = make_filtered_memfd(input_fd, "/proc/self/maps");
+    ZS_CHECK(filtered_fd >= 0);
+    std::string out = read_fd_to_string(filtered_fd);
+
+    ZS_CHECK_EQ(out.size(), expected.size());
+    ZS_CHECK(out == expected);
+    ZS_CHECK_STR_CONTAINS(out, "/system/lib64/libtail.so");
+    ZS_CHECK_STR_ABSENT(out, "libdetector.so");
+    ZS_CHECK_STR_ABSENT(out, "last_line.so");
+
+    close(input_fd);
+    close(filtered_fd);
+}
+
+// Round 8 (S2): the environ filter drops our variables from a
+// NUL-separated /proc/self/environ stream.
+ZS_TEST(make_filtered_memfd_filters_environ) {
+    std::string input;
+    input += "PATH=/sbin:/system/bin"; input += '\0';
+    input += "ZYGISK_STUDY_DEBUG=1";    input += '\0';
+    input += "HOME=/data";              input += '\0';
+    input += "ZYGISK_STUDY_LOG_TAG=zs"; input += '\0';
+    input += "BOOTCLASSPATH=/system/framework/core.jar"; input += '\0';
+
+    std::string expected;
+    expected += "PATH=/sbin:/system/bin"; expected += '\0';
+    expected += "HOME=/data";              expected += '\0';
+    expected += "BOOTCLASSPATH=/system/framework/core.jar"; expected += '\0';
+
+    int input_fd = write_text_to_memfd(input);
+    int filtered_fd = make_filtered_memfd(input_fd, "/proc/self/environ");
+    ZS_CHECK(filtered_fd >= 0);
+    std::string out = read_fd_to_string(filtered_fd);
+
+    // NUL-aware comparison (string::operator== handles embedded NULs).
+    ZS_CHECK_EQ(out.size(), expected.size());
+    ZS_CHECK(out == expected);
+    ZS_CHECK(memmem(out.data(), out.size(), "ZYGISK_STUDY",
+                    strlen("ZYGISK_STUDY")) == nullptr);
+
+    close(input_fd);
+    close(filtered_fd);
+}
+
+// Round 8 (S1): the /proc/net/unix filter hides our daemon socket.
+ZS_TEST(make_filtered_memfd_filters_unix_socket_table) {
+    std::string input =
+        "Num       RefCount Protocol Flags    Type St Inode Path\n"
+        "    0000000000000000: 00000002 00000000 00010000 0001 01 10000 "
+        "/dev/socket/thermal\n"
+        "    0000000000000001: 00000002 00000000 00010000 0001 01 10001 "
+        "/data/system/zygisk_study/sock/sock\n"
+        "    0000000000000002: 00000002 00000000 00010000 0001 01 10002 "
+        "@com.android.webview\n";
+    int input_fd = write_text_to_memfd(input);
+    int filtered_fd = make_filtered_memfd(input_fd, "/proc/net/unix");
+    ZS_CHECK(filtered_fd >= 0);
+    std::string out = read_fd_to_string(filtered_fd);
+
+    ZS_CHECK_STR_CONTAINS(out, "/dev/socket/thermal");
+    ZS_CHECK_STR_CONTAINS(out, "@com.android.webview");
+    ZS_CHECK_STR_ABSENT(out, "zygisk_study");
+    ZS_CHECK_STR_ABSENT(out, "/data/adb/");
+
+    close(input_fd);
+    close(filtered_fd);
+}
+
+// Round 8 (B1): the syscall hook forwards ALL SIX varargs. The Round 7
+// version forwarded four — a 5/6-argument syscall through the libc
+// wrapper had its trailing arguments replaced with garbage.
+static long g_syscall_capture_num = 0;
+static long g_syscall_capture_args[6] = {0};
+static long recording_syscall(long number, ...) {
+    va_list ap;
+    va_start(ap, number);
+    for (int i = 0; i < 6; ++i) {
+        g_syscall_capture_args[i] = va_arg(ap, long);
+    }
+    va_end(ap);
+    g_syscall_capture_num = number;
+    return 42;
+}
+
+ZS_TEST(syscall_hook_forwards_all_six_arguments) {
+    SyscallFn saved = g_real_syscall;
+    g_real_syscall = &recording_syscall;
+
+    long rv = zygisk_study_hook_syscall(424242L, 11L, 22L, 33L, 44L,
+                                        55L, 66L);
+    ZS_CHECK_EQ(rv, 42L);
+    ZS_CHECK_EQ(g_syscall_capture_num, 424242L);
+    ZS_CHECK_EQ(g_syscall_capture_args[0], 11L);
+    ZS_CHECK_EQ(g_syscall_capture_args[1], 22L);
+    ZS_CHECK_EQ(g_syscall_capture_args[2], 33L);
+    ZS_CHECK_EQ(g_syscall_capture_args[3], 44L);
+    ZS_CHECK_EQ(g_syscall_capture_args[4], 55L);
+    ZS_CHECK_EQ(g_syscall_capture_args[5], 66L);
+
+    g_real_syscall = saved;
+}
+
+// Round 8 (P1): the hash-indexed matcher resolves registered hooks.
+ZS_TEST(hook_index_matches_registered_hooks) {
+    hide_advanced_register_got_hook("zs_test_sym_a", (void*)0x1234);
+    hide_advanced_register_got_hook("zs_test_sym_b", (void*)0x5678);
+
+    ZS_CHECK_EQ((uintptr_t)zs_test_match_registered_hook("zs_test_sym_a"),
+                (uintptr_t)0x1234);
+    ZS_CHECK_EQ((uintptr_t)zs_test_match_registered_hook("zs_test_sym_b"),
+                (uintptr_t)0x5678);
+    ZS_CHECK_EQ((uintptr_t)zs_test_match_registered_hook("zs_test_sym_c"),
+                (uintptr_t)0);
+    ZS_CHECK_EQ((uintptr_t)zs_test_match_registered_hook("zs_test_sym"),
+                (uintptr_t)0);
+    // Re-registering an existing name is a no-op (first wins).
+    hide_advanced_register_got_hook("zs_test_sym_a", (void*)0x9999);
+    ZS_CHECK_EQ((uintptr_t)zs_test_match_registered_hook("zs_test_sym_a"),
+                (uintptr_t)0x1234);
+}
+
+// Round 8 (B8): fopen falls back to open()+fdopen() when dlsym could
+// not resolve the real fopen — instead of failing every file open.
+ZS_TEST(fopen_hook_falls_back_to_open_fdopen) {
+    FopenFn saved = g_real_fopen;
+    int prev_active = hide_advanced_is_active();
+    g_real_fopen = nullptr;
+    hide_advanced_set_active(0);
+
+    FILE* f = zygisk_study_hook_fopen("/proc/self/status", "r");
+    ZS_CHECK(f != nullptr);
+    if (f) {
+        char buf[32];
+        size_t n = fread(buf, 1, sizeof buf, f);
+        ZS_CHECK(n > 0);
+        fclose(f);
+    }
+
+    g_real_fopen = saved;
+    hide_advanced_set_active(prev_active);
+}
+
+// Round 8 (S3): opendir reports ENOENT for hidden paths; ordinary
+// directories still open.
+ZS_TEST(opendir_hook_enoent_for_hidden_paths) {
+    OpendirFn saved = g_real_opendir;
+    g_real_opendir = (OpendirFn)zs_resolve_libc("opendir");
+    ZS_CHECK(g_real_opendir != nullptr);
+    int prev_active = hide_advanced_is_active();
+    hide_advanced_set_active(1);
+
+    errno = 0;
+    DIR* d = zygisk_study_hook_opendir("/data/adb/magisk");
+    ZS_CHECK(d == nullptr);
+    ZS_CHECK_EQ(errno, ENOENT);
+
+    errno = 0;
+    d = zygisk_study_hook_opendir("/data/adb/modules/zygisk_study");
+    ZS_CHECK(d == nullptr);
+    ZS_CHECK_EQ(errno, ENOENT);
+
+    // A non-hidden directory still lists.
+    DIR* ok = zygisk_study_hook_opendir("/tmp");
+    ZS_CHECK(ok != nullptr);
+    if (ok) closedir(ok);
+
+    // Inactive: pure passthrough (must not fabricate ENOENT for
+    // paths that exist).
+    hide_advanced_set_active(0);
+    ok = zygisk_study_hook_opendir("/tmp");
+    ZS_CHECK(ok != nullptr);
+    if (ok) closedir(ok);
+
+    g_real_opendir = saved;
+    hide_advanced_set_active(prev_active);
+}
+
+// Round 8 (B10): the property spoof table covers
+// ro.dalvik.vm.native.bridge (our loudest property tell) and the
+// read hooks treat it as absent.
+ZS_TEST(prop_spoof_table_covers_native_bridge) {
+    size_t n = 0;
+    const ZsPropSpoof* t = zs_prop_spoof_table(&n);
+    const ZsPropSpoof* nb = nullptr;
+    for (size_t i = 0; i < n; ++i) {
+        if (strcmp(t[i].key, "ro.dalvik.vm.native.bridge") == 0) {
+            nb = &t[i];
+            break;
+        }
+    }
+    ZS_CHECK(nb != nullptr);
+    ZS_CHECK(nb->value != nullptr);
+    ZS_CHECK_EQ(nb->value[0], '\0');   // spoofed to empty
+    // Absent semantics for find()/get() (a stock arm64 device does
+    // not report a native bridge).
+    ZS_CHECK_EQ(prop_key_is_absent("ro.dalvik.vm.native.bridge"), 1);
+    // Boot keys with real stock values are NOT treated as absent.
+    ZS_CHECK_EQ(prop_key_is_absent("ro.boot.verifiedbootstate"), 0);
+}
+
+// Round 8 (P4): the walked-DSO mark set behaves (skip, clear, and
+// garbage collection against the live linker state).
+ZS_TEST(walked_dso_set_marks_clears_and_gcs) {
+    clear_walked_dsos();
+    mark_dso_walked(0x1234);
+    ZS_CHECK(dso_already_walked(0x1234) == 1);
+    ZS_CHECK(dso_already_walked(0x5678) == 0);
+
+    // 0x1234 is not a live DSO address — the GC after a dlclose must
+    // drop it.
+    gc_walked_dso_set();
+    ZS_CHECK(dso_already_walked(0x1234) == 0);
+
+    clear_walked_dsos();
+    ZS_CHECK(dso_already_walked(0x1234) == 0);
+}
+
+// Round 8 (B5): the property-mapping scan survives maps files larger
+// than any fixed buffer — the zygote's maps runs ~110 KB on real
+// devices and the Round 7 single-read scan silently missed every
+// /dev/__properties__ mapping past its 96 KB cap.
+ZS_TEST(find_prop_mappings_from_fd_handles_oversized_maps) {
+    // Build a >100 KB maps-like file with property mappings at the
+    // start, middle, and very END.
+    std::string content;
+    content.reserve(120 * 1024);
+    char line[200];
+    unsigned long addr = 0x700000000000UL;
+    int lineno = 0;
+    auto add_prop = [&](const char* perms) {
+        snprintf(line, sizeof line,
+                 "%012lx-%012lx %s 00000000 00:00 %d  "
+                 "/dev/__properties__/u:object_r:default_prop:s0\n",
+                 addr, addr + 0x1000, perms, lineno);
+        content += line;
+        addr += 0x1000;
+        ++lineno;
+    };
+    auto add_plain = [&]() {
+        snprintf(line, sizeof line,
+                 "%012lx-%012lx r--p 00000000 fd:00 %d  "
+                 "/system/lib64/libc.so\n",
+                 addr, addr + 0x1000, lineno);
+        content += line;
+        addr += 0x1000;
+        ++lineno;
+    };
+
+    add_prop("r--p");                       // near the start
+    while (content.size() < 60 * 1024) add_plain();
+    add_prop("r--p");                       // middle
+    while (content.size() < 120 * 1024) add_plain();
+    add_prop("r--p");                       // the very last line
+
+    int fd = write_text_to_memfd(content);
+    ZS_CHECK(fd >= 0);
+
+    PropMapping out[8];
+    size_t n = find_prop_mappings_from_fd(fd, out, 8);
+    ZS_CHECK_EQ(n, (size_t)3);
+    if (n == 3) {
+        // All three must be the property mappings (r--p perms).
+        ZS_CHECK(out[0].hi > out[0].lo);
+        ZS_CHECK(out[1].hi > out[1].lo);
+        ZS_CHECK(out[2].hi > out[2].lo);
+        ZS_CHECK(out[0].lo != out[1].lo);
+        ZS_CHECK(out[1].lo != out[2].lo);
+    }
+    close(fd);
+}
+
 int main() {
     std::fprintf(stderr, "=== Zygisk Study advanced hide layer tests ===\n");
     return zstest::run_all();

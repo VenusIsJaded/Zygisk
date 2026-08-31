@@ -45,6 +45,7 @@
 #pragma once
 
 #include <cstddef>
+#include <sys/types.h>
 
 namespace zygisk_study {
 
@@ -114,10 +115,45 @@ struct ZsPropSpoof {
 const ZsPropSpoof* zs_prop_spoof_table(size_t* count);
 
 // Tier-B-only: is `path` one of the /proc files we filter? Matches
-// the /proc/self/<f>, /proc/thread-self/<f> and /proc/<pid>/<f>
+// the /proc/self/<f>, /proc/thread-self/<f>, /proc/<pid>/<f>,
+// /proc/<pid>/task/<tid>/<f>, /proc/net/<f> and /proc/self/net/<f>
 // forms (most real detectors use their own numeric pid — the
 // pre-Round-7 code only matched the literal "/proc/self/..." string,
 // which every pid-based probe trivially bypassed).
 int zs_path_is_filtered(const char* path);
+
+// Round 8 — WHAT kind of filtering a matched path needs. The filter
+// engine (streaming memfd rewrite) behaves differently per kind:
+enum ZsFilterKind {
+    ZS_FILTER_NONE = 0,    // not a /proc file we touch
+    ZS_FILTER_PROC_LINE,   // maps/mounts/smaps/...: drop lines whose
+                           // path field matches kHiddenSubstrings
+    ZS_FILTER_STATUS,      // /proc/<pid>/status: rewrite TracerPid -> 0
+    ZS_FILTER_ENVIRON,     // NUL-separated env entries: drop ours
+    ZS_FILTER_NET_UNIX,    // /proc/net/unix: drop lines naming root-
+                           // framework sockets (our daemon socket leaks
+                           // its path there system-wide)
+};
+
+// Resolve the filter kind for a path (also the source of truth for
+// zs_path_is_filtered — "filtered" == kind != ZS_FILTER_NONE).
+ZsFilterKind zs_filter_kind_for_path(const char* path);
+
+// Filter one record of a /proc file (a line for newline-separated
+// kinds, an env entry for environ). `rec_len` excludes the separator.
+// Writes the kept (possibly rewritten) bytes to `dst` (which may
+// alias `rec` — in-place compaction) and returns the kept length, or
+// -1 when the record must be dropped. Pure function: host tests
+// exercise it directly.
+ssize_t zs_filter_record(char* dst, size_t dst_cap,
+                         const char* rec, size_t rec_len,
+                         ZsFilterKind kind);
+
+#ifdef ZS_HOST_TEST
+// Test-only: access the live-registry matcher used by the GOT walk
+// (hash-indexed since Round 8; verifies the index stays consistent
+// with the registry).
+void* zs_test_match_registered_hook(const char* name);
+#endif
 
 } // namespace zygisk_study

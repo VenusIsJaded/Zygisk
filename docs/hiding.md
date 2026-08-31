@@ -599,6 +599,56 @@ Be honest about what the hide layer does not do:
   `hlen < plen` guard. Covered by a new host-side test
   (`path_is_hidden_handles_prefix_of_hidden_path`).
 
+## Round 8 — additional gaps closed (this round)
+
+Round 8 closed the residual leaks the Round 7 ledger documented,
+plus several the fresh audit found:
+
+1. **`/proc/net/unix` (the daemon socket leak).** The daemon's
+   filesystem unix socket is listed in the GLOBAL, world-readable
+   socket table — directory permissions do not help, the socket
+   NAME is the tell. Tier B now filters `/proc/net/unix` (and the
+   `/proc/self/net/unix`, `/proc/<pid>/net/unix` aliases), dropping
+   every line that names a root-framework socket (`/data/adb/...`,
+   magisk/zygisk/riru strings, our own path). Residual: an app that
+   `execve()`s a helper binary reads the file unhooked — the same
+   exec residual every in-process hider has.
+
+2. **`/proc/self/environ`.** `unsetenv()` rewrites the `environ`
+   array; the proc file serves the ORIGINAL stack environment
+   block, so our variables were readable there forever. The file
+   is now filtered (NUL-separated entry drop) in addition to the
+   unsetenv scrub.
+
+3. **`ro.dalvik.vm.native.bridge`.** The injection mechanism leaves
+   it set to "libzygisk.so" for every process. Hidden processes now
+   see the stock state (empty value; find()/get() report absence —
+   what the property looked like before the swap, which the swap
+   guard guarantees was the original state).
+
+4. **`opendir()` on hidden paths.** stat/access returned ENOENT,
+   but directory ENUMERATION was never gated — `File.list()` and
+   native `opendir("/data/adb")` listed entries. opendir is now a
+   Tier B hook with the same ENOENT semantics. Residual: libc-
+   internal callers (scandir) are not caught.
+
+5. **Per-thread path variants.** `/proc/<pid>/task/<tid>/maps|status|environ`
+   and the readlink targets `task/<tid>/exe|fd` now match the
+   filters and rewriters.
+
+6. **`/proc/mounts` (the bare alias).** The most classic way to
+   read the mount table now matches the filter.
+
+7. **App-library collision guard.** The maps scanner no longer
+   claims mappings under `/data/app/`, `/data/data/`, `/data/user/`,
+   `/mnt/expand/`, `/storage/` — an app shipping its own
+   `libpayload.so` was crashable by name collision before.
+
+8. **Tier A soinfo safety.** Read-only segments of hidden libraries
+   are replaced by content-preserving anonymous pages instead of
+   being unmapped (see ANDROID-REALISM.md Round 8): the linker's
+   solist walks stay safe AND the file paths leave maps.
+
 ## Why this is "public knowledge"
 
 Every technique described in this file appears in one or more of:

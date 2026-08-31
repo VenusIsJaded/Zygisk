@@ -98,17 +98,25 @@ void hide_apply_for_target(const char* package_name);
 void hide_clean_trace();
 
 // ---- self-unmap record access (used by entry.cpp + trampoline) ----
-
-// One maps segment to be unmapped from the denylisted child.
+//
+// One maps segment to be removed from the denylisted child.
 // Kept in sync with the asm trampolines in
-// unmap_trampoline_aarch64.S / unmap_trampoline_x86_64.S — they read
-// {base, size} pairs with the exact layout below. Do not reorder.
+// unmap_trampoline_aarch64.S / unmap_trampoline_x86_64.S — the blob
+// reads {base, size} pairs with the exact layout below. Do not
+// reorder the leading fields.
 struct so_record {
     uintptr_t base;    // segment start
     size_t    size;    // segment length
     uint32_t  flags;   // ZS_SO_* bits
-    uint32_t  _pad;    // keep 8-byte stride stable for the asm
+    uint32_t  prot;    // ZS_SEG_* bits (from the maps perms field)
+    uint32_t  _pad;    // keep the stride stable
 };
+
+// Segment protection bits (so_record.prot), straight from the rwxp
+// chars of the maps line. Tier A uses them to decide HOW a segment
+// disappears — see hide_prepare_tier_a_records().
+#define ZS_SEG_X 0x1u   // executable (r-xp / rwxp)
+#define ZS_SEG_W 0x2u   // writable (rw-p / rwxp)
 
 // Records whose unmap must be deferred to the asm trampoline
 // (segments of libpayload itself — unmapping them from C would
@@ -130,10 +138,47 @@ size_t hide_unmap_records(struct so_record* out, size_t cap);
 // libpayload.so mapping this is 0 and the whole thing is a no-op.
 int    hide_trampoline_unmap_pending();
 
+// Round 8 — Tier A record preprocessing. MUST run as the first step
+// of the Tier A path, while libpayload code is still executing
+// normally:
+//
+//   - Every READ-ONLY (r--p) segment of every record — ours, the
+//     bridge, the loader, module .so files — is replaced by a
+//     content-preserving ANONYMOUS copy (same address, same bytes,
+//     named "linker_alloc" where PR_SET_VMA exists). Why not munmap:
+//     the dynamic linker keeps a soinfo node for every dlopen'd lib,
+//     and those nodes point into the r--p segment (program headers,
+//     .dynstr with the soname). Unmapping it leaves every later
+//     dlopen()/dl_iterate_phdr() walk reading unmapped memory — a
+//     random crash in app code long after we left. Keeping the bytes
+//     (but hiding the file path from maps) keeps those walks safe.
+//   - Executable/writable segments of ZS_SO_OTHER records are
+//     munmap'd right here (their code never runs again).
+//   - Executable/writable segments of ZS_SO_SELF records are copied
+//     into `out` (SELF records first, so the trampoline's fixed 32
+//     record array can never cut them when many modules are loaded)
+//     for the asm trampoline to unmap as its final act.
+//
+// Returns the number of records written to out.
+size_t hide_prepare_tier_a_records(struct so_record* out, size_t cap);
+
 #ifdef ZS_HOST_TEST
 // Test-only: inject a uid into the deny set (no root access to
 // packages.list on the host).
 void hide_test_force_deny_uid(uid_t uid);
+
+// Test-only: replace the record set (drives Tier A preprocessing
+// against synthetic records without loading real .so files).
+void hide_test_set_records(const struct so_record* recs, size_t count);
+
+// Test-only: point the denylist at a writable file and drive the
+// mtime-refresh + throttle logic deterministically.
+void   hide_test_set_denylist_path(const char* path);
+void   hide_test_reset_refresh();   // force the next mtime check to run
+int    hide_test_denylist_reload_count();
+
+// Test-only: run the maps scanner over synthetic content.
+void   zs_scan_maps_into_records_test(const char* buf, size_t total);
 #endif
 
 } // namespace zygisk_study

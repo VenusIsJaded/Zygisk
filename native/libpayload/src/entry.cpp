@@ -227,22 +227,6 @@ static void load_all_modules() {
 // package-name API).
 // ------------------------------------------------------------------------
 
-// Unmap every ZS_SO_OTHER record (module .so files, the loader, the
-// bridge — none of their code runs past this point) via plain C.
-// Returns the number of records unmapped. The ZS_SO_SELF records are
-// left for the trampoline.
-static void unmap_non_self_records() {
-    so_record recs[kTrampMaxRecords];
-    size_t n = hide_unmap_records(recs, kTrampMaxRecords);
-    for (size_t i = 0; i < n; ++i) {
-        if (!(recs[i].flags & ZS_SO_OTHER)) continue;
-        if (munmap((void*)recs[i].base, recs[i].size) != 0) {
-            ZS_LOGW("payload: munmap(%lx, %zu) failed",
-                    (unsigned long)recs[i].base, recs[i].size);
-        }
-    }
-}
-
 // A no-op "real call" for pipeline invocations that have no libc
 // function to relay (the exported package-name API).
 static long priv_drop_nop(void*) { return 0; }
@@ -271,9 +255,20 @@ static bool run_hide_pipeline(void* wrapper_fp,
     if (wrapper_fp && zs_trampoline_supported() &&
         hide_trampoline_unmap_pending()) {
         // ---------------- Tier A: vanish ----------------
-        // 1. Modules/loader segments go first (plain C is safe for
-        //    them — nothing of theirs executes past this point).
-        unmap_non_self_records();
+        // 1. Preprocess the record set (hide.cpp):
+        //      - every READ-ONLY segment of every record becomes a
+        //        content-preserving anonymous copy (the linker's
+        //        soinfo nodes point into those segments — unmapping
+        //        them turned a later dlopen() solist walk into a
+        //        crash; see hide.h),
+        //      - exec/writable segments of OTHER records (modules,
+        //        bridge, loader) are munmap'd right there,
+        //      - the remaining SELF exec/writable segments come back
+        //        for the trampoline, SELF records first so the fixed
+        //        32-record array can never cut them.
+        so_record prep_out[kTrampMaxRecords];
+        size_t pn = hide_prepare_tier_a_records(prep_out,
+                                                kTrampMaxRecords);
         // 2. Restore every GOT slot we ever patched. A slot pointing
         //    into soon-to-be-unmapped memory is a guaranteed crash on
         //    the app's next libc call.
@@ -282,15 +277,15 @@ static bool run_hide_pipeline(void* wrapper_fp,
         //    resumes after us assumes the call succeeded.
         long rv = call_real(real_ctx);
         // 4. Hand everything left to the trampoline: it unmaps our
-        //    own segments and returns `rv` to the wrapper's caller
-        //    without executing another libpayload instruction.
+        //    own remaining segments (text/data — the read-only
+        //    metadata survives as anonymous pages) and returns `rv`
+        //    to the wrapper's caller without executing another
+        //    libpayload instruction.
         ZsTrampRecord tramp_recs[kTrampMaxRecords];
-        so_record all[kTrampMaxRecords];
-        size_t an = hide_unmap_records(all, kTrampMaxRecords);
         size_t tn = 0;
-        for (size_t i = 0; i < an && tn < kTrampMaxRecords; ++i) {
-            tramp_recs[tn].base = all[i].base;
-            tramp_recs[tn].size = all[i].size;
+        for (size_t i = 0; i < pn && tn < kTrampMaxRecords; ++i) {
+            tramp_recs[tn].base = prep_out[i].base;
+            tramp_recs[tn].size = prep_out[i].size;
             ++tn;
         }
         if (zs_trampoline_unmap(tramp_recs, tn, wrapper_fp, rv) == 0) {
@@ -470,7 +465,6 @@ int zs_trampoline_unmap(const ZsTrampRecord* records, size_t count,
     }
     __builtin___clear_cache((char*)page, (char*)page + page_size);
 
-    // DEBUG markers (temporary)
     // Enter the blob. Never returns on success.
     ((void(*)(void*))page)((void*)data);
     return -1;  // unreachable on success; caller falls back to Tier B

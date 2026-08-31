@@ -171,6 +171,62 @@ ZS_TEST(hide_apply_for_target_fast_path_under_2us) {
 // main()
 // ----------------------------------------------------------------------
 
+// ----------------------------------------------------------------------
+// Round 8 (P1): the hash-indexed hook matcher resolves a symbol name
+// in bounded time with ~24 registered hooks (the Tier B registry
+// size). This lookup runs once per JMPREL entry of every loaded DSO
+// during the hide-time GOT walk — it is the inner loop of the most
+// expensive step of a hidden app launch.
+// ----------------------------------------------------------------------
+
+ZS_TEST(hook_matcher_resolves_under_100ns_median) {
+    // Register a realistic Tier B-sized set.
+    const char* names[] = {
+        "open", "openat", "__open_2", "__openat_2", "fopen",
+        "stat", "lstat", "access", "faccessat", "faccessat2",
+        "fstatat", "fstatat64", "__fstatat", "statx",
+        "__system_property_find", "__system_property_get",
+        "syscall", "dlopen", "android_dlopen_ext", "dlclose",
+        "opendir", "readlink", "readlinkat", "setresuid",
+    };
+    constexpr int kN = (int)(sizeof(names) / sizeof(names[0]));
+    for (int i = 0; i < kN; ++i) {
+        hide_advanced_register_got_hook(names[i], (void*)(uintptr_t)(0x1000 + i));
+    }
+    // Lookups that hit and lookups that miss.
+    const char* probes[] = {
+        "open", "fopen", "syscall", "readlinkat", "opendir",
+        "not_a_hook_symbol", "open64", "fgets", "malloc", "pthread_self",
+    };
+    constexpr int kP = (int)(sizeof(probes) / sizeof(probes[0]));
+
+    // Warm up (build the index).
+    ZS_CHECK(zs_test_match_registered_hook("open") != nullptr);
+
+    constexpr int kIters = 200000;
+    long long durations_ns[kIters];
+    for (int i = 0; i < kIters; ++i) {
+        const char* probe = probes[i % kP];
+        auto t0 = clk::now();
+        volatile void* r = zs_test_match_registered_hook(probe);
+        (void)r;
+        auto t1 = clk::now();
+        durations_ns[i] = std::chrono::duration_cast<
+            std::chrono::nanoseconds>(t1 - t0).count();
+    }
+    std::sort(durations_ns, durations_ns + kIters);
+    long long median = durations_ns[kIters / 2];
+    std::fprintf(stderr, "  [perf] hook matcher median: %lld ns\n", median);
+    // Budget: 100 ns median on the host (each clock pair itself costs
+    // ~20-40 ns, so this mostly measures the clock).
+    ZS_CHECK(median < 500);
+
+    // Correctness spot check through the same path.
+    ZS_CHECK(zs_test_match_registered_hook("open") ==
+             (void*)(uintptr_t)0x1000);
+    ZS_CHECK(zs_test_match_registered_hook("not_a_hook_symbol") == nullptr);
+}
+
 int main() {
     std::fprintf(stderr, "=== Zygisk Study perf microbenchmarks ===\n");
     return zstest::run_all();

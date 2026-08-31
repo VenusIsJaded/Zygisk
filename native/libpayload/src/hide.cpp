@@ -59,6 +59,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/mount.h>
+#include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/uio.h>
@@ -118,6 +119,24 @@ static std::atomic<int>                g_uid_map_loaded{0};
 // actually changed — user edits still show up, the steady-state cost
 // per fork is one stat.
 static std::atomic<time_t> g_denylist_mtime{-1};
+
+// Round 8 (P2): the mtime check itself is throttled. The pre-Round-8
+// code stat()ed the denylist on EVERY fork of EVERY app (~1 µs of
+// syscall per app launch, system-wide, forever). Children inherit
+// the zygote's loaded copy AND its load timestamp, so a wall-clock
+// throttle would degenerate to a per-fork re-read. Instead: a vDSO
+// clock read (CLOCK_MONOTONIC_COARSE, ~20 ns, no context switch)
+// gates the stat(); the stat() only runs at most once per interval.
+// User edits still land within 2 seconds.
+static constexpr time_t kDenylistRefreshIntervalSec = 2;
+static std::atomic<time_t> g_next_refresh_check{0};
+static int g_denylist_reload_count = 0;   // test observable
+
+// DenyList file path. Overridable by host tests (the real path needs
+// a root-owned /data/system tree that does not exist on the host).
+static const char* g_denylist_path =
+    "/data/system/zygisk_study/denylist";
+static const char* denylist_path() { return g_denylist_path; }
 
 // The set of properties that publicly reveal Magisk's presence.
 // This list is NOT exhaustive — it is the union of the keys
@@ -206,8 +225,11 @@ struct MapsLine {
 };
 
 // Parse a single maps line (NUL-terminated copy in `line`).
-// Returns 1 on success.
-static int parse_maps_line(const char* line, MapsLine* out) {
+// Returns 1 on success. `prot_out` receives the ZS_SEG_X/ZS_SEG_W
+// bits for the segment (Round 8: Tier A needs to know HOW each
+// segment disappears).
+static int parse_maps_line(const char* line, MapsLine* out,
+                           uint32_t* prot_out = nullptr) {
     char perms[8], off[32], dev[32];
     char path[256] = "";
     uintptr_t lo = 0, hi = 0;
@@ -221,6 +243,11 @@ static int parse_maps_line(const char* line, MapsLine* out) {
     memcpy(out->path, path, len);
     out->path[len] = '\0';
     out->has_path = (n >= 6) && len > 0;
+    if (prot_out) {
+        *prot_out = (uint32_t)
+            ((strchr(perms, 'x') ? ZS_SEG_X : 0u) |
+             (strchr(perms, 'w') ? ZS_SEG_W : 0u));
+    }
     return 1;
 }
 
@@ -230,7 +257,8 @@ static int parse_maps_line(const char* line, MapsLine* out) {
 static std::vector<std::string> g_extra_so_fragments;
 
 // Add a record if there is room and it is not already present.
-static void add_so_record(uintptr_t lo, uintptr_t hi, uint32_t flags) {
+static void add_so_record(uintptr_t lo, uintptr_t hi, uint32_t flags,
+                          uint32_t prot) {
     if (lo >= hi) return;
     for (size_t i = 0; i < g_self_so_count; ++i) {
         if (g_self_so_records[i].base == lo) return; // dedupe
@@ -244,7 +272,33 @@ static void add_so_record(uintptr_t lo, uintptr_t hi, uint32_t flags) {
     rec->base  = lo;
     rec->size  = hi - lo;
     rec->flags = flags;
+    rec->prot  = prot;
     rec->_pad  = 0;
+}
+
+// Round 8 (B9): app library directories. A mapping whose path lives
+// under one of these belongs to the APP (its own bundled .so files),
+// not to us — even when the file name collides with ours (an app is
+// free to ship its own "libpayload.so"). Unmapping or anonymizing an
+// app library would crash the app; the pre-Round-8 scanner matched on
+// the bare file NAME, so a name collision was enough to do exactly
+// that.
+static const char* const kAppLibPathPrefixes[] = {
+    "/data/app/",
+    "/data/data/",
+    "/data/user/",
+    "/data/user_de/",
+    "/mnt/expand/",
+    "/storage/",
+    "/sdcard/",
+};
+
+static int path_is_under_app_dirs(const char* path, size_t len) {
+    for (const char* pre : kAppLibPathPrefixes) {
+        size_t n = __builtin_strlen(pre);
+        if (len >= n && memcmp(path, pre, n) == 0) return 1;
+    }
+    return 0;
 }
 
 // Should a maps path be treated as "one of ours"?
@@ -253,6 +307,8 @@ static void add_so_record(uintptr_t lo, uintptr_t hi, uint32_t flags) {
 // r-xp segments, which left the r--p/rw-p segment lines containing
 // "libpayload.so" in /proc/self/maps after the unmap — the most
 // basic `grep libpayload /proc/self/maps` probe still hit).
+// Round 8 (B9): the file-name match now excludes app library
+// directories (see kAppLibPathPrefixes).
 static void scan_maps_into_records(const char* buf, size_t total) {
     char linebuf[512];
     const char* line_start = buf;
@@ -267,20 +323,25 @@ static void scan_maps_into_records(const char* buf, size_t total) {
         linebuf[copy_len] = '\0';
 
         MapsLine ml{};
-        if (parse_maps_line(linebuf, &ml) && ml.has_path) {
-            int is_self = strstr(ml.path, "libpayload.so") != nullptr;
+        uint32_t prot = 0;
+        if (parse_maps_line(linebuf, &ml, &prot) && ml.has_path) {
+            const size_t plen = strnlen(ml.path, sizeof(ml.path));
+            int in_app_dir = path_is_under_app_dirs(ml.path, plen);
+            int is_self = !in_app_dir &&
+                          strstr(ml.path, "libpayload.so") != nullptr;
             int is_ours =
                 is_self ||
-                strstr(ml.path, "libzygisk.so")    != nullptr ||
-                strstr(ml.path, "libzn_loader.so") != nullptr;
+                (!in_app_dir &&
+                 (strstr(ml.path, "libzygisk.so")    != nullptr ||
+                  strstr(ml.path, "libzn_loader.so") != nullptr));
             if (is_ours) {
                 add_so_record(ml.lo, ml.hi,
-                              is_self ? ZS_SO_SELF : ZS_SO_OTHER);
-            } else {
+                              is_self ? ZS_SO_SELF : ZS_SO_OTHER, prot);
+            } else if (!in_app_dir) {
                 // Registered module .so paths (hide_register_extra_so).
                 for (const std::string& frag : g_extra_so_fragments) {
                     if (strstr(ml.path, frag.c_str()) != nullptr) {
-                        add_so_record(ml.lo, ml.hi, ZS_SO_OTHER);
+                        add_so_record(ml.lo, ml.hi, ZS_SO_OTHER, prot);
                         break;
                     }
                 }
@@ -345,7 +406,13 @@ static constexpr const char* kPackagesListPath =
     "/data/system/packages.list";
 
 static void load_denylist_locked_state() {
-    FILE* fp = fopen("/data/system/zygisk_study/denylist", "r");
+    // Round 8 (caught by the new reload tests): the cache must be
+    // rebuilt from scratch. The old code merged every reload into the
+    // existing set — once a package was denylisted, REMOVING it from
+    // the denylist file never took effect until the next zygote
+    // restart.
+    g_denylist_cache.clear();
+    FILE* fp = fopen(denylist_path(), "r");
     if (fp) {
         char line[256];
         while (fgets(line, sizeof line, fp)) {
@@ -359,6 +426,7 @@ static void load_denylist_locked_state() {
         fclose(fp);
     }
     g_denylist_loaded.store(1);
+    ++g_denylist_reload_count;
 
     // uid map: denylist package names -> appIds.
     g_deny_app_ids.clear();
@@ -382,15 +450,24 @@ static void load_denylist_locked_state() {
 static void load_denylist() {
     load_denylist_locked_state();
     struct stat st{};
-    if (stat("/data/system/zygisk_study/denylist", &st) == 0) {
+    if (stat(denylist_path(), &st) == 0) {
         g_denylist_mtime.store(st.st_mtime, std::memory_order_relaxed);
     }
 }
 
-// Reload only when the file's mtime moved. One stat() per lookup.
+// Reload only when the file's mtime moved, and only check the mtime
+// when the throttle interval has elapsed. Steady-state per-fork cost:
+// one vDSO clock read.
 static void maybe_refresh_denylist() {
+    struct timespec now{};
+    clock_gettime(CLOCK_MONOTONIC_COARSE, &now);   // vDSO, ~20 ns
+    if (now.tv_sec < g_next_refresh_check.load(std::memory_order_relaxed)) {
+        return;
+    }
+    g_next_refresh_check.store(now.tv_sec + kDenylistRefreshIntervalSec,
+                               std::memory_order_relaxed);
     struct stat st{};
-    if (stat("/data/system/zygisk_study/denylist", &st) != 0) return;
+    if (stat(denylist_path(), &st) != 0) return;
     time_t known = g_denylist_mtime.load(std::memory_order_relaxed);
     if (st.st_mtime == known) return;
     load_denylist();
@@ -677,12 +754,161 @@ int hide_trampoline_unmap_pending() {
     return 0;
 }
 
+// ------------------------------------------------------------------------
+// Round 8 — Tier A record preprocessing (see hide.h for the contract)
+// ------------------------------------------------------------------------
+
+// Replace the mapping at [lo, lo+size) with a content-preserving
+// ANONYMOUS copy: save the bytes, MAP_FIXED an anon mapping over the
+// range, restore the bytes, then restore the original protection and
+// (where the kernel supports it) name the region "linker_alloc" so
+// /proc/self/maps shows a benign anon label instead of a file path.
+//
+// The read-only segments of our .so files carry the ELF program
+// headers and .dynstr that the dynamic linker's soinfo nodes point
+// at. munmap()ing them (the Round 7 behavior) left every later
+// dlopen()/dl_iterate_phdr() solist walk one strcmp away from a
+// SIGSEGV in app code. Keeping the bytes — while hiding the file
+// path — keeps those walks safe AND removes the name from maps.
+static int zs_anonymize_range(uintptr_t lo, size_t size, uint32_t prot) {
+    if (!size || lo == 0) return 0;
+    void* addr = reinterpret_cast<void*>(lo);
+
+    void* scratch = mmap(nullptr, size, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (scratch == MAP_FAILED) return 0;
+    memcpy(scratch, addr, size);   // save the original bytes
+
+    void* remapped = mmap(addr, size, PROT_READ | PROT_WRITE,
+                          MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
+                          -1, 0);
+    if (remapped == MAP_FAILED) {
+        munmap(scratch, size);
+        return 0;
+    }
+    memcpy(addr, scratch, size);   // restore content into the copy
+    munmap(scratch, size);
+
+    int out_prot = ((prot & ZS_SEG_W) ? PROT_WRITE : 0) |
+                   ((prot & ZS_SEG_X) ? PROT_EXEC : 0) |
+                   PROT_READ;
+    if (mprotect(addr, size, out_prot) != 0) {
+        // Anonymized RW is safe content-wise; fall back to read-only.
+        (void)mprotect(addr, size, PROT_READ);
+    }
+    // Best-effort label. PR_SET_VMA is an Android vendor extension;
+    // no-op elsewhere. "linker_alloc" regions exist in every ART
+    // process, so the label itself is not an anomaly.
+    constexpr int kPrSetVma = 0x53564d41;          // "AVMS"
+    constexpr int kPrSetVmaAnonName = 0;
+    const char kAnonName[] = "linker_alloc";
+    (void)prctl(kPrSetVma, kPrSetVmaAnonName, lo, size,
+                (unsigned long)(uintptr_t)kAnonName);
+    return 1;
+}
+
+size_t hide_prepare_tier_a_records(struct so_record* out, size_t cap) {
+    size_t n_out = 0;
+
+    // Pass 1: every read-only segment of every record becomes an
+    // anonymous, content-identical copy. Executable/writable segments
+    // of OTHER records are munmap'd now (their code never runs again);
+    // SELF ones are deferred to the asm trampoline.
+    for (size_t i = 0; i < g_self_so_count; ++i) {
+        so_record* rec = &g_self_so_records[i];
+        uint32_t dynamic_bits = rec->prot & (ZS_SEG_X | ZS_SEG_W);
+        if (dynamic_bits == 0) {
+            // Read-only metadata segment: keep the bytes, hide the path.
+            if (!zs_anonymize_range(rec->base, rec->size, rec->prot)) {
+                ZS_LOGW("hide: anonymize(%lx, %zu) failed; segment "
+                        "stays file-backed",
+                        (unsigned long)rec->base, rec->size);
+            }
+            continue;
+        }
+        if (rec->flags & ZS_SO_OTHER) {
+            // Code/data of other libs: nothing of theirs executes
+            // past this point, plain munmap is safe.
+            if (munmap((void*)rec->base, rec->size) != 0) {
+                ZS_LOGW("hide: munmap(%lx, %zu) failed",
+                        (unsigned long)rec->base, rec->size);
+            }
+            continue;
+        }
+        // SELF + (exec|writable): the trampoline's job. Collected in
+        // pass 2 (SELF first) below.
+    }
+
+    // Pass 2: SELF records that still need the trampoline. SELF
+    // records go FIRST so the trampoline's fixed kTrampMaxRecords
+    // (32) array can never cut them when many modules pushed the
+    // record count past the cap (Round 8 / B7: the old code copied
+    // records in scan order, so a payload segment could land past
+    // index 32 and stay mapped — silently degrading Tier A).
+    for (size_t i = 0; i < g_self_so_count && n_out < cap; ++i) {
+        const so_record* rec = &g_self_so_records[i];
+        if ((rec->flags & ZS_SO_SELF) &&
+            (rec->prot & (ZS_SEG_X | ZS_SEG_W))) {
+            out[n_out++] = *rec;
+        }
+    }
+    // Then any OTHER exec/writable records that did not fit... there
+    // are none — pass 1 munmap'd them all. Any overflow of SELF
+    // records beyond `cap` is logged by the caller.
+    if (n_out == cap) {
+        size_t overflow = 0;
+        for (size_t i = 0; i < g_self_so_count; ++i) {
+            const so_record* rec = &g_self_so_records[i];
+            if ((rec->flags & ZS_SO_SELF) &&
+                (rec->prot & (ZS_SEG_X | ZS_SEG_W))) {
+                ++overflow;
+            }
+        }
+        if (overflow > cap) {
+            ZS_LOGW("hide: %zu SELF segment(s) exceed the trampoline "
+                    "record cap (%zu); they will remain mapped",
+                    overflow - cap, cap);
+        }
+    }
+    return n_out;
+}
+
 #ifdef ZS_HOST_TEST
 // Test-only: force a uid into the deny set so the e2e test can drive
 // the uid-keyed pipeline without root access to packages.list.
 void hide_test_force_deny_uid(uid_t uid) {
     g_deny_app_ids.insert((uid_t)(uid % 100000));
     g_uid_map_loaded.store(1);
+}
+
+void hide_test_set_records(const struct so_record* recs, size_t count) {
+    g_self_so_count = count < kMaxSoRecords ? count : kMaxSoRecords;
+    for (size_t i = 0; i < g_self_so_count; ++i) {
+        g_self_so_records[i] = recs[i];
+    }
+}
+
+void hide_test_set_denylist_path(const char* path) {
+    g_denylist_path = path;
+    // Force a fresh load against the new path.
+    g_denylist_loaded.store(0);
+    g_uid_map_loaded.store(0);
+    g_denylist_mtime.store(-1);
+    g_denylist_cache.clear();
+    g_deny_app_ids.clear();
+}
+
+void hide_test_reset_refresh() {
+    g_next_refresh_check.store(0);
+}
+
+int hide_test_denylist_reload_count() {
+    return g_denylist_reload_count;
+}
+
+void zs_scan_maps_into_records_test(const char* buf, size_t total) {
+    g_self_so_count = 0;
+    scan_maps_into_records(buf, total);
 }
 #endif
 

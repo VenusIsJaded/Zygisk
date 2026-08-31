@@ -29,6 +29,8 @@
 #include <cstdio>
 #include <fstream>
 #include <string>
+#include <fcntl.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -427,8 +429,10 @@ ZS_TEST(hide_setup_for_target_uid_matches_app_id_family) {
 
 ZS_TEST(unmap_record_flags_drive_tier_a_split) {
     g_self_so_count = 0;
-    g_self_so_records[0] = so_record{0x2000, 0x1000, ZS_SO_SELF, 0};
-    g_self_so_records[1] = so_record{0x8000, 0x1000, ZS_SO_OTHER, 0};
+    g_self_so_records[0] =
+        so_record{0x2000, 0x1000, ZS_SO_SELF, 0, 0};
+    g_self_so_records[1] =
+        so_record{0x8000, 0x1000, ZS_SO_OTHER, 0, 0};
     g_self_so_count = 2;
 
     ZS_CHECK_EQ(hide_trampoline_unmap_pending(), 1);
@@ -478,6 +482,231 @@ ZS_TEST(property_spoof_list_reports_stock_values_for_boot_keys) {
 // ----------------------------------------------------------------------
 // main(): run all tests.
 // ----------------------------------------------------------------------
+
+// ----------------------------------------------------------------------
+// Round 8 tests
+// ----------------------------------------------------------------------
+
+// Round 8: the REAL denylist parser (through the new path seam — the
+// pre-Round-8 tests had to mirror the parser by hand because the
+// production path was hardcoded).
+ZS_TEST(denylist_real_parser_via_path_seam) {
+    std::string path = make_temp_denylist(
+        "com.example.app1\n"
+        "com.example.app2\n"
+        "# a comment\n"
+        "\n"
+        "   \n"
+        "com.third.party\n");
+    hide_test_set_denylist_path(path.c_str());
+
+    ZS_CHECK_EQ(hide_setup_for_target("com.example.app1"), 1);
+    ZS_CHECK_EQ(hide_setup_for_target("com.example.app2"), 1);
+    ZS_CHECK_EQ(hide_setup_for_target("com.third.party"), 1);
+    ZS_CHECK_EQ(hide_setup_for_target("com.other.app"), 0);
+
+    remove_temp(path);
+    // Restore the (host-absent) production path for later tests.
+    hide_test_set_denylist_path("/data/system/zygisk_study/denylist");
+}
+
+// Round 8 (mtime refresh): an edited denylist is picked up once the
+// refresh gate opens.
+ZS_TEST(denylist_reloads_when_mtime_changes) {
+    std::string path = make_temp_denylist("com.version.one\n");
+    hide_test_set_denylist_path(path.c_str());
+    ZS_CHECK_EQ(hide_setup_for_target("com.version.one"), 1);
+    int count_after_first = hide_test_denylist_reload_count();
+
+    // Rewrite with different content and force a distinct mtime.
+    {
+        FILE* fp = fopen(path.c_str(), "w");
+        ZS_CHECK(fp != nullptr);
+        fputs("com.version.two\n", fp);
+        fclose(fp);
+        struct timespec times[2];
+        times[0].tv_sec = time(nullptr) + 10;
+        times[0].tv_nsec = 0;
+        times[1] = times[0];
+        utimensat(AT_FDCWD, path.c_str(), times, 0);
+    }
+
+    // The throttle gate is closed (checked moments ago); force it
+    // open the way a 2-second wait would.
+    hide_test_reset_refresh();
+    ZS_CHECK_EQ(hide_setup_for_target("com.version.two"), 1);
+    ZS_CHECK_EQ(hide_setup_for_target("com.version.one"), 0);
+    ZS_CHECK(hide_test_denylist_reload_count() > count_after_first);
+
+    remove_temp(path);
+    hide_test_set_denylist_path("/data/system/zygisk_study/denylist");
+}
+
+// Round 8 (P2): between refresh checks the denylist is NOT re-read —
+// steady state costs one vDSO clock read, not a stat() per fork.
+ZS_TEST(denylist_refresh_is_throttled) {
+    std::string path = make_temp_denylist("com.stale.app\n");
+    hide_test_set_denylist_path(path.c_str());
+    ZS_CHECK_EQ(hide_setup_for_target("com.stale.app"), 1);
+    int count_after_first = hide_test_denylist_reload_count();
+
+    // Change the file AND its mtime — but do NOT open the throttle
+    // gate (that is what the 2 s interval enforces in production).
+    {
+        FILE* fp = fopen(path.c_str(), "w");
+        ZS_CHECK(fp != nullptr);
+        fputs("com.fresh.app\n", fp);
+        fclose(fp);
+        struct timespec times[2];
+        times[0].tv_sec = time(nullptr) + 20;
+        times[0].tv_nsec = 0;
+        times[1] = times[0];
+        utimensat(AT_FDCWD, path.c_str(), times, 0);
+    }
+    // The very first setup call in this test already armed the gate
+    // (now + 2 s); this call runs microseconds later and must skip
+    // the stat() entirely.
+    ZS_CHECK_EQ(hide_setup_for_target("com.fresh.app"), 0);
+    ZS_CHECK_EQ(hide_test_denylist_reload_count(),
+                count_after_first);
+
+    // Once the gate opens, the change lands.
+    hide_test_reset_refresh();
+    ZS_CHECK_EQ(hide_setup_for_target("com.fresh.app"), 1);
+    ZS_CHECK(hide_test_denylist_reload_count() > count_after_first);
+
+    remove_temp(path);
+    hide_test_set_denylist_path("/data/system/zygisk_study/denylist");
+}
+
+// Round 8 (B9): the maps scanner must NEVER claim app-bundled
+// libraries as ours, even when the file name collides with ours
+// (an app shipping its own "libpayload.so" was enough to make the
+// Round 7 scanner unmap the app's library — a guaranteed crash).
+ZS_TEST(maps_scan_ignores_app_library_directories) {
+    const char* synthetic =
+        "00010000-00011000 r--p 00000000 00:00 1  /system/lib64/libpayload.so\n"
+        "00012000-00013000 r-xp 00000000 00:00 2  /data/app/~~aX==/com.x-1/lib/arm64/libpayload.so\n"
+        "00014000-00015000 r-xp 00000000 00:00 3  /data/app/com.z-2/lib/arm64/libzygisk.so\n"
+        "00016000-00017000 r-xp 00000000 00:00 4  /home/dev/zygisk/tests/libpayload.so\n"
+        "00018000-00019000 rw-p 00000000 00:00 5  /data/user/0/com.w/lib/libzn_loader.so\n";
+    zs_scan_maps_into_records_test(synthetic, strlen(synthetic));
+    ZS_CHECK_EQ(hide_unmap_record_count(), (size_t)2);
+
+    so_record out[8] = {};
+    size_t n = hide_unmap_records(out, 8);
+    ZS_CHECK_EQ(n, (size_t)2);
+    ZS_CHECK_EQ(out[0].base, (uintptr_t)0x00010000);   // /system copy
+    ZS_CHECK_EQ(out[0].prot, (uint32_t)0);             // r--p
+    ZS_CHECK_EQ(out[0].flags, (uint32_t)ZS_SO_SELF);
+    ZS_CHECK_EQ(out[1].base, (uintptr_t)0x00016000);   // host-test copy
+    ZS_CHECK_EQ(out[1].prot, (uint32_t)ZS_SEG_X);      // r-xp
+    // The app copies at 0x12000 / 0x14000 / 0x18000 must be absent.
+
+    hide_test_set_records(nullptr, 0);
+}
+
+// Helper: the /proc/self/maps line covering `addr`, if any.
+static int maps_line_for_addr(uintptr_t addr, char* out, size_t cap) {
+    FILE* f = fopen("/proc/self/maps", "r");
+    if (!f) return 0;
+    int found = 0;
+    char line[600];
+    while (fgets(line, sizeof line, f)) {
+        uintptr_t lo = 0, hi = 0;
+        if (sscanf(line, "%lx-%lx", &lo, &hi) == 2 &&
+            lo <= addr && addr < hi) {
+            snprintf(out, cap, "%s", line);
+            found = 1;
+            break;
+        }
+    }
+    fclose(f);
+    return found;
+}
+
+// Round 8 (B6): Tier A preprocessing anonymizes read-only segments
+// instead of unmapping them — content preserved byte-for-byte, the
+// file path gone from maps (this is what keeps the linker's soinfo
+// walks safe after we vanish).
+ZS_TEST(tier_a_prepare_anonymizes_readonly_segments) {
+    int fd = open("/proc/self/exe", O_RDONLY | O_CLOEXEC);
+    ZS_CHECK(fd >= 0);
+    void* p = mmap(nullptr, 4096, PROT_READ, MAP_PRIVATE, fd, 0);
+    ZS_CHECK(p != MAP_FAILED);
+    unsigned char before[4096];
+    memcpy(before, p, 4096);
+
+    char line[600];
+    ZS_CHECK(maps_line_for_addr((uintptr_t)p, line, sizeof line));
+    ZS_CHECK(strchr(line, '/') != nullptr);   // file-backed right now
+
+    so_record recs[1];
+    recs[0] = so_record{(uintptr_t)p, 4096, ZS_SO_OTHER, 0, 0};
+    hide_test_set_records(recs, 1);
+
+    so_record out[8];
+    ZS_CHECK_EQ(hide_prepare_tier_a_records(out, 8), (size_t)0);
+
+    // Content preserved exactly.
+    ZS_CHECK(memcmp(before, p, 4096) == 0);
+    // The mapping is now anonymous: no path in its maps line.
+    ZS_CHECK(maps_line_for_addr((uintptr_t)p, line, sizeof line));
+    ZS_CHECK(strchr(line, '/') == nullptr);
+
+    munmap(p, 4096);
+    close(fd);
+    hide_test_set_records(nullptr, 0);
+}
+
+// Round 8: executable segments of OTHER records are really munmap'd.
+ZS_TEST(tier_a_prepare_munmaps_other_exec_segments) {
+    void* x = mmap(nullptr, 4096, PROT_READ | PROT_EXEC,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ZS_CHECK(x != MAP_FAILED);
+
+    so_record recs[1];
+    recs[0] = so_record{(uintptr_t)x, 4096, ZS_SO_OTHER, ZS_SEG_X, 0};
+    hide_test_set_records(recs, 1);
+
+    so_record out[8];
+    ZS_CHECK_EQ(hide_prepare_tier_a_records(out, 8), (size_t)0);
+
+    char line[600];
+    ZS_CHECK(!maps_line_for_addr((uintptr_t)x, line, sizeof line));
+
+    hide_test_set_records(nullptr, 0);
+}
+
+// Round 8 (B7): SELF records come out FIRST and the trampoline cap
+// can never cut them when many module records precede them in scan
+// order.
+ZS_TEST(tier_a_prepare_prioritizes_self_records) {
+    // 35 OTHER records at addresses that are (a) unmapped in this
+    // process and (b) below mmap_min_addr, so neither munmap nor a
+    // MAP_FIXED anonymize can touch real memory.
+    so_record recs[40];
+    for (int i = 0; i < 35; ++i) {
+        recs[i] = so_record{(uintptr_t)(0x1000 + (size_t)i * 0x400),
+                            0x100, ZS_SO_OTHER, ZS_SEG_X, 0};
+    }
+    for (int i = 0; i < 5; ++i) {
+        recs[35 + i] =
+            so_record{(uintptr_t)(0x7f0000000000UL + (unsigned long)i * 0x10000UL),
+                      0x1000, ZS_SO_SELF, ZS_SEG_X, 0};
+    }
+    hide_test_set_records(recs, 40);
+
+    so_record out[8];
+    size_t n = hide_prepare_tier_a_records(out, 8);
+    ZS_CHECK_EQ(n, (size_t)5);
+    for (size_t i = 0; i < n; ++i) {
+        ZS_CHECK_EQ(out[i].flags, (uint32_t)ZS_SO_SELF);
+        ZS_CHECK(out[i].prot & ZS_SEG_X);
+    }
+
+    hide_test_set_records(nullptr, 0);
+}
 
 int main() {
     std::fprintf(stderr, "=== Zygisk Study hide layer tests ===\n");

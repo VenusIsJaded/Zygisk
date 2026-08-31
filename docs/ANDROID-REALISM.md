@@ -540,3 +540,157 @@ To get true 100% confidence on Android, the user needs to:
 The 43 host-side tests + the Android cost-model analysis above +
 the architecture reference give us "high confidence" — which is
 the strongest honest claim I can make from this sandbox.
+
+
+## Round 8 — what changed and why
+
+Round 8 targeted three things the Round 7 ledger flagged as residuals
+plus a fresh audit of the Tier B surface: more stealth coverage,
+faster hot paths, and the bugs hiding underneath both.
+
+### Tier A no longer leaves dangling soinfo pointers (was: "the
+linker's tolerance of the dangling soinfo entries" residual)
+
+Round 7's Tier A munmap'd EVERY segment of every hidden library. But
+the dynamic linker keeps a `soinfo` node per dlopen'd library, and
+those nodes point INTO the library's first (read-only) segment: the
+program headers (`soinfo::validate()` reads the ELF magic through
+`si->phdr` on dlopen-reuse) and the `.dynstr` soname
+(`find_loaded_library_by_soname()` strcmps through it on every
+dlopen). Unmapping that segment turns a completely ordinary later
+`dlopen()` by the app into an unconditional SIGSEGV — in app code,
+long after we left, with nothing pointing back at us.
+
+Round 8 replaces the munmap of read-only segments with a
+**content-preserving anonymous remap** (same address, same bytes,
+`PR_SET_VMA`-named "linker_alloc"): the linker's walks stay safe
+while the file path disappears from /proc/self/maps. Only the
+executable and writable segments are actually unmapped (OTHER
+libraries in C, our own via the asm trampoline — the read-only
+metadata of our own library survives as anonymous pages too).
+
+Honest residuals of the new design:
+
+- The anonymous metadata pages carry ELF-header/dynstr bytes at the
+  original library addresses. A scanner that reads every anonymous
+  page looking for `\x7fELF` magic can spot them (real Zygisk
+  remappers share this artifact; nothing in the public ecosystem
+  scrubs the e_ident, because `soinfo::validate()` needs it).
+- `dl_iterate_phdr()` still lists our soinfo entries (now with valid
+  metadata). A phdr-based reader that computes a text-segment range
+  and dereferences it would fault — no known production reader does
+  that, but it is a weaker guarantee than "gone".
+- A detector that dlopen()s "/system/lib64/libpayload.so" by path
+  gets the cached soinfo back; dlsym() returns pointers into the
+  unmapped text. Calling them crashes the DETECTOR (its own fault,
+  but a crash is a signal).
+
+### The property swap tell closed (ro.dalvik.vm.native.bridge)
+
+While loaded, the injection mechanism leaves
+`ro.dalvik.vm.native.bridge = "libzygisk.so"` visible to EVERY
+process — the single most greppable property in the design. The
+post-fs-data swap is guarded to only fire when the property was
+originally EMPTY, so the stock state of every device we can run on
+is "no native bridge". Round 8 spoofs the key back to exactly that
+state in hidden processes: the clone patches the value to empty and
+the Tier B find/get hooks report it absent.
+
+Confidence: HIGH for Java-level readers (`SystemProperties.get`
+returns "" either way), MEDIUM for native `__system_property_find`
+users — stock AOSP does not set the property at all on arm64
+devices (absent), but we cannot enumerate every OEM. The spoof
+matches the AOSP behavior, which is the best available default.
+
+### /proc/net/unix — the daemon socket leak
+
+The daemon's filesystem unix socket
+(`/data/system/zygisk_study/sock/sock`) appears in `/proc/net/unix`
+— a GLOBAL, world-readable socket table. Directory permissions do
+not help; the name itself is the tell. Tier B now filters
+`/proc/net/unix` (and its `/proc/self/net/unix`, `/proc/<pid>/net/unix`
+aliases), dropping lines that name root-framework sockets
+(`/data/adb/...`, magisk/zygisk/riru strings, our own path).
+
+Honest residual: the filter is in-process. An app that
+`execve()`s a helper binary (`cat /proc/net/unix`) reads the file
+with a fresh libc and no hooks. The same residual applies to every
+in-process hiding technique (and to every public implementation);
+documenting it is the honest position. A mount-namespace or
+network-namespace fix has unacceptable collateral (the app's own
+sockets live in that table too).
+
+### /proc/self/environ — unsetenv() does not rewrite the proc file
+
+`scrub_env()` calls `unsetenv()`, which rewrites the `environ`
+ARRAY. `/proc/self/environ` serves the ORIGINAL stack environment
+block — our `ZYGISK_STUDY_*` variables stayed readable there
+forever. The environ file is now filtered (NUL-separated entry drop,
+same memfd mechanism), in addition to the unsetenv scrub.
+
+### opendir — directory enumeration was never gated
+
+stat/access reported ENOENT for hidden paths, but
+`opendir("/data/adb")` + readdir listed the entries (and Java's
+`File.list()` goes straight through it). opendir is now a Tier B
+hook with the same ENOENT semantics.
+
+Honest residual: `scandir()` and friends call libc-internal
+opendir (hidden alias, not the caller's PLT) and are NOT caught.
+Java and direct native opendir callers are covered.
+
+### The Round 8 bug fixes (all invisible in host tests)
+
+- **syscall() forwarded 4 of 6 arguments.** Any 5/6-argument syscall
+  through the libc `syscall()` wrapper (pselect6, clone, splice,
+  epoll_pwait2, ...) had args 5-6 replaced with garbage in hidden
+  apps. Now all six are extracted and forwarded.
+- **`/proc/mounts` bypassed the filter.** The classic alias of
+  `/proc/self/mounts` — arguably the most common way code reads the
+  mount table — did not match the Round 7 path parser. Same for
+  every `task/<tid>/` per-thread variant. Both are matched now.
+- **The filtered memfd truncated at 256 KB.** Real `/proc/self/smaps`
+  runs 1-3 MB; the tail (which can include our own .so lines) was
+  silently dropped. The filter is now a streaming rewrite (64 KB
+  chunks + carry) that is correct at any size.
+- **Denylist reloads merged instead of replacing.** A package
+  removed from the denylist stayed denied until the next zygote
+  restart. Caught by the new reload tests; the cache is now rebuilt
+  on every load.
+- **The property-area scan truncated at 96 KB.** A zygote with the
+  full preloaded class list carries ~1500 mappings (~110 KB of
+  maps); property mappings past the cap were silently missed and
+  property spoofing did nothing. Chunked scan added.
+- **App-library name collisions.** An app shipping its own
+  `libpayload.so` under `/data/app/...` got it unmapped by our
+  scanner (guaranteed app crash). The scanner now excludes app
+  library directories.
+- **fopen() without a resolved real fopen** returned nullptr for
+  every file. Now falls back to open()+fdopen().
+
+### Verified in this sandbox (Round 8)
+
+- 95 host tests, all passing, including: the streaming filter
+  against a 400 KB synthetic maps file (exact-output comparison,
+  hidden lines at the very end), the environ and unix-table
+  filters, the six-argument syscall forwarding (recorded stub), the
+  hash-indexed matcher, the opendir hook, the denylist
+  refresh/throttle cycle (through a path seam), the app-directory
+  collision guard, and the Tier A preprocessing against REAL
+  file-backed mappings (content preserved byte-for-byte, path gone
+  from maps, exec segments really unmapped).
+- The trampoline e2e still passes with the new prepare step: child
+  survives, payload path completely gone from maps, real return
+  value relayed.
+
+### Still needs a device (Round 8 additions)
+
+- The PR_SET_VMA "linker_alloc" name on the anonymized pages (the
+  label is cosmetic if the vendor prctl is absent — the content
+  preservation is what matters).
+- The exact per-app-launch latency delta of the Tier A anonymize
+  pass (three mmaps + two mprotects + a prctl per read-only
+  segment, all while still root — single-digit microseconds each).
+- The incremental GOT re-walk behavior across a real
+  dlclose/dlopen-reuse cycle on bionic (the gc hook is designed
+  for it; bionic's linker semantics are the remaining unknown).

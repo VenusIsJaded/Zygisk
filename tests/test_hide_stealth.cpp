@@ -366,6 +366,42 @@ ZS_TEST(ensure_cwd_is_root_sets_cwd_to_slash) {
 // main()
 // ----------------------------------------------------------------------
 
+// ----------------------------------------------------------------------
+// Round 8 tests (S5): per-thread path variants for the readlink
+// rewrites — /proc/<pid>/task/<tid>/exe|fd was missed by the Round 7
+// matchers, and thread-self/fd was missing entirely.
+// ----------------------------------------------------------------------
+
+ZS_TEST(path_is_proc_exe_recognizes_task_variants) {
+    ZS_CHECK_EQ(path_is_proc_exe("/proc/self/task/123/exe"),  1);
+    ZS_CHECK_EQ(path_is_proc_exe("/proc/1234/task/567/exe"),  1);
+    ZS_CHECK_EQ(path_is_proc_exe("/proc/thread-self/task/7/exe"), 1);
+
+    // Malformed variants.
+    ZS_CHECK_EQ(path_is_proc_exe("/proc/self/task/exe"),      0); // no tid
+    ZS_CHECK_EQ(path_is_proc_exe("/proc/self/task/abc/exe"),  0); // non-numeric
+    ZS_CHECK_EQ(path_is_proc_exe("/proc/self/task/123/maps"), 0); // wrong file
+    ZS_CHECK_EQ(path_is_proc_exe("/proc/self/task/123"),      0); // no file
+}
+
+ZS_TEST(path_is_proc_fd_recognizes_task_and_thread_self) {
+    // Documented Round 7 forms keep working.
+    ZS_CHECK_EQ(path_is_proc_fd("/proc/self/fd/0"),      1);
+    ZS_CHECK_EQ(path_is_proc_fd("/proc/self/fd/123"),    1);
+    ZS_CHECK_EQ(path_is_proc_fd("/proc/1234/fd/5"),      1);
+    // Round 8 forms.
+    ZS_CHECK_EQ(path_is_proc_fd("/proc/thread-self/fd/3"), 1);
+    ZS_CHECK_EQ(path_is_proc_fd("/proc/self/task/123/fd/3"), 1);
+    ZS_CHECK_EQ(path_is_proc_fd("/proc/1234/task/567/fd/0"), 1);
+
+    // Malformed variants.
+    ZS_CHECK_EQ(path_is_proc_fd("/proc/self/fd/"),       0);
+    ZS_CHECK_EQ(path_is_proc_fd("/proc/self/fd/x"),      0);
+    ZS_CHECK_EQ(path_is_proc_fd("/proc/self/task/123/fd/x"), 0);
+    ZS_CHECK_EQ(path_is_proc_fd("/proc/thread-self/fd"), 0);
+    ZS_CHECK_EQ(path_is_proc_fd("/proc/self/task/fd/3"), 0);   // no tid
+}
+
 int main() {
     std::fprintf(stderr, "=== Zygisk Study stealth layer tests ===\n");
     return zstest::run_all();

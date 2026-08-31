@@ -847,6 +847,67 @@ record those too.
 - The fork latency claims still need on-device measurement; the
   three microbenchmarks keep their Round 6 numbers (see below).
 
+## Round 8 ledger
+
+### ✅ Round 8 — HIGH-confidence wins
+
+- **Hash-indexed GOT hook matcher (P-R8-1).** The Tier B walk runs
+  once per hidden app launch over every JMPREL entry of every loaded
+  DSO (tens of thousands of entries in a real app). The Round 7
+  matcher was a linear scan over ~24 hooks per entry; it is now an
+  FNV-1a open-addressing index (names kept for verification — a hash
+  collision can never patch the wrong function). Host measured:
+  42 ns per lookup median, and that includes the clock pair used to
+  measure it. The walk is the most expensive step of a hidden app
+  launch; this cuts its inner loop to a hash + one strcmp.
+- **Denylist refresh throttle (P-R8-2).** Every fork of every app
+  paid a `stat()` (~1 µs syscall) to check the denylist mtime.
+  The check is now gated by a `CLOCK_MONOTONIC_COARSE` vDSO read
+  (~20 ns, no context switch); the stat runs at most once per 2
+  seconds. Steady-state per-fork cost: one vDSO clock read. User
+  edits still land within 2 seconds.
+- **Incremental dlopen re-walks (P-R8-3).** The dlopen hook used to
+  re-walk EVERY loaded DSO after each `System.loadLibrary` — an app
+  loading N libs paid N full walks. The walker now marks DSOs it has
+  processed (by load address) and re-examines only new ones. The
+  mark set is cleared when the hook registry changes and garbage-
+  collected after every successful dlclose (via a new dlclose hook),
+  so a dlclose→dlopen-reuse cycle at the same address can never
+  silently skip re-patching.
+- **Streaming /proc filter (P-R8-4, also a bug fix).** The filtered
+  memfd was capped at 256 KB — real `/proc/self/smaps` runs 1-3 MB
+  and the tail was silently dropped. The rewrite streams in 64 KB
+  chunks with a carry buffer: correct at any size, and the typical
+  (small) case is unchanged (194 µs median for a 500-line maps file
+  on the host, same budget as Round 7).
+
+### ⚠️ Round 8 — accepted, documented residuals
+
+- The hash matcher keeps a name pointer per index slot and verifies
+  with strcmp, so it is correct by construction — but the index is
+  rebuilt on the first lookup after any registry mutation (a few
+  hundred ns, once per walk).
+- The incremental walk's mark set is a fixed 512-entry array; a
+  process with more than 512 DSOs stops marking and later re-walks
+  degrade to full walks (correct, just slower). Real apps are far
+  below this.
+- The Tier A anonymize pass adds three mmaps + two mprotects + a
+  prctl per read-only segment (single-digit µs each, once per hidden
+  app launch, while still root). This is the price of NOT leaving
+  dangling soinfo pointers; see docs/ANDROID-REALISM.md Round 8 for
+  why that trade is mandatory.
+
+### 🔧 Round 8 — bug fixes with performance character
+
+- `syscall()` hook now forwards all SIX varargs (args 5-6 were
+  garbage before — sporadic breakage of pselect6/clone/splice-class
+  calls in hidden apps).
+- Denylist reloads now REPLACE the cache (they used to merge into
+  it — removing a package from the denylist never took effect).
+- The property-area scan handles >96 KB maps files (chunked), so
+  property spoofing can no longer silently do nothing on
+  heavy-preload zygotes.
+
 ## What I cannot do in this sandbox
 
 I cannot:

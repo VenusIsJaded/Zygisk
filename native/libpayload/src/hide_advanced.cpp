@@ -140,6 +140,16 @@ static const ZsPropSpoof kPropSpoofTable[] = {
     {"ro.kernelsu.version",         ""},
     {"ro.kernelsu.exposed",         ""},
     {"ro.zygisk_study.version",     ""},
+    // Round 8 (B10): ro.dalvik.vm.native.bridge IS "libzygisk.so" on
+    // every process while we are loaded (post-fs-data.sh swaps it —
+    // that is the injection mechanism). It is also the single most
+    // greppable property in the entire design: every root-detection
+    // writeup checks it. We are only ever loaded when the original
+    // value was EMPTY (the swap is guarded), so a stock arm64 device
+    // reports this property as absent — spoof it to empty + report
+    // absence in the find()/get() hooks below, which is what the
+    // property looked like before we touched the device.
+    {"ro.dalvik.vm.native.bridge",   ""},
     // init.svc.adbd is deliberately NOT spoofed: adbd exists on stock
     // devices and "running"/"stopped" are both normal values.
 };
@@ -246,6 +256,52 @@ static size_t find_prop_mappings(const char* buf, size_t total,
 // After step 3 the range holds a byte-identical private copy. The
 // page is left writable so patch_prop_value() can fix values; the
 // caller mprotects it back to PROT_READ after patching.
+// Round 8 (B5): /proc/self/maps of the zygote can exceed the 96 KB
+// static buffer on real devices (a zygote with the full preloaded
+// class list carries ~1500 mappings ~= 110 KB). The single-read scan
+// then silently missed property mappings past the cap and property
+// spoofing quietly did NOTHING — a detection, not a failure. This
+// chunked scan (8 KB chunk + carry) finds every mapping at any file
+// size with bounded stack use.
+static size_t find_prop_mappings_from_fd(int fd, PropMapping* out,
+                                         size_t cap) {
+    constexpr size_t kChunk = 8 * 1024;
+    char buf[kChunk + 1024];
+    size_t carry = 0;
+    size_t n = 0;
+    off_t off = 0;
+    for (;;) {
+        ssize_t r = pread(fd, buf + carry, kChunk, off);
+        if (r <= 0) break;
+        off += r;
+        size_t have = carry + (size_t)r;
+
+        // Only complete lines are scanned in this pass.
+        size_t last_nl = 0;
+        for (size_t i = have; i > 0; --i) {
+            if (buf[i - 1] == '\n') { last_nl = i; break; }
+        }
+        if (last_nl == 0) {
+            // No complete line in this chunk. Maps lines are < 512 B;
+            // if a hostile "line" overflows the carry region, give up
+            // gracefully with what we have.
+            if (have >= sizeof buf) return n;
+            carry = have;
+            continue;
+        }
+        if (n < cap) {
+            n += find_prop_mappings(buf, last_nl, out + n, cap - n);
+        }
+        memmove(buf, buf + last_nl, have - last_nl);
+        carry = have - last_nl;
+    }
+    // Final unterminated line.
+    if (carry > 0 && n < cap) {
+        n += find_prop_mappings(buf, carry, out + n, cap - n);
+    }
+    return n;
+}
+
 static int remap_prop_mapping_private(uintptr_t lo, uintptr_t hi) {
     size_t size = hi - lo;
     void* addr = reinterpret_cast<void*>(lo);
@@ -282,17 +338,35 @@ static void clone_property_area_private() {
     int fd = open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
     if (fd < 0) return;
     ssize_t total = 0;
+    int truncated = 0;
     while ((size_t)total < kMapsCap) {
         ssize_t n = read(fd, maps_buf + total, kMapsCap - total);
         if (n <= 0) break;
         total += n;
     }
-    close(fd);
-    if (total <= 0) return;
+    if ((size_t)total == kMapsCap) {
+        char probe;
+        if (read(fd, &probe, 1) > 0) truncated = 1;
+    }
 
     PropMapping mappings[32];
-    size_t n_mappings = find_prop_mappings(maps_buf, (size_t)total,
-                                           mappings, 32);
+    size_t n_mappings;
+    if (truncated) {
+        // Round 8 (B5): maps larger than the static buffer. Rewind
+        // and scan in chunks so property mappings past the cap are
+        // still found (see find_prop_mappings_from_fd).
+        if (lseek(fd, 0, SEEK_SET) != (off_t)-1) {
+            n_mappings = find_prop_mappings_from_fd(fd, mappings, 32);
+        } else {
+            n_mappings = 0;
+        }
+    } else {
+        n_mappings = total > 0
+            ? find_prop_mappings(maps_buf, (size_t)total, mappings, 32)
+            : 0;
+    }
+    close(fd);
+    if (n_mappings == 0) return;
     int n_remapped = 0;
     for (size_t i = 0; i < n_mappings; ++i) {
         if (remap_prop_mapping_private(mappings[i].lo,
@@ -355,8 +429,9 @@ static void clone_property_area_private() {
 // ------------------------------------------------------------------------
 
 // The /proc files whose contents would reveal us. Matched by base
-// name; see zs_path_is_filtered for the /proc/self, /proc/thread-self
-// and /proc/<pid> prefix handling.
+// name; see zs_filter_kind_for_path for the /proc/self,
+// /proc/thread-self, /proc/<pid>, /proc/<pid>/task/<tid>/ and
+// /proc/net prefix handling.
 static const char* const kFilteredBaseNames[] = {
     "maps",
     "mounts",
@@ -366,6 +441,11 @@ static const char* const kFilteredBaseNames[] = {
     "status",
     "smaps",
     "smaps_rollup",
+    // Round 8 (S2): the process environment. unsetenv() rewrites the
+    // environ ARRAY, but /proc/self/environ is a window onto the
+    // ORIGINAL stack env block — scrub_env() alone never cleaned it,
+    // so our ZYGISK_STUDY_* variables stayed readable there forever.
+    "environ",
 };
 
 // Tier B also filters these in the maps/mounts content:
@@ -392,8 +472,30 @@ static constexpr HiddenSubstring kHiddenSubstrings[] = {
     "/data/system/zygisk_study",
 };
 
-// True if `rest` (the part after "/proc/<id>/") names a file we
-// filter.
+// Round 8 (S1): /proc/net/unix is a GLOBAL socket table — every
+// filesystem-path unix socket on the device appears there, including
+// our daemon's /data/system/zygisk_study/sock/sock (an app can read
+// the file; perms do not help). We drop lines naming root-framework
+// sockets. Bare "magisk"/"zygisk" matter here because socket names
+// (abstract or path) are the actual thing detectors grep for.
+static const HiddenSubstring kUnixHiddenSubstrings[] = {
+    "/data/system/zygisk_study",
+    "/data/adb/",
+    "magisk",
+    "zygisk",
+    "riru",
+};
+
+// Environment entries we strip from /proc/self/environ (and scrub
+// via unsetenv — see scrub_env()). Defined here, before the filter
+// engine, because zs_filter_record() needs them.
+static const char* const kOurEnvVars[] = {
+    "ZYGISK_STUDY_DEBUG",
+    "ZYGISK_STUDY_LOG_TAG",
+    "ZYGISK_STUDY_WORKDIR",
+};
+
+// True if `rest` (the part after "/proc/") names a file we filter.
 static int basename_is_filtered(const char* rest) {
     for (const char* b : kFilteredBaseNames) {
         if (strcmp(rest, b) == 0) return 1;
@@ -401,15 +503,30 @@ static int basename_is_filtered(const char* rest) {
     return 0;
 }
 
-int zs_path_is_filtered(const char* path) {
-    if (ZS_UNLIKELY(!path)) return 0;
-    if (memcmp(path, "/proc/", 6) != 0) return 0;
-    const char* rest = path + 6;
-
+// Parse the per-process / net / task prefix that may sit between
+// "/proc/" and the base file name. On success sets *base to the base
+// name and *is_net for /proc/net and /proc/<pid>/net forms, and
+// returns 1. Returns 0 when the path does not name a per-process
+// file at all (or names ANOTHER process — we never touch those).
+//
+// Round 8 fixes handled here:
+//   B2: "/proc/mounts" (the classic alias of /proc/self/mounts) used
+//       to fall through the old matcher — a detector could simply
+//       read the mount table through it, unfiltered.
+//   B3: "/proc/<pid>/task/<tid>/maps" and friends — per-thread
+//       variants of every filtered file — bypassed the old matcher.
+//   S1: "/proc/net/unix" and its /proc/self/net + /proc/<pid>/net
+//       aliases (the daemon socket leak — see kUnixHiddenSubstrings).
+static int parse_proc_prefix(const char* rest, const char** base,
+                             int* is_net) {
+    *is_net = 0;
     if (strncmp(rest, "thread-self/", 12) == 0) {
         rest += 12;
     } else if (strncmp(rest, "self/", 5) == 0) {
         rest += 5;
+    } else if (strncmp(rest, "net/", 4) == 0) {
+        rest += 4;
+        *is_net = 1;               // the global /proc/net form
     } else {
         // Numeric pid form: /proc/<pid>/<file>. Only OUR pid counts —
         // /proc/1/mounts from an app fails with EACCES anyway.
@@ -425,7 +542,53 @@ int zs_path_is_filtered(const char* path) {
         if (v != (long)getpid()) return 0;
         rest = p + 1;
     }
-    return basename_is_filtered(rest);
+    // Second-level net/: /proc/self/net/<f>, /proc/<pid>/net/<f>.
+    if (!*is_net && strncmp(rest, "net/", 4) == 0) {
+        rest += 4;
+        *is_net = 1;
+    }
+    // Optional per-thread component: task/<tid>/.
+    if (strncmp(rest, "task/", 5) == 0) {
+        rest += 5;
+        const char* p = rest;
+        while (*p >= '0' && *p <= '9') ++p;
+        if (ZS_UNLIKELY(p == rest || *p != '/')) return 0;
+        rest = p + 1;
+    }
+    *base = rest;
+    return 1;
+}
+
+ZsFilterKind zs_filter_kind_for_path(const char* path) {
+    if (ZS_UNLIKELY(!path)) return ZS_FILTER_NONE;
+    if (memcmp(path, "/proc/", 6) != 0) return ZS_FILTER_NONE;
+    const char* rest = path + 6;
+
+    const char* base = nullptr;
+    int is_net = 0;
+    if (!parse_proc_prefix(rest, &base, &is_net)) {
+        // "/proc/mounts" — the historical alias for
+        // /proc/self/mounts and the single most common way code reads
+        // the mount table. It names OUR process by definition.
+        if (strcmp(path, "/proc/mounts") == 0) {
+            return ZS_FILTER_PROC_LINE;
+        }
+        return ZS_FILTER_NONE;
+    }
+    if (is_net) {
+        // Only the unix socket table is filtered; /proc/net/tcp etc.
+        // carry no path information about us.
+        return strcmp(base, "unix") == 0 ? ZS_FILTER_NET_UNIX
+                                          : ZS_FILTER_NONE;
+    }
+    if (strcmp(base, "status") == 0)   return ZS_FILTER_STATUS;
+    if (strcmp(base, "environ") == 0)  return ZS_FILTER_ENVIRON;
+    if (basename_is_filtered(base))     return ZS_FILTER_PROC_LINE;
+    return ZS_FILTER_NONE;
+}
+
+int zs_path_is_filtered(const char* path) {
+    return zs_filter_kind_for_path(path) != ZS_FILTER_NONE;
 }
 
 // We hold the original libc open/openat addresses so our hook can
@@ -453,141 +616,210 @@ static int syscall_memfd_create(const char* name, unsigned int flags) {
 #endif
 }
 
-// Rewrite the TracerPid line of /proc/self/status to "TracerPid:\t0".
-static ssize_t rewrite_status_line(char* dst, size_t dst_cap,
-                                    const char* line_start,
-                                    size_t line_len) {
-    static const char kPrefix[] = "TracerPid:";
-    constexpr size_t kPrefixLen = sizeof(kPrefix) - 1;
-    if (line_len < kPrefixLen) return 0;
-    if (memcmp(line_start, kPrefix, kPrefixLen) != 0) return 0;
-
-    static const char kReplacement[] = "TracerPid:\t0\n";
-    constexpr size_t kReplacementLen = sizeof(kReplacement) - 1;
-    if (dst_cap < kReplacementLen) return 0;
-    memcpy(dst, kReplacement, kReplacementLen);
-    return (ssize_t)kReplacementLen;
-}
-
-// True if `path` is a filtered /proc path whose base name is `base`.
-static int filtered_path_basename_is(const char* path, const char* base) {
-    if (!path) return 0;
-    size_t plen = strlen(path);
-    size_t blen = strlen(base);
-    if (plen <= blen + 1) return 0;
-    if (path[plen - blen - 1] != '/') return 0;
-    return strcmp(path + plen - blen, base) == 0;
-}
-
-// Produce a filtered copy of the given file's contents in a memfd.
-// Returns the memfd fd, or -1 on error.
+// Round 8: the record filter. One record = one line (newline-
+// separated kinds) or one env entry (NUL-separated environ). Pure,
+// allocation-free, and unit-tested directly (host tests).
 //
-// PERF/SAFETY NOTE (Round 7): the pre-Round-7 version used a 256 KB
-// STACK array. This runs inside an open() hook on whatever app thread
-// performed the open — including deep ART call stacks on threads with
-// 1 MB stacks. 256 KB of stack there is a silent stack-overflow bomb
-// that only fires on device. The scratch buffer is now an anonymous
-// mmap: two extra syscalls (~4 µs) against a ~200 µs filtering pass,
-// and zero stack pressure on any thread.
-static int make_filtered_memfd(int orig_fd, const char* target_path) {
-    int memfd = syscall_memfd_create("scudo", 0);
-    if (memfd < 0) return -1;
+// Returns the kept length written to dst (dst may alias rec — the
+// streaming loop compacts in place), or -1 to drop the record.
+ssize_t zs_filter_record(char* dst, size_t dst_cap,
+                         const char* rec, size_t rec_len,
+                         ZsFilterKind kind) {
+    if (ZS_UNLIKELY(!rec && rec_len > 0)) return -1;
 
-    constexpr size_t kReadCap = 256 * 1024;
-    char* buf = (char*)mmap(nullptr, kReadCap, PROT_READ | PROT_WRITE,
-                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (buf == MAP_FAILED) {
-        close(memfd);
-        return -1;
+    switch (kind) {
+    case ZS_FILTER_STATUS: {
+        // Rewrite the TracerPid line to 0; pass everything else
+        // through byte-for-byte.
+        static const char kPrefix[] = "TracerPid:";
+        constexpr size_t kPrefixLen = sizeof(kPrefix) - 1;
+        static const char kReplacement[] = "TracerPid:\t0";
+        constexpr size_t kReplacementLen = sizeof(kReplacement) - 1;
+        if (rec_len >= kPrefixLen &&
+            memcmp(rec, kPrefix, kPrefixLen) == 0) {
+            // Only rewrite in place when the replacement provably fits
+            // (real TracerPid lines are >= 13 bytes; a hand-crafted
+            // shorter one is passed through unchanged).
+            if (kReplacementLen > rec_len || dst_cap < kReplacementLen) {
+                break;   // keep the original record
+            }
+            memcpy(dst, kReplacement, kReplacementLen);
+            return (ssize_t)kReplacementLen;
+        }
+        break;
     }
-    ssize_t total = 0;
-    while ((size_t)total < kReadCap) {
-        ssize_t n = pread(orig_fd, buf + total, kReadCap - total,
-                          (off_t)total);
-        if (n <= 0) break;
-        total += n;
-    }
-    if (total < 0) {
-        munmap(buf, kReadCap);
-        close(memfd);
-        return -1;
-    }
-
-    // In-place compaction: kept lines move to the front, then ONE
-    // write() pushes the whole result into the memfd (P1.18 history:
-    // this replaced one write() per line, ~490 syscalls per read).
-    char* write_ptr = buf;
-    const char* line_start = buf;
-    const char* end = buf + total;
-    int is_status = zs_path_is_filtered(target_path ? target_path : "") &&
-                    filtered_path_basename_is(target_path, "status");
-    while (line_start < end) {
-        const char* line_end = (const char*)memchr(line_start, '\n',
-                                                   end - line_start);
-        if (!line_end) line_end = end;
-        size_t line_len = line_end - line_start;
-        size_t nl_len   = (line_end < end && *line_end == '\n') ? 1 : 0;
-        size_t full_len = line_len + nl_len;
-
-        if (is_status) {
-            char rewrite_buf[64];
-            ssize_t rewritten = rewrite_status_line(
-                rewrite_buf, sizeof rewrite_buf, line_start, full_len);
-            if (rewritten > 0) {
-                size_t rlen = (size_t)rewritten;
-                if (write_ptr + rlen <= buf + kReadCap) {
-                    memcpy(write_ptr, rewrite_buf, rlen);
-                    write_ptr += rlen;
-                }
-                line_start = line_end + nl_len;
-                continue;
+    case ZS_FILTER_ENVIRON: {
+        // Drop entries that belong to us. unsetenv() only rewrites
+        // the environ ARRAY — /proc/self/environ keeps serving the
+        // ORIGINAL stack block, so this is the only place the
+        // ZYGISK_STUDY_* variables actually disappear from.
+        for (const char* v : kOurEnvVars) {
+            size_t n = __builtin_strlen(v);
+            if (rec_len > n && memcmp(rec, v, n) == 0 && rec[n] == '=') {
+                return -1;
             }
         }
-
+        break;
+    }
+    case ZS_FILTER_NET_UNIX: {
+        // Whole-line scan: socket names, not path fields, are what
+        // carries the signal here.
+        for (const HiddenSubstring& sub : kUnixHiddenSubstrings) {
+            if (sub.len == 0 || sub.len > rec_len) continue;
+            if (memmem(rec, rec_len, sub.data, sub.len)) return -1;
+        }
+        break;
+    }
+    case ZS_FILTER_PROC_LINE:
+    default: {
         // Find the path field (after the 5th whitespace run) and
         // search the hidden substrings only within it (P1.39/P1.40
         // history: compile-time lengths + branch hints).
-        const char* p = line_start;
+        const char* p = rec;
+        const char* rec_end = rec + rec_len;
         const char* path_field = nullptr;
         int col = 0;
-        while (p < line_end) {
+        while (p < rec_end) {
             char c = *p;
             if (c == ' ' || c == '\t') {
-                while (p < line_end && (*p == ' ' || *p == '\t')) ++p;
+                while (p < rec_end && (*p == ' ' || *p == '\t')) ++p;
                 ++col;
                 if (col == 5) { path_field = p; break; }
             } else {
                 ++p;
             }
         }
-
-        int skip = 0;
-        if (path_field && path_field < line_end) {
-            size_t path_len = line_end - path_field;
+        if (path_field && path_field < rec_end) {
+            size_t path_len = (size_t)(rec_end - path_field);
             for (const HiddenSubstring& sub : kHiddenSubstrings) {
                 if (sub.len == 0 || sub.len > path_len) continue;
                 if (memmem(path_field, path_len, sub.data, sub.len)) {
-                    skip = 1;
-                    break;
+                    return -1;
                 }
             }
         }
+        break;
+    }
+    }
 
-        if (ZS_LIKELY(!skip)) {
-            if (write_ptr != line_start) {
-                memmove(write_ptr, line_start, full_len);
-            }
-            write_ptr += full_len;
+    if (dst != rec) {
+        if (dst_cap < rec_len) return -1;
+        memmove(dst, rec, rec_len);
+    }
+    return (ssize_t)rec_len;
+}
+
+// Produce a filtered copy of the given file's contents in a memfd.
+// Returns the memfd fd, or -1 on error.
+//
+// Round 8 (B4): this is now a STREAMING filter. The Round 7 version
+// read up to 256 KB and silently DROPPED everything beyond — and
+// /proc/self/smaps of a real app process runs 1-3 MB (about 30 lines
+// per mapping x thousands of mappings). A truncated smaps meant
+// missing mappings in the output AND, for maps, potentially our own
+// .so entries sitting in the dropped tail. We now filter in 64 KB
+// chunks with a carry buffer, so the output is correct at any size
+// with bounded memory.
+//
+// PERF/SAFETY (unchanged rationale): the scratch buffer is an
+// anonymous mmap, never a stack array — this runs inside an open()
+// hook on whatever app thread performed the open, including deep ART
+// call stacks on threads with 1 MB stacks.
+static int make_filtered_memfd(int orig_fd, const char* target_path) {
+    ZsFilterKind kind = zs_filter_kind_for_path(target_path ? target_path
+                                                            : "");
+    if (kind == ZS_FILTER_NONE) kind = ZS_FILTER_PROC_LINE;
+
+    int memfd = syscall_memfd_create("scudo", 0);
+    if (memfd < 0) return -1;
+
+    constexpr size_t kChunk = 64 * 1024;
+    char* buf = (char*)mmap(nullptr, kChunk, PROT_READ | PROT_WRITE,
+                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (buf == MAP_FAILED) {
+        close(memfd);
+        return -1;
+    }
+
+    const char sep = (kind == ZS_FILTER_ENVIRON) ? '\0' : '\n';
+    size_t carry = 0;      // unterminated record bytes at buf[0..carry)
+    size_t file_off = 0;   // pread offset into orig_fd
+    int ok = 1;
+
+    for (;;) {
+        ssize_t n = pread(orig_fd, buf + carry, kChunk - carry,
+                          (off_t)file_off);
+        if (n <= 0) break;
+        file_off += (size_t)n;
+        size_t have = carry + (size_t)n;
+
+        // Locate the LAST separator in the buffer; everything after
+        // it is a partial record carried into the next iteration.
+        size_t last_sep = (size_t)-1;
+        for (size_t i = have; i > 0; --i) {
+            if (buf[i - 1] == sep) { last_sep = i - 1; break; }
         }
-        line_start = line_end + nl_len;
+        if (last_sep == (size_t)-1) {
+            // No complete record in this chunk (a >64 KB single line
+            // does not occur in any filtered /proc file; if a hostile
+            // source produces one, drop it rather than stall).
+            if (have >= kChunk - 1) {
+                ZS_LOGW("hide_advanced: oversized record (%zu B) in "
+                        "filtered /proc file; dropping it", have);
+                carry = 0;
+            } else {
+                carry = have;
+            }
+            continue;
+        }
+
+        // In-place compaction of complete records. The record that
+        // ENDS at the last separator is included: memchr's range must
+        // reach last_sep itself, and the loop must run while
+        // rec_start <= last_sep (an empty final record is a blank
+        // line — preserved, like the Round 7 filter did).
+        size_t write_ptr = 0;
+        size_t rec_start = 0;
+        while (rec_start <= last_sep) {
+            char* sep_pos = (char*)memchr(buf + rec_start, sep,
+                                          last_sep - rec_start + 1);
+            if (!sep_pos) break;   // cannot happen; paranoia
+            size_t rec_len = (size_t)(sep_pos - (buf + rec_start));
+            ssize_t kept = zs_filter_record(buf + write_ptr,
+                                            kChunk - write_ptr,
+                                            buf + rec_start, rec_len,
+                                            kind);
+            if (kept >= 0) {
+                write_ptr += (size_t)kept;
+                buf[write_ptr++] = sep;   // re-emit the separator
+            }
+            rec_start = (size_t)(sep_pos - buf) + 1;
+        }
+        if (write_ptr > 0) {
+            if (write(memfd, buf, write_ptr) != (ssize_t)write_ptr) {
+                ok = 0;
+                break;
+            }
+        }
+        // Carry the trailing partial record to the front.
+        size_t consumed = last_sep + 1;
+        memmove(buf, buf + consumed, have - consumed);
+        carry = have - consumed;
     }
 
-    size_t kept_total = (size_t)(write_ptr - buf);
-    if (kept_total > 0) {
-        ssize_t w = write(memfd, buf, kept_total);
-        (void)w;
+    // Final record without a trailing separator (EOF mid-record).
+    if (ok && carry > 0) {
+        ssize_t kept = zs_filter_record(buf, carry, buf, carry, kind);
+        if (kept > 0 && write(memfd, buf, (size_t)kept) != kept) {
+            ok = 0;
+        }
     }
-    munmap(buf, kReadCap);
+
+    munmap(buf, kChunk);
+    if (!ok) {
+        close(memfd);
+        return -1;
+    }
     lseek(memfd, 0, SEEK_SET);
     return memfd;
 }
@@ -684,18 +916,39 @@ extern "C" int zygisk_study_hook_openat(int dirfd, const char* path,
 using FopenFn = FILE* (*)(const char*, const char*);
 static FopenFn g_real_fopen = nullptr;
 
+// Round 8 (B8): call the REAL fopen, with an open()+fdopen() fallback
+// for the (unusual) case where dlsym could not resolve fopen — the
+// old code returned nullptr for EVERY file in that situation, which
+// breaks far more than it hides.
+static FILE* zs_real_fopen(const char* path, const char* mode) {
+    if (g_real_fopen) return g_real_fopen(path, mode);
+    if (!path || !mode) { errno = EINVAL; return nullptr; }
+    int flags = O_RDONLY;
+    if (strchr(mode, 'w'))      flags = O_WRONLY | O_CREAT | O_TRUNC;
+    else if (strchr(mode, 'a')) flags = O_WRONLY | O_CREAT | O_APPEND;
+    else if (strchr(mode, '+')) flags = O_RDWR;
+    int fd = g_real_open
+        ? g_real_open(path, flags | O_CLOEXEC, 0666)
+        : (int)syscall(SYS_openat, AT_FDCWD, path, flags | O_CLOEXEC,
+                       0666);
+    if (fd < 0) return nullptr;
+    FILE* f = fdopen(fd, mode);
+    if (!f) close(fd);
+    return f;
+}
+
 extern "C" FILE* zygisk_study_hook_fopen(const char* path,
                                          const char* mode) {
     if (ZS_UNLIKELY(!hide_advanced_is_active()) || !path || !mode) {
-        return g_real_fopen ? g_real_fopen(path, mode) : nullptr;
+        return zs_real_fopen(path, mode);
     }
     // Never intercept write/append modes (and path_is_filtered only
     // ever matches /proc reads anyway).
     if (strchr(mode, 'w') || strchr(mode, 'a') ||
         !zs_path_is_filtered(path)) {
-        return g_real_fopen ? g_real_fopen(path, mode) : nullptr;
+        return zs_real_fopen(path, mode);
     }
-    FILE* f = g_real_fopen ? g_real_fopen(path, mode) : nullptr;
+    FILE* f = zs_real_fopen(path, mode);
     if (!f) return f;
     int fd = fileno(f);
     int memfd = make_filtered_memfd(fd, path);
@@ -964,44 +1217,42 @@ using SyscallFn = long (*)(long, ...);
 static SyscallFn g_real_syscall = nullptr;
 
 extern "C" long zygisk_study_hook_syscall(long number, ...) {
+    // Extract ALL SIX syscall arguments up front. The Round 7 version
+    // forwarded only four: any caller invoking a 5- or 6-argument
+    // syscall through the libc wrapper (pselect6, epoll_pwait2,
+    // clone, splice, sync_file_range, ...) had arguments 5 and 6
+    // silently replaced with garbage. In a hidden app that meant
+    // sporadic, impossible-to-debug breakage in exactly the kind of
+    // low-level code that also uses raw syscalls to probe us.
+    va_list ap;
+    va_start(ap, number);
+    long a[6];
+    for (int i = 0; i < 6; ++i) a[i] = va_arg(ap, long);
+    va_end(ap);
+
     if (ZS_UNLIKELY(!hide_advanced_is_active())) {
-        // Pass the varargs straight through.
-        va_list ap;
-        va_start(ap, number);
-        long a[6];
-        for (int i = 0; i < 6; ++i) a[i] = va_arg(ap, long);
-        va_end(ap);
         return g_real_syscall
             ? g_real_syscall(number, a[0], a[1], a[2], a[3], a[4], a[5])
             : -ENOSYS;
     }
-    // Extract the first four arguments (the most any of our handled
-    // syscalls use) and dispatch.
-    va_list ap;
-    va_start(ap, number);
-    long a0 = va_arg(ap, long);
-    long a1 = va_arg(ap, long);
-    long a2 = va_arg(ap, long);
-    long a3 = va_arg(ap, long);
-    va_end(ap);
 
 #ifdef SYS_openat
     if (number == (long)SYS_openat) {
-        const char* path = (const char*)a1;
-        if (path && path[0] == '/' && (int)a0 == AT_FDCWD &&
+        const char* path = (const char*)a[1];
+        if (path && path[0] == '/' && (int)a[0] == AT_FDCWD &&
             zs_path_is_filtered(path)) {
-            int flags = (int)a2;
-            mode_t mode = (flags & O_CREAT) ? (mode_t)a3 : 0;
-            return wrapped_openat((int)a0, path, flags, mode);
+            int flags = (int)a[2];
+            mode_t mode = (flags & O_CREAT) ? (mode_t)a[3] : 0;
+            return wrapped_openat((int)a[0], path, flags, mode);
         }
     }
 #endif
 #ifdef SYS_open
     if (number == (long)SYS_open) {
-        const char* path = (const char*)a0;
+        const char* path = (const char*)a[0];
         if (path && zs_path_is_filtered(path)) {
-            int flags = (int)a1;
-            mode_t mode = (flags & O_CREAT) ? (mode_t)a2 : 0;
+            int flags = (int)a[1];
+            mode_t mode = (flags & O_CREAT) ? (mode_t)a[2] : 0;
             return wrapped_open(path, flags, mode);
         }
     }
@@ -1014,7 +1265,7 @@ extern "C" long zygisk_study_hook_syscall(long number, ...) {
         number == (long)SYS_faccessat2 ||
 #endif
         false) {
-        const char* path = (const char*)a1;
+        const char* path = (const char*)a[1];
         if (path && path[0] == '/' && path_is_hidden(path)) {
             errno = ENOENT;
             return -1;
@@ -1022,18 +1273,16 @@ extern "C" long zygisk_study_hook_syscall(long number, ...) {
     }
 #if defined(SYS_newfstatat)
     if (number == (long)SYS_newfstatat) {
-        const char* path = (const char*)a1;
+        const char* path = (const char*)a[1];
         if (path && path[0] == '/' && path_is_hidden(path)) {
             errno = ENOENT;
             return -1;
         }
     }
 #endif
-    // Not ours — pass all four extracted args through. (Handled
-    // syscalls never use more than four; callers passing fewer are
-    // harmless — extra register args are ignored by the kernel.)
+    // Not ours — pass every argument through untouched.
     return g_real_syscall
-        ? g_real_syscall(number, a0, a1, a2, a3)
+        ? g_real_syscall(number, a[0], a[1], a[2], a[3], a[4], a[5])
         : -ENOSYS;
 }
 
@@ -1057,6 +1306,66 @@ static size_t       g_got_hook_count = 0;
 static GotHookEntry g_tier_b_hooks[kMaxGotHooks];
 static size_t       g_tier_b_hook_count = 0;
 
+// ---- Round 8 (P1): hash index over the live registry ----
+// The Round 7 matcher was a linear scan with a first-char gate. That
+// is fine for the 5 zygote-time hooks, but Tier B promotes ~24 hooks
+// and the walk then runs over every JMPREL entry of every loaded DSO
+// (tens of thousands of entries in a real app) — per hidden app
+// launch. The index below (FNV-1a, open addressing, names kept for
+// verification) turns the per-entry cost into one hash + one strcmp.
+constexpr size_t kHookIndexCap = 128;   // power of two > kMaxGotHooks
+static uint32_t    g_hook_idx_hash[kHookIndexCap];
+static void*       g_hook_idx_fn[kHookIndexCap];
+static const char* g_hook_idx_name[kHookIndexCap];
+static int         g_hook_idx_dirty = 1;
+
+static uint32_t zs_fnv1a(const char* s) {
+    uint32_t h = 2166136261u;
+    while (*s) { h ^= (uint32_t)(uint8_t)*s++; h *= 16777619u; }
+    return h;
+}
+
+static void zs_rebuild_hook_index() {
+    memset(g_hook_idx_hash, 0, sizeof g_hook_idx_hash);
+    memset(g_hook_idx_fn,   0, sizeof g_hook_idx_fn);
+    memset(g_hook_idx_name, 0, sizeof g_hook_idx_name);
+    for (size_t i = 0; i < g_got_hook_count; ++i) {
+        uint32_t h = zs_fnv1a(g_got_hooks[i].name);
+        if (h == 0) h = 1;   // 0 marks an empty slot
+        size_t idx = h & (kHookIndexCap - 1);
+        while (g_hook_idx_fn[idx]) idx = (idx + 1) & (kHookIndexCap - 1);
+        g_hook_idx_hash[idx] = h;
+        g_hook_idx_fn[idx]   = g_got_hooks[i].fn;
+        g_hook_idx_name[idx] = g_got_hooks[i].name;
+    }
+    g_hook_idx_dirty = 0;
+}
+
+// ---- Round 8 (P4): the walked-DSO mark set ----
+// See the dlopen hook comment. Cleared whenever the registry changes
+// (so the next install_got_hooks() is a full walk) and garbage-
+// collected after every successful dlclose.
+constexpr size_t kMaxWalkedDsos = 512;
+static uintptr_t g_walked_dsos[kMaxWalkedDsos];
+static size_t    g_walked_dso_count = 0;
+
+static void clear_walked_dsos() { g_walked_dso_count = 0; }
+
+static int dso_already_walked(uintptr_t addr) {
+    for (size_t i = 0; i < g_walked_dso_count; ++i) {
+        if (g_walked_dsos[i] == addr) return 1;
+    }
+    return 0;
+}
+
+static void mark_dso_walked(uintptr_t addr) {
+    if (g_walked_dso_count < kMaxWalkedDsos) {
+        g_walked_dsos[g_walked_dso_count++] = addr;
+    }
+    // Overflow (a process with > 512 DSOs): stop marking. Later
+    // re-walks then re-examine everything — correct, just slower.
+}
+
 int hide_advanced_register_got_hook(const char* name, void* fn) {
     if (!name || !fn) return 0;
     if (g_got_hook_count >= kMaxGotHooks) {
@@ -1070,6 +1379,11 @@ int hide_advanced_register_got_hook(const char* name, void* fn) {
     g_got_hooks[g_got_hook_count].name = name;
     g_got_hooks[g_got_hook_count].fn   = fn;
     ++g_got_hook_count;
+    // Registry mutation: the hash index and the walked-DSO set are
+    // both stale now (a DSO marked "walked" under the OLD hook set
+    // must be re-walked for the new hooks).
+    g_hook_idx_dirty = 1;
+    clear_walked_dsos();
     return 1;
 }
 
@@ -1104,19 +1418,24 @@ static long got_pagesize() {
     return ps > 0 ? ps : 4096;
 }
 
-// Resolve a registered hook by symbol name; first-char gate then
-// strcmp (P1.60 history: one byte compare rejects most names).
+// Resolve a registered hook by symbol name. Hash-indexed since
+// Round 8 (P1); the name is still verified with strcmp so a hash
+// collision can never patch the wrong function.
 // Only the LIVE registry is consulted: deferred Tier B entries are
 // invisible until hide_advanced_install_tier_b() promotes them,
 // which happens before the walk runs — so the walker never misses
 // anything and non-hidden processes provably carry no Tier B hooks.
 static void* match_registered_hook(const char* name) {
-    const char c = name[0];
-    for (size_t i = 0; i < g_got_hook_count; ++i) {
-        const char* h = g_got_hooks[i].name;
-        if (h[0] == c && strcmp(name, h) == 0) {
-            return g_got_hooks[i].fn;
+    if (ZS_UNLIKELY(g_hook_idx_dirty)) zs_rebuild_hook_index();
+    uint32_t h = zs_fnv1a(name);
+    if (h == 0) h = 1;
+    size_t idx = h & (kHookIndexCap - 1);
+    while (g_hook_idx_fn[idx]) {
+        if (g_hook_idx_hash[idx] == h &&
+            strcmp(name, g_hook_idx_name[idx]) == 0) {
+            return g_hook_idx_fn[idx];
         }
+        idx = (idx + 1) & (kHookIndexCap - 1);
     }
     return nullptr;
 }
@@ -1143,6 +1462,13 @@ static int patch_got_all_for_phdr(struct dl_phdr_info* info,
         strstr(info->dlpi_name, "libzn_loader.so") != nullptr) {
         return 0;
     }
+
+    // Round 8 (P4): skip DSOs this walk has already processed. The
+    // set is cleared when the registry changes and garbage-collected
+    // after a dlclose, so this can never skip a DSO that still needs
+    // (re-)patching — see the dlopen hook comment.
+    if (dso_already_walked(info->dlpi_addr)) return 0;
+    mark_dso_walked(info->dlpi_addr);
 
     const ElfW(Dyn)* dyn = nullptr;
     for (int i = 0; i < info->dlpi_phnum; i++) {
@@ -1214,6 +1540,12 @@ static int patch_got_all_for_phdr(struct dl_phdr_info* info,
 }
 
 void hide_advanced_install_got_hooks() {
+    // Full walk: clear the mark set so every DSO is re-examined
+    // (callers of this function just changed — or may have changed —
+    // the live registry; incremental re-walks happen in the dlopen
+    // hooks instead).
+    clear_walked_dsos();
+    g_hook_idx_dirty = 1;   // pick up registry mutations
     dl_iterate_phdr(patch_got_all_for_phdr, nullptr);
     ZS_LOGD("hide_advanced: GOT walk done (%zu hook(s), %zu slot(s))",
             g_got_hook_count, g_patched_slot_count);
@@ -1237,7 +1569,7 @@ void hide_advanced_uninstall_got_hooks() {
 }
 
 // ------------------------------------------------------------------------
-// dlopen hook (Tier B): patch libs the app loads later
+// dlopen / dlclose hooks (Tier B): patch libs the app loads later
 // ------------------------------------------------------------------------
 
 // In Tier B the payload stays resident, and apps load their detector
@@ -1245,14 +1577,23 @@ void hide_advanced_uninstall_got_hooks() {
 // freshly loaded library's GOT is pristine, so its open()/stat()
 // calls bypass every hook. Hooking dlopen/android_dlopen_ext and
 // re-running the walk after each load closes that window.
+//
+// Round 8 (P4): the re-walk is now INCREMENTAL. The walker marks every
+// DSO it has processed (by load address); a re-walk after a dlopen
+// only examines DSOs not seen before (the new library + any of its
+// dependencies that were loaded with it). The mark set is cleared
+// whenever the live registry changes (a re-walk is then a full walk)
+// and garbage-collected after every successful dlclose — a library
+// that is unloaded and later re-dlopen'd AT THE SAME ADDRESS must not
+// be skipped as "already walked".
 using DlopenFn = void* (*)(const char*, int);
 static DlopenFn g_real_dlopen = nullptr;
 
 extern "C" void* zygisk_study_hook_dlopen(const char* path, int flags) {
     void* h = g_real_dlopen ? g_real_dlopen(path, flags) : nullptr;
     if (h && hide_advanced_is_active()) {
-        // Re-walk: patches the newly loaded module's GOT (and is
-        // idempotent for everything already patched).
+        // Incremental re-walk: patches the newly loaded module's GOT
+        // (and anything else loaded alongside it).
         dl_iterate_phdr(patch_got_all_for_phdr, nullptr);
     }
     return h;
@@ -1276,15 +1617,85 @@ extern "C" void* zygisk_study_hook_android_dlopen_ext(
     return h;
 }
 
+using DlcloseFn = int (*)(void*);
+static DlcloseFn g_real_dlclose = nullptr;
+
+// Collect the load addresses of every currently loaded DSO (used to
+// garbage-collect the walked-DSO mark set after a dlclose).
+static uintptr_t g_live_dso_addrs[512];
+static size_t    g_live_dso_count = 0;
+static int gc_collect_live_cb(struct dl_phdr_info* info, size_t,
+                              void*) {
+    if (info && g_live_dso_count <
+                sizeof(g_live_dso_addrs) / sizeof(g_live_dso_addrs[0])) {
+        g_live_dso_addrs[g_live_dso_count++] = info->dlpi_addr;
+    }
+    return 0;
+}
+
+static void gc_walked_dso_set() {
+    g_live_dso_count = 0;
+    dl_iterate_phdr(gc_collect_live_cb, nullptr);   // cheap: no GOT work
+    size_t kept = 0;
+    for (size_t i = 0; i < g_walked_dso_count; ++i) {
+        uintptr_t addr = g_walked_dsos[i];
+        int live = 0;
+        for (size_t j = 0; j < g_live_dso_count; ++j) {
+            if (g_live_dso_addrs[j] == addr) { live = 1; break; }
+        }
+        if (live) g_walked_dsos[kept++] = addr;
+    }
+    g_walked_dso_count = kept;
+}
+
+extern "C" int zygisk_study_hook_dlclose(void* handle) {
+    if (!g_real_dlclose) {
+        g_real_dlclose = (DlcloseFn)zs_resolve_libc("dlclose");
+    }
+    if (!g_real_dlclose) return -1;
+    int rv = g_real_dlclose(handle);
+    if (rv == 0 && hide_advanced_is_active()) {
+        gc_walked_dso_set();
+    }
+    return rv;
+}
+
+// ------------------------------------------------------------------------
+// opendir hook (Tier B) — Round 8 (S3)
+// ------------------------------------------------------------------------
+
+// stat()/access() report ENOENT for hidden paths, but a detector can
+// simply opendir("/data/adb") and readdir() the entries — directory
+// contents were never gated. Java's File.list() goes through
+// libjavacore's opendir import, so the GOT patch covers it; native
+// detectors calling opendir directly are covered too. (scandir()
+// uses libc-internal opendir and is NOT covered — documented residual
+// in docs/ANDROID-REALISM.md.)
+using OpendirFn = DIR* (*)(const char*);
+static OpendirFn g_real_opendir = nullptr;
+
+extern "C" DIR* zygisk_study_hook_opendir(const char* name) {
+    if (ZS_LIKELY(!hide_advanced_is_active()) || !name ||
+        !(name[0] == '/' && path_is_hidden(name))) {
+        if (g_real_opendir) return g_real_opendir(name);
+        // Fallback when dlsym failed: openat + fdopendir.
+        int fd = (int)syscall(SYS_openat, AT_FDCWD, name,
+                              O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (fd < 0) return nullptr;
+        DIR* d = fdopendir(fd);
+        if (!d) close(fd);
+        return d;
+    }
+    errno = ENOENT;
+    return nullptr;
+}
+
 // ------------------------------------------------------------------------
 // Env scrub
 // ------------------------------------------------------------------------
 
-static const char* const kOurEnvVars[] = {
-    "ZYGISK_STUDY_DEBUG",
-    "ZYGISK_STUDY_LOG_TAG",
-    "ZYGISK_STUDY_WORKDIR",
-};
+// kOurEnvVars is defined next to the /proc filter engine (it is
+// shared with zs_filter_record's ZS_FILTER_ENVIRON handling).
 
 static void scrub_env() {
     for (const char* v : kOurEnvVars) {
@@ -1323,6 +1734,8 @@ void hide_advanced_init() {
     g_real_dlopen     = (DlopenFn)zs_resolve_libc("dlopen");
     g_real_android_dlopen_ext = (AndroidDlopenExtFn)zs_resolve_libc(
         "android_dlopen_ext");
+    g_real_dlclose    = (DlcloseFn)zs_resolve_libc("dlclose");
+    g_real_opendir    = (OpendirFn)zs_resolve_libc("opendir");
 
     // Register the Tier B hooks into the DEFERRED registry. They are
     // promoted and walked only when a hide actually lands on the
@@ -1365,7 +1778,19 @@ void hide_advanced_init() {
         (void*)&zygisk_study_hook_dlopen);
     hide_advanced_register_tier_b_hook("android_dlopen_ext",
         (void*)&zygisk_study_hook_android_dlopen_ext);
+    hide_advanced_register_tier_b_hook("dlclose",
+        (void*)&zygisk_study_hook_dlclose);
+    // Round 8 (S3): directory enumeration of hidden paths.
+    hide_advanced_register_tier_b_hook("opendir",
+        (void*)&zygisk_study_hook_opendir);
 }
+
+#ifdef ZS_HOST_TEST
+// Test-only: the live-registry matcher behind the hash index.
+void* zs_test_match_registered_hook(const char* name) {
+    return match_registered_hook(name);
+}
+#endif
 
 void hide_advanced_install_tier_b() {
     // Promote every deferred hook into the live registry, flip the

@@ -102,45 +102,57 @@ static const char* stock_exe_path() {
 #endif
 }
 
-// Returns 1 if `path` looks like a /proc/<pid>/exe path.
-static int path_is_proc_exe(const char* path) {
-    if (!path) return 0;
-    static const char kProc[] = "/proc/";
-    constexpr size_t kProcLen = sizeof(kProc) - 1;
-    if (strncmp(path, kProc, kProcLen) != 0) return 0;
-
-    const char* p = path + kProcLen;
+// Round 8 (S5): skip the "<pid>|self|thread-self" component and any
+// following "task/<tid>/" component (per-thread paths:
+// /proc/<pid>/task/<tid>/exe is the exe of a specific THREAD and was
+// missed by the Round 7 matchers). Returns the pointer past them, or
+// nullptr when the path does not have this shape.
+static const char* skip_proc_pid_components(const char* p) {
     if (strncmp(p, "self", 4) == 0) {
         p += 4;
     } else if (strncmp(p, "thread-self", 11) == 0) {
         p += 11;
     } else {
-        if (*p < '0' || *p > '9') return 0;
+        if (*p < '0' || *p > '9') return nullptr;
         while (*p >= '0' && *p <= '9') ++p;
     }
-
-    static const char kSuffix[] = "/exe";
-    constexpr size_t kSuffixLen = sizeof(kSuffix) - 1;
-    if (strncmp(p, kSuffix, kSuffixLen) != 0) return 0;
-    return p[kSuffixLen] == '\0' ? 1 : 0;
+    if (*p != '/') return nullptr;
+    ++p;
+    // Optional per-thread component.
+    if (strncmp(p, "task/", 5) == 0) {
+        p += 5;
+        if (*p < '0' || *p > '9') return nullptr;
+        while (*p >= '0' && *p <= '9') ++p;
+        if (*p != '/') return nullptr;
+        ++p;
+    }
+    return p;
 }
 
-// Returns 1 if `path` looks like a /proc/<pid>/fd/<n> path.
+// Returns 1 if `path` looks like a /proc/<pid>[/task/<tid>]/exe path.
+static int path_is_proc_exe(const char* path) {
+    if (!path) return 0;
+    static const char kProc[] = "/proc/";
+    constexpr size_t kProcLen = sizeof(kProc) - 1;
+    if (strncmp(path, kProc, kProcLen) != 0) return 0;
+    const char* p = skip_proc_pid_components(path + kProcLen);
+    if (!p) return 0;
+    return strcmp(p, "exe") == 0;
+}
+
+// Returns 1 if `path` looks like a /proc/<pid>[/task/<tid>]/fd/<n>
+// path (thread-self included — an fd of the calling thread).
 static int path_is_proc_fd(const char* path) {
     if (!path) return 0;
     static const char kProc[] = "/proc/";
     constexpr size_t kProcLen = sizeof(kProc) - 1;
     if (strncmp(path, kProc, kProcLen) != 0) return 0;
+    const char* p = skip_proc_pid_components(path + kProcLen);
+    if (!p) return 0;
 
-    const char* p = path + kProcLen;
-    if (strncmp(p, "self", 4) == 0) {
-        p += 4;
-    } else {
-        if (*p < '0' || *p > '9') return 0;
-        while (*p >= '0' && *p <= '9') ++p;
-    }
-
-    static const char kFd[] = "/fd/";
+    // skip_proc_pid_components already consumed the separator after
+    // the pid (and task) component, so the remainder is "fd/<n>".
+    static const char kFd[] = "fd/";
     constexpr size_t kFdLen = sizeof(kFd) - 1;
     if (strncmp(p, kFd, kFdLen) != 0) return 0;
     p += kFdLen;

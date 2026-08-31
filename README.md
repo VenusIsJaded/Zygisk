@@ -189,15 +189,23 @@ cd native/zygiskd
 cargo test
 ```
 
-What the tests cover (Round 7):
+What the tests cover (Round 8):
 
-- **`test_hide`** (16 tests) — basic hide layer: maps snapshot,
+- **`test_hide`** (23 tests) — basic hide layer: maps snapshot,
   denylist parser, decision logic, the property key list, the
   uid/appId denylist math (user 0 / work profile / secondary user
   all collapse to the same appId), the unmap record flag split that
   drives Tier A, and the mount-line parser matching BOTH magic-mount
-  sources and mount points.
-- **`test_hide_advanced`** (30 tests) — advanced hide layer: the
+  sources and mount points. Round 8 adds: the REAL denylist parser
+  and its mtime refresh + 2-second throttle (driven through a path
+  seam — which caught a production bug where a reload merged into
+  the old set instead of replacing it), the app-library-directory
+  guard (an app shipping its own `libpayload.so` must not get it
+  unmapped), and the Tier A record preprocessing (read-only segments
+  anonymized content-preserving, OTHER exec segments munmap'd, SELF
+  records prioritized so the trampoline's fixed record array can
+  never cut them).
+- **`test_hide_advanced`** (45 tests) — advanced hide layer: the
   hidden-substring set, memfd filtering (drops Magisk/.so entries,
   preserves libc, handles empty input), the open/fopen/FORTIFY
   hook matchers, the **/proc/<pid>/... and /proc/thread-self/...
@@ -208,10 +216,23 @@ What the tests cover (Round 7):
   Tier B registry, TracerPid rewrite, batched-write correctness,
   smaps filtering, the stat/faccessat2/fstatat/statx hooks behind
   the per-process active gate, and the `wrapped_open` closed-fd fix.
-- **`test_hide_stealth`** (14 tests) — the readlink rewriters
+  Round 8 adds: the filter-kind resolver (`/proc/mounts` alias,
+  `task/<tid>/` per-thread files, `/proc/net/unix` and its aliases,
+  `/proc/self/environ`), per-kind record filtering
+  (maps-line drop / TracerPid rewrite / env-entry drop / unix-line
+  drop), streaming filtering of arbitrarily large files (a 400 KB
+  maps file with hidden lines at the very end — the Round 7 cap
+  silently truncated at 256 KB), the six-argument syscall passthrough
+  (args 5-6 were garbage before), the hash-indexed hook matcher, the
+  fopen open+fdopen fallback, the opendir ENOENT hook, the
+  `ro.dalvik.vm.native.bridge` spoof entry, the walked-DSO mark set
+  with dlclose garbage collection, and the chunked
+  property-mapping scan for >96 KB maps files.
+- **`test_hide_stealth`** (16 tests) — the readlink rewriters
   (exe targets → stock app_process32/64 by pointer size; fd targets
   → /dev/null), the pid-variant matchers, idempotency, RLIMIT_CORE,
-  and the cwd fixup.
+  and the cwd fixup. Round 8 adds: per-thread path variants
+  (`/proc/<pid>/task/<tid>/exe|fd`, `thread-self/fd`).
 - **`test_e2e_hide`** (5 tests) — forked-child survival, denylist
   inheritance across fork, real /proc/self/maps parsing with a
   spiked Magisk line.
@@ -225,9 +246,9 @@ What the tests cover (Round 7):
   test that would have caught the original self-unmap crash (and
   that did catch an off-by-one in the first x86_64 register
   restore).
-- **`test_perf`** (3 tests) — the three microbenchmarks.
+- **`test_perf`** (4 tests) — the microbenchmarks.
 
-(Total: 70 host-side tests, plus the daemon's `cargo test` suite.)
+(Total: 95 host-side tests, plus the daemon's `cargo test` suite.)
 - **`test_perf`** (3 tests) — host-side microbenchmarks of the
   three hot paths (`make_filtered_memfd`,
   `hide_setup_for_target` fast path,
@@ -331,6 +352,48 @@ docs/ANDROID-REALISM.md; the short version:
   re-patching, magic-mount source matching, stock-value property
   spoofing, module .so unmapping.
 
+### Round 8 — deeper hiding, faster walks, and the bugs underneath
+
+The full ledger lives in PERFORMANCE-CLAIMS.md and
+docs/ANDROID-REALISM.md; the short version:
+
+- **Five more real bugs fixed**, all invisible in host tests:
+  the `syscall()` hook forwarded only 4 of 6 arguments (any
+  5/6-argument syscall through the libc wrapper got garbage
+  trailing args in hidden apps); `/proc/mounts` — the classic
+  alias — bypassed the filter entirely; `/proc/<pid>/task/<tid>/...`
+  per-thread variants bypassed it too; the filtered memfd silently
+  truncated files at 256 KB (real `/proc/self/smaps` runs 1-3 MB);
+  and a denylist reload merged into the old set instead of
+  replacing it (removing a package from the denylist never took
+  effect until a zygote restart).
+- **Tier A no longer leaves dangling soinfo pointers**: read-only
+  segments of every hidden library become content-preserving
+  ANONYMOUS pages instead of being unmapped. The dynamic linker's
+  `soinfo` nodes point into those segments (program headers,
+  `.dynstr` soname) — Round 7's full munmap left every later
+  `dlopen()`/`dl_iterate_phdr()` solist walk one `strcmp` away from
+  a crash in app code. The bytes stay (linker walks stay safe), the
+  file path disappears from maps (the hide stays complete).
+- **New stealth coverage**: `/proc/net/unix` (our daemon socket's
+  path was readable there system-wide — now filtered),
+  `/proc/self/environ` (unsetenv rewrites the environ array, NOT
+  the original stack block the proc file serves — our entries are
+  filtered out), `opendir` on hidden paths (directory enumeration
+  was never gated — Java `File.list()` covered),
+  `ro.dalvik.vm.native.bridge` (was literally "libzygisk.so" — now
+  spoofed to its pre-swap absent/empty state), and per-thread
+  readlink targets.
+- **App-library collision guard**: an app shipping its own
+  `libpayload.so` in `/data/app/...` no longer gets it unmapped by
+  our scanner.
+- **Performance**: the GOT-walk hook matcher is hash-indexed (it is
+  the inner loop of the most expensive step of a hidden app launch);
+  the denylist mtime check is gated by a vDSO clock read (no more
+  `stat()` per fork); dlopen re-walks are incremental (only newly
+  loaded DSOs re-examined), with a dlclose-hook garbage collection
+  that keeps the mark set correct across unload/reload cycles.
+
 ### Host-side perf microbenchmarks
 
 `tests/test_perf.cpp` measures the three hot paths above on the
@@ -343,9 +406,10 @@ cd tests && make test_perf && ./test_perf
 Current results on x86_64:
 
 ```
-[perf] make_filtered_memfd median:           ~171-181 us  (was 303 us before P1.18; ~168 us after P1.39/P1.40)
-[perf] hide_setup_for_target fast path median:  0 us  (sub-us)
+[perf] make_filtered_memfd median:           ~190-195 us  (streaming rewrite, Round 8; was 303 us before P1.18)
+[perf] hide_setup_for_target fast path median:  0 us  (sub-us; the Round 8 throttle removed the per-fork stat() entirely)
 [perf] hide_apply_for_target fast path median:  0 us  (sub-us)
+[perf] hook matcher median:                     ~42 ns  (Round 8 hash index; measured through the clock pair itself)
 ```
 
 Round 6 additionally merged the advanced layer's two
