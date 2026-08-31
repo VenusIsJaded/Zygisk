@@ -734,3 +734,33 @@ novel.
    open()/fopen() GOT call. Now hooked: the stream is rebound to
    the filtered memfd via its /proc/self/fd link, with write modes
    and non-proc paths passing through untouched.
+
+## Round 15-17 additions
+
+**fd observable parity** — a filtered /proc read now answers every
+descriptor-level probe like a stock procfs fd:
+
+| probe | stock procfs | pre-R15 | now |
+|---|---|---|---|
+| readlink `/proc/self/fd/N` | the proc path | `memfd:scudo` | the proc path (dups too) |
+| fstat `st_size` | 0 | filtered byte count | 0 |
+| fstat `st_mode` | `S_IFREG\|0444` | `S_IFREG\|0777` | `S_IFREG\|0444` |
+| mmap | ENODEV | works | ENODEV |
+
+**linker enumeration** — `dl_iterate_phdr` no longer lists our DSOs
+(and its `dlpi_adds` counter arithmetic stays exact so a counting
+detector sees a consistent, smaller universe); `dladdr` answers 0 for
+addresses inside our anonymous remaps, like any stock anon mapping.
+
+**directory contents** — `readdir`/`readdir_r`/raw `getdents64` drop
+entry names of root-framework artifacts from ANY directory listing.
+
+**relative /proc paths** — `chdir("/proc/self") + open("maps")`,
+`openat(proc_dirfd, "maps")`, and `.`/`..` traversal variants are
+filtered like the absolute path.
+
+**raw openat2** — `syscall(SYS_openat2, ...)` (Android 13+ kernels,
+no bionic wrapper in any release) flows through the filter.
+
+Still open (see ANDROID-REALISM residuals): dup'd memfd fstat size,
+>383-byte traversal strings, fdopendir dirfds, exec'd helpers.

@@ -1089,3 +1089,33 @@ with-modules case must be priced:
   invalidation story trivial.
 - The deny-decision key is a single slot: the uid!=gid corner simply
   re-checks (correct, just not faster).
+
+## Round 15-17
+
+### Wins
+
+- fd shadow table: pure array scans (≤32 entries) on the rare hit
+  paths only (readlink/fstat/mmap of OUR fds); the mmap hook's
+  non-tracked path is one atomic load + one ≤32 int comparison pass —
+  measured inside the perf suite budget (hook matcher median 40 ns
+  unchanged).
+- readdir filtering: first-char gate (m/./k/z/l) before any strcmp —
+  per-entry cost bounded at ~5 comparisons for 99% of names.
+- dl_iterate_phdr collect-and-emit: one extra copy per entry, only
+  in hidden apps, only on explicit enumeration — and zero cost on
+  the fast path (inactive: single atomic load).
+- GOT walk now restores the ORIGINAL page protection computed from
+  phdrs — same one mprotect per page as before, but no PROT_EXEC.
+
+### Costs added (honest)
+
+- mmap GOT hook on every mapping call in hidden apps: one table scan
+  (bounded 32) after the fd guard — the ART/scudo anonymous path
+  (fd -1) exits at the guard.
+- dl_iterate_phdr enumeration in hidden apps allocates one vector +
+  copies names (std::string) — rare call, exception-guarded.
+
+### Regression guards
+
+- tier_b_registry_size_is_pinned: the live hook count is locked by
+  test; the registry ceiling (64) cannot be reached silently again.

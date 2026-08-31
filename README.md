@@ -662,3 +662,50 @@ If you actually want a working Zygisk loader, use the official releases
 of the project of your choice from its official source. This repo exists
 for people who specifically want to read, study, and reimplement the
 loader concept themselves.
+
+### Round 15 — fd-observable parity + linker enumeration closure
+
+Every filtered `/proc` read used to hand the app a memfd whose CONTENT
+was right but whose DESCRIPTOR answered questions differently from
+procfs: `readlink("/proc/self/fd/N")` said `memfd:scudo`, `fstat`
+reported the filtered byte count and mode 0777, and `mmap` succeeded
+where procfs answers ENODEV. Each mismatch was a silent hook-detector
+with zero false positives. The fd shadow table (dev/ino/size identity,
+self-healing stale entries, dup-aware identity scan) now makes those
+descriptors answer exactly like stock procfs, and `dl_iterate_phdr`/
+`dladdr` no longer leak our library paths through the linker's solist
+(with the dlpi_adds counter arithmetic kept exact).
+
+### Round 16 — directory contents + relative /proc opens
+
+`readdir`/`readdir_r` now drop hidden entry names (listing `/` shows no
+`debug_ramdisk`, `/data` shows no `adb` — the classic RootBeer checks),
+and raw `syscall(SYS_getdents64)` results are compacted in place.
+`chdir("/proc/self"); open("maps")` and `openat(proc_dirfd, "maps")` —
+including `.`/`..` traversal — are filtered exactly like the absolute
+path.
+
+### Round 17 — adversarial pass: a real crash class flushed out
+
+The GOT patcher had been leaving pages `PROT_READ|PROT_EXEC` since
+Round 7, which breaks LAZY PLT BINDING: the dynamic linker writes
+resolved addresses into lazy `.got.plt` slots at first call, and
+writing to an RX page faults. Any hidden app that dlopen'd a
+lazy-binding third-party library would have crashed on the first call
+of an unresolved import. Found by the new registry pin test (which
+crashed the test binary at exit after all tests passed), fixed by
+computing each page's original protection from the ELF headers.
+Also: oversized streaming records no longer lose just their first
+chunk, the getdents64 compactor survives a 2000-iteration adversarial
+fuzz under ASan, and the GOT registry capacity moved 48 → 64 before
+the live set (47) silently hit the ceiling.
+
+Android version research behind these rounds (bionic sources read
+across Android 9/13/main: fortify `__open_2` routing, no `openat2`
+wrapper in any release, `memfd_create` API 30+, aarch64 fstat-as-
+fstatat, `readdir_r` still exported) is documented in
+docs/ANDROID-REALISM.md.
+
+**158/158 host tests** (31 hide / 85 advanced / 18 stealth / 5 e2e /
+4 perf / 2 trampoline / 13 dispatch), 0 warnings, ASan+UBSan+leaks
+green, every test binary exits 0.

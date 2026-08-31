@@ -1110,3 +1110,90 @@ behavior of the env (a fake table stands in).
   so only the FORCE mode is affected.
 
 133 host tests (126 → 133), all green, sanitizer run green.
+
+## Round 15-17 — Android version research, fd parity, directory entries
+
+### Version research actually performed this round (AOSP bionic sources fetched and read)
+
+The instruction was to look up how Android versions actually work
+before writing version-sensitive code. These facts were pulled from
+android.googlesource.com (bionic, at android-9.0.0_r1,
+android-13.0.0_r1, and refs/heads/main) rather than assumed:
+
+| Fact | Verified from | Consequence taken |
+|---|---|---|
+| FORTIFY 2-arg `open`/`openat` route to `__open_2`/`__openat_2` | `libc/include/bits/fortify/fcntl.h` (identical in 9 and 13) | both names stay hooked; confirmed stable across the whole supported range |
+| No bionic release wraps `openat2` (not even main) | `libc/include/fcntl.h` @ main | `SYS_openat2` handled only in the raw-syscall hook — the single path an app can reach it through on Android 13+ (kernel 5.6+) |
+| `memfd_create` libc wrapper is `__INTRODUCED_IN(30)`; the syscall needs Linux 3.17+ | `libc/include/sys/mman.h` @ main | raw-syscall memfd stays (works on every Android 8+ kernel: 3.18 floor); fail-open path added for ENOMEM-class failures |
+| `readdir_r` deprecated but still exported | `libc/include/dirent.h` @ main | hooked anyway (pragma-silenced); the deprecation removes it from NEW NDK headers, not from libc |
+| `dl_iterate_phdr` / `dladdr` exported since API 21; `dlpi_adds`/`dlpi_subs` counters present | `libc/include/link.h` @ main | enumeration hooks safe on the whole range; the adds/subs counter arithmetic is real (host-verified: iterations == adds - subs) |
+| `stat64`/`lstat64`/`fstat64` are separate symbols on 32-bit ABIs, aliases on LP64 | bionic symbol tables | extra GOT names registered — free where absent |
+| aarch64 bionic implements `fstat()` as `fstatat(AT_FDCWD, "", AT_EMPTY_PATH)`; x86_64 has `SYS_fstat` | bionic source layout | both the fstat symbol hook AND the statx AT_EMPTY_PATH arm are needed for full coverage |
+| kernel formats memfd readlink targets as `/memfd:<name> (deleted)` | host kernel (verified empirically; same format since memfd_create) | the readlink spoof marker matches the prefixed and bare forms |
+| procfs files report `st_size` 0 and reject `mmap` with ENODEV; memfd files are mode-0777 shmem | host kernel (anchor-asserted in tests) | the fd shadow table reproduces all four observables; the anchor test fails loudly if a kernel ever changes this |
+| GOT pages under RELRO are read-only, lazy `.got.plt` pages are writable | ELF/PT_GNU_RELRO semantics (the anchor is the crash itself) | original page protection computed from phdrs; RW window only (no PROT_EXEC — SELinux execmem class) |
+
+### Round 15 — fd observable parity
+
+Adopted (beyond ReZygisk — their loader answers none of these):
+- fstat/fstat64/statx(AT_EMPTY_PATH) hooks: tracked memfds answer
+  size 0, mode 0444, procfs st_dev.
+- mmap/mmap64: tracked fds answer ENODEV like procfs.
+- readlink/readlinkat: tracked fds (including dups, by dev/ino) answer
+  with the original /proc path — the Riru-era cross-check.
+- dl_iterate_phdr: our DSOs vanish AND dlpi_adds arithmetic stays
+  exact (collect-and-emit; the streaming design failed its own test
+  when the hidden entry was last — fixed before shipping).
+- dladdr/dladdr1: addresses in our anonymous remap answer 0.
+
+### Round 16 — directory contents and relative paths
+
+- readdir/readdir_r entry filtering (shared name set with scandir;
+  first-char gate).
+- Raw SYS_getdents64 buffer compaction (header-then-reclen validation;
+  the naive 275-byte-struct version emptied every directory and was
+  caught by its own test).
+- chdir/fchdir state + proc-dirfd tracking: relative opens from
+  /proc directories (including `.`/`..` traversal, normalized
+  lexically) are filtered like the absolute path.
+
+### Round 17 — adversarial pass
+
+- REAL BUG (since Round 7): GOT pages left PROT_READ|PROT_EXEC broke
+  LAZY BINDING — the dynamic linker's write of a resolved address
+  into a lazy .got.plt slot faults on RX pages. Any hidden app that
+  dlopen'd a lazy-binding third-party .so would crash on the first
+  call of an unresolved import. Found because the new registry pin
+  test crashed the test binary at exit after all tests passed.
+  Fixed by computing the original page protection from PT_GNU_RELRO/
+  PT_LOAD and using a plain RW window.
+- REAL BUG: oversized streaming records lost only their first 64 KB
+  chunk; the tail was re-emitted as a fresh record. Drop-state machine
+  now skips to the record's actual separator.
+- GOT registry hit 47/48 capacity — one hook away from silently
+  refusing registrations. Raised to 64, arithmetic pinned by test.
+- 2000-iteration adversarial fuzz of the getdents64 compactor under
+  ASan (broken headers, bogus reclens, non-NUL-terminated names).
+
+### Honest residuals (Round 15-17)
+
+- fstat-size spoofing covers the ORIGINAL fd number; a dup'd memfd
+  readlink is covered (identity scan) but its fstat reports the real
+  memfd size. Deep edge, documented rather than hooked (close/dup
+  tracking would add two more hot-path hooks for a corner no public
+  detector exercises).
+- mmap rejection matches procfs ENODEV, but `pread`/`lseek` on the
+  memfd still succeed where a pipe would fail (real procfs also
+  supports pread — only the STALE-offset semantics differ).
+- Relative >383-byte traversal strings from proc dirfds fall back to
+  unfiltered (bounded reconstruction buffer).
+- fdopendir()-based directory walks get readdir filtering (entry
+  names) but the fd was not registered as a proc-dir (only app-visible
+  open-family fds are).
+- ld.so's internal calls to dl_iterate_phdl etc. never go through
+  GOT — unchanged, by design.
+- The exec'd-helper residual (Runtime.exec("cat /proc/self/maps"))
+  still stands from Round 8.
+
+158 host tests (133 → 158), 0 warnings, ASan+UBSan+leaks green, all
+test binaries exit 0.
