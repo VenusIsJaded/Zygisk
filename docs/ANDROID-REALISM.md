@@ -1601,3 +1601,44 @@ Round 19 bind mount).
 
 186 host tests (182 → 186), 0 warnings, ASan+UBSan+leaks green, all
 test binaries exit 0.
+
+## Round 24 — kernel research: the merged-VMA trap in the R23 restoration
+
+### Version research actually performed this round
+
+Fetched and read mainline Linux (torvalds/linux master via the GitHub
+mirror): `include/uapi/linux/prctl.h`, `mm/Kconfig` (ANON_VMA_NAME),
+and `kernel/sys.c` (the PR_SET_VMA handler).
+
+| Fact | Verified from | Consequence taken |
+|---|---|---|
+| `PR_SET_VMA = 0x53564d41`, `PR_SET_VMA_ANON_NAME = 0` | prctl.h @ master | the R7+ constants are correct |
+| `CONFIG_ANON_VMA_NAME` depends on PROC_FS && ADVISE_SYSCALLS && MMU — a bool kernels may disable (mainline since 5.17; Android-common longer) | mm/Kconfig | best-effort prctl with no-op failure was and remains the right design |
+| "Assigning a name to anonymous virtual memory area might prevent that area from being merged with adjacent virtual memory areas **due to the difference in their name**" | mm/Kconfig help | VMAs with MATCHING names (or both unnamed) still merge |
+
+That last line flushed out a REAL bug in the Round 23 restoration
+shipped one round earlier: the two property mappings sit at ADJACENT
+addresses (bionic maps them back-to-back), and after the clone both
+are anonymous with identical protection and the identical
+"linker_alloc" name — **the kernel merges them into a single VMA**.
+The raw maps line a Tier B filter must answer for on a real device is
+the UNION range, not the two exact per-mapping ranges my host tests
+used. The exact-prefix matcher from Round 23 silently skipped the
+restoration in exactly the real-device case — the classic
+host-test-green, device-different trap this project keeps hitting.
+
+The matcher is now containment-based: a record whose address range
+CONTAINS a registered range restores every stock line it covers (in
+ascending order) — one merged anon input line becomes exactly the two
+stock lines a stock process shows for the region. Partial overlaps
+fabricate nothing (no device scenario produces them). The parse is a
+manual hex reader (~5 ns/line, same order as the exact-prefix
+prototype; the sscanf prototype from R23 had measured 2-5x filter
+regressions before being replaced).
+
+Also verified this round: the JNI JavaVM vtable indices used by the
+module dispatch (JNIInvokeInterface: GetEnv at slot 6,
+AttachCurrentThreadAsDaemon at slot 7 — spec-stable since Java 1.2,
+and matching the constants in module_dispatch.cpp).
+
+188 host tests (186 → 188), 0 warnings, ASan+UBSan+leaks green.

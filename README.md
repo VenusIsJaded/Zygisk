@@ -821,3 +821,22 @@ used memcpy on formally-overlapping ranges (memmove now).
 4 perf / 2 trampoline / 16 dispatch), 0 warnings, ASan+UBSan+leaks
 green, trampoline binary verification green, every test binary
 exits 0.
+
+### Round 24 — kernel research catches the merged-VMA trap
+
+Reading mainline Linux's `mm/Kconfig` ANON_VMA_NAME help text ("an
+area might prevent merging **due to the difference in their name**")
+revealed that the two property-clone mappings — adjacent addresses,
+identical protection, identical "linker_alloc" name — MERGE into one
+VMA on a real device. The Round 23 maps restoration matched exact
+per-mapping ranges: it would have silently done nothing in exactly
+the real-device case (my host tests used two separate lines; the
+kernel shows one merged line). The matcher is now containment-based:
+one merged anon line in, the exact two stock lines out. PR_SET_VMA
+constants and CONFIG_ANON_VMA_NAME's kernel gating were verified from
+prctl.h/mm/Kconfig in the same pass, and the module dispatch's JavaVM
+vtable indices (GetEnv@6, AttachCurrentThreadAsDaemon@7) against the
+JNI spec.
+
+**188/188 host tests**, 0 warnings, ASan+UBSan+leaks green, trampoline
+binary verification green.

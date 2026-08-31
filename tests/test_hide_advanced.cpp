@@ -4364,3 +4364,95 @@ ZS_TEST(streaming_filter_restores_property_lines_in_stream) {
     }
     g_prop_line_restore_count = 0;
 }
+
+// Round 24 — the MERGED-VMA case. On a real device the two property
+// mappings sit at adjacent addresses; after the clone both are
+// anonymous with identical protection, and the kernel MERGES them
+// into a single VMA — the raw maps line is the UNION range. The
+// exact-prefix matcher silently skipped restoration there (host tests
+// used two separate lines; the device shows one). Verified from the
+// ANON_VMA_NAME Kconfig help text (VMAs merge when names match).
+ZS_TEST(streaming_filter_restores_merged_property_vma) {
+    const char* maps_before =
+        "7f1a0000000-7f1a0020000 r--p 00000000 00:0c 8401      /dev/__properties__/properties_serial\n"
+        "7f1a0020000-7f1a0040000 r--p 00000000 00:0c 8402      /dev/__properties__/property_info\n";
+    capture_prop_line_restores(maps_before, strlen(maps_before));
+    ZS_CHECK_EQ(g_prop_line_restore_count, (size_t)2);
+
+    // The post-clone KERNEL view: ONE merged anon line covering both.
+    char path[] = "/tmp/zs_maps24_XXXXXX";
+    int fd = mkstemp(path);
+    ZS_CHECK(fd >= 0);
+    const char* maps_after =
+        "7e2b300000-7e2b320000 r--p 00000000 103:02 5001  /system/lib64/libc.so\n"
+        "7f1a0000000-7f1a0040000 r--p 00000000 00:00 0   \n"
+        "7fff0000-7fff1000 rw-p 00000000 00:00 0                          [stack]\n";
+    ZS_CHECK(write(fd, maps_after, strlen(maps_after)) ==
+             (ssize_t)strlen(maps_after));
+    close(fd);
+    fd = open(path, O_RDONLY);
+    ZS_CHECK(fd >= 0);
+    int mfd = make_filtered_memfd(fd, "/proc/self/maps");
+    close(fd);
+    unlink(path);
+    ZS_CHECK(mfd >= 0);
+    if (mfd >= 0) {
+        char out[2048];
+        ssize_t n = read(mfd, out, sizeof out - 1);
+        close(mfd);
+        ZS_CHECK(n > 0);
+        out[n > 0 ? n : 0] = '\0';
+        // BOTH stock lines restored from the single merged line, in
+        // address order, with the real dev/ino and paths.
+        ZS_CHECK(strstr(out, "/dev/__properties__/properties_serial") != nullptr);
+        ZS_CHECK(strstr(out, "/dev/__properties__/property_info") != nullptr);
+        const char* p1 = strstr(out, "properties_serial");
+        const char* p2 = strstr(out, "property_info");
+        ZS_CHECK(p1 != nullptr && p2 != nullptr && p1 < p2);
+        // The merged anon line is GONE (replaced, not appended).
+        ZS_CHECK(strstr(out, "7f1a0000000-7f1a0040000") == nullptr);
+        // Neighbors untouched.
+        ZS_CHECK(strstr(out, "libc.so") != nullptr);
+        ZS_CHECK(strstr(out, "[stack]") != nullptr);
+    }
+    g_prop_line_restore_count = 0;
+}
+
+// The parse + containment helpers directly (no I/O).
+ZS_TEST(prop_restore_containment_matching) {
+    const char* maps_before =
+        "7f1a0000000-7f1a0020000 r--p 00000000 00:0c 8401      /dev/__properties__/properties_serial\n"
+        "7f1a0020000-7f1a0040000 r--p 00000000 00:0c 8402      /dev/__properties__/property_info\n";
+    capture_prop_line_restores(maps_before, strlen(maps_before));
+
+    const PropLineRestore* hits[8];
+    // Exact single range: one hit.
+    size_t n = prop_line_restore_covered(
+        "7f1a0000000-7f1a0020000 r--p 00000000 00:00 0", 47, hits);
+    ZS_CHECK_EQ(n, (size_t)1);
+    // Merged union: both hits, ascending.
+    n = prop_line_restore_covered(
+        "7f1a0000000-7f1a0040000 r--p 00000000 00:00 0", 47, hits);
+    ZS_CHECK_EQ(n, (size_t)2);
+    ZS_CHECK_EQ(hits[0]->lo, (uintptr_t)0x7f1a0000000ul);
+    ZS_CHECK_EQ(hits[1]->lo, (uintptr_t)0x7f1a0020000ul);
+    // Partial overlap (half the range): no hit — we never fabricate a
+    // line for a range we did not fully clone.
+    n = prop_line_restore_covered(
+        "7f1a0010000-7f1a0030000 r--p 00000000 00:00 0", 47, hits);
+    ZS_CHECK_EQ(n, (size_t)0);
+    // Unrelated range: no hit.
+    n = prop_line_restore_covered(
+        "7e2b300000-7e2b320000 r--p 00000000 103:02 5001", 47, hits);
+    ZS_CHECK_EQ(n, (size_t)0);
+    // Non-maps lines: no hit, no parse.
+    n = prop_line_restore_covered("Size:               128 kB", 28, hits);
+    ZS_CHECK_EQ(n, (size_t)0);
+    // Malformed: no crash.
+    n = prop_line_restore_covered("-", 1, hits);
+    ZS_CHECK_EQ(n, (size_t)0);
+    n = prop_line_restore_covered("zzzz-ffff x", 11, hits);
+    ZS_CHECK_EQ(n, (size_t)0);
+
+    g_prop_line_restore_count = 0;
+}

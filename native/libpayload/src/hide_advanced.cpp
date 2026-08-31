@@ -425,11 +425,65 @@ struct PropLineRestore {
 static PropLineRestore g_prop_line_restore[8];
 static size_t          g_prop_line_restore_count;
 
+// Parse a maps line's leading "hexlo-hexhi" range. Manual — no
+// sscanf on the hot path (~5 ns vs ~300 ns per line).
+static int zs_parse_maps_range(const char* rec, size_t rec_len,
+                               uintptr_t* lo, uintptr_t* hi) {
+    auto hexval = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    uintptr_t a = 0, b = 0;
+    size_t i = 0;
+    int n1 = 0, n2 = 0;
+    while (i < rec_len) {
+        int v = hexval(rec[i]);
+        if (v < 0) break;
+        a = (a << 4) | (uintptr_t)v;
+        ++i; ++n1;
+    }
+    if (n1 == 0 || n1 > 16 || i >= rec_len || rec[i] != '-') return 0;
+    ++i;
+    while (i < rec_len) {
+        int v = hexval(rec[i]);
+        if (v < 0) break;
+        b = (b << 4) | (uintptr_t)v;
+        ++i; ++n2;
+    }
+    if (n2 == 0 || n2 > 16) return 0;
+    *lo = a;
+    *hi = b;
+    return 1;
+}
+
+// How many registered stock lines does this record's address range
+// COVER? The two property mappings sit at adjacent addresses on a
+// real device, and after the clone both are anonymous with identical
+// protection — the kernel MERGES them into a single VMA, so the raw
+// maps line we must answer for is the UNION range, not the exact
+// per-mapping range. (Verified from the ANON_VMA_NAME Kconfig help
+// text this round: named/unnamed VMAs merge when the name matches.
+// The exact-prefix prototype silently skipped restoration for the
+// merged case — the classic host-test-green, device-different trap.)
+// Emits the stock lines in table (ascending address) order.
+static size_t prop_line_restore_covered(const char* rec, size_t rec_len,
+                                        const PropLineRestore* out[8]) {
+    if (g_prop_line_restore_count == 0 || !rec || rec_len < 16) return 0;
+    uintptr_t lo = 0, hi = 0;
+    if (!zs_parse_maps_range(rec, rec_len, &lo, &hi) || hi <= lo) return 0;
+    size_t n = 0;
+    for (size_t i = 0; i < g_prop_line_restore_count && n < 8; ++i) {
+        const PropLineRestore* r = &g_prop_line_restore[i];
+        if (r->lo >= lo && r->hi <= hi) out[n++] = r;
+    }
+    return n;
+}
+
 // Match a record's leading "lo-hi " address range against the restore
-// table. Shared by the streaming loop (which must bypass in-place
-// compaction for restored records — the stock line can be LONGER
-// than the anon record it replaces) and by zs_filter_record (direct
-// calls with a separate destination buffer).
+// table (EXACT form — for zs_filter_record's direct-call path with a
+// separate destination buffer).
 // PERF: a precomputed "lo-hi " prefix + memcmp — an early sscanf
 // prototype cost ~100-250 us per 500-line maps read (one libc sscanf
 // per line); the memcmp fails on the first differing byte (~5 ns per
@@ -1689,9 +1743,10 @@ static int make_filtered_memfd(int orig_fd, const char* target_path) {
             if (!sep_pos) break;   // cannot happen; paranoia
             size_t rec_len = (size_t)(sep_pos - (buf + rec_start));
             if (kind == ZS_FILTER_PROC_LINE && g_prop_line_restore_count) {
-                const PropLineRestore* rr =
-                    prop_line_restore_for(buf + rec_start, rec_len);
-                if (rr) {
+                const PropLineRestore* hits[8];
+                size_t nhits = prop_line_restore_covered(buf + rec_start,
+                                                         rec_len, hits);
+                if (nhits > 0) {
                     if (write_ptr > 0) {
                         if (write(memfd, buf, write_ptr) !=
                             (ssize_t)write_ptr) {
@@ -1699,9 +1754,17 @@ static int make_filtered_memfd(int orig_fd, const char* target_path) {
                             break;
                         }
                     }
-                    if (write(memfd, rr->line, rr->len) !=
-                            (ssize_t)rr->len ||
-                        write(memfd, &sep, 1) != 1) {
+                    // One input (possibly MERGED) anon line becomes
+                    // every stock line it covers — the exact byte
+                    // content a stock process shows for the region.
+                    int write_ok = 1;
+                    for (size_t h = 0; h < nhits && write_ok; ++h) {
+                        write_ok =
+                            write(memfd, hits[h]->line, hits[h]->len) ==
+                                (ssize_t)hits[h]->len &&
+                            write(memfd, &sep, 1) == 1;
+                    }
+                    if (!write_ok) {
                         ok = 0;
                         break;
                     }
