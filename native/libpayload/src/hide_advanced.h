@@ -111,6 +111,14 @@ ssize_t hide_advanced_spoof_memfd_readlink(int fd,
                                            size_t real_len, char* buf,
                                            size_t bufsiz);
 
+// Round 23 — resolve a RELATIVE path against a tracked /proc dirfd
+// (or the tracked /proc cwd when dirfd == AT_FDCWD) into a malloc'd,
+// normalized ABSOLUTE path the caller must free(). Returns null when
+// the dirfd/cwd is not tracked /proc (passthrough territory). Used by
+// the readlink hooks so relative proc reads hit the same matchers as
+// absolute ones (the Round 16 openat closure's readlink twin).
+char* hide_advanced_resolve_proc_relative(int dirfd, const char* rel);
+
 // One-time init: resolve real libc symbols and register this layer's
 // Tier B hooks into the registry. Does NOT walk yet.
 void hide_advanced_init();

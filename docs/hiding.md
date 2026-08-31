@@ -825,3 +825,17 @@ crash class in the hidden app itself); fdopendir()-built DIR*
 handles from bare fds (the last directory-fd registration gap);
 and over-383-byte relative-path traversals (now heap-reconstructed
 and filtered, previously an explicit unfiltered fall-through).
+
+## Round 23 — relative readlinks and the maps parity table
+
+The readlink matchers now resolve relative paths through the tracked
+proc dirfd/cwd exactly like the open wrappers do — the
+"/memfd:scudo (deleted)" answer for one of our filtered descriptors
+is unreachable through readlinkat(dirfd, "fd/N") or
+chdir()+readlink("fd/N") too. And the maps parity table gains the
+property-file lines: a Tier B maps read of a hidden process is now
+byte-identical to a stock process's maps around the property area
+(same address, perms, size, dev/ino, path — restored from the
+captured pre-clone line). Tier A raw maps keep the one documented
+deviation: anonymous lines at the identical address/perms/size with
+a blank path column.

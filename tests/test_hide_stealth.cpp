@@ -487,3 +487,89 @@ ZS_TEST(rewrite_if_suspicious_truncates_to_exact_bufsiz) {
     ZS_CHECK_EQ(n, (ssize_t)8);
     ZS_CHECK_EQ(memcmp(buf, "/dev/nul", 8), 0);
 }
+
+// Round 23 — the RELATIVE-path readlink closures. Before this round
+// the hooks skipped every matcher unless the path started with '/':
+//   readlinkat(proc_dirfd, "fd/3", ...)   -> raw "memfd:scudo (deleted)"
+//   chdir("/proc/self"); readlink("fd/3") -> same leak
+// Both must resolve through the tracked prefix and answer exactly
+// like the absolute form.
+ZS_TEST(readlinkat_relative_against_proc_dirfd_is_spoofed) {
+    hide_advanced_set_active(1);
+
+    // A tracked /proc dirfd (the opendir hook registers it).
+    DIR* d = zygisk_study_hook_opendir("/proc/self");
+    ZS_CHECK(d != nullptr);
+    int dfd = d ? dirfd(d) : -1;
+    ZS_CHECK(dfd >= 0);
+
+    // A filtered memfd through the hooked open.
+    int fd = zygisk_study_hook_open("/proc/self/maps", O_RDONLY);
+    ZS_CHECK(fd >= 0);
+
+    // THE BYPASS: relative "fd/<n>" against the proc dirfd.
+    char rel[32];
+    snprintf(rel, sizeof rel, "fd/%d", fd);
+    char buf[256];
+    memset(buf, 0, sizeof buf);
+    ssize_t n = zygisk_study_hook_readlinkat(dfd, rel, buf,
+                                             sizeof buf - 1);
+    ZS_CHECK(n > 0);
+    ZS_CHECK_EQ((int)n, 15);
+    ZS_CHECK_EQ(strncmp(buf, "/proc/self/maps", 15), 0);
+
+    // A dot-dot traversal naming a nonexistent entry: the KERNEL's
+    // own walk fails (ENOENT — it resolves components as it goes,
+    // unlike our lexical reconstruction) and the hook passes the
+    // failure through untouched. No crash, no rewrite.
+    memset(buf, 0, sizeof buf);
+    n = zygisk_study_hook_readlinkat(dfd, "task/../fd/x/../..",
+                                     buf, sizeof buf - 1);
+    ZS_CHECK_EQ(n, (ssize_t)-1);
+
+    // A non-proc dirfd stays passthrough (no record -> no resolve):
+    // readlink of "." on a directory fails EINVAL via the REAL call,
+    // untouched by any matcher.
+    int tfd = open("/tmp", O_RDONLY | O_DIRECTORY);
+    if (tfd >= 0) {
+        memset(buf, 0, sizeof buf);
+        n = zygisk_study_hook_readlinkat(tfd, ".", buf, sizeof buf - 1);
+        ZS_CHECK_EQ(n, (ssize_t)-1);
+        close(tfd);
+    }
+
+    close(fd);
+    if (d) closedir(d);
+    hide_advanced_set_active(0);
+}
+
+// Round 23 — readlink() with a relative path while the cwd is a
+// tracked /proc directory (the chdir hook maintains the prefix).
+ZS_TEST(readlink_relative_with_proc_cwd_is_spoofed) {
+    hide_advanced_set_active(1);
+
+    int fd = zygisk_study_hook_open("/proc/self/maps", O_RDONLY);
+    ZS_CHECK(fd >= 0);
+
+    ZS_CHECK_EQ(zygisk_study_hook_chdir("/proc/self"), 0);
+    char rel[32];
+    snprintf(rel, sizeof rel, "fd/%d", fd);
+    char buf[256];
+    memset(buf, 0, sizeof buf);
+    ssize_t n = zygisk_study_hook_readlink(rel, buf, sizeof buf - 1);
+    ZS_CHECK(n > 0);
+    ZS_CHECK_EQ((int)n, 15);
+    ZS_CHECK_EQ(strncmp(buf, "/proc/self/maps", 15), 0);
+
+    // Relative "exe" from the proc cwd hits the exe matcher (not a
+    // crash, not a leak; the test binary's exe is stock content so
+    // the rewrite leaves it alone — but the matcher must run).
+    memset(buf, 0, sizeof buf);
+    n = zygisk_study_hook_readlink("exe", buf, sizeof buf - 1);
+    ZS_CHECK(n > 0);
+    ZS_CHECK(strstr(buf, "test_hide_stealth") != nullptr);  // untouched
+
+    close(fd);
+    ZS_CHECK_EQ(chdir("/"), 0);   // leave the cwd sane
+    hide_advanced_set_active(0);
+}

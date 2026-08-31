@@ -1510,3 +1510,94 @@ Round 7 is closed.
 
 182 host tests (171 → 182), 0 warnings, ASan+UBSan+leaks green,
 trampoline binary verification green, all test binaries exit 0.
+
+## Round 23 — the adversarial pass: three real leaks closed
+
+### The relative-path readlink bypasses (REAL, same class as the R16 openat closure)
+
+The readlink hooks only ran their matchers when the path started
+with '/'. Two forms sailed past every matcher and answered with the
+RAW kernel target:
+
+    int dfd = open("/proc/self", O_RDONLY | O_DIRECTORY);
+    readlinkat(dfd, "fd/3", buf, sz);          // "/memfd:scudo (deleted)"
+    chdir("/proc/self");
+    readlink("fd/3", buf, sz);                  // same
+
+The memfd-origin spoof (Round 15) and the suspicious-substring
+rewrites only ever saw absolute paths — this is the exact bypass
+class Round 16 closed for open/openat, missed for readlink/readlinkat
+because those hooks live in a different file. Both now resolve the
+relative path against the tracked proc dirfd / tracked proc cwd
+(`hide_advanced_resolve_proc_relative`: the same stack-join + heap
+fallback pair the open wrappers use) and run the full matcher chain
+on the reconstructed absolute path. Non-tracked dirfds/cwds stay
+pure passthrough.
+
+Also fixed this round: the heap twin of the path normalizer called
+`memcpy` on formally-overlapping ranges (dst==src in-place
+normalization) — switched to `memmove` (the sanitizer suite never
+flagged it because the tested inputs never actually overlapped; the
+forward-only write cursor made it work in practice, but it was UB by
+the letter).
+
+### The missing /dev/__properties__ maps lines (REAL deviation, newly realized)
+
+Every stock Android process carries exactly two file-backed
+/dev/__properties__ lines in /proc/self/maps. The property-area
+clone — the mechanism that makes Tier A's hook-free spoofing work —
+replaces those file mappings with ANONYMOUS ones at the same
+addresses, so the hidden process's maps show blank/[anon:linker_alloc]
+lines where stock shows the property files. Nothing in Rounds 7-22
+ever noticed: the lines carry no root indicator, so no filter ever
+touched them.
+
+Tier B (filtered reads) now restores the captured stock lines: the
+clone captures each property line's original text before the remap
+(`capture_prop_line_restores`), and the streaming filter emits it for
+any record whose address range matches (same address, same perms,
+same size, the real file's dev/ino and path). Two implementation
+lessons worth recording:
+
+- The streaming filter's in-place compaction CANNOT express a
+  replacement longer than the record it replaces — the first version
+  of the restoration wrote the 91-byte stock line over the 48-byte
+  anon record and clobbered the not-yet-processed input records
+  (caught by the new end-to-end test: the output showed the first
+  stock line four times and the other lines gone). Restored records
+  are now flushed straight to the memfd, the remaining input shifts
+  to the front, and the record scan restarts — at most two hits per
+  stream, so the extra memmove is bounded and rare.
+- The record matcher precomputes a "lo-hi " prefix and memcmp's it
+  (~5 ns/line). The sscanf prototype cost one libc sscanf per maps
+  line — ~100-250 us per 500-line read, a 2-5x regression of the
+  Round 19 filter win. Caught by reading the perf numbers before
+  committing, not by a test.
+
+Tier A children (trampoline path, no hooks) still read their raw
+kernel maps: the property lines there are anonymous at the identical
+addresses/perms/sizes, with only the path column blank. Documented
+residual — there is no hook to intercept with, and renaming the
+pages via PR_SET_VMA can only ever produce "[anon:name]", never a
+file path. The exec'd-helper path is unaffected (execve rebuilds the
+address space; the helpers map properties_serial fresh through the
+Round 19 bind mount).
+
+### Honest residuals (Round 23)
+
+- Tier A raw maps: property mappings anonymous (address/perms/size
+  identical, path column blank). The Tier B filter and every filtered
+  read (including fopen/freopen/scandir/readdir paths) now show the
+  stock lines.
+- When the clone's maps read hits the 96 KB static-buffer truncation
+  path (a >1000-mapping process), the line-restoration capture is
+  skipped (the chunked fallback finds the mappings but not their line
+  texts) — filtered reads then keep the anon lines. The zygote's own
+  maps run well under the cap; documented rather than threaded
+  through the chunked scanner.
+- The maps filter's final unterminated record (EOF mid-line) does
+  not get the restoration applied (dst aliases rec there). Kernel
+  maps output always ends with a newline, so the path is theoretical.
+
+186 host tests (182 → 186), 0 warnings, ASan+UBSan+leaks green, all
+test binaries exit 0.

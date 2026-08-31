@@ -798,3 +798,26 @@ from the encoding).
 e2e / 4 perf / 2 trampoline / 16 dispatch), 0 warnings,
 ASan+UBSan+leaks green, trampoline binary verification green,
 every test binary exits 0.
+
+### Round 23 — the adversarial pass: three real leaks
+
+Reviewing the newest and the least-audited code with fresh eyes found
+three real gaps, all closed with regression tests. First, the
+readlink hooks only matched ABSOLUTE paths — `readlinkat(proc_dirfd,
+"fd/3")` and `chdir("/proc/self"); readlink("fd/3")` answered with
+the raw "/memfd:scudo (deleted)" target that the absolute-path arm
+had been rewriting since Round 15 (the same bypass class Round 16
+closed for open/openat). Second, every stock Android process carries
+exactly two /dev/__properties__ file-backed lines in its maps, and
+the property clone had silently replaced them with anonymous lines at
+the same addresses since Round 7 — the Tier B filter now restores the
+captured stock lines (the implementation tale — in-place compaction
+cannot grow a record, and one sscanf per maps line would have
+regressed the Round 19 filter win 2-5x — is in
+docs/ANDROID-REALISM.md). Third, the heap fallback's path normalizer
+used memcpy on formally-overlapping ranges (memmove now).
+
+**186/186 host tests** (35 hide / 104 advanced / 20 stealth / 5 e2e /
+4 perf / 2 trampoline / 16 dispatch), 0 warnings, ASan+UBSan+leaks
+green, trampoline binary verification green, every test binary
+exits 0.

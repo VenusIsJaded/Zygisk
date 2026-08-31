@@ -4249,3 +4249,118 @@ ZS_TEST(clone_remap_full_copy_for_non_areas) {
     ZS_CHECK(memcmp(map, page, sizeof page) == 0);
     munmap(map, sizeof page);
 }
+
+// Round 23 — stock-line restoration for the cloned property mappings.
+// The clone replaces the two /dev/__properties__ file mappings with
+// anonymous ones at the same addresses; the filter must put the
+// captured stock lines back so a Tier B maps/smaps read shows exactly
+// what a stock process shows (every Android process carries these two
+// lines — their ABSENCE is a deviation).
+ZS_TEST(maps_filter_restores_stock_property_lines) {
+    // The pre-clone maps (what the capture sees).
+    const char* maps_before =
+        "7e2b300000-7e2b320000 r--p 00000000 103:02 5001  /system/lib64/libc.so\n"
+        "7f1a0000000-7f1a0020000 r--p 00000000 00:0c 8401      /dev/__properties__/properties_serial\n"
+        "7f1a0020000-7f1a0040000 r--p 00000000 00:0c 8402      /dev/__properties__/property_info\n"
+        "7f2c100000-7f2c140000 rw-p 00000000 00:00 0                          [heap]\n";
+    capture_prop_line_restores(maps_before, strlen(maps_before));
+    ZS_CHECK_EQ(g_prop_line_restore_count, (size_t)2);
+    ZS_CHECK_EQ(g_prop_line_restore[0].lo, (uintptr_t)0x7f1a0000000ul);
+    ZS_CHECK_EQ(g_prop_line_restore[0].hi, (uintptr_t)0x7f1a0020000ul);
+    ZS_CHECK(strstr(g_prop_line_restore[0].line,
+                    "/dev/__properties__/properties_serial") != nullptr);
+
+    // The post-clone maps (what the app reads: anon lines at the same
+    // addresses — blank name column, prctl name variant included).
+    const char* maps_after =
+        "7e2b300000-7e2b320000 r--p 00000000 103:02 5001  /system/lib64/libc.so\n"
+        "7f1a0000000-7f1a0020000 r--p 00000000 00:00 0   \n"
+        "7f1a0020000-7f1a0040000 r--p 00000000 00:00 0   [anon:linker_alloc]\n"
+        "7f2c100000-7f2c140000 rw-p 00000000 00:00 0                          [heap]\n";
+
+    char out[512];
+    // Line 2 (the serial clone): restored to the STOCK text.
+    const char* line2 = strchr(maps_after, '\n') + 1;
+    const char* line2_end = strchr(line2, '\n');
+    ssize_t n = zs_filter_record(out, sizeof out, line2,
+                                 (size_t)(line2_end - line2),
+                                 ZS_FILTER_PROC_LINE);
+    ZS_CHECK(n > 0);
+    ZS_CHECK(memmem(out, (size_t)n, "/dev/__properties__/properties_serial",
+                    34) != nullptr);
+    ZS_CHECK(memmem(out, (size_t)n, "8401", 4) != nullptr);   // real inode
+
+    // Line 3 (property_info clone, prctl-named variant): also restored.
+    const char* line3 = line2_end + 1;
+    const char* line3_end = strchr(line3, '\n');
+    n = zs_filter_record(out, sizeof out, line3,
+                         (size_t)(line3_end - line3),
+                         ZS_FILTER_PROC_LINE);
+    ZS_CHECK(n > 0);
+    ZS_CHECK(memmem(out, (size_t)n, "/dev/__properties__/property_info",
+                    29) != nullptr);
+    ZS_CHECK(memmem(out, (size_t)n, "[anon:linker_alloc]", 19) == nullptr);
+
+    // Non-matching lines (libc, heap) pass through untouched.
+    const char* libc_line =
+        "7e2b300000-7e2b320000 r--p 00000000 103:02 5001  /system/lib64/libc.so";
+    n = zs_filter_record(out, sizeof out, libc_line, strlen(libc_line),
+                         ZS_FILTER_PROC_LINE);
+    ZS_CHECK_EQ((size_t)n, strlen(libc_line));
+    ZS_CHECK(memcmp(out, libc_line, strlen(libc_line)) == 0);
+
+    // smaps detail lines never match the lo-hi pattern.
+    const char* detail = "Size:               128 kB";
+    n = zs_filter_record(out, sizeof out, detail, strlen(detail),
+                         ZS_FILTER_PROC_LINE);
+    ZS_CHECK_EQ((size_t)n, strlen(detail));
+
+    // Round trip: capture with no property lines -> no restores, and
+    // the anon line then passes through (Tier B without a clone).
+    capture_prop_line_restores("1111-2222 r--p 00000000 00:00 0  /a\n", 34);
+    ZS_CHECK_EQ(g_prop_line_restore_count, (size_t)0);
+    g_prop_line_restore_count = 0;
+}
+
+// The END-TO-END form: full stream through the streaming filter —
+// the anon clone lines are replaced in the OUTPUT, in order.
+ZS_TEST(streaming_filter_restores_property_lines_in_stream) {
+    const char* maps_before =
+        "7f1a0000000-7f1a0020000 r--p 00000000 00:0c 8401      /dev/__properties__/properties_serial\n"
+        "7f1a0020000-7f1a0040000 r--p 00000000 00:0c 8402      /dev/__properties__/property_info\n";
+    capture_prop_line_restores(maps_before, strlen(maps_before));
+    ZS_CHECK_EQ(g_prop_line_restore_count, (size_t)2);
+
+    // Write the post-clone anon lines to a real file, then run the
+    // production memfd filter over it and read the result back.
+    char path[] = "/tmp/zs_maps23_XXXXXX";
+    int fd = mkstemp(path);
+    ZS_CHECK(fd >= 0);
+    const char* maps_after =
+        "7f1a0000000-7f1a0020000 r--p 00000000 00:00 0   \n"
+        "7f1a0020000-7f1a0040000 r--p 00000000 00:00 0   [anon:linker_alloc]\n"
+        "7fff0000-7fff1000 rw-p 00000000 00:00 0                          [stack]\n";
+    ZS_CHECK(write(fd, maps_after, strlen(maps_after)) ==
+             (ssize_t)strlen(maps_after));
+    close(fd);
+
+    // make_filtered_memfd wants the real fd of the file to filter.
+    fd = open(path, O_RDONLY);
+    ZS_CHECK(fd >= 0);
+    int mfd = make_filtered_memfd(fd, "/proc/self/maps");
+    close(fd);
+    unlink(path);
+    ZS_CHECK(mfd >= 0);
+    if (mfd >= 0) {
+        char out[1024];
+        ssize_t n = read(mfd, out, sizeof out - 1);
+        close(mfd);
+        ZS_CHECK(n > 0);
+        out[n] = '\0';
+        ZS_CHECK(strstr(out, "/dev/__properties__/properties_serial") != nullptr);
+        ZS_CHECK(strstr(out, "/dev/__properties__/property_info") != nullptr);
+        ZS_CHECK(strstr(out, "[anon:linker_alloc]") == nullptr);
+        ZS_CHECK(strstr(out, "[stack]") != nullptr);   // untouched lines stay
+    }
+    g_prop_line_restore_count = 0;
+}

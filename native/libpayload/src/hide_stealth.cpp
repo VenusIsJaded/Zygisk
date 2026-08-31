@@ -219,21 +219,35 @@ extern "C" ssize_t zygisk_study_hook_readlink(const char* path,
         ? g_real_readlink(path, buf, bufsiz)
         : (ssize_t)syscall(SYS_readlink, path, buf, bufsiz);
     if (n < 0) return n;
-    if (path_is_proc_exe(path)) {
-        return rewrite_if_suspicious(buf, bufsiz, n, 0);
-    }
-    if (path_is_proc_fd(path)) {
+    // Round 23: a RELATIVE path with the cwd inside a tracked /proc
+    // directory resolves to the same symlink the absolute path would
+    // (chdir("/proc/self"); readlink("fd/3") — the pre-R23 hook
+    // returned the raw "memfd:scudo (deleted)" target here, the exact
+    // leak the absolute-path arm had already fixed).
+    const char* eff_path = path;
+    char* resolved = (path && path[0] != '/')
+        ? hide_advanced_resolve_proc_relative(AT_FDCWD, path)
+        : nullptr;
+    if (resolved) eff_path = resolved;
+    ssize_t out = n;
+    if (path_is_proc_exe(eff_path)) {
+        out = rewrite_if_suspicious(buf, bufsiz, n, 0);
+    } else if (path_is_proc_fd(eff_path)) {
         // Round 15 (fd observable parity): one of OUR filtered memfds
         // answers "memfd:scudo" where a stock fd would answer the proc
         // path it was opened from. Rewrite it to exactly that before
         // the generic suspicious-substring rewrite gets a chance.
-        int fd = proc_fd_path_number(path);
+        int fd = proc_fd_path_number(eff_path);
         ssize_t spoofed = hide_advanced_spoof_memfd_readlink(
             fd, buf, (size_t)n, buf, bufsiz);
-        if (spoofed > 0) return spoofed;
-        return rewrite_if_suspicious(buf, bufsiz, n, 1);
+        if (spoofed > 0) {
+            out = spoofed;
+        } else {
+            out = rewrite_if_suspicious(buf, bufsiz, n, 1);
+        }
     }
-    return n;
+    free(resolved);
+    return out;
 }
 
 extern "C" ssize_t zygisk_study_hook_readlinkat(int dirfd,
@@ -249,19 +263,34 @@ extern "C" ssize_t zygisk_study_hook_readlinkat(int dirfd,
         ? g_real_readlinkat(dirfd, path, buf, bufsiz)
         : (ssize_t)syscall(SYS_readlinkat, dirfd, path, buf, bufsiz);
     if (n < 0) return n;
-    if (!path || path[0] != '/') return n;
-    if (path_is_proc_exe(path)) {
-        return rewrite_if_suspicious(buf, bufsiz, n, 0);
-    }
-    if (path_is_proc_fd(path)) {
+    if (!path) return n;
+    // Round 23: relative path + tracked /proc dirfd resolves to the
+    // same symlink the absolute path would:
+    //     int dfd = open("/proc/self", O_DIRECTORY);
+    //     readlinkat(dfd, "fd/3", buf, sz);
+    // leaked the raw memfd target before this round. (Absolute paths
+    // ignore dirfd per POSIX — unchanged behavior.)
+    const char* eff_path = path;
+    char* resolved = (path[0] != '/')
+        ? hide_advanced_resolve_proc_relative(dirfd, path)
+        : nullptr;
+    if (resolved) eff_path = resolved;
+    ssize_t out = n;
+    if (path_is_proc_exe(eff_path)) {
+        out = rewrite_if_suspicious(buf, bufsiz, n, 0);
+    } else if (path_is_proc_fd(eff_path)) {
         // Round 15: same memfd-origin spoof as readlink().
-        int fd = proc_fd_path_number(path);
+        int fd = proc_fd_path_number(eff_path);
         ssize_t spoofed = hide_advanced_spoof_memfd_readlink(
             fd, buf, (size_t)n, buf, bufsiz);
-        if (spoofed > 0) return spoofed;
-        return rewrite_if_suspicious(buf, bufsiz, n, 1);
+        if (spoofed > 0) {
+            out = spoofed;
+        } else {
+            out = rewrite_if_suspicious(buf, bufsiz, n, 1);
+        }
     }
-    return n;
+    free(resolved);
+    return out;
 }
 
 // ----------------------------------------------------------------------------

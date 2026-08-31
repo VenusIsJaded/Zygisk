@@ -400,6 +400,111 @@ static int remap_prop_mapping_private(uintptr_t lo, uintptr_t hi) {
 // declaration because clone_property_area_private() calls it.
 static void collect_absent_prop_infos();
 
+// ------------------------------------------------------------------------
+// Round 23 — stock-line restoration for the property mappings.
+//
+// The private clone replaces the /dev/__properties__ file mappings
+// with ANONYMOUS ones at the same addresses (the mechanism that makes
+// Tier A's hook-free property spoofing work). Side effect: every
+// stock Android process carries exactly two /dev/__properties__ lines
+// in /proc/self/maps, and the hidden process's RAW maps show blank
+// anon lines there instead. Tier B reads (the filtered memfd) now
+// restore the captured stock line for any cloned range — same
+// addresses, same perms, same size, and the real file's dev/ino and
+// path. (Tier A children read unfiltered maps: the deviation there is
+// documented in ANDROID-REALISM Round 23 — the address/perms/size all
+// match stock; only the path column is blank.)
+// ------------------------------------------------------------------------
+struct PropLineRestore {
+    uintptr_t lo, hi;
+    size_t    prefix_len;   // strlen("lo-hi ") — precomputed matcher
+    char      prefix[40];   // "lo-hi " (hex, lowercase, as maps shows)
+    size_t    len;          // without the trailing newline
+    char      line[152];
+};
+static PropLineRestore g_prop_line_restore[8];
+static size_t          g_prop_line_restore_count;
+
+// Match a record's leading "lo-hi " address range against the restore
+// table. Shared by the streaming loop (which must bypass in-place
+// compaction for restored records — the stock line can be LONGER
+// than the anon record it replaces) and by zs_filter_record (direct
+// calls with a separate destination buffer).
+// PERF: a precomputed "lo-hi " prefix + memcmp — an early sscanf
+// prototype cost ~100-250 us per 500-line maps read (one libc sscanf
+// per line); the memcmp fails on the first differing byte (~5 ns per
+// line, the same order as the record token scan itself).
+static const PropLineRestore* prop_line_restore_for(const char* rec,
+                                                    size_t rec_len) {
+    if (g_prop_line_restore_count == 0 || !rec || rec_len < 16) {
+        return nullptr;
+    }
+    for (size_t i = 0; i < g_prop_line_restore_count; ++i) {
+        const PropLineRestore* r = &g_prop_line_restore[i];
+        if (rec_len > r->prefix_len &&
+            memcmp(rec, r->prefix, r->prefix_len) == 0) {
+            return r;
+        }
+    }
+    return nullptr;
+}
+
+// Capture the stock text of every /dev/__properties__ maps line.
+// Same 5th-whitespace path-field discipline as find_prop_mappings.
+// Pure function over the maps buffer (host-testable directly).
+static void capture_prop_line_restores(const char* buf, size_t total) {
+    g_prop_line_restore_count = 0;
+    static const char kPropPath[] = "/dev/__properties__/";
+    constexpr size_t kPropPathLen = sizeof(kPropPath) - 1;
+    const char* p = buf;
+    const char* end = buf + total;
+    while (p < end && g_prop_line_restore_count < 8) {
+        const char* nl = (const char*)memchr(p, '\n', end - p);
+        const char* line_end = nl ? nl : end;
+        // Locate the path field (5th whitespace run — maps layout).
+        const char* fp = p;
+        const char* path_field = nullptr;
+        int col = 0;
+        while (fp < line_end) {
+            char c = *fp;
+            if (c == ' ' || c == '\t') {
+                while (fp < line_end && (*fp == ' ' || *fp == '\t')) ++fp;
+                ++col;
+                if (col == 5) { path_field = fp; break; }
+            } else {
+                ++fp;
+            }
+        }
+        if (path_field && path_field + kPropPathLen <= line_end &&
+            memcmp(path_field, kPropPath, kPropPathLen) == 0) {
+            unsigned long lo = 0, hi = 0;
+            char head[48];
+            size_t copy = (size_t)(line_end - p);
+            if (copy >= sizeof head) copy = sizeof head - 1;
+            memcpy(head, p, copy);
+            head[copy] = '\0';
+            if (sscanf(head, "%lx-%lx", &lo, &hi) == 2 && hi > lo) {
+                PropLineRestore* r =
+                    &g_prop_line_restore[g_prop_line_restore_count];
+                size_t len = (size_t)(line_end - p);
+                if (len >= sizeof r->line) len = sizeof r->line - 1;
+                memcpy(r->line, p, len);
+                r->line[len] = '\0';
+                r->lo = (uintptr_t)lo;
+                r->hi = (uintptr_t)hi;
+                r->len = len;
+                int pn = snprintf(r->prefix, sizeof r->prefix,
+                                  "%lx-%lx ", lo, hi);
+                r->prefix_len = pn > 0 && (size_t)pn < sizeof r->prefix
+                    ? (size_t)pn : 0;
+                if (r->prefix_len == 0) continue;   // unreachable lengths
+                ++g_prop_line_restore_count;
+            }
+        }
+        p = line_end + (nl ? 1 : 0);
+    }
+}
+
 static void clone_property_area_private() {
     if (g_props_cloned.exchange(1)) return;
 
@@ -444,6 +549,12 @@ static void clone_property_area_private() {
     }
     close(fd);
     if (n_mappings == 0) return;
+    // Round 23: capture the stock text of every property line BEFORE
+    // the remap replaces the mappings — the filter restores these
+    // lines for Tier B maps/smaps reads (see PropLineRestore above).
+    if (!truncated) {
+        capture_prop_line_restores(maps_buf, (size_t)total);
+    }
     int n_remapped = 0;
     for (size_t i = 0; i < n_mappings; ++i) {
         if (remap_prop_mapping_private(mappings[i].lo,
@@ -1393,6 +1504,27 @@ ssize_t zs_filter_record(char* dst, size_t dst_cap,
     }
     case ZS_FILTER_PROC_LINE:
     default: {
+        // Round 23: the property-area clone replaced the stock
+        // file-backed /dev/__properties__ mappings with anonymous
+        // ones at the same addresses. Restore the captured stock
+        // line for any cloned range BEFORE the hidden-token scan (the
+        // stock line is not ours to drop, and the blank anon line is
+        // not what a stock process would show).
+        //
+        // ONLY when dst is a SEPARATE buffer: the streaming loop
+        // compacts in place (dst may alias rec) and a restored line
+        // can be LONGER than the record — the loop handles restores
+        // itself BEFORE calling here, so this path is for direct
+        // callers with their own destination. smaps detail lines
+        // ("Size:", "Rss:", ...) never parse as "lo-hi" and pass
+        // through, keeping the entry's sizes coherent.
+        if (g_prop_line_restore_count && dst != rec) {
+            const PropLineRestore* r = prop_line_restore_for(rec, rec_len);
+            if (r && dst_cap >= r->len) {
+                memcpy(dst, r->line, r->len);
+                return (ssize_t)r->len;
+            }
+        }
         // Round 19: format-agnostic token matching (see the long
         // comment above the kHiddenExactPaths table). The old
         // "path field = after 5th whitespace run" logic only fit the
@@ -1537,6 +1669,18 @@ static int make_filtered_memfd(int orig_fd, const char* target_path) {
         // reach last_sep itself, and the loop must run while
         // rec_start <= last_sep (an empty final record is a blank
         // line — preserved, like the Round 7 filter did).
+        //
+        // Round 23: records whose address range matches a captured
+        // stock property line are REPLACED by it — and the stock line
+        // can be LONGER than the anon record it replaces, which
+        // in-place compaction cannot express (the write would clobber
+        // input records that are not processed yet — the sanitizer
+        // suite's maps test caught exactly that). Restored records
+        // are flushed straight to the memfd instead: flush whatever
+        // is pending in the compaction buffer, write the stock line,
+        // shift the remaining input to the front, and restart the
+        // scan. At most two hits per stream (the two property
+        // mappings), so the extra memmove is bounded and rare.
         size_t write_ptr = 0;
         size_t rec_start = 0;
         while (rec_start <= last_sep) {
@@ -1544,6 +1688,38 @@ static int make_filtered_memfd(int orig_fd, const char* target_path) {
                                           last_sep - rec_start + 1);
             if (!sep_pos) break;   // cannot happen; paranoia
             size_t rec_len = (size_t)(sep_pos - (buf + rec_start));
+            if (kind == ZS_FILTER_PROC_LINE && g_prop_line_restore_count) {
+                const PropLineRestore* rr =
+                    prop_line_restore_for(buf + rec_start, rec_len);
+                if (rr) {
+                    if (write_ptr > 0) {
+                        if (write(memfd, buf, write_ptr) !=
+                            (ssize_t)write_ptr) {
+                            ok = 0;
+                            break;
+                        }
+                    }
+                    if (write(memfd, rr->line, rr->len) !=
+                            (ssize_t)rr->len ||
+                        write(memfd, &sep, 1) != 1) {
+                        ok = 0;
+                        break;
+                    }
+                    // Shift the remaining input to the front and
+                    // restart the record scan on the shifted buffer.
+                    size_t after = (size_t)(sep_pos - buf) + 1;
+                    memmove(buf, buf + after, have - after);
+                    have -= after;
+                    last_sep = (size_t)-1;
+                    for (size_t i = have; i > 0; --i) {
+                        if (buf[i - 1] == sep) { last_sep = i - 1; break; }
+                    }
+                    write_ptr = 0;
+                    rec_start = 0;
+                    if (last_sep == (size_t)-1) break;
+                    continue;
+                }
+            }
             ssize_t kept = zs_filter_record(buf + write_ptr,
                                             kChunk - write_ptr,
                                             buf + rec_start, rec_len,
@@ -1909,7 +2085,12 @@ static size_t zs_normalize_path(const char* in, char* out, size_t cap) {
         }
         if (w + 1 + clen + 1 > cap) return 0;
         out[w++] = '/';
-        memcpy(out + w, comp, clen);
+        // memmove, not memcpy: the Round 22 heap twin calls this with
+        // in == out (in-place normalization). The write cursor never
+        // passes the read cursor (w <= p-comp), so ranges only ever
+        // overlap forward — but overlapping memcpy is formally UB and
+        // the sanitizer's interceptor would flag it.
+        memmove(out + w, comp, clen);
         w += clen;
     }
     if (w == 0) out[w++] = '/';
@@ -1957,6 +2138,39 @@ static char* zs_join_proc_dir_heap(const char* prefix, const char* rel) {
     size_t n = zs_normalize_path(joined, joined, plen + 1 + rlen + 2);
     if (n == 0) { free(joined); return nullptr; }
     return joined;
+}
+
+// Public helper used by the readlink hooks (hide_stealth.cpp).
+// Round 23: resolve a RELATIVE path against a tracked /proc dirfd (or
+// the tracked /proc cwd) into a malloc'd, lexically-normalized
+// ABSOLUTE path (caller frees). Returns null when nothing tracked
+// matches — callers must then treat the path as unresolvable and
+// pass through, exactly as before this round. The readlink/readlinkat
+// hooks used to skip ALL of their matchers for relative paths:
+//     int dfd = open("/proc/self", O_DIRECTORY);
+//     readlinkat(dfd, "fd/3", buf, sz);      // leaked "memfd:scudo"
+//     chdir("/proc/self"); readlink("exe", buf, sz);
+// — the same bypass class the Round 16 openat closure fixed for open.
+char* hide_advanced_resolve_proc_relative(int dirfd, const char* rel) {
+    if (!rel || rel[0] == '/') return nullptr;
+    if (!hide_advanced_is_active()) return nullptr;
+    const char* prefix = nullptr;
+    if (dirfd != AT_FDCWD) {
+        FdShadow* rec = fd_shadow_lookup(dirfd, FD_SHADOW_PROC_DIR);
+        if (!rec) return nullptr;
+        prefix = rec->orig_path;
+    } else {
+        if (g_cwd_proc_prefix_len == 0) return nullptr;
+        prefix = g_cwd_proc_prefix;
+    }
+    if (!prefix || prefix[0] != '/') return nullptr;
+    char full[160];
+    if (zs_join_proc_dir(prefix, rel, full, sizeof full)) {
+        return strdup(full);
+    }
+    // Cold path: >383-byte joined traversals (same discipline as the
+    // open wrappers — never fall through unfiltered for size reasons).
+    return zs_join_proc_dir_heap(prefix, rel);
 }
 
 // Wrap the original open so the caller gets back either the original
