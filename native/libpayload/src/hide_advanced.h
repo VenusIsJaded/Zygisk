@@ -154,6 +154,26 @@ ssize_t zs_filter_record(char* dst, size_t dst_cap,
 // (hash-indexed since Round 8; verifies the index stays consistent
 // with the registry).
 void* zs_test_match_registered_hook(const char* name);
+
+// Round 9 (B2): inject synthetic prop_info pointers as "absent
+// spoof" keys and a fake __system_property_foreach, to drive the
+// read_callback / read / foreach hooks without a bionic runtime.
+void zs_test_set_absent_prop_infos(const void** arr, size_t n);
+void zs_test_set_real_prop_foreach(
+    int (*fn)(void (*)(const void*, void*), void*));
+
+// Round 9 (S1): replace the real scandir() so tests can supply a
+// synthetic dirent list to the scandir/scandirat hooks.
+void zs_test_set_real_scandir(void* fn);
+
+// Round 9 (P1): how many TLS scratch buffers the filter engine has
+// allocated. Repeated filtering on one thread must not grow this.
+int  zs_test_filter_scratch_allocs();
+
+// Round 9 (S2): point the fd-link scan at a host-creatable directory
+// so tests can exercise the getdents64 walk + readlink resolution
+// against real file descriptors.
+void zs_test_set_fd_root_prefix(const char* prefix);
 #endif
 
 } // namespace zygisk_study

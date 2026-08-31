@@ -323,6 +323,10 @@ static int remap_prop_mapping_private(uintptr_t lo, uintptr_t hi) {
     return 1;
 }
 
+// Defined with the property READ hooks in section 5c below; forward
+// declaration because clone_property_area_private() calls it.
+static void collect_absent_prop_infos();
+
 static void clone_property_area_private() {
     if (g_props_cloned.exchange(1)) return;
 
@@ -396,6 +400,10 @@ static void clone_property_area_private() {
             }
         }
         ZS_LOGD("hide_advanced: spoofed %zu property value(s)", n_spoof);
+        // Round 9 (B2): record the clone addresses of every key we
+        // spoof as absent so the read_callback/read/foreach hooks can
+        // make them vanish even for callers that never call find().
+        collect_absent_prop_infos();
     }
 
     // Restore read-only protection on every remapped range — the
@@ -721,10 +729,40 @@ ssize_t zs_filter_record(char* dst, size_t dst_cap,
 // chunks with a carry buffer, so the output is correct at any size
 // with bounded memory.
 //
-// PERF/SAFETY (unchanged rationale): the scratch buffer is an
-// anonymous mmap, never a stack array — this runs inside an open()
-// hook on whatever app thread performed the open, including deep ART
-// call stacks on threads with 1 MB stacks.
+// PERF/SAFETY: the scratch is a heap mmap, never a stack array —
+// this runs inside an open() hook on whatever app thread performed
+// the open, including deep ART call stacks on threads with 1 MB
+// stacks. See the TLS scratch notes below for why it is allocated
+// once per thread rather than per call.
+// Round 9 (P1): the 64 KB scratch is now a lazily-allocated
+// THREAD-LOCAL buffer instead of a per-call mmap/munmap pair. Every
+// filtered /proc read used to pay two syscalls PLUS the cost of
+// zeroing 16 fresh anonymous pages (mmap always zeroes) — in a
+// hidden app, every open() of maps/smaps/mounts/status/environ paid
+// it, on every thread that touched one. The TLS buffer is allocated
+// once per filtering thread and reused for the process lifetime.
+//
+// Memory bound: 64 KB x (threads that filter /proc files) — a few
+// dozen at worst, and the alternative (per-call 64 KB zeroing) cost
+// more in raw page-touch time than this costs in RSS.
+//
+// Unloading: Tier A unmaps only exec/writable SELF segments and no
+// hook of ours can run afterwards, so nothing ever dereferences this
+// pointer post-unmap; Tier B keeps the payload mapped. The buffer
+// itself is a plain libc mmap, not part of our image.
+static thread_local char* tls_filter_scratch = nullptr;
+static std::atomic<int> g_filter_scratch_allocs{0};
+
+static char* zs_filter_scratch_acquire(size_t size) {
+    if (ZS_LIKELY(tls_filter_scratch != nullptr)) return tls_filter_scratch;
+    char* p = (char*)mmap(nullptr, size, PROT_READ | PROT_WRITE,
+                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) return nullptr;
+    tls_filter_scratch = p;
+    g_filter_scratch_allocs.fetch_add(1, std::memory_order_relaxed);
+    return p;
+}
+
 static int make_filtered_memfd(int orig_fd, const char* target_path) {
     ZsFilterKind kind = zs_filter_kind_for_path(target_path ? target_path
                                                             : "");
@@ -734,9 +772,8 @@ static int make_filtered_memfd(int orig_fd, const char* target_path) {
     if (memfd < 0) return -1;
 
     constexpr size_t kChunk = 64 * 1024;
-    char* buf = (char*)mmap(nullptr, kChunk, PROT_READ | PROT_WRITE,
-                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (buf == MAP_FAILED) {
+    char* buf = zs_filter_scratch_acquire(kChunk);
+    if (!buf) {
         close(memfd);
         return -1;
     }
@@ -815,7 +852,8 @@ static int make_filtered_memfd(int orig_fd, const char* target_path) {
         }
     }
 
-    munmap(buf, kChunk);
+    // Round 9 (P1): no munmap — the scratch is thread-local and
+    // reused by this thread's next filtered /proc read.
     if (!ok) {
         close(memfd);
         return -1;
@@ -1165,7 +1203,7 @@ extern "C" int zygisk_study_hook_statx(int dirfd, const char* path,
 // ------------------------------------------------------------------------
 // 5c. Property READ hooks (Tier B)
 // ------------------------------------------------------------------------
-
+//
 // For keys whose stock behavior is "does not exist", find()/get()
 // must report absence. The clone alone can only empty the VALUE —
 // the key still enumerates and find() still returns non-NULL.
@@ -1176,8 +1214,35 @@ extern "C" int zygisk_study_hook_statx(int dirfd, const char* path,
 // SystemProperties.get() call.
 using PropFindFn = const void* (*)(const char*);
 using PropGetFn  = int (*)(const char*, char*);
+// Round 9 (B2): the enumeration path. __system_property_foreach()
+// hands the caller a prop_info* for EVERY key in the area; the
+// modern read API is __system_property_read_callback (get() is
+// implemented on top of it since Android O), and __system_property_read
+// is the legacy variant. Without hooks here, a detector could
+// enumerate all properties and read each one directly from the
+// (patched-value) clone — seeing every absent-spoofed key EXIST with
+// an empty value, which no stock device shows.
+using PropReadCbFn = void (*)(const void*,
+                              void (*)(void*, const char*, const char*,
+                                       uint32_t),
+                              void*);
+using PropReadFn    = int (*)(const void*, char*);
+using PropForeachFn = int (*)(void (*)(const void*, void*), void*);
+static PropReadCbFn g_real_prop_read_cb = nullptr;
+static PropReadFn   g_real_prop_read    = nullptr;
+static PropForeachFn g_real_prop_foreach = nullptr;
+
 static PropFindFn g_real_prop_find = nullptr;
 static PropGetFn  g_real_prop_get  = nullptr;
+
+// prop_info addresses (inside our private clone) of every key we
+// spoof as ABSENT. Collected by clone_property_area_private() right
+// after the values are patched — the trie walk finds the addresses
+// in the clone, which is what any later read sees. Bounded at the
+// spoof table size; if the table grows past this, extras fall back
+// to the clone-only behavior (documented residual, tested).
+static const void* g_absent_prop_infos[32];
+static size_t      g_absent_prop_count = 0;
 
 static int prop_key_is_absent(const char* key) {
     if (!key) return 0;
@@ -1187,6 +1252,34 @@ static int prop_key_is_absent(const char* key) {
         }
     }
     return 0;
+}
+
+// Is this prop_info one of the absent-spoof keys? Address identity
+// is the only portable test: the public prop_info struct layout
+// varies per Android release, but the pointer values are what
+// foreach/read_callback hand the caller.
+static int prop_pi_is_absent(const void* pi) {
+    if (!pi) return 0;
+    for (size_t i = 0; i < g_absent_prop_count; ++i) {
+        if (g_absent_prop_infos[i] == pi) return 1;
+    }
+    return 0;
+}
+
+// collect_absent_prop_infos() is called from
+// clone_property_area_private() once the clone (with patched values)
+// is live at the original addresses.
+static void collect_absent_prop_infos() {
+    if (!g_find_prop) return;
+    g_absent_prop_count = 0;
+    for (const ZsPropSpoof& s : kPropSpoofTable) {
+        if (s.value != nullptr && s.value[0] != '\0') continue;
+        const void* pi = g_find_prop(s.key);
+        if (pi && g_absent_prop_count <
+                      sizeof(g_absent_prop_infos) / sizeof(void*)) {
+            g_absent_prop_infos[g_absent_prop_count++] = pi;
+        }
+    }
 }
 
 extern "C" const void* zygisk_study_hook_prop_find(const char* key) {
@@ -1202,6 +1295,59 @@ extern "C" int zygisk_study_hook_prop_get(const char* key, char* value) {
     }
     if (value) value[0] = '\0';
     return 0;  // length 0 = not found
+}
+
+// Round 9 (B2): read_callback for an absent key must not invoke the
+// caller's callback at all — calling it with an empty value is
+// exactly the "present but empty" anomaly only hiding creates. This
+// matters even for callers that never touched find(): any prop_info
+// pointer obtained from foreach() or cached before we hid resolves
+// into the clone, so the address test still sees the spoof.
+extern "C" void zygisk_study_hook_prop_read_callback(
+    const void* pi, void (*cb)(void*, const char*, const char*, uint32_t),
+    void* cookie) {
+    if (ZS_LIKELY(!hide_advanced_is_active()) || !prop_pi_is_absent(pi)) {
+        if (g_real_prop_read_cb) g_real_prop_read_cb(pi, cb, cookie);
+        return;  // no real symbol on host: no-op
+    }
+    // Absent key: swallow the read entirely.
+}
+
+// Legacy __system_property_read (same treatment as read_callback).
+extern "C" int zygisk_study_hook_prop_read(const void* pi, char* value) {
+    if (ZS_LIKELY(!hide_advanced_is_active()) || !prop_pi_is_absent(pi)) {
+        return g_real_prop_read ? g_real_prop_read(pi, value) : 0;
+    }
+    if (value) value[0] = '\0';
+    return 0;
+}
+
+// __system_property_foreach: run the REAL enumeration with a
+// trampoline callback that drops absent keys before the caller ever
+// sees them. Value-spoofed keys pass through: the clone already
+// holds the patched values, which is what the caller's own
+// read_callback will read.
+namespace {
+struct ForeachCtx {
+    void (*user_cb)(const void*, void*);
+    void* user_cookie;
+};
+} // namespace
+static void zs_foreach_trampoline(const void* pi, void* cookie) {
+    ForeachCtx* ctx = static_cast<ForeachCtx*>(cookie);
+    if (prop_pi_is_absent(pi)) return;  // key vanishes from enumeration
+    ctx->user_cb(pi, ctx->user_cookie);
+}
+
+extern "C" int zygisk_study_hook_prop_foreach(
+    void (*cb)(const void*, void*), void* cookie) {
+    if (ZS_LIKELY(!hide_advanced_is_active()) || !cb) {
+        return g_real_prop_foreach ? g_real_prop_foreach(cb, cookie) : -1;
+    }
+    ForeachCtx ctx{cb, cookie};
+    return g_real_prop_foreach ? g_real_prop_foreach(&zs_foreach_trampoline,
+                                                     &ctx)
+                               : -1;
 }
 
 // ------------------------------------------------------------------------
@@ -1691,6 +1837,235 @@ extern "C" DIR* zygisk_study_hook_opendir(const char* name) {
 }
 
 // ------------------------------------------------------------------------
+// scandir / scandirat hooks (Tier B) — Round 9 (S1)
+// ------------------------------------------------------------------------
+//
+// scandir() walks the directory with libc-INTERNAL opendir/readdir
+// calls, so the opendir GOT hook never sees it (documented Round 8
+// residual — closed here). Detector-friendly directories ("/",
+// "/data") are not themselves hidden, so the DIRECTORY-level ENOENT
+// rewrite is not enough: the ENTRY list must drop every name that
+// matches a root-framework artifact.
+//
+// Implementation: run the real scandir (with the caller's own filter
+// and comparator), then compact the resulting list in place, freeing
+// every hidden entry. No globals, so concurrent scandirs on different
+// app threads are safe; entries that survive are untouched (and
+// still owned by the caller to free as usual).
+//
+// The name list is deliberately TIGHT: entry-name filtering happens
+// in directories that are NOT hidden themselves, so a false positive
+// hides a legitimate app file. Exact matches of framework binaries
+// and our own artifacts only; everything else stays visible.
+
+static const char* const kHiddenDirentNames[] = {
+    "magisk", "magisk32", "magisk64", "magiskinit", "magiskboot",
+    ".magisk",
+    "ksu", "zygiskd",
+    "zygisk_study",
+    "libzygisk.so", "libpayload.so", "libzn_loader.so",
+};
+
+static int zs_dirent_name_is_hidden(const char* name) {
+    if (!name) return 0;
+    for (const char* h : kHiddenDirentNames) {
+        if (strcmp(name, h) == 0) return 1;
+    }
+    return 0;
+}
+
+using ScandirFn = int (*)(const char*, struct dirent***,
+                          int (*)(const struct dirent*),
+                          int (*)(const struct dirent**,
+                                  const struct dirent**));
+using ScandiratFn = int (*)(int, const char*, struct dirent***,
+                            int (*)(const struct dirent*),
+                            int (*)(const struct dirent**,
+                                    const struct dirent**));
+static ScandirFn   g_real_scandir = nullptr;
+static ScandiratFn g_real_scandirat = nullptr;
+
+// Shared post-filter for both scandir variants: compacts namelist in
+// place and returns the new count. Frees the dropped entries exactly
+// like a caller looping over the list would, so there is no leak and
+// no double-free contract change.
+static int zs_scandir_postfilter(struct dirent*** namelist, int n) {
+    if (n <= 0 || !namelist || !*namelist) return n;
+    struct dirent** list = *namelist;
+    int w = 0;
+    for (int i = 0; i < n; ++i) {
+        if (zs_dirent_name_is_hidden(list[i]->d_name)) {
+            free(list[i]);
+            continue;
+        }
+        list[w++] = list[i];
+    }
+    return w;
+}
+
+extern "C" int zygisk_study_hook_scandir(
+    const char* dir, struct dirent*** namelist,
+    int (*filter)(const struct dirent*),
+    int (*compar)(const struct dirent**, const struct dirent**)) {
+    if (!g_real_scandir) {
+        errno = ENOSYS;
+        return -1;
+    }
+    int n = g_real_scandir(dir, namelist, filter, compar);
+    if (n <= 0) return n;
+    // Same rewrite opendir() applies: a hidden directory "does not
+    // exist" rather than "permission denied".
+    if (hide_advanced_is_active() && dir && dir[0] == '/' &&
+        path_is_hidden(dir)) {
+        for (int i = 0; i < n; ++i) free((*namelist)[i]);
+        free(*namelist);
+        *namelist = nullptr;
+        errno = ENOENT;
+        return -1;
+    }
+    if (hide_advanced_is_active()) {
+        n = zs_scandir_postfilter(namelist, n);
+    }
+    return n;
+}
+
+extern "C" int zygisk_study_hook_scandirat(
+    int dirfd, const char* dir, struct dirent*** namelist,
+    int (*filter)(const struct dirent*),
+    int (*compar)(const struct dirent**, const struct dirent**)) {
+    if (!g_real_scandirat) {
+        errno = ENOSYS;
+        return -1;
+    }
+    int n = g_real_scandirat(dirfd, dir, namelist, filter, compar);
+    if (n <= 0) return n;
+    // Absolute paths get the full treatment; relative paths (relative
+    // to an unknown dirfd) are only entry-filtered — resolving them
+    // cheaply is not possible without /proc probing per call.
+    if (hide_advanced_is_active() && dir && dir[0] == '/' &&
+        path_is_hidden(dir)) {
+        for (int i = 0; i < n; ++i) free((*namelist)[i]);
+        free(*namelist);
+        *namelist = nullptr;
+        errno = ENOENT;
+        return -1;
+    }
+    if (hide_advanced_is_active()) {
+        n = zs_scandir_postfilter(namelist, n);
+    }
+    return n;
+}
+
+// ------------------------------------------------------------------------
+// Leaked-fd closing by link target (Tier A + B) — Round 9 (S2)
+// ------------------------------------------------------------------------
+//
+// close_tracked_fds() closes exactly the descriptors WE opened.
+// But any OTHER descriptor whose /proc/self/fd/<n> link resolves
+// into a root-framework path is equally a detection vector — and a
+// better one than most, because readlink("/proc/self/fd/N") is a
+// single cheap syscall that needs no directory listing. Sources of
+// such fds: a Zygisk module that dlopen'd (open fd kept briefly),
+// a module .so that leaked one at fork time, or a file under
+// /data/adb opened before the child dropped privileges.
+//
+// The scan reads /proc/self/fd with raw getdents64 syscalls and
+// resolves each link with the REAL readlink (resolved once, so it
+// bypasses our own Tier B GOT rewrite of readlink — no recursion),
+// then closes exactly the descriptors whose target is under a
+// hidden prefix. GPU/graphics/ashmem fds point at /dev or memfd:
+// names that never start with a root prefix, so they are untouched.
+//
+// ReZygisk solves the general case with an fd allow-list snapshot
+// taken at pre-fork and closes everything else; we deliberately do
+// NOT — closing descriptors the runtime owns (the exact bug Round 7
+// fixed) is a crash class, while a /data/adb link target is purely
+// ours to remove.
+
+using ReadlinkFn = ssize_t (*)(const char*, char*, size_t);
+static ReadlinkFn g_real_readlink_for_fd_scan = nullptr;
+
+// Raw getdents64 layout (neither glibc nor bionic headers expose it
+// for direct syscall use). d_reclen advances the walk; d_name is the
+// fd number string.
+#pragma pack(push, 1)
+struct zs_linux_dirent64 {
+    uint64_t        d_ino;
+    int64_t         d_off;
+    unsigned short  d_reclen;
+    unsigned char   d_type;
+    char            d_name[256];
+};
+#pragma pack(pop)
+
+// Root-path prefixes for the fd-link scan. File-scope (not a local
+// constant) so host tests can point the scanner at a directory they
+// can actually create — the getdents64 walk and readlink resolution
+// then run for real against the host kernel.
+struct FdRootPrefix { const char* p; size_t n; };
+static FdRootPrefix g_fd_root_prefixes[] = {
+    {"/data/adb/",                 10},
+    {"/sbin/",                      6},
+    {"/debug_ramdisk/",            15},
+    {"/data/system/zygisk_study/", 26},
+};
+
+static int fd_target_is_root_path(const char* t, size_t len) {
+    for (const auto& pre : g_fd_root_prefixes) {
+        if (len >= pre.n && memcmp(t, pre.p, pre.n) == 0) return 1;
+    }
+    return 0;
+}
+
+static void close_leaked_root_fds() {
+    if (!g_real_syscall) return;   // cannot scan without raw syscalls
+
+    int dirfd = (int)g_real_syscall(SYS_openat, AT_FDCWD, "/proc/self/fd",
+                                    O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0);
+    if (dirfd < 0) return;
+
+    // Bounded buffer: /proc/self/fd entries are tiny; 8 KB covers
+    // ~200 descriptors per getdents64 round.
+    char buf[8192];
+    if (!g_real_readlink_for_fd_scan) {
+        g_real_readlink_for_fd_scan =
+            (ReadlinkFn)zs_resolve_libc("readlink");
+    }
+    int closed = 0;
+    for (;;) {
+        long n = g_real_syscall(SYS_getdents64, dirfd, buf, (long)sizeof buf);
+        if (n <= 0) break;
+        for (long off = 0; off < n;) {
+            struct zs_linux_dirent64* de =
+                (struct zs_linux_dirent64*)(buf + off);
+            off += de->d_reclen;
+            if (off > n) break;  // corrupt record; stop this round
+            // d_name must be a pure fd number ("." / ".." excluded).
+            if (de->d_name[0] < '0' || de->d_name[0] > '9') continue;
+            int fd = atoi(de->d_name);
+            if (fd <= 0 || fd == dirfd) continue;
+            char path[64];
+            char target[PATH_MAX];
+            int nw = snprintf(path, sizeof path, "/proc/self/fd/%d", fd);
+            if (nw <= 0 || (size_t)nw >= sizeof path) continue;
+            ssize_t tl = g_real_readlink_for_fd_scan
+                ? g_real_readlink_for_fd_scan(path, target, sizeof target - 1)
+                : -1;
+            if (tl <= 0) continue;
+            target[tl] = '\0';
+            if (fd_target_is_root_path(target, (size_t)tl)) {
+                close(fd);
+                ++closed;
+            }
+        }
+    }
+    close(dirfd);
+    if (closed) {
+        ZS_LOGD("hide_advanced: closed %d leaked root-path fd(s)", closed);
+    }
+}
+
+// ------------------------------------------------------------------------
 // Env scrub
 // ------------------------------------------------------------------------
 
@@ -1730,6 +2105,16 @@ void hide_advanced_init() {
     g_real_statx      = (StatxFn)zs_resolve_libc("statx");
     g_real_prop_find  = (PropFindFn)zs_resolve_libc("__system_property_find");
     g_real_prop_get   = (PropGetFn)zs_resolve_libc("__system_property_get");
+    // Round 9 (B2): the enumeration/read path.
+    g_real_prop_read_cb = (PropReadCbFn)zs_resolve_libc(
+        "__system_property_read_callback");
+    g_real_prop_read  = (PropReadFn)zs_resolve_libc(
+        "__system_property_read");
+    g_real_prop_foreach = (PropForeachFn)zs_resolve_libc(
+        "__system_property_foreach");
+    g_real_scandir    = (ScandirFn)zs_resolve_libc("scandir");
+    g_real_scandirat  = (ScandiratFn)zs_resolve_libc("scandirat");
+    g_real_readlink_for_fd_scan = (ReadlinkFn)zs_resolve_libc("readlink");
     g_real_syscall    = (SyscallFn)zs_resolve_libc("syscall");
     g_real_dlopen     = (DlopenFn)zs_resolve_libc("dlopen");
     g_real_android_dlopen_ext = (AndroidDlopenExtFn)zs_resolve_libc(
@@ -1772,6 +2157,14 @@ void hide_advanced_init() {
         (void*)&zygisk_study_hook_prop_find);
     hide_advanced_register_tier_b_hook("__system_property_get",
         (void*)&zygisk_study_hook_prop_get);
+    // Round 9 (B2): the enumeration path — read_callback, the legacy
+    // read, and foreach itself.
+    hide_advanced_register_tier_b_hook("__system_property_read_callback",
+        (void*)&zygisk_study_hook_prop_read_callback);
+    hide_advanced_register_tier_b_hook("__system_property_read",
+        (void*)&zygisk_study_hook_prop_read);
+    hide_advanced_register_tier_b_hook("__system_property_foreach",
+        (void*)&zygisk_study_hook_prop_foreach);
     hide_advanced_register_tier_b_hook("syscall",
         (void*)&zygisk_study_hook_syscall);
     hide_advanced_register_tier_b_hook("dlopen",
@@ -1783,12 +2176,53 @@ void hide_advanced_init() {
     // Round 8 (S3): directory enumeration of hidden paths.
     hide_advanced_register_tier_b_hook("opendir",
         (void*)&zygisk_study_hook_opendir);
+    // Round 9 (S1): scandir()/scandirat() build their dirent list
+    // through libc-internal opendir/readdir, so the opendir GOT hook
+    // does not see them. Post-filtering the result list here covers
+    // the "simple API" detectors reach for first.
+    hide_advanced_register_tier_b_hook("scandir",
+        (void*)&zygisk_study_hook_scandir);
+    hide_advanced_register_tier_b_hook("scandirat",
+        (void*)&zygisk_study_hook_scandirat);
 }
 
 #ifdef ZS_HOST_TEST
 // Test-only: the live-registry matcher behind the hash index.
 void* zs_test_match_registered_hook(const char* name) {
     return match_registered_hook(name);
+}
+
+// Round 9 (B2): drive the property enumeration hooks with synthetic
+// prop_info pointers and a fake real-foreach, exactly like the
+// denylist path seam drives the reload logic.
+void zs_test_set_absent_prop_infos(const void** arr, size_t n) {
+    g_absent_prop_count = 0;
+    for (size_t i = 0; i < n && i < 32; ++i) {
+        g_absent_prop_infos[g_absent_prop_count++] = arr[i];
+    }
+}
+
+void zs_test_set_real_prop_foreach(int (*fn)(void (*)(const void*, void*),
+                                              void*)) {
+    g_real_prop_foreach = (PropForeachFn)fn;
+}
+
+// Round 9 (S1): scandir — replace the real scandir so tests can
+// supply a synthetic dirent list.
+void zs_test_set_real_scandir(void* fn) {
+    g_real_scandir = (ScandirFn)fn;
+}
+
+// Round 9 (P1): the number of TLS scratch allocations the filter
+// engine has performed (should be <= 1 per thread, ever).
+int zs_test_filter_scratch_allocs() {
+    return g_filter_scratch_allocs.load(std::memory_order_relaxed);
+}
+
+// Round 9 (S2): point the fd-link scan at a host-creatable directory
+// so the getdents64 walk + readlink resolution run for real.
+void zs_test_set_fd_root_prefix(const char* prefix) {
+    g_fd_root_prefixes[0] = FdRootPrefix{prefix, strlen(prefix)};
 }
 #endif
 
@@ -1809,7 +2243,11 @@ void hide_advanced_apply_post_fork(const char* /*package_name*/) {
     //   1. Property clone + spoof — see clone_property_area_private
     //      for why this must preserve content.
     //   2. Close OUR fds (tracked) — never the runtime's.
-    //   3. Env scrub.
+    //   3. Round 9 (S2): close ANY fd whose /proc/self/fd link target
+    //      is under a root-framework path (leaked module fds are a
+    //      readlink-away detection vector that tracking alone cannot
+    //      catch).
+    //   4. Env scrub.
     //
     // REMOVED in Round 7:
     //   - reset_signals(): ART installs the SIGSEGV/SIGBUS handlers for
@@ -1821,6 +2259,7 @@ void hide_advanced_apply_post_fork(const char* /*package_name*/) {
     //   - close_unknown_fds(): see close_tracked_fds().
     clone_property_area_private();
     close_tracked_fds();
+    close_leaked_root_fds();
     scrub_env();
 }
 

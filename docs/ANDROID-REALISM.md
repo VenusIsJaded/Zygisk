@@ -694,3 +694,110 @@ Java and direct native opendir callers are covered.
 - The incremental GOT re-walk behavior across a real
   dlclose/dlopen-reuse cycle on bionic (the gc hook is designed
   for it; bionic's linker semantics are the remaining unknown).
+
+## Round 9 — what changed and why (the ReZygisk study round)
+
+### ReZygisk guidance: adopted vs. rejected (with reasons)
+
+ADOPTED (after understanding WHY they do it):
+
+- **MS_SLAVE|MS_REC after unshare** — ReZygisk escapes the
+  propagation problem entirely by `setns()`-switching into a "clean"
+  namespace captured from the first process at boot; Magisk's
+  DenyList does unshare + slave remount. We validated that our
+  unshare-alone approach was broken in BOTH directions (umounts
+  propagate back to init; later init mounts propagate in) and
+  adopted the slave remount, which keeps our architecture
+  self-contained (no daemon coordination, no clean-ns reference
+  process to pick, no window where the reference process might
+  itself get mounted into).
+- **Fail-closed unmount** — our old "fall through and let umount2
+  fail" reasoning after a FAILED unshare was exactly backwards
+  (still root, still in the INIT namespace → umount2 succeeds
+  globally). ReZygisk never had this hole because their setns path
+  fails safe; ours now does too: no namespace isolation, no
+  unmounts, period.
+- **fd hygiene at fork time** — ReZygisk snapshots /proc/self/fd
+  pre-fork and closes everything not in the allow-list. We
+  deliberately took the precise version instead of the blunt one:
+  close exactly the descriptors whose link target is under a
+  root-framework path (the Round 7 close-all crash class stays
+  impossible) — this catches module-leaked fds we never tracked,
+  which was the actual detection vector.
+- **The zygote fd-sanitization safety net
+  (`FileDescriptorInfo::ReopenOrDetach` hook)** — considered and
+  REJECTED for our ordering: their unmount can land before the
+  child's fd restore, ours lands at setresgid (after it), so the
+  window ReZygisk protects against does not exist here. Adding a
+  mangled-C++-symbol GOT hook with a near-zero payoff for our
+  pipeline would be complexity without benefit. Documented here so
+  the decision is not re-litigated blind.
+
+### Bugs fixed
+
+- B1 (CRITICAL, system-breaking on device): mount propagation —
+  described above. Host tests could never see it (no root, no
+  shared mounts in the container); the new seam tests verify the
+  ordering and the fail-closed gating instead.
+- B2: property ENUMERATION bypass — `__system_property_foreach`
+  handed out prop_info pointers for every key (including the ones
+  we spoof as absent), and `__system_property_read_callback` (the
+  modern read API — `get` is implemented on top of it) would read
+  them from the patched clone: "present with empty value", an
+  anomaly only hiding creates. foreach now drops absent keys;
+  read_callback swallows them; legacy read reports not-found.
+  Absent-key prop_info addresses are collected from our patched
+  clone at hide time, so pointers obtained via enumeration or
+  cached pre-hide are all caught.
+- B3: `/data/system/zygisk_study/` prefix length 28 in both unmount
+  prefix tables — the string is 26 bytes. memcmp over-read the
+  literal and never matched: mounts of our own working directory
+  were never detached from denylisted apps. Found by the new
+  fd-target test; regression test added for every prefix.
+
+### Stealth added
+
+- S1: `scandir`/`scandirat` hooks (libc-internal opendir bypass —
+  the documented Round 8 residual). Hidden dirs → ENOENT;
+  root-marker dirent names dropped in place with caller-owned
+  memory contract preserved (hook frees only what it drops).
+- S2: leaked-fd closing by link target — raw getdents64 scan of
+  /proc/self/fd + REAL readlink resolution (bypasses our own Tier B
+  readlink rewrite — no recursion); closes exactly the descriptors
+  under root-framework prefixes.
+
+### Performance
+
+- P1: thread-local filter scratch — every filtered /proc read paid
+  mmap+munmap+16-zeroed-pages; now once per filtering thread.
+  Verified by the new allocation-count test (5 passes → ≤1 alloc).
+
+### Verified in this sandbox (Round 9)
+
+- 108 host tests (95 → 108), 0 warnings on -Wall -Wextra.
+- Mount seam tests: ordering (unshare → slave → umounts) and BOTH
+  fail-closed paths (no umount2 after failed unshare; none after
+  failed slave remount).
+- Property enumeration hooks driven with synthetic prop_info
+  pointers + a fake real-foreach (absent keys: dropped from
+  enumeration, swallowed in read_callback, empty in legacy read;
+  gate-off = exact passthrough).
+- scandir hooks: entry filtering + ENOENT with ownership preserved.
+- REAL fd scan: a descriptor into a "module" directory is closed, a
+  runtime fd survives — getdents64 and readlink ran against the
+  host kernel for real.
+
+### Still needs a device (Round 9 additions)
+
+- The MS_SLAVE remount's interaction with per-vendor propagation
+  setups (some devices mount / private already — the remount is a
+  no-op there, which is fine).
+- The property foreach hook against bionic's real prop_area trie
+  (host glibc has no __system_property_* — the logic is tested via
+  the fake driver; the bionic callback re-entrancy is not).
+- The scandir hooks against bionic's scandir (glibc's list layout
+  matches; bionic's `scandirat` argument order is identical by
+  POSIX, but the dlclose/reallocation interplay is untested).
+- The fd scan's cost on a process with hundreds of descriptors
+  (bounded: one getdents64 round per ~200 fds + one readlink per
+  descriptor; both single-digit microseconds).

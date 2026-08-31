@@ -189,9 +189,9 @@ cd native/zygiskd
 cargo test
 ```
 
-What the tests cover (Round 8):
+What the tests cover (Round 9):
 
-- **`test_hide`** (23 tests) — basic hide layer: maps snapshot,
+- **`test_hide`** (27 tests) — basic hide layer: maps snapshot,
   denylist parser, decision logic, the property key list, the
   uid/appId denylist math (user 0 / work profile / secondary user
   all collapse to the same appId), the unmap record flag split that
@@ -204,8 +204,14 @@ What the tests cover (Round 8):
   unmapped), and the Tier A record preprocessing (read-only segments
   anonymized content-preserving, OTHER exec segments munmap'd, SELF
   records prioritized so the trampoline's fixed record array can
-  never cut them).
-- **`test_hide_advanced`** (45 tests) — advanced hide layer: the
+  never cut them). Round 9 adds: the mount-namespace seam tests —
+  unshare → MS_SLAVE remount → umount ordering, and the fail-closed
+  contract that NO umount2 ever runs after a failed unshare or a
+  failed slave remount (the old code fell through and would have
+  unmounted the init namespace system-wide on a real device), plus
+  the prefix-length regression (the /data/system/zygisk_study/
+  entry claimed 28 bytes for a 26-byte string, so it never matched).
+- **`test_hide_advanced`** (54 tests) — advanced hide layer: the
   hidden-substring set, memfd filtering (drops Magisk/.so entries,
   preserves libc, handles empty input), the open/fopen/FORTIFY
   hook matchers, the **/proc/<pid>/... and /proc/thread-self/...
@@ -227,7 +233,17 @@ What the tests cover (Round 8):
   fopen open+fdopen fallback, the opendir ENOENT hook, the
   `ro.dalvik.vm.native.bridge` spoof entry, the walked-DSO mark set
   with dlclose garbage collection, and the chunked
-  property-mapping scan for >96 KB maps files.
+  property-mapping scan for >96 KB maps files. Round 9 adds: the
+  property ENUMERATION path (`__system_property_read_callback`
+  swallows absent keys, legacy `__system_property_read` returns
+  empty, `__system_property_foreach` drops absent keys before the
+  caller's callback — driven with synthetic prop_info pointers and
+  a fake foreach), the scandir/scandirat hooks (root-marker dirent
+  entries dropped, hidden directories ENOENT, caller ownership
+  preserved), the leaked-fd scan (REAL getdents64 + readlink
+  against the host kernel: a fd pointing into the "module" dir is
+  closed, a runtime fd survives), and the TLS filter scratch
+  (five filter passes, at most one allocation).
 - **`test_hide_stealth`** (16 tests) — the readlink rewriters
   (exe targets → stock app_process32/64 by pointer size; fd targets
   → /dev/null), the pid-variant matchers, idempotency, RLIMIT_CORE,
@@ -248,7 +264,7 @@ What the tests cover (Round 8):
   restore).
 - **`test_perf`** (4 tests) — the microbenchmarks.
 
-(Total: 95 host-side tests, plus the daemon's `cargo test` suite.)
+(Total: 108 host-side tests, plus the daemon's `cargo test` suite.)
 - **`test_perf`** (3 tests) — host-side microbenchmarks of the
   three hot paths (`make_filtered_memfd`,
   `hide_setup_for_target` fast path,
@@ -393,6 +409,60 @@ docs/ANDROID-REALISM.md; the short version:
   `stat()` per fork); dlopen re-walks are incremental (only newly
   loaded DSOs re-examined), with a dlclose-hook garbage collection
   that keeps the mark set correct across unload/reload cycles.
+
+### Round 9 — propagation-safe unmount + enumeration-proof properties
+
+Studied ReZygisk (PerformanC) for guidance this round — the ledger
+of what we adopted vs. rejected and why lives in
+docs/ANDROID-REALISM.md. The short version:
+
+- **CRITICAL mount-propagation fix** (the round's headline): after
+  `unshare(CLONE_NEWNS)` the new namespace stays in the same SHARED
+  propagation peer group as init's on Android. Two consequences, both
+  severe: our `umount2()`s on shared mounts propagate BACK to the
+  init namespace (every process on the device loses its module
+  mounts — triggered by one denylisted app fork), and any later
+  mount event in init propagates INTO the child (root mounts return
+  after we unmounted them). The fix is the same one Magisk's
+  DenyList and ReZygisk's clean-namespace switch rely on: remount
+  `/` as `MS_SLAVE|MS_REC` after the unshare. The pipeline is now
+  also FAIL-CLOSED: if the unshare or the slave remount fails, the
+  unmount phase is skipped entirely — the old code fell through
+  after a failed unshare, and as root in the INIT namespace those
+  umount2s would have succeeded (the old comment assumed the
+  opposite).
+- **Property enumeration closed**: `__system_property_foreach`,
+  `read_callback`, and legacy `read` are now hooked. Previously a
+  detector could enumerate all properties and see every key we spoof
+  as "absent" present with an empty value — an anomaly that only
+  hiding creates. `foreach` now drops absent keys before the
+  caller's callback runs; `read_callback` swallows reads of absent
+  keys entirely (prop_info addresses are collected from our patched
+  clone at hide time, so cached/enumumerated pointers are caught
+  too).
+- **scandir/scandirat hooks**: scandir builds its list through
+  libc-internal opendir/readdir, so the opendir GOT hook never saw
+  it (documented Round 8 residual — now closed). Hidden directories
+  report ENOENT (consistent with opendir); non-hidden directories
+  get root-marker ENTRY names dropped in place.
+- **Leaked-fd closing by link target**: `readlink("/proc/self/fd/N")`
+  is a single-syscall detection vector. The hide pipeline now scans
+  /proc/self/fd (raw getdents64, no recursion into our own hooks)
+  and closes any descriptor whose target resolves under a
+  root-framework path — including fds opened by modules, not just
+  the ones we tracked ourselves. Runtime fds (/dev, memfd) are
+  untouched.
+- **Prefix-length bug**: the `/data/system/zygisk_study/` entries in
+  both unmount prefix tables claimed 28 bytes for a 26-byte string.
+  memcmp over-read the literal and never matched, so mounts of our
+  own working directory were never unmounted from denylisted apps.
+  Caught by the new fd-target test, fixed with a behavioral
+  regression test on every prefix.
+- **Performance**: the 64 KB /proc filter scratch is now a
+  thread-local, allocate-once buffer — every filtered open() of
+  maps/smaps/mounts/status/environ used to pay an mmap+munmap pair
+  PLUS zeroing 16 fresh pages; now the first filtered open on a
+  thread pays it once for the process lifetime.
 
 ### Host-side perf microbenchmarks
 

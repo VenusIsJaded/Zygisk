@@ -515,7 +515,7 @@ static int field_is_root_path(const char* f, size_t len) {
         {"/data/adb/",       10},
         {"/sbin/",            6},
         {"/debug_ramdisk/",  15},
-        {"/data/system/zygisk_study/", 28},
+        {"/data/system/zygisk_study/", 26},
     };
     for (const auto& pre : kPrefixes) {
         if (len >= pre.n && memcmp(f, pre.p, pre.n) == 0) return 1;
@@ -525,6 +525,72 @@ static int field_is_root_path(const char* f, size_t len) {
     if (len >= 13 && memcmp(f, "/sbin/.magisk", 13) == 0) return 1;
     return 0;
 }
+
+// ------------------------------------------------------------------------
+// Round 9 (B1) — mount-namespace syscall seam
+// ------------------------------------------------------------------------
+//
+// unshare(CLONE_NEWNS) alone does NOT give a namespace that is
+// private in the propagation sense. Android mounts / (and much of the
+// tree) as SHARED: the new namespace's copies stay members of the
+// same peer group as the originals. Two consequences, both severe:
+//
+//   1. Our umount2()s on shared mounts PROPAGATE BACK to the init
+//      namespace — every other process on the device would lose its
+//      module mounts (a system-wide breakage triggered by an app
+//      fork).
+//   2. Any mount event in the init namespace after our unshare
+//      PROPAGATES INTO the child, re-introducing root mounts after
+//      we unmounted them (a hide leak).
+//
+// The fix is the same one Magisk's DenyList and ReZygisk's clean-
+// namespace switch rely on: after unshare(), remount / as
+// MS_SLAVE|MS_REC. A slave mount receives nothing from the peer group
+// and propagates nothing back — the child is fully detached while
+// keeping a *copy* of the mount tree to unmount from.
+//
+// These three indirections exist so host tests can verify the ORDER
+// and the fail-closed gating without root (mount(2) needs
+// CAP_SYS_ADMIN). Production cost: three cold-path indirect calls.
+
+typedef int (*ZsUnshareFn)(int);
+typedef int (*ZsMountSlaveFn)();
+typedef int (*ZsUmount2Fn)(const char*, int);
+
+static int zs_do_mount_slave() {
+    // mount(2) with MS_SLAVE|MS_REC: source, target, filesystem type
+    // and data are all NULL for a propagation-type change.
+    return mount(nullptr, "/", nullptr, MS_SLAVE | MS_REC, nullptr);
+}
+
+// Call-order log (bounded, cold path). 'u' = unshare, 's' = slave
+// remount, 'm' = umount2. Written by the production defaults too, so
+// a future reorder of the pipeline is caught by the existing tests.
+static char  g_mount_log[96];
+static size_t g_mount_log_n;
+
+static inline void zs_mount_log(char op) {
+    if (g_mount_log_n < sizeof(g_mount_log)) g_mount_log[g_mount_log_n++] = op;
+}
+
+static int zs_prod_unshare(int flags) {
+    int rv = unshare(flags);
+    zs_mount_log(rv == 0 ? 'u' : 'U');
+    return rv;
+}
+static int zs_prod_mount_slave() {
+    int rv = zs_do_mount_slave();
+    zs_mount_log(rv == 0 ? 's' : 'S');
+    return rv;
+}
+static int zs_prod_umount2(const char* target, int flags) {
+    int rv = umount2(target, flags);
+    zs_mount_log(rv == 0 ? 'm' : 'M');
+    return rv;
+}
+static ZsUnshareFn    g_fn_unshare = zs_prod_unshare;
+static ZsMountSlaveFn g_fn_mount_slave = zs_prod_mount_slave;
+static ZsUmount2Fn    g_fn_umount2 = zs_prod_umount2;
 
 // Unmount everything the root framework mounted, inside our private
 // mount namespace (caller did unshare(CLONE_NEWNS)).
@@ -592,7 +658,7 @@ static void unmount_magisk_paths() {
         if (mpath + mlen >= buf + kBufCap) continue; // paranoia
         char saved = mpath[mlen];
         mpath[mlen] = '\0';
-        if (umount2(mpath, MNT_DETACH) != 0) {
+        if (g_fn_umount2(mpath, MNT_DETACH) != 0) {
             ZS_LOGW("hide: umount2(%s) failed", mpath);
         }
         mpath[mlen] = saved;
@@ -628,7 +694,7 @@ static void unmount_magisk_paths_streaming() {
     endmntent(fp);
 
     for (int i = 0; i < n_matches; ++i) {
-        if (umount2(paths[i], MNT_DETACH) != 0) {
+        if (g_fn_umount2(paths[i], MNT_DETACH) != 0) {
             ZS_LOGW("hide: umount2(%s) failed", paths[i]);
         }
     }
@@ -722,13 +788,43 @@ void hide_apply_for_target(const char* /*package_name*/) {
     // CAP_SYS_ADMIN, which is gone the moment the real setresuid
     // runs. This is why the hide pipeline hooks the *privilege drop*
     // rather than postAppSpecialize.
-    if (ZS_UNLIKELY(unshare(CLONE_NEWNS) != 0)) {
-        ZS_LOGW("hide: unshare(CLONE_NEWNS) failed: %s", strerror(errno));
-        // Continue anyway — the umounts will fail without a private
-        // namespace, but property spoofing and the self-unmap still
-        // apply. NEVER unmount globally: fall through with the
-        // namespace shared and let umount2 fail rather than mutate
-        // the system-wide mount table for every other process.
+    //
+    // Round 9 (B1): this function is now FAIL-CLOSED around the
+    // namespace dance. The old code had two system-breaking defects
+    // that host tests could not see (no root, no shared mounts):
+    //
+    //   a) On unshare() failure it fell through to the umount loop,
+    //      reasoning that "umount2 will fail without a private
+    //      namespace". That is exactly backwards: after a FAILED
+    //      unshare we are still in the INIT namespace and still root,
+    //      so umount2() SUCCEEDS there — detaching module mounts for
+    //      every process on the device. A denylisted app fork could
+    //      break the whole system's module mounts.
+    //   b) On unshare() SUCCESS, the copied namespace stays in the
+    //      same SHARED propagation peer group as init's. Every
+    //      umount2() on a shared mount propagates back to the init
+    //      namespace (same global breakage), and any mount event in
+    //      init after our unshare propagates INTO the child (a hide
+    //      leak). The MS_SLAVE|MS_REC remount below detaches us from
+    //      the peer group in both directions — the same guarantee
+    //      Magisk's DenyList and ReZygisk's clean-namespace setns()
+    //      rely on.
+    //
+    // Both failures now skip the unmount phase entirely: property
+    // spoofing, fd closing and the self-unmap still apply, we just
+    // leave the mount table alone rather than risk a global mutation.
+    if (ZS_UNLIKELY(g_fn_unshare(CLONE_NEWNS) != 0)) {
+        ZS_LOGW("hide: unshare(CLONE_NEWNS) failed: %s — skipping the "
+                "unmount phase (never umount in the init namespace)",
+                strerror(errno));
+        return;
+    }
+    if (ZS_UNLIKELY(g_fn_mount_slave() != 0)) {
+        ZS_LOGW("hide: MS_SLAVE|MS_REC remount of / failed: %s — "
+                "skipping the unmount phase (shared propagation would "
+                "leak our umounts system-wide)",
+                strerror(errno));
+        return;
     }
     unmount_magisk_paths();
     // NOTE: no scrub_properties() and no unmap_self() here anymore.
@@ -910,6 +1006,33 @@ void zs_scan_maps_into_records_test(const char* buf, size_t total) {
     g_self_so_count = 0;
     scan_maps_into_records(buf, total);
 }
+
+// ---- Round 9 (B1) mount-namespace seam ----
+//
+// hide_apply_for_target()'s ordering contract:
+//   unshare('u') -> slave remount('s') -> umount2('m'...)
+// and its fail-closed contract: 'U' (unshare failed) or 'S' (slave
+// remount failed) must NEVER be followed by any 'm'. The tests
+// replace the three syscalls with recorders that also seed the mount
+// table, then assert the log shape.
+
+void zs_test_set_mount_fns(ZsUnshareFn u, ZsMountSlaveFn s,
+                           ZsUmount2Fn um) {
+    g_fn_unshare    = u ? u : zs_prod_unshare;
+    g_fn_mount_slave = s ? s : zs_prod_mount_slave;
+    g_fn_umount2    = um ? um : zs_prod_umount2;
+}
+
+void zs_test_mount_log_reset() {
+    g_mount_log_n = 0;
+    g_mount_log[0] = '\0';   // clear stale bytes, not just the length
+}
+
+// Test recorders append their own markers so the ordering assertions
+// work no matter which fn set is installed.
+void zs_test_mount_log_append(char op) { zs_mount_log(op); }
+
+const char* zs_test_mount_log() { return g_mount_log; }
 #endif
 
 } // namespace zygisk_study

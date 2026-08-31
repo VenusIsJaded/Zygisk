@@ -649,6 +649,49 @@ plus several the fresh audit found:
    being unmapped (see ANDROID-REALISM.md Round 8): the linker's
    solist walks stay safe AND the file paths leave maps.
 
+## Round 9 — additional gaps closed (this round)
+
+Round 9 studied ReZygisk for guidance; the adopted/rejected ledger
+with reasoning lives in ANDROID-REALISM.md.
+
+1. **Mount propagation (the big one).** `unshare(CLONE_NEWNS)`
+   alone does NOT isolate: the copied namespace stays in the same
+   SHARED peer group, so our umount2s could propagate BACK to init
+   (system-wide module-mount loss) and later init mounts propagate
+   IN (root mounts returning after we detached them). The unmount
+   pipeline now remounts `/` as `MS_SLAVE|MS_REC` right after the
+   unshare, and is fail-closed: a failed unshare OR failed slave
+   remount skips the unmount phase entirely. Host seam tests assert
+   the ordering and both fail-closed paths.
+
+2. **Property enumeration.** `__system_property_foreach` +
+   `read_callback` (the modern read API) could walk the patched
+   clone and see every "absent" key present-but-empty. foreach now
+   drops absent keys before the caller's callback; read_callback
+   swallows them; legacy read reports not-found. Absent-key
+   prop_info addresses are recorded from the clone at hide time, so
+   pointers from enumeration or pre-hide caches are all covered.
+
+3. **scandir / scandirat.** These build their lists through
+   libc-internal opendir/readdir, bypassing the opendir GOT hook
+   (the Round 8 residual). Both are now hooked: hidden directories
+   report ENOENT, and root-marker entry names
+   (magisk/.magisk/ksu/zygisk_study/our .so names) are dropped from
+   the results of any directory listing, with the caller-owned
+   memory contract preserved.
+
+4. **Leaked descriptors by link target.** Any fd whose
+   `/proc/self/fd/N` link resolves under a root-framework path is
+   now closed at hide time (raw getdents64 scan + real readlink —
+   no recursion into our own hooks). This catches module-leaked
+   descriptors the tracked-fd list never knew about, without
+   reintroducing the Round 7 close-everything crash class.
+
+5. **The zygisk_study prefix.** Both unmount prefix tables carried
+   a 28 for the 26-byte `/data/system/zygisk_study/` string — the
+   memcmp over-read and never matched, so our own mounts were never
+   detached. Fixed + regression-tested for every prefix.
+
 ## Why this is "public knowledge"
 
 Every technique described in this file appears in one or more of:

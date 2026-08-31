@@ -332,21 +332,113 @@ ZS_TEST(hide_apply_for_target_is_noop_when_not_hiding) {
 }
 
 // ----------------------------------------------------------------------
-// Test 7: hide_apply_for_target() with g_will_hide=true attempts the
-// unshare path. On a non-root host, unshare(CLONE_NEWNS) returns -1.
-// We verify the function continues anyway (logs warning, proceeds).
+// Test 7: hide_apply_for_target() with g_will_hide=true and a FAILING
+// unshare (non-root host) skips the unmount phase entirely.
+//
+// Round 9 (B1): the old code fell through to the umount loop after a
+// failed unshare — which, on a real rooted device, would umount the
+// INIT namespace's module mounts system-wide. Now the function is
+// fail-closed: no unmount after any namespace-setup failure.
 // ----------------------------------------------------------------------
 
-ZS_TEST(hide_apply_for_target_continues_when_unshare_fails) {
+ZS_TEST(hide_apply_for_target_skips_unmounts_when_unshare_fails) {
     g_will_hide.store(1);
-    // P1.38: fixed-size array, reset count to ensure unmap_self is a no-op.
     g_self_so_count = 0;
+    zs_test_mount_log_reset();
     hide_apply_for_target("test");
-    // No assertions on return value (function is void). The test
-    // passes if we did not crash. The non-root host cannot do unshare,
-    // so the function logs a warning and proceeds — exactly the
-    // documented behavior.
-    ZS_CHECK(true);
+    // On the host the REAL unshare fails (no CAP_SYS_ADMIN), so the
+    // log must contain the failure marker 'U' and NO umount2 'm'.
+    const char* log = zs_test_mount_log();
+    ZS_CHECK_STR_CONTAINS(log, "U");
+    ZS_CHECK_STR_ABSENT(log, "m");
+    ZS_CHECK_STR_ABSENT(log, "s");  // slave remount never runs either
+}
+
+// ----------------------------------------------------------------------
+// Round 9 (B1) mount-namespace ordering + fail-closed tests, driven
+// through the syscall seam (no root required).
+// ----------------------------------------------------------------------
+
+// Recorder versions of the three syscalls. They append their own
+// markers to the mount log so the ordering assertions are meaningful
+// regardless of which fn set is installed.
+static int rec_unshare_ok(int) { zs_test_mount_log_append('u'); return 0; }
+static int rec_slave_ok()     { zs_test_mount_log_append('s'); return 0; }
+static int rec_umount_ok(const char*, int) {
+    zs_test_mount_log_append('m');
+    return 0;
+}
+
+// unshare succeeds, slave remount FAILS (e.g. propagation already
+// detached differently, or an LSM denied mount(2)).
+static int rec_unshare_ok_slave_fails() {
+    // Used as the SLAVE fn: log the slave-failure marker 'S'.
+    zs_test_mount_log_append('S');
+    errno = EPERM;
+    return -1;
+}
+
+ZS_TEST(hide_apply_unmount_order_is_unshare_then_slave_then_umounts) {
+    g_will_hide.store(1);
+    g_self_so_count = 0;
+    zs_test_set_mount_fns(rec_unshare_ok, rec_slave_ok, rec_umount_ok);
+    zs_test_mount_log_reset();
+
+    hide_apply_for_target("test");
+
+    const char* log = zs_test_mount_log();
+    // The happy path: unshare -> slave -> (>= 1 umount on the real
+    // host mount table, which always has /data mounted... or none if
+    // this container's mount table matches nothing — the ORDER is
+    // what matters, so assert the prefix exactly).
+    ZS_CHECK_STR_CONTAINS(log, "us");
+    // And nothing after a failure marker.
+    ZS_CHECK_STR_ABSENT(log, "U");
+    ZS_CHECK_STR_ABSENT(log, "S");
+    // If any umounts happened, they all follow the slave remount.
+    const char* first_m = strchr(log, 'm');
+    if (first_m) {
+        ZS_CHECK((size_t)(first_m - log) >= 2);
+    }
+
+    zs_test_set_mount_fns(nullptr, nullptr, nullptr);
+}
+
+ZS_TEST(hide_apply_skips_unmounts_when_slave_remount_fails) {
+    g_will_hide.store(1);
+    g_self_so_count = 0;
+    zs_test_set_mount_fns(rec_unshare_ok, rec_unshare_ok_slave_fails,
+                          rec_umount_ok);
+    zs_test_mount_log_reset();
+
+    hide_apply_for_target("test");
+
+    const char* log = zs_test_mount_log();
+    ZS_CHECK_STR_CONTAINS(log, "u");   // unshare itself succeeded
+    ZS_CHECK_STR_CONTAINS(log, "S");   // slave remount failed
+    ZS_CHECK_STR_ABSENT(log, "m");     // ...so NO unmount ran
+    zs_test_set_mount_fns(nullptr, nullptr, nullptr);
+}
+
+ZS_TEST(hide_apply_never_umounts_in_the_init_namespace) {
+    // The regression that motivated Round 9 (B1): simulate the exact
+    // sequence the OLD code executed on the host — real unshare
+    // failing, then the umount loop running anyway — and prove the
+    // current code cannot produce umount2 calls without a successful
+    // unshare + slave pair first.
+    g_will_hide.store(1);
+    g_self_so_count = 0;
+    // Real unshare (fails on host) + recorders for the rest.
+    zs_test_set_mount_fns(nullptr, rec_slave_ok, rec_umount_ok);
+    zs_test_mount_log_reset();
+
+    hide_apply_for_target("test");
+
+    const char* log = zs_test_mount_log();
+    ZS_CHECK_STR_CONTAINS(log, "U");   // unshare failed for real
+    ZS_CHECK_STR_ABSENT(log, "m");     // umount2 recorder never invoked
+    ZS_CHECK_STR_ABSENT(log, "s");     // slave never invoked either
+    zs_test_set_mount_fns(nullptr, nullptr, nullptr);
 }
 
 // ----------------------------------------------------------------------
@@ -393,6 +485,34 @@ ZS_TEST(unmount_magisk_paths_parser_recognizes_data_adb_and_sbin) {
                       field_is_root_path(mf.source,   mf.source_len);
         ZS_CHECK_EQ(matched, c.expect);
     }
+}
+
+// Round 9: regression for the wrong-hardcoded-length bug. The
+// /data/system/zygisk_study/ prefix in field_is_root_path's table
+// claimed length 28; the string is 26 characters. memcmp(28) read
+// past the literal and NEVER matched — every mount of our own
+// working directory stayed visible to denylisted apps. Direct
+// behavioral assertions on every table prefix at its TRUE length.
+ZS_TEST(field_is_root_path_prefix_lengths_are_correct) {
+    ZS_CHECK(field_is_root_path("/data/adb/", strlen("/data/adb/")) == 1);
+    ZS_CHECK(field_is_root_path("/data/adb/modules/x",
+                                strlen("/data/adb/modules/x")) == 1);
+    ZS_CHECK(field_is_root_path("/sbin/", strlen("/sbin/")) == 1);
+    ZS_CHECK(field_is_root_path("/sbin/.magisk",
+                                strlen("/sbin/.magisk")) == 1);
+    ZS_CHECK(field_is_root_path("/debug_ramdisk/",
+                                strlen("/debug_ramdisk/")) == 1);
+    ZS_CHECK(field_is_root_path("/debug_ramdisk/anything",
+                                strlen("/debug_ramdisk/anything")) == 1);
+    ZS_CHECK(field_is_root_path("/data/system/zygisk_study/",
+                                strlen("/data/system/zygisk_study/")) == 1);
+    ZS_CHECK(field_is_root_path("/data/system/zygisk_study/sock",
+                                strlen("/data/system/zygisk_study/sock")) == 1);
+    // Near-miss non-matches.
+    ZS_CHECK(field_is_root_path("/data/system/zygisk_studyz",
+                                strlen("/data/system/zygisk_studyz")) == 0);
+    ZS_CHECK(field_is_root_path("/data/app/com.x",
+                                strlen("/data/app/com.x")) == 0);
 }
 
 // ----------------------------------------------------------------------

@@ -179,6 +179,19 @@ int    hide_test_denylist_reload_count();
 
 // Test-only: run the maps scanner over synthetic content.
 void   zs_scan_maps_into_records_test(const char* buf, size_t total);
+
+// Round 9 (B1) — mount-namespace seam. Replace the unshare /
+// MS_SLAVE remount / umount2 syscalls with recorders to verify the
+// ordering and fail-closed gating of hide_apply_for_target()
+// without CAP_SYS_ADMIN. See hide.cpp for the log format.
+typedef int (*ZsUnshareFn)(int);
+typedef int (*ZsMountSlaveFn)();
+typedef int (*ZsUmount2Fn)(const char*, int);
+void        zs_test_set_mount_fns(ZsUnshareFn u, ZsMountSlaveFn s,
+                                  ZsUmount2Fn um);
+void        zs_test_mount_log_reset();
+void        zs_test_mount_log_append(char op);
+const char* zs_test_mount_log();
 #endif
 
 } // namespace zygisk_study

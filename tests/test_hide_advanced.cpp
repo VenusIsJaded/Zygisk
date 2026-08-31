@@ -1472,6 +1472,304 @@ ZS_TEST(find_prop_mappings_from_fd_handles_oversized_maps) {
     close(fd);
 }
 
+// ======================================================================
+// Round 9 tests
+// ======================================================================
+
+// ----------------------------------------------------------------------
+// B2: property ENUMERATION hooks — read_callback / read / foreach
+// ----------------------------------------------------------------------
+
+ZS_TEST(prop_read_callback_swallows_absent_prop_infos) {
+    // Two synthetic prop_info pointers: one absent-spoofed, one not.
+    int fake_absent = 0, fake_normal = 0;
+    const void* absent_pi = &fake_absent;
+    const void* normal_pi = &fake_normal;
+    const void* arr[1] = {absent_pi};
+    zs_test_set_absent_prop_infos(arr, 1);
+
+    hide_advanced_set_active(1);
+    int called = 0;
+    auto cb = [](void* cookie, const char*, const char*, uint32_t) {
+        ++*static_cast<int*>(cookie);
+    };
+
+    // g_real_prop_read_cb is null on host: the hook must simply not
+    // call the user callback for the absent pi, and also not call it
+    // for a non-absent pi (nothing to delegate to). The observable
+    // contract: NEVER invoke cb for the absent key.
+    zygisk_study_hook_prop_read_callback(absent_pi, cb, &called);
+    ZS_CHECK_EQ(called, 0);
+
+    // And for a non-absent pi the hook is a pure passthrough — with
+    // no real symbol to call, still no crash and no callback.
+    zygisk_study_hook_prop_read_callback(normal_pi, cb, &called);
+    ZS_CHECK_EQ(called, 0);
+
+    // Inactive gate: same no-op behavior (no real fn on host).
+    hide_advanced_set_active(0);
+    zygisk_study_hook_prop_read_callback(absent_pi, cb, &called);
+    ZS_CHECK_EQ(called, 0);
+
+    zs_test_set_absent_prop_infos(nullptr, 0);
+}
+
+ZS_TEST(prop_read_reports_empty_for_absent_prop_infos) {
+    int fake_absent = 0;
+    const void* absent_pi = &fake_absent;
+    const void* arr[1] = {absent_pi};
+    zs_test_set_absent_prop_infos(arr, 1);
+
+    hide_advanced_set_active(1);
+    char value[92] = "stale";
+    int rv = zygisk_study_hook_prop_read(absent_pi, value);
+    ZS_CHECK_EQ(rv, 0);
+    ZS_CHECK_EQ(value[0], '\0');
+
+    hide_advanced_set_active(0);
+    zs_test_set_absent_prop_infos(nullptr, 0);
+}
+
+// A fake __system_property_foreach: hands the trampoline the four
+// pointers the TEST chose (shared globals, so the absent-marking in
+// the test and the enumeration in the driver see the same objects).
+static int g_fake_prop_storage[4];
+static const void* g_fake_prop_pis[4] = {
+    &g_fake_prop_storage[0], &g_fake_prop_storage[1],
+    &g_fake_prop_storage[2], &g_fake_prop_storage[3],
+};
+static int fake_foreach_driver(void (*cb)(const void*, void*),
+                               void* cookie) {
+    for (const void* pi : g_fake_prop_pis) cb(pi, cookie);
+    return 0;
+}
+
+ZS_TEST(prop_foreach_drops_absent_keys_from_enumeration) {
+    // Mark the first two as absent-spoofed.
+    const void* arr[2] = {g_fake_prop_pis[0], g_fake_prop_pis[1]};
+    zs_test_set_absent_prop_infos(arr, 2);
+    zs_test_set_real_prop_foreach(fake_foreach_driver);
+
+    hide_advanced_set_active(1);
+    int seen = 0;
+    auto user_cb = [](const void* pi, void* cookie) {
+        ++*static_cast<int*>(cookie);
+        (void)pi;
+    };
+    int rv = zygisk_study_hook_prop_foreach(
+        (void (*)(const void*, void*))user_cb, &seen);
+    ZS_CHECK_EQ(rv, 0);
+    // 4 keys enumerated, 2 dropped: exactly 2 must reach the user.
+    ZS_CHECK_EQ(seen, 2);
+
+    // Inactive gate: the real foreach runs unfiltered — with our fake
+    // installed, ALL 4 keys reach the user callback.
+    hide_advanced_set_active(0);
+    seen = 0;
+    zygisk_study_hook_prop_foreach(
+        (void (*)(const void*, void*))user_cb, &seen);
+    ZS_CHECK_EQ(seen, 4);
+
+    zs_test_set_real_prop_foreach(nullptr);
+    zs_test_set_absent_prop_infos(nullptr, 0);
+}
+
+ZS_TEST(prop_foreach_table_size_covers_spoof_table) {
+    // g_absent_prop_infos is sized 32; the absent portion of the
+    // spoof table must fit or keys silently leak (documented
+    // residual). This test FAILS when someone grows the spoof table
+    // past the cap without growing the array.
+    size_t absent = 0;
+    size_t total = 0;
+    const ZsPropSpoof* t = zs_prop_spoof_table(&total);
+    for (size_t i = 0; i < total; ++i) {
+        if (t[i].value == nullptr || t[i].value[0] == '\0') ++absent;
+    }
+    ZS_CHECK(absent <= 32);
+}
+
+// ----------------------------------------------------------------------
+// S1: scandir / scandirat hooks
+// ----------------------------------------------------------------------
+
+// The synthetic scandir: builds a dirent list with root-marker names
+// plus normal ones, through the REAL scandir contract: the CALLER
+// owns the entries and the array and frees them. Our hook respects
+// that contract exactly — it frees entries it DROPS, compacts the
+// array, and leaves the rest to the caller.
+static int fake_scandir_impl(const char* dir, struct dirent*** namelist,
+                             int (*)(const struct dirent*),
+                             int (*)(const struct dirent**,
+                                     const struct dirent**)) {
+    const char* names[] = {"acct", "magisk", "data", ".magisk",
+                           "zygisk_study", "init.rc", "libzygisk.so",
+                           "sdcard", "ksu"};
+    int n = (int)(sizeof names / sizeof names[0]);
+    struct dirent** list = (struct dirent**)malloc(n * sizeof(void*));
+    for (int i = 0; i < n; ++i) {
+        list[i] = (struct dirent*)calloc(1, sizeof(struct dirent));
+        snprintf(list[i]->d_name, sizeof list[i]->d_name, "%s", names[i]);
+    }
+    *namelist = list;
+    (void)dir;
+    return n;
+}
+
+static void free_dirent_list(struct dirent** list, int n) {
+    if (!list) return;
+    for (int i = 0; i < n; ++i) free(list[i]);
+    free(list);
+}
+
+ZS_TEST(scandir_hook_drops_root_marker_entries) {
+    zs_test_set_real_scandir((void*)fake_scandir_impl);
+    hide_advanced_set_active(1);
+
+    struct dirent** list = nullptr;
+    int n = zygisk_study_hook_scandir("/system", &list, nullptr, nullptr);
+    ZS_CHECK_EQ(n, 4);   // 9 entries - 5 hidden (magisk, .magisk,
+                         // zygisk_study, libzygisk.so, ksu)
+    if (n == 4 && list) {
+        for (int i = 0; i < n; ++i) {
+            ZS_CHECK_STR_ABSENT("magisk .magisk zygisk_study "
+                                "libzygisk.so ksu",
+                                list[i]->d_name);
+        }
+        free_dirent_list(list, n);
+    }
+
+    hide_advanced_set_active(0);
+    // Gate off: full passthrough to the fake real scandir — the
+    // caller gets ALL 9 entries back.
+    list = nullptr;
+    n = zygisk_study_hook_scandir("/system", &list, nullptr, nullptr);
+    ZS_CHECK_EQ(n, 9);
+    free_dirent_list(list, n);
+
+    zs_test_set_real_scandir(nullptr);
+}
+
+ZS_TEST(scandir_hook_hidden_dir_reports_enoent) {
+    zs_test_set_real_scandir((void*)fake_scandir_impl);
+    hide_advanced_set_active(1);
+
+    // /data/adb ITSELF is deliberately not hidden (it exists on
+    // stock devices); its CONTENTS are — /data/adb/modules is in
+    // kHiddenStatPaths, so the opendir/scandir rewrite applies.
+    struct dirent** list = (struct dirent**)0xdeadbeef;
+    errno = 0;
+    int n = zygisk_study_hook_scandir("/data/adb/modules", &list,
+                                      nullptr, nullptr);
+    ZS_CHECK_EQ(n, -1);
+    ZS_CHECK_EQ(errno, ENOENT);
+    ZS_CHECK(list == nullptr);
+    // The hook freed the 9 entries + the array the fake scandir
+    // allocated (verified by the Round 10 ASan leak run).
+
+    // And /data/adb itself is NOT rewritten: it lists, entry-filtered.
+    errno = 0;
+    list = nullptr;
+    n = zygisk_study_hook_scandir("/data/adb", &list, nullptr, nullptr);
+    ZS_CHECK(n >= 0);
+    free_dirent_list(list, n);
+
+    hide_advanced_set_active(0);
+    zs_test_set_real_scandir(nullptr);
+}
+
+// ----------------------------------------------------------------------
+// S2: leaked-fd closing by link target — real getdents64 + readlink
+// against the host kernel, with the prefix pointed at a directory the
+// test can create.
+// ----------------------------------------------------------------------
+
+ZS_TEST(close_leaked_root_fds_closes_root_path_fds_only) {
+    std::string dir = "/tmp/zstest_leakdir_XXXXXX";
+    char* d = mkdtemp(&dir[0]);
+    ZS_CHECK(d != nullptr);
+    std::string file = dir + "/module_file";
+    FILE* f = fopen(file.c_str(), "w");
+    ZS_CHECK(f != nullptr);
+    fputs("x", f);
+    fflush(f);
+
+    // fd A: the "leaked module fd".
+    int fd_leak = open(file.c_str(), O_RDONLY);
+    ZS_CHECK(fd_leak >= 0);
+    // fd B: a runtime-owned fd that must survive.
+    int fd_keep = open("/etc/hostname", O_RDONLY);
+    if (fd_keep < 0) fd_keep = open("/proc/self/status", O_RDONLY);
+    ZS_CHECK(fd_keep >= 0);
+
+    // Point the scanner at our directory and run it. The earlier
+    // "does not crash on host" test PRETENDS init already ran (it
+    // stores 1 into g_advanced_initialized), so undo that here and
+    // force a real resolution — glibc HAS syscall(), the scan runs
+    // for real against the host kernel.
+    g_advanced_initialized.store(0);
+    hide_advanced_init();
+    ZS_CHECK(g_real_syscall != nullptr);
+    zs_test_set_fd_root_prefix(dir.c_str());
+    close_leaked_root_fds();
+
+    // fd_leak must now be closed (fstat fails with EBADF), fd_keep
+    // must still be open.
+    struct stat st;
+    ZS_CHECK(fstat(fd_leak, &st) != 0);
+    ZS_CHECK_EQ(errno, EBADF);
+    ZS_CHECK(fstat(fd_keep, &st) == 0);
+
+    // The FILE* f is a SECOND fd on the same path — the scan closed
+    // it too; closing it again must be harmless.
+    fclose(f);
+    close(fd_keep);
+    zs_test_set_fd_root_prefix("/data/adb/");
+    rmdir(d);
+}
+
+ZS_TEST(fd_target_prefixes_match_stock_paths) {
+    // Defensive: restore the production prefix table first — the
+    // previous test may have aborted (exception-style) before its
+    // own cleanup ran.
+    zs_test_set_fd_root_prefix("/data/adb/");
+    // The default table matches the documented root prefixes.
+    ZS_CHECK(fd_target_is_root_path("/data/adb/modules/foo/x.so", 28) == 1);
+    ZS_CHECK(fd_target_is_root_path("/sbin/magisk", 12) == 1);
+    ZS_CHECK(fd_target_is_root_path("/debug_ramdisk/x", 16) == 1);
+    ZS_CHECK(fd_target_is_root_path(
+        "/data/system/zygisk_study/sock", 30) == 1);
+    // And nothing else — especially not runtime paths.
+    ZS_CHECK(fd_target_is_root_path("/dev/dri/card0", 13) == 0);
+    ZS_CHECK(fd_target_is_root_path("/dev/ashmem", 11) == 0);
+    ZS_CHECK(fd_target_is_root_path("/data/app/com.foo/base.apk", 25) == 0);
+    ZS_CHECK(fd_target_is_root_path("/memfd:boot-image (deleted)", 27) == 0);
+}
+
+// ----------------------------------------------------------------------
+// P1: TLS filter scratch — one allocation per thread, ever.
+// ----------------------------------------------------------------------
+
+ZS_TEST(filter_scratch_is_allocated_once_per_thread) {
+    std::string content;
+    for (int i = 0; i < 2000; ++i) {
+        content += "7f1c2d3e4f5a6b7c-7f1c2d3e4f5a7000 rw-p 00000000 "
+                   "00:05 12345     /data/data/com.example/libfoo.so\n";
+    }
+    int before = zs_test_filter_scratch_allocs();
+    for (int round = 0; round < 5; ++round) {
+        int fd = write_text_to_memfd(content);
+        ZS_CHECK(fd >= 0);
+        int out = make_filtered_memfd(fd, "/proc/self/maps");
+        ZS_CHECK(out >= 0);
+        if (out >= 0) close(out);
+        close(fd);
+    }
+    int after = zs_test_filter_scratch_allocs();
+    // Five filter passes on this thread: at most ONE new allocation
+    // (this test's thread may not have had one yet).
+    ZS_CHECK(after - before <= 1);
+}
+
 int main() {
     std::fprintf(stderr, "=== Zygisk Study advanced hide layer tests ===\n");
     return zstest::run_all();

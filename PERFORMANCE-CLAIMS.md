@@ -958,18 +958,50 @@ To get true 100% confidence on Android, the user needs to:
    Magisk / zygisk entries appear.
 8. Run `time /system/bin/app_process` to measure fork latency.
 9. Run `stat /data/adb/magisk` from a denylisted app and verify it
-   returns ENOENT (the new stat hook works).
+   returns ENOENT (the stat hook works).
 10. Run `getprop ro.boot.verifiedbootstate` from a denylisted app
-    and verify it returns empty (the new direct-write prop scrub
-    works on ro.* properties).
+    and verify it returns the STOCK value ("green"), not empty —
+    the per-process property clone + read hooks spoof values
+    (Round 7 replaced the old, unsafe direct-write scrub; the
+    retraction is documented above).
 11. Read `/proc/self/maps` and verify the cloned property area
-    appears as `[anon:linker_alloc]` (the new PR_SET_VMA rename
+    appears as `[anon:linker_alloc]` (the PR_SET_VMA rename
     works).
-12. Use `dumpsys batterystats` over a 24h period and verify the
+12. Enumerate properties from a denylisted app (native code calling
+    `__system_property_foreach` + `__system_property_read_callback`)
+    and verify no `ro.magisk.*` / `init.svc.magisk` / KSU keys
+    appear at all (Round 9 enumeration hooks).
+13. `ls /data/adb` via scandir from a denylisted app and verify
+    root-marker entries are absent (Round 9 scandir hooks).
+14. `ls -l /proc/self/fd/` from a denylisted app and verify no
+    descriptor resolves under /data/adb (Round 9 fd scan).
+15. Use `dumpsys batterystats` over a 24h period and verify the
     daemon's wakeups dropped from ~2880/day (old polling) to ~0/day
     (new inotify).
 
-The 54 host-side tests + the Android-cost-model walk-through in
+The 108 host-side tests + the Android-cost-model walk-through in
 `docs/ANDROID-REALISM.md` + the architecture reference give us "high
 confidence" — which is the strongest honest claim I can make from
 this sandbox.
+
+## Round 9 — performance ledger
+
+| Change | Claim | Confidence | Why |
+|--------|-------|------------|-----|
+| MS_SLAVE\|MS_REC remount after unshare | +1 cold syscall per hidden fork (mount(2)) | Certain | Correctness fix, not a perf claim. Negligible vs the ~30 syscalls of the unmount scan it protects. |
+| Property enumeration hooks (foreach/read_callback/read) | ~0 on the fast path | Certain | One `hide_advanced_is_active()` relaxed atomic load + (for absent checks) a ≤32-entry pointer scan, only on property reads in hidden apps. Non-hidden processes have no hooks at all. |
+| scandir/scandirat hooks | ~0 on the fast path | Certain | One atomic load gate; the entry filter runs only in hidden apps and only on actual scandir calls (rare). |
+| TLS filter scratch (replaces per-call 64 KB mmap+munmap) | 2 syscalls + 16 page-zeroes saved per filtered /proc open, per call | Certain | Replaces an mmap+munmap pair with a cached pointer read. Bounded RSS cost: 64 KB × filtering threads. Measured on host by the allocation-count test (5 passes → ≤1 alloc); the per-call savings is arithmetic, not measurement. |
+
+### Round 9 honest negatives
+
+- The fd scan adds one getdents64 round + one readlink per open
+  descriptor to EVERY hidden fork (post-fork pipeline). For a
+  typical app inheriting 30-60 fds that is ~60-120 syscalls of
+  cheap metadata work, once per fork, not per request. It is the
+  single largest post-fork addition of this round and is priced
+  here deliberately: it closes a one-syscall readlink detection
+  vector that survives every other countermeasure.
+- Nothing in this round speeds up the denylist decision or the GOT
+  walk further; those were Round 8 work and remain as measured
+  there.
