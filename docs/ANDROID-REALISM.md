@@ -916,3 +916,91 @@ untouched; a filter failure falls back to the real call.
   than changed).
 
 113 host tests (108 → 113), all green, sanitizer run green.
+
+## Round 12 — the module dispatch layer
+
+The feature flagged as "stubbed" since Round 7. What is REAL on a
+device, and what is honestly less than upstream:
+
+### What actually runs on device
+
+- **JNIEnv acquisition**: `dlsym(RTLD_DEFAULT,
+  "JNI_GetCreatedJavaVMs")` (fallback: dlopen by libart.so soname,
+  which returns the already-loaded handle) + `GetEnv` /
+  `AttachCurrentThreadAsDaemon` on the zygote's main thread, at the
+  zygote's FIRST fork. Standard public JNI — no ART internals. The
+  first zygote fork is system_server's; by then the VM is fully
+  created. Children inherit the env pointer; it remains the same
+  thread through fork + specialization, which is exactly the
+  validity window upstream's callbacks have too.
+- **Dispatch point**: the setresgid/setresuid hooks proven in
+  Rounds 7-11. pre callbacks fire at the setresuid ENTRY (child
+  still root — a module can still unshare/mount); post callbacks
+  right after the real call (specialized). Denylisted children
+  never dispatch — they take the hide pipeline (module .so's get
+  unmapped; running module code after that would be a crash).
+- **Writable uid/gid**: module writes through args->uid/args->gid
+  are forwarded to the REAL privilege-drop calls. A changed gid is
+  re-applied with setresgid from inside the setresuid hook — legal
+  because euid is still 0 there and gid changes alone do not clear
+  the effective capability set (capabilities(7): only an euid
+  transition from 0 clears the effective set; setgid has no
+  capability-clearing fixup hook in the commoncap layer).
+
+### Honest deviations from upstream Zygisk
+
+- **No ART method hooking.** Upstream (Magisk v4, ReZygisk) hooks
+  `nativeForkAndSpecialize` itself (ArtMethod entry-point swap /
+  RegisterNatives) and therefore receives the JAVA-side arguments:
+  jstring nice_name, se_info, runtime_flags, gids,
+  mount_external, rlimits... We deliberately do not (that is
+  version-specific ART internal surgery). Our
+  AppSpecializeArgs carries only what our hook point can source
+  truthfully: uid/gid (writable), nice_name (/proc/self/cmdline,
+  package-name fallback when argv has not been rewritten yet),
+  package_name (packages.list), app_data_dir (derived). The
+  upstream fields we cannot source are omitted, not stubbed.
+- **postAppSpecialize runs earlier than upstream's.** Ours fires
+  right after the real setresuid — while the REST of
+  specialization (seccomp filter install, capability drop, fd
+  cleanup, SELinux context switch) is still pending. Upstream's
+  runs after forkCommon completes. A module that inspects
+  seccomp/caps in post will see pre-specialization state; one that
+  calls JNI or reads /proc sees the same thing either way.
+- **onLoad depends on the fork GOT hook firing in the zygote.**
+  If a platform's zygote forks without crossing a patched slot
+  (e.g. a direct-clone path), onLoad never runs; the specialize
+  callbacks still dispatch (the env is also acquired lazily at
+  dispatch time), but a module that only stashes its Api in onLoad
+  would see a null api. Modules that take the Api from the factory
+  call are immune. Documented, not worked around: the fork hook
+  firing is the same assumption the whole privilege-drop design
+  rests on.
+- **A crashing module crashes the app.** No isolation around
+  module callbacks (same property as upstream Zygisk).
+- **packages.list staleness**: g_pkg_map (appId -> package) loads
+  in the zygote with the DenyList and reloads only when the
+  DENYLIST file's mtime changes. An app installed after zygote
+  start has no package_name/app_data_dir in its args until the
+  next denylist edit or zygote restart. (Known; the cheap fix —
+  also stat packages.list in the refresh check — is a Round 13
+  candidate.)
+- **connectCompanion** returns a live fd to the daemon's 'C'
+  channel, but the study daemon's companion protocol is an echo
+  placeholder, not a root companion per module.
+
+### What the host tests actually prove
+
+test_module_dispatch drives the REAL payload through the REAL
+daemon protocol, the REAL dlopen/factory path, the REAL env
+acquisition (the test binary exports a fake JNI_GetCreatedJavaVMs
+into the global dlsym scope — the payload's resolution path is
+genuine), and the REAL gid/uid-drop hook bodies: callback order,
+argument values (multi-user included), rewritten-uid/gid
+forwarding (drop-seam recorder), server path, legacy setuid path,
+denylist suppression, and force-unmount-after-post. Not covered on
+host: Tier A interaction (wrapper_fp null in the drives — the
+trampoline suite covers Tier A separately), and the real-ART
+behavior of the env (a fake table stands in).
+
+123 host tests (113 → 123), all green, sanitizer run green.

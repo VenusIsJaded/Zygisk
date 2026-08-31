@@ -6,7 +6,7 @@ CXXFLAGS ?= -std=c++17 -O2 -g -Wall -Wextra
 INCLUDES  = -I../native/common -I.. -DZS_HOST_TEST
 
 TESTS = test_hide test_hide_advanced test_hide_stealth test_e2e_hide \
-        test_perf test_unmap_trampoline
+	test_perf test_unmap_trampoline test_module_dispatch
 
 # The REAL payload, built as a shared library so the trampoline test
 # can dlopen it and exercise the actual Tier A code path. Named
@@ -14,6 +14,7 @@ TESTS = test_hide test_hide_advanced test_hide_stealth test_e2e_hide \
 # so the record set is real.
 PAYLOAD_SRC = \
     ../native/libpayload/src/entry.cpp \
+    ../native/libpayload/src/module_dispatch.cpp \
     ../native/libpayload/src/hide.cpp \
     ../native/libpayload/src/hide_advanced.cpp \
     ../native/libpayload/src/hide_stealth.cpp
@@ -50,7 +51,21 @@ test_perf: test_perf.cpp ../native/libpayload/src/hide.cpp ../native/libpayload/
 test_unmap_trampoline: test_unmap_trampoline.cpp libpayload.so test_framework.h
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -o $@ $< -ldl
 
-libpayload.so: $(PAYLOAD_SRC) $(TRAMPOLINE_SRC) ../native/common/log.h
+# Round 12 — the module dispatch e2e test. Links the REAL payload
+# (libpayload.so, dlopen'd) plus a REAL module .so built from
+# module_stub.cpp. -rdynamic exports the test binary's fake
+# JNI_GetCreatedJavaVMs into the global dlsym scope so libpayload's
+# REAL env-acquisition path resolves it.
+test_module_dispatch: test_module_dispatch.cpp libzs_test_module.so \
+	              libpayload.so test_framework.h
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -o $@ $< -ldl -pthread -rdynamic
+
+libzs_test_module.so: module_stub.cpp ../zygisk.hpp
+	$(CXX) $(CXXFLAGS) -fPIC -shared -I.. -o $@ $<
+
+libpayload.so: $(PAYLOAD_SRC) $(TRAMPOLINE_SRC) \
+	      ../native/libpayload/src/module_dispatch.h \
+	      ../native/common/log.h
 	$(CXX) $(CXXFLAGS) -fPIC -shared $(INCLUDES) -o $@ $(PAYLOAD_SRC) $(TRAMPOLINE_SRC) -ldl
 
 run: all
@@ -73,10 +88,14 @@ run: all
 # byte (read size = exact page multiple from a page-aligned start;
 # ASan reports the first poisoned byte, not the access start). The
 # unsanitized `run` target exercises it against real mappings.
+# test_module_dispatch is also excluded: it dlopens an UNINSTRUMENTED
+# module .so into an instrumented process and forks real children —
+# the cross-instrumentation boundary (module callbacks recorded from
+# forked children through a shared mmap) produces noise, not signal.
 SAN_CXXFLAGS = -std=c++17 -O1 -g -Wall -Wextra -fno-omit-frame-pointer \
-               -fsanitize=address,undefined
+	       -fsanitize=address,undefined
 SAN_TESTS = test_hide test_hide_advanced test_hide_stealth \
-            test_e2e_hide test_perf
+	    test_e2e_hide test_perf
 
 .PHONY: run-sanitize
 
@@ -93,4 +112,4 @@ run-sanitize:
 	exit $$fail
 
 clean:
-	rm -f $(TESTS) libpayload.so
+	rm -f $(TESTS) libpayload.so libzs_test_module.so

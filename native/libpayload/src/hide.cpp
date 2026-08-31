@@ -69,6 +69,7 @@
 #include <atomic>
 #include <cstring>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -111,6 +112,11 @@ static std::unordered_set<std::string> g_denylist_cache;
 static std::atomic<int>                g_denylist_loaded{0};
 static std::unordered_set<uid_t>       g_deny_app_ids;   // uid % 100000
 static std::atomic<int>                g_uid_map_loaded{0};
+// Round 12 — appId -> package name for EVERY package (not just
+// denylisted ones). Filled in the same packages.list pass; used by
+// the module dispatch layer to source the real specialize args.
+// First entry wins for shared-appId packages (rare, deprecated).
+static std::unordered_map<uid_t, std::string> g_pkg_map;
 
 // DenyList refresh: forked children inherit the zygote's loaded copy
 // AND its load timestamp, so a wall-clock throttle would make every
@@ -404,6 +410,8 @@ static void snapshot_self_so() {
 // package.
 static constexpr const char* kPackagesListPath =
     "/data/system/packages.list";
+static const char* g_packages_list_path = kPackagesListPath;
+static const char* packages_list_path() { return g_packages_list_path; }
 
 static void load_denylist_locked_state() {
     // Round 8 (caught by the new reload tests): the cache must be
@@ -430,7 +438,9 @@ static void load_denylist_locked_state() {
 
     // uid map: denylist package names -> appIds.
     g_deny_app_ids.clear();
-    fp = fopen(kPackagesListPath, "r");
+    // Round 12: full appId -> package map (module dispatch args).
+    g_pkg_map.clear();
+    fp = fopen(packages_list_path(), "r");
     if (fp) {
         char line[1024];
         while (fgets(line, sizeof line, fp)) {
@@ -440,6 +450,10 @@ static void load_denylist_locked_state() {
                 if (g_denylist_cache.count(pkg) > 0) {
                     g_deny_app_ids.insert((uid_t)(uid % 100000));
                 }
+                // The packages.list uid column is the user-0 uid; the
+                // appId family key makes the map usable from children
+                // of any profile/user.
+                g_pkg_map.emplace((uid_t)(uid % 100000), pkg);
             }
         }
         fclose(fp);
@@ -777,6 +791,20 @@ int hide_setup_for_target_uid(uid_t uid) {
     return hide;
 }
 
+void hide_lookup_package_for_uid(uid_t uid, char* out, size_t cap) {
+    if (ZS_UNLIKELY(!out || cap == 0)) return;
+    out[0] = '\0';
+    // uid < 10000 is never an app (system_server, root, daemons).
+    if (uid < 10000) return;
+    if (ZS_UNLIKELY(!g_uid_map_loaded.load(std::memory_order_acquire))) {
+        load_denylist();
+    }
+    auto it = g_pkg_map.find((uid_t)(uid % 100000));
+    if (it == g_pkg_map.end()) return;
+    strncpy(out, it->second.c_str(), cap - 1);
+    out[cap - 1] = '\0';
+}
+
 void hide_apply_for_target(const char* /*package_name*/) {
     // Fast path: if setup decided NOT to hide, we're a no-op.
     if (ZS_UNLIKELY(!g_will_hide.load(std::memory_order_acquire))) return;
@@ -984,7 +1012,7 @@ void hide_test_set_records(const struct so_record* recs, size_t count) {
     }
 }
 
-void hide_test_set_denylist_path(const char* path) {
+extern "C" void hide_test_set_denylist_path(const char* path) {
     g_denylist_path = path;
     // Force a fresh load against the new path.
     g_denylist_loaded.store(0);
@@ -994,11 +1022,19 @@ void hide_test_set_denylist_path(const char* path) {
     g_deny_app_ids.clear();
 }
 
-void hide_test_reset_refresh() {
+// Round 12 — packages.list seam for the module-args lookup tests.
+extern "C" void hide_test_set_packages_list_path(const char* path) {
+    g_packages_list_path = path ? path : kPackagesListPath;
+    g_uid_map_loaded.store(0);
+    g_deny_app_ids.clear();
+    g_pkg_map.clear();
+}
+
+extern "C" void hide_test_reset_refresh() {
     g_next_refresh_check.store(0);
 }
 
-int hide_test_denylist_reload_count() {
+extern "C" int hide_test_denylist_reload_count() {
     return g_denylist_reload_count;
 }
 

@@ -6,11 +6,11 @@
 // originally defined by Magisk's `zygisk/zygisk.hpp` and reused by every
 // downstream Zygisk implementation (including this study project).
 //
-// The API is reproduced here from the public documentation
+// The interface contract is reproduced here from the public documentation
 // (https://topjohnwu.github.io/Magisk/guides.html#zygisk) so that
 // downstream modules written against that API can compile against this
-// project unchanged. The interface contract is identical; the
-// implementation behind it is original to this repository.
+// project unchanged. The implementation behind it is original to this
+// repository.
 //
 // A Zygisk module is a .so file placed under
 //   /data/adb/modules/<module_id>/zygisk/<abi>.so
@@ -18,11 +18,33 @@
 // files, dlopen-s each one, and looks up the symbol `zygisk_module`
 // which must be a function returning a `ZygiskModule*` factory.
 //
-// The module then receives the four lifecycle callbacks below in
+// The module then receives the lifecycle callbacks below in
 // order. The loader's job is to feed them in at the right moment
 // relative to the zygote fork.
+//
+// Round 12 (API v2): the module lifecycle is now actually driven.
+//
+//   onLoad            — called once in the zygote, at the first fork
+//                       (the earliest moment a JNIEnv exists), with a
+//                       REAL JNIEnv obtained via JNI_GetCreatedJavaVMs.
+//   preAppSpecialize  — called in the forked child at the
+//                       setresuid/setuid hook ENTRY: the child is still
+//                       root, and the specialize arguments are real.
+//   postAppSpecialize — called right after the real privilege drop.
+//   preServer/postServerSpecialize — same pair for system_server
+//                       (uid 1000).
+//
+// AppSpecializeArgs deviates from upstream v4 on purpose: it contains
+// only the arguments this loader can source WITHOUT ART-internal
+// method hooking (which this project deliberately avoids). uid/gid
+// are pointers into the live dispatch state — writes made in the pre
+// callback are forwarded to the real privilege-drop calls. The string
+// arguments are read-only C strings.
 
 #pragma once
+
+#include <stdint.h>
+#include <stddef.h>
 
 // The default callback bodies below are intentionally empty (modules
 // opt in by overriding). Silence the unused-parameter warnings so the
@@ -37,7 +59,9 @@
 // typedefs are enough for the header to compile anywhere.
 using JNIEnv = void;
 using JavaVM = void;
-using jint   = int;
+using JNINativeInterface = void;
+using jint = int;
+using jboolean = unsigned char;
 #define JNI_VERSION_1_6 0x00010006
 #endif
 
@@ -46,14 +70,48 @@ namespace zygisk {
 // ------------------------------------------------------------------
 // Capabilities — feature flags a module can opt into.
 // The loader checks the module's reported caps to decide whether to
-// park data on its behalf or skip its callbacks entirely.
+// spend time on per-fork work (e.g. reading the process name only if
+// some module declared it wants names).
 // ------------------------------------------------------------------
 enum : uint32_t {
-    // Module wants the process name and the nice name at pre-fork time.
+    // Module wants the process/nice name at pre-specialize time.
+    // Declaring nothing means the loader skips the /proc read on
+    // every fork — see PERFORMANCE-CLAIMS.md (Round 12).
     PROCESS_UNPRIORITY = 1u << 0,
-    // Module wants the file descriptors of the companion socket pair
-    // so it can talk to zygiskd directly from inside the app.
+    // Module wants a file descriptor to the companion socket.
     MODULE_BINDER      = 1u << 1,
+};
+
+// ------------------------------------------------------------------
+// AppSpecializeArgs — the real Zygote arguments this loader can see.
+//
+// Upstream's v4 struct exposes pointers into the Java-side argument
+// list of forkAndSpecialize (jstring nice_name, jint runtime_flags,
+// ...). Sourcing those requires hooking the JNI native methods
+// themselves (ART ArtMethod patching), which this project avoids by
+// design. What we CAN source honestly, at the privilege-drop hook:
+//
+//   uid/gid   — the actual arguments of the setresuid/setresgid the
+//               runtime is about to execute. Writable in pre: the
+//               modified values are forwarded to the real calls.
+//   nice_name — /proc/self/cmdline of the child (the runtime rewrites
+//               argv before specializing in the common path; if the
+//               name is still the zygote's, the package name is used).
+//   package_name — the owning package from packages.list.
+//   app_data_dir — derived: /data/user/<uid/100000>/<package>.
+//
+// ------------------------------------------------------------------
+struct AppSpecializeArgs {
+    jint*       uid;
+    jint*       gid;
+    const char* nice_name;
+    const char* package_name;
+    const char* app_data_dir;
+};
+
+struct ServerSpecializeArgs {
+    jint* uid;
+    jint* gid;
 };
 
 // ------------------------------------------------------------------
@@ -63,75 +121,83 @@ enum : uint32_t {
 // ------------------------------------------------------------------
 class Api {
 public:
-    // Write a single value into the running process's environment
-    // (properties, env vars, etc.). Used by modules that need to
-    // scrub/replace Magisk-related signals before the app's first
-    // line of code runs.
-    virtual void setOption(uint32_t option) = 0;
+    enum Option {
+        // Force the DenyList-style unmount for every process the
+        // module runs in, even when the process is not denylisted.
+        // Modules stay loaded and get their callbacks; the unmount
+        // runs AFTER postAppSpecialize returns (their last executed
+        // code — the module .so is then unmapped).
+        FORCE_DENYLIST_UNMOUNT = 0,
+    };
 
-    // Module can ask the loader to dlopen another module's .so on
-    // its behalf. Returns the unique handle (or -1 on error).
-    virtual int  connectCompanion(void* handle) = 0;
+    // Set a loader option. Call from onLoad().
+    virtual void setOption(Option option) = 0;
 
-    // Read the running process's package name. Empty string if the
-    // loader hasn't populated it yet (e.g. during pre-server specialize).
+    // Connect to the companion daemon. Returns a blocking fd to the
+    // daemon's companion channel, or -1 (module should fall back).
+    virtual int  connectCompanion() = 0;
+
+    // Read the running process's module directory (where the module
+    // itself was loaded from).
     virtual void getModuleDir(char* out, size_t cap) = 0;
 
-    // Read the running process's nice name (the per-process label
-    // Android uses for logcat). Same caveat as getModuleDir.
+    // Read the running process's name.
     virtual void getProcessName(char* out, size_t cap) = 0;
 
-    // Hook the JNIEnv of the new app. Returns 0 on success.
-    virtual int  hookJniEnv(JNIEnv** env) = 0;
+    // Replace the JNI function table of `env` with `newTable`,
+    // returning the previous table through `oldTable`. This is the
+    // documented mechanism for module-side JNI hooking: the module
+    // copies the original table, patches the slots it wants, installs
+    // the copy, and keeps the original for chaining. Affects calls
+    // made through that JNIEnv on that thread (the JNIEnv object is
+    // per-thread ART state; the slot itself is writable memory).
+    // Returns 0 on success.
+    virtual int  hookJniEnv(JNIEnv* env, const JNINativeInterface* newTable,
+                            const JNINativeInterface** oldTable) = 0;
 
     // Schedule cleanup of any signals the module left behind before
     // the app's first user code runs. Called once per fork; idempotent.
     virtual void cleanTrace() = 0;
 
-    // API version negotiation.
+    // API version negotiation. 2 since Round 12.
     virtual uint32_t apiVersion() = 0;
 };
 
 // ------------------------------------------------------------------
 // Module — the C++ base class. A Zygisk module's .so must export an
-// entry point `extern "C" ZygiskModule* zygisk_module(Api*, JNIEnv*)`
-// returning a pointer to a heap-allocated instance of a class derived
-// from this one.
+// entry point `extern "C" zygisk::Module* zygisk_module(Api*, JNIEnv*)`
+// returning a pointer to an instance of a class derived from this one.
 // ------------------------------------------------------------------
 class Module {
 public:
-    // Called once per module, very early, inside the zygote before any
-    // fork has happened. The module can use this to:
-    //   - request capabilities via api->setOption
-    //   - open its own socket back to zygiskd
-    //   - pre-load heavy resources
+    // Called once per module in the zygote, before the first fork.
+    // The loader acquires a real JNIEnv (JNI_GetCreatedJavaVMs +
+    // GetEnv/AttachCurrentThreadAsDaemon) for this call.
     virtual void onLoad(Api* api, JNIEnv* env) = 0;
 
-    // Pre-fork callback for app processes. The module sees the
-    // forked-inherited fds and may take action that survives the
-    // fork (e.g. set up its own hook on libc functions). Returns
-    // flags the loader uses to decide whether to call postApp.
-    virtual void preAppSpecialize(Api* api, JNIEnv* env) { ZS_UNUSED(api); ZS_UNUSED(env); }
-
-    // Post-fork callback for app processes. The process has now
-    // specialized — i.e. setresuid / setresgid has happened, the
-    // app's package name and Application object are known. This is
-    // the last chance to alter the environment before user code.
-    virtual void postAppSpecialize(const char* package_name,
-                                    Api* api, JNIEnv* env) {
-        ZS_UNUSED(package_name); ZS_UNUSED(api); ZS_UNUSED(env);
+    // Called in the forked app child while it is STILL ROOT (the
+    // runtime's setresuid has not executed yet) with the specialize
+    // arguments. Modules doing mount work must do it here.
+    virtual void preAppSpecialize(JNIEnv* env, AppSpecializeArgs* args) {
+        ZS_UNUSED(env); ZS_UNUSED(args);
     }
 
-    // Pre-fork callback for server processes (system_server).
-    // Useful for modules that want to influence the system server's
-    // view of the world before any system service starts.
-    virtual void preServerSpecialize(Api* api, JNIEnv* env) { ZS_UNUSED(api); ZS_UNUSED(env); }
+    // Called right after the real privilege drop: the process runs as
+    // the app user and is on its way to executing app code.
+    virtual void postAppSpecialize(const AppSpecializeArgs* args) {
+        ZS_UNUSED(args);
+    }
 
-    // Post-fork callback for server processes.
-    virtual void postServerSpecialize(Api* api, JNIEnv* env) { ZS_UNUSED(api); ZS_UNUSED(env); }
+    // Server equivalents (system_server, uid 1000).
+    virtual void preServerSpecialize(JNIEnv* env, ServerSpecializeArgs* args) {
+        ZS_UNUSED(env); ZS_UNUSED(args);
+    }
+    virtual void postServerSpecialize(const ServerSpecializeArgs* args) {
+        ZS_UNUSED(args);
+    }
 
     // Module declares which capabilities it wants. The loader uses
-    // this to size per-process state.
+    // this to skip per-fork work nobody asked for.
     virtual uint32_t caps() const { return 0; }
 
     // Empty virtual dtor for safe deletion through base pointer.

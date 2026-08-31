@@ -9,6 +9,10 @@
 #   - zygisk_study_payload_post_fork  (called by our fork hook)
 # Everything else is hidden.
 #
+# Round 12: module_dispatch.cpp owns the module-facing machinery
+# (registry, zygisk::Api implementation, JNIEnv acquisition, the
+# onLoad / pre/post-specialize dispatch state machines).
+#
 # Round 7: the build now includes the per-architecture self-unmap
 # trampoline (asm wrappers + the PIC blob). arm64-v8a and x86_64 get
 # the full Tier A "vanish" path; other ABIs fall back to the Tier B
@@ -18,6 +22,7 @@ cmake_minimum_required(VERSION 3.18)
 
 set(PAYLOAD_SOURCES
     src/entry.cpp
+    src/module_dispatch.cpp
     src/hide.cpp
     src/hide_advanced.cpp
     src/hide_stealth.cpp

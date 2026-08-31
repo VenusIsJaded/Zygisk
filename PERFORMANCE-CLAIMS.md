@@ -1016,3 +1016,38 @@ ownership contract, and the fd scan. Sanitized builds are ~2x slower
 (the perf medians under ASan: 420 us filter, 49 ns matcher) — that
 is instrumentation cost, not a production claim; the unsanitized
 numbers above remain the reference.
+
+## Round 12 — module dispatch costs
+
+The dispatch layer adds work to every privilege-drop hook. The
+zero-module case (the study default) must stay free, and the
+with-modules case must be priced:
+
+| Path | Cost | Confidence | Notes |
+| --- | --- | --- | --- |
+| Drop hooks, zero modules installed | one `g_modules.empty()` check per hook call (~1 ns) | High | `zs_module_dispatch_wanted()` short-circuits before any classification; vector size is stable after init. |
+| Drop hooks, modules installed, non-app uid (system daemons, USAP pre-specialize) | 2 atomic loads + uid classify (2 compares) | High | `ZS_CHILD_NONE` returns before touching strings or the packages map. |
+| App fork, modules installed, nobody declared PROCESS_UNPRIORITY | + hash lookup (appId -> package) + snprintf of app_data_dir (~sub-µs) | High | The /proc/self/cmdline read is SKIPPED entirely — that is what the caps bit buys. |
+| App fork, a module declared PROCESS_UNPRIORITY | + one open+read+close of /proc/self/cmdline (~10-15 µs on device, once per app start) | Medium | The single real syscall added per fork. Priced deliberately: names are the most-requested module argument. |
+| Module callbacks themselves | 2 virtual calls per module per fork | High | Measured-class: an indirect call is ~2 ns; the module's own body dominates by orders of magnitude. |
+| onLoad / env acquisition | once per zygote lifetime | High | One dlsym + one GetEnv. Zero per-fork cost. |
+| FORCE_DENYLIST_UNMOUNT processes | the full hide pipeline (as measured in Rounds 8-9) | High | Opt-in per module; denylisted processes already paid it. |
+
+### Round 12 honest negatives
+
+- With any module loaded that wants names, every app fork pays one
+  extra /proc read. Upstream Zygisk gets the same name from the
+  JNI method arguments it hooks for free — our honest sourcing
+  costs one syscall that upstream does not pay. That is the price
+  of not doing ART-internal method hooking.
+- The deny-check in the uid-drop hook runs a second hash lookup
+  (the gid-drop hook already checked with the gid). ~tens of ns;
+  only when modules are installed (the check is behind the same
+  `zs_module_dispatch_wanted()` gate... it is not — the deny check
+  precedes the dispatch gate to preserve Round 8-11 semantics for
+  hidden children with modules loaded; the lookup is the same
+  appId-family hash the gid hook used, and both are nanosecond
+  class).
+- g_pkg_map doubles the memory of the packages.list parse in the
+  zygote (a few hundred small strings; tens of KB class). Children
+  inherit it copy-on-write — zero marginal cost per fork.

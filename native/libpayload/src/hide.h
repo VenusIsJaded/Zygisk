@@ -88,6 +88,14 @@ int  hide_setup_for_target(const char* package_name);
 // match). Returns 1 if yes, 0 if no.
 int  hide_setup_for_target_uid(uid_t uid);
 
+// Round 12 — look up the package name that owns `uid` (appId family,
+// first entry wins for shared-appId packages). Fills out[0..cap) with
+// the package name or an empty string when unknown. Backed by the
+// same packages.list parse the DenyList uid map uses (no extra file
+// reads). Used by the module dispatch layer to fill the real
+// specialize arguments.
+void hide_lookup_package_for_uid(uid_t uid, char* out, size_t cap);
+
 // Apply the mount unmount + property clone/spoof actions. Only
 // meaningful if hide_setup_for_target*() returned 1. Must be called
 // while the child is still root (before the real privilege drop).
@@ -172,10 +180,17 @@ void hide_test_force_deny_uid(uid_t uid);
 void hide_test_set_records(const struct so_record* recs, size_t count);
 
 // Test-only: point the denylist at a writable file and drive the
-// mtime-refresh + throttle logic deterministically.
+// mtime-refresh + throttle logic deterministically. (extern "C" so
+// the dlopen-based dispatch test can resolve them with dlsym.)
+extern "C" {
 void   hide_test_set_denylist_path(const char* path);
 void   hide_test_reset_refresh();   // force the next mtime check to run
 int    hide_test_denylist_reload_count();
+
+// Test-only (Round 12): point the packages.list parse at a writable
+// file so hide_lookup_package_for_uid is drivable on the host.
+void   hide_test_set_packages_list_path(const char* path);
+}
 
 // Test-only: run the maps scanner over synthetic content.
 void   zs_scan_maps_into_records_test(const char* buf, size_t total);

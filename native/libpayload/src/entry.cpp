@@ -49,6 +49,7 @@
 #include "hide_advanced.h"
 #include "hide_stealth.h"
 #include "log.h"
+#include "module_dispatch.h"
 #include "resolve_libc.h"
 #include "unmap_trampoline.h"
 
@@ -84,19 +85,6 @@ namespace zygisk_study {
 
 static std::atomic<int> g_initialized{0};
 
-// Socket path the daemon opened.
-static constexpr const char* kDaemonSocket =
-    "/data/system/zygisk_study/sock/sock";
-
-struct LoadedModule {
-    void* dl_handle;
-    zygisk::Module* instance;
-    std::string path;
-    std::string id;
-};
-static std::vector<LoadedModule> g_modules;
-static std::atomic<int>          g_modules_loaded{0};
-
 // The pid that loaded the payload (the zygote). Any process whose pid
 // differs is a fork. This is the primary "are we in a child?" check —
 // more robust than a fork-hook flag, because it also covers children
@@ -108,119 +96,10 @@ static pid_t g_origin_pid = -1;
 // setresgid AND setresuid both triggering it).
 static std::atomic<int> g_hide_done{0};
 
-// ------------------------------------------------------------------------
-// The zygisk::Api surface we hand back to modules.
-// ------------------------------------------------------------------------
-
-class PayloadApi : public zygisk::Api {
-public:
-    void setOption(uint32_t) override {}
-    int  connectCompanion(void*) override { return -1; }
-
-    void getModuleDir(char* out, size_t cap) override {
-        strncpy(out, "/data/system/zygisk_study/modules", cap - 1);
-        out[cap - 1] = '\0';
-    }
-
-    void getProcessName(char* out, size_t cap) override {
-        int fd = open("/proc/self/cmdline", O_RDONLY | O_CLOEXEC);
-        if (fd < 0) { out[0] = '\0'; return; }
-        ssize_t n = read(fd, out, cap - 1);
-        close(fd);
-        if (n < 0) n = 0;
-        out[n] = '\0';
-    }
-
-    int  hookJniEnv(JNIEnv**) override { return 0; }
-    void cleanTrace() override { hide_clean_trace(); }
-    uint32_t apiVersion() override { return 1; }
-};
-
-static PayloadApi g_api;
-
-// ------------------------------------------------------------------------
-// Module loading
-// ------------------------------------------------------------------------
-
-static std::vector<LoadedModule> fetch_module_list_from_daemon() {
-    std::vector<LoadedModule> out;
-    int sock = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    if (sock < 0) return out;
-    struct sockaddr_un addr{};
-    addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, kDaemonSocket, sizeof(addr.sun_path) - 1);
-
-    if (connect(sock, (struct sockaddr*)&addr, sizeof addr) != 0) {
-        close(sock);
-        return out;
-    }
-    char req = 'L';
-    if (send(sock, &req, 1, 0) != 1) {
-        close(sock);
-        return out;
-    }
-    char buf[8192];
-    ssize_t n = recv(sock, buf, sizeof buf - 1, 0);
-    close(sock);
-    if (n <= 0) return out;
-    buf[n] = '\0';
-
-    char* save_outer = nullptr;
-    for (char* line = strtok_r(buf, "\n", &save_outer);
-         line != nullptr;
-         line = strtok_r(nullptr, "\n", &save_outer)) {
-        char* save_inner = nullptr;
-        char* id   = strtok_r(line, ";", &save_inner);
-        char* path = strtok_r(nullptr, ";",  &save_inner);
-        if (!id || !path) continue;
-        LoadedModule m{};
-        m.id   = id;
-        m.path = path;
-        out.push_back(std::move(m));
-    }
-    return out;
-}
-
-static void load_all_modules() {
-    auto list = fetch_module_list_from_daemon();
-    g_modules.reserve(list.size());
-    g_modules.clear();
-    for (auto& m : list) {
-        // Register the module .so path BEFORE dlopen'ing so the
-        // record rescan below sees both the fragment and the fresh
-        // maps entries in one pass.
-        hide_register_extra_so(m.path.c_str());
-        m.dl_handle = dlopen(m.path.c_str(), RTLD_NOW | RTLD_LOCAL);
-        if (!m.dl_handle) {
-            ZS_LOGW("payload: dlopen(%s) failed: %s",
-                    m.path.c_str(), dlerror());
-            continue;
-        }
-        using FactoryFn = zygisk::Module* (*)(zygisk::Api*, JNIEnv*);
-        auto factory = (FactoryFn)dlsym(m.dl_handle, "zygisk_module");
-        if (!factory) {
-            ZS_LOGW("payload: %s: no zygisk_module symbol", m.id.c_str());
-            dlclose(m.dl_handle);
-            continue;
-        }
-        m.instance = factory(&g_api, nullptr);
-        if (!m.instance) {
-            ZS_LOGW("payload: %s: factory returned null", m.id.c_str());
-            dlclose(m.dl_handle);
-            continue;
-        }
-        ZS_LOGI("payload: loaded module %s from %s",
-                m.id.c_str(), m.path.c_str());
-        g_modules.push_back(std::move(m));
-    }
-    // One maps rescan picks up every module's segments.
-    hide_rescan_records();
-
-    // CRITICAL: mark modules as loaded so nothing re-fetches the list
-    // from the daemon (per-fork socket round-trips would be a major
-    // latency regression).
-    g_modules_loaded.store(1);
-}
+// Round 12: set once the module post-dispatch + forced-unmount phase
+// has run (guards the setresuid hook against double-entry the same
+// way g_hide_done guards the hide pipeline).
+static std::atomic<int> g_dispatch_done{0};
 
 // ------------------------------------------------------------------------
 // The hide pipeline (shared by the uid hooks and the exported
@@ -236,18 +115,36 @@ static long priv_drop_nop(void*) { return 0; }
 // when invoked from an asm wrapper (Tier A possible); null when
 // invoked from the exported API (Tier B forced).
 //
+// Round 12: the pipeline is split into two phases because the
+// FORCE_DENYLIST_UNMOUNT path needs the mount work while the child is
+// still root (it runs BEFORE the module pre callbacks) but the
+// spoof/unmap work only AFTER the post callbacks (they are the last
+// module code that will ever execute).
+//
+// Phase 1 (requires euid 0 / CAP_SYS_ADMIN): unshare + unmounts.
+static void hide_mount_phase() {
+    hide_apply_for_target(nullptr);          // unshare + unmount
+}
+
+// Phase 2: per-process spoofing + cleanup, ending in the Tier A
+// unmap (relaying the real call's return value to the runtime) or the
+// Tier B hook install.
+//
 // `call_real`/`real_ctx` invoke the real libc function this hook
 // replaced. In the Tier A path it MUST run before the trampoline
 // jumps out — the runtime expects setresgid/setresuid to have
 // actually executed, and skipping it would leave the app running as
 // root (an instant detection and a security hole).
 //
-// Returns true if the real call was already made (Tier A).
-static bool run_hide_pipeline(void* wrapper_fp,
-                              long (*call_real)(void*), void* real_ctx) {
-    // ---- still root here: mount namespace work ----
-    hide_apply_for_target(nullptr);          // unshare + unmount
-
+// `real_already_ran`/`rv_in`: the FORCE path already made the real
+// call (module post callbacks needed the dropped privileges); the
+// trampoline relays `rv_in` instead of calling again.
+//
+// Returns true if the trampoline jumped out (caller must return
+// immediately — no libpayload instruction after it is safe).
+static bool hide_process_phase(void* wrapper_fp,
+                               long (*call_real)(void*), void* real_ctx,
+                               bool real_already_ran, long rv_in) {
     // ---- per-process spoofing + cleanup (both tiers) ----
     hide_advanced_apply_post_fork(nullptr);  // props clone+spoof, fds, env
     hide_stealth_apply_post_fork(nullptr);   // comm, rlimit_core, cwd
@@ -275,7 +172,7 @@ static bool run_hide_pipeline(void* wrapper_fp,
         hide_advanced_uninstall_got_hooks();
         // 3. Drop privileges for real — the specialization code that
         //    resumes after us assumes the call succeeded.
-        long rv = call_real(real_ctx);
+        long rv = real_already_ran ? rv_in : call_real(real_ctx);
         // 4. Hand everything left to the trampoline: it unmaps our
         //    own remaining segments (text/data — the read-only
         //    metadata survives as anonymous pages) and returns `rv`
@@ -305,29 +202,18 @@ static bool run_hide_pipeline(void* wrapper_fp,
     return false;
 }
 
-// The shared body of the privilege-drop hooks.
-//
-// `id` is the uid/gid the runtime is about to switch to. Real zygote
-// specialization always calls setresgid() and setresuid() (in that
-// order) in the child, both while it is still root — exactly the
-// window we need.
-static long priv_drop_hook(void* wrapper_fp, uid_t id,
-                           long (*call_real)(void*), void* real_ctx) {
-    if (getpid() != g_origin_pid &&
-        !g_hide_done.load(std::memory_order_acquire)) {
-        if (hide_setup_for_target_uid(id)) {
-            g_hide_done.store(1, std::memory_order_release);
-            if (run_hide_pipeline(wrapper_fp, call_real, real_ctx)) {
-                return 0;  // unreachable — Tier A already jumped out
-            }
-            // Tier B: the real call still needs to run.
-            return call_real(real_ctx);
-        }
-    }
-    return call_real(real_ctx);
+// The classic denylisted path: both phases back to back, real call
+// made from inside the Tier A branch as before.
+static bool run_hide_pipeline(void* wrapper_fp,
+                              long (*call_real)(void*), void* real_ctx) {
+    hide_mount_phase();
+    return hide_process_phase(wrapper_fp, call_real, real_ctx,
+                              false, 0);
 }
 
-// Real-call thunks (resolved from libc at init).
+// Real-call thunks (resolved from libc at init). Under ZS_HOST_TEST a
+// recorder seam can replace them so tests can assert what the hooks
+// actually forwarded (module-rewritten uid/gid included).
 static int (*g_real_setresgid)(gid_t, gid_t, gid_t) = nullptr;
 static int (*g_real_setresuid)(uid_t, uid_t, uid_t) = nullptr;
 static int (*g_real_setgid)(gid_t)                  = nullptr;
@@ -339,23 +225,176 @@ struct RealCtx1 { long a; };
 
 static long call_real_setresgid(void* ctx) {
     RealCtx3* c = (RealCtx3*)ctx;
+#ifdef ZS_HOST_TEST
+    if (ZsDropSeam* s = zs_test_drop_seam(); s && s->setresgid)
+        return s->setresgid((gid_t)c->a, (gid_t)c->b, (gid_t)c->c);
+#endif
     return g_real_setresgid ? g_real_setresgid((gid_t)c->a, (gid_t)c->b, (gid_t)c->c)
                             : syscall(SYS_setresgid, c->a, c->b, c->c);
 }
 static long call_real_setresuid(void* ctx) {
     RealCtx3* c = (RealCtx3*)ctx;
+#ifdef ZS_HOST_TEST
+    if (ZsDropSeam* s = zs_test_drop_seam(); s && s->setresuid)
+        return s->setresuid((uid_t)c->a, (uid_t)c->b, (uid_t)c->c);
+#endif
     return g_real_setresuid ? g_real_setresuid((uid_t)c->a, (uid_t)c->b, (uid_t)c->c)
                             : syscall(SYS_setresuid, c->a, c->b, c->c);
 }
 static long call_real_setgid(void* ctx) {
     RealCtx1* c = (RealCtx1*)ctx;
+#ifdef ZS_HOST_TEST
+    if (ZsDropSeam* s = zs_test_drop_seam(); s && s->setgid)
+        return s->setgid((gid_t)c->a);
+#endif
     return g_real_setgid ? g_real_setgid((gid_t)c->a)
                          : syscall(SYS_setgid, c->a);
 }
 static long call_real_setuid(void* ctx) {
     RealCtx1* c = (RealCtx1*)ctx;
+#ifdef ZS_HOST_TEST
+    if (ZsDropSeam* s = zs_test_drop_seam(); s && s->setuid)
+        return s->setuid((uid_t)c->a);
+#endif
     return g_real_setuid ? g_real_setuid((uid_t)c->a)
                          : syscall(SYS_setuid, c->a);
+}
+
+// The shared body of the GID-drop hooks (setresgid/setgid — the first
+// privilege-drop call the runtime makes in the child).
+//
+// `id` is the gid the runtime is about to install. Real zygote
+// specialization always calls setresgid() and setresuid() (in that
+// order) in the child, both while it is still root — exactly the
+// window we need.
+//
+// Round 12: on the non-hidden path the gid is recorded for the module
+// dispatch args; the module callbacks themselves fire from the
+// UID-drop hooks (the uid argument is the identity key).
+static long gid_drop_hook(void* wrapper_fp, uid_t id,
+                          long (*call_real)(void*), void* real_ctx) {
+    if (getpid() != g_origin_pid &&
+        !g_hide_done.load(std::memory_order_acquire)) {
+        if (hide_setup_for_target_uid(id)) {
+            g_hide_done.store(1, std::memory_order_release);
+            if (run_hide_pipeline(wrapper_fp, call_real, real_ctx)) {
+                return 0;  // unreachable — Tier A already jumped out
+            }
+            // Tier B: the real call still needs to run.
+            return call_real(real_ctx);
+        }
+        // Not hidden: remember the gid the runtime is installing so
+        // the module args carry the real value.
+        zs_module_record_gid((gid_t)id);
+    }
+    return call_real(real_ctx);
+}
+
+// Apply a module-requested gid change from inside the UID-drop hook.
+// Still legal here: euid is 0 until the real setresuid runs (gid
+// changes alone do not clear the effective capability set), so
+// CAP_SETGID is still held. Failure is logged and ignored — the
+// runtime's own gid stands.
+static void apply_module_gid_override(gid_t gid) {
+#ifdef ZS_HOST_TEST
+    if (ZsDropSeam* s = zs_test_drop_seam(); s && s->setresgid) {
+        (void)s->setresgid(gid, gid, gid);
+        return;
+    }
+#endif
+    if (g_real_setresgid) {
+        if (g_real_setresgid(gid, gid, gid) != 0) {
+            ZS_LOGW("payload: module gid override to %u failed: %s",
+                    (unsigned)gid, strerror(errno));
+        }
+    } else {
+        if (syscall(SYS_setresgid, gid, gid, gid) != 0) {
+            ZS_LOGW("payload: module gid override to %u failed: %s",
+                    (unsigned)gid, strerror(errno));
+        }
+    }
+}
+
+// The shared body of the UID-drop hooks (setresuid/setuid — the LAST
+// privilege-drop call, the one that actually changes euid).
+//
+// Round 12 dispatch order (non-denylisted children):
+//   1. (still root) FORCE_DENYLIST_UNMOUNT mount work, if requested —
+//      module pre callbacks see the unmounted state and can still add
+//      their own mounts in the private namespace.
+//   2. (still root) preAppSpecialize / preServerSpecialize with the
+//      real args; module writes to args->uid/args->gid are forwarded
+//      to the real calls below.
+//   3. the real privilege drop.
+//   4. postAppSpecialize / postServerSpecialize (specialized).
+//   5. the FORCE spoof/unmap phase — the post callbacks were the last
+//      module code that will ever execute here.
+//
+// Denylisted children never reach the dispatch: the hide pipeline
+// (which unmaps the module .so's) takes over at the first drop.
+static long uid_drop_hook(void* wrapper_fp, uid_t id,
+                          long (*call_real)(void*), void* real_ctx,
+                          int arg_count) {
+    if (getpid() != g_origin_pid &&
+        !g_hide_done.load(std::memory_order_acquire) &&
+        !g_dispatch_done.load(std::memory_order_acquire)) {
+        // The DenyList check in case the gid drop did not fire (or did
+        // not match): denylisted children hide instead of dispatching.
+        if (hide_setup_for_target_uid(id)) {
+            g_hide_done.store(1, std::memory_order_release);
+            if (run_hide_pipeline(wrapper_fp, call_real, real_ctx)) {
+                return 0;  // unreachable — Tier A already jumped out
+            }
+            return call_real(real_ctx);
+        }
+
+        // ---- Round 12: module dispatch ----
+        if (zs_module_dispatch_wanted()) {
+            if (zs_module_force_unmount()) {
+                hide_mount_phase();               // still root
+            }
+
+            uid_t eff_uid = id, eff_gid = 0;
+            ZsChildKind kind =
+                zs_module_pre_specialize(id, &eff_uid, &eff_gid);
+            if (kind != ZS_CHILD_NONE) {
+                if ((gid_t)eff_gid != zs_module_recorded_gid()) {
+                    apply_module_gid_override((gid_t)eff_gid);
+                }
+                // The runtime calls setresuid(uid, uid, uid) /
+                // setuid(uid) — forward the (possibly module-rewritten)
+                // effective uid. RealCtx1 is a layout prefix of
+                // RealCtx3 (both start with the `a` field).
+                if (arg_count == 3) {
+                    RealCtx3* c = (RealCtx3*)real_ctx;
+                    c->a = (long)eff_uid;
+                    c->b = (long)eff_uid;
+                    c->c = (long)eff_uid;
+                } else {
+                    RealCtx1* c = (RealCtx1*)real_ctx;
+                    c->a = (long)eff_uid;
+                }
+                long rv = call_real(real_ctx);
+
+                zs_module_post_specialize();
+                g_dispatch_done.store(1, std::memory_order_release);
+
+                // Re-read the flag: a module may have called
+                // setOption(FORCE_DENYLIST_UNMOUNT) from its pre
+                // callback (late request — the mount phase of this
+                // fork was already decided, but the spoof/unmap phase
+                // still applies after its post callback).
+                if (zs_module_force_unmount()) {
+                    if (hide_process_phase(wrapper_fp, priv_drop_nop,
+                                           nullptr, true, rv)) {
+                        return 0;  // Tier A jumped out with rv relayed
+                    }
+                }
+                return rv;
+            }
+        }
+    }
+    return call_real(real_ctx);
 }
 
 // The C++ implementations the asm wrappers call.
@@ -363,31 +402,37 @@ static long call_real_setuid(void* ctx) {
 
 extern "C" long zs_impl_setresgid(void* wrapper_fp, long a0, long a1, long a2) {
     RealCtx3 ctx{a0, a1, a2};
-    return priv_drop_hook(wrapper_fp, (uid_t)a0,
-                          call_real_setresgid, &ctx);
+    return gid_drop_hook(wrapper_fp, (uid_t)a0,
+                         call_real_setresgid, &ctx);
 }
 
 extern "C" long zs_impl_setresuid(void* wrapper_fp, long a0, long a1, long a2) {
     RealCtx3 ctx{a0, a1, a2};
-    return priv_drop_hook(wrapper_fp, (uid_t)a0,
-                          call_real_setresuid, &ctx);
+    return uid_drop_hook(wrapper_fp, (uid_t)a0,
+                         call_real_setresuid, &ctx, 3);
 }
 
 extern "C" long zs_impl_setgid(void* wrapper_fp, long a0) {
     RealCtx1 ctx{a0};
-    return priv_drop_hook(wrapper_fp, (uid_t)a0,
-                          call_real_setgid, &ctx);
+    return gid_drop_hook(wrapper_fp, (uid_t)a0,
+                         call_real_setgid, &ctx);
 }
 
 extern "C" long zs_impl_setuid(void* wrapper_fp, long a0) {
     RealCtx1 ctx{a0};
-    return priv_drop_hook(wrapper_fp, (uid_t)a0,
-                          call_real_setuid, &ctx);
+    return uid_drop_hook(wrapper_fp, (uid_t)a0,
+                         call_real_setuid, &ctx, 1);
 }
 
 // Kept for the fork wrapper (registered but not required — the pid
 // comparison above is the primary child detection).
 extern "C" long zs_impl_fork(void* /*wrapper_fp*/) {
+    // Round 12: the zygote's first fork is the earliest moment the
+    // VM exists AND we still run pre-fork — acquire the JNIEnv and
+    // dispatch module onLoad there (once per process lifetime).
+    if (getpid() == g_origin_pid) {
+        zs_module_on_first_fork();
+    }
     // Direct libc fork; ART's pthread_atfork handlers must still run.
     if (g_real_fork) return g_real_fork();
     return syscall(SYS_clone, SIGCHLD, 0, nullptr, nullptr, nullptr);
@@ -514,8 +559,9 @@ void zygisk_study_payload_init() {
     hide_stealth_init();
 
     // Load Zygisk modules (their .so paths get registered for the
-    // unmap set inside load_all_modules).
-    load_all_modules();
+    // unmap set inside zs_module_init).
+    zs_module_init();
+    zs_module_capture_zygote_name();
 
     // Install ONLY the privilege-drop hooks (plus fork) — the four
     // entry points that detect + drive the whole pipeline. Every
@@ -577,6 +623,29 @@ void zygisk_study_payload_post_fork(const char* package_name,
 extern "C" __attribute__((visibility("default")))
 void zs_test_force_deny_uid(int uid) {
     hide_test_force_deny_uid((uid_t)uid);
+}
+
+// Round 12 — drive the REAL hook implementations from the dispatch
+// tests (wrapper_fp = null -> Tier B forced; the dispatch paths under
+// test never enter Tier A).
+extern "C" __attribute__((visibility("default")))
+void zs_test_first_fork() {
+    zs_module_on_first_fork();
+}
+
+extern "C" __attribute__((visibility("default")))
+long zs_test_setresgid(long g) {
+    return zs_impl_setresgid(nullptr, g, g, g);
+}
+
+extern "C" __attribute__((visibility("default")))
+long zs_test_setresuid(long u) {
+    return zs_impl_setresuid(nullptr, u, u, u);
+}
+
+extern "C" __attribute__((visibility("default")))
+long zs_test_setuid(long u) {
+    return zs_impl_setuid(nullptr, u);
 }
 
 extern "C" __attribute__((visibility("default")))

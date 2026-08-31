@@ -45,12 +45,17 @@ your machine, not a copy of any upstream artifact.
   point for someone who wants to do a serious reimplementation.
 - It is **not** a finished product. The `ro.dalvik.vm.native.bridge`
   swap IS implemented (post-fs-data.sh + the systemless layout in
-  customize.sh, with uninstall restore), and the privilege-drop hook
-  chain works end-to-end on host tests — but JNI hooking (module
-  pre/post-specialize callbacks with real Zygote arguments) and the
-  ptrace injection of `libzn_loader.so` remain stubbed, and nothing
-  has been booted on real hardware. Treat it as a study skeleton
-  until you have personally flashed and recovered it.
+  customize.sh, with uninstall restore), the privilege-drop hook
+  chain works end-to-end on host tests, and (since Round 12) the
+  Zygisk module lifecycle is actually driven: modules get a real
+  JNIEnv at onLoad, real pre/post-specialize callbacks with the
+  specialize arguments this hook point can source (uid/gid —
+  WRITABLE, forwarded to the real privilege-drop calls — plus
+  nice_name / package_name / app_data_dir), a working
+  `hookJniEnv` table swap, and `connectCompanion()`. The ptrace
+  injection of `libzn_loader.so` remains stubbed, and nothing has
+  been booted on real hardware. Treat it as a study skeleton until
+  you have personally flashed and recovered it.
 
 ## Why this exists
 
@@ -263,8 +268,22 @@ What the tests cover (Round 9):
   that did catch an off-by-one in the first x86_64 register
   restore).
 - **`test_perf`** (4 tests) — the microbenchmarks.
+- **`test_module_dispatch`** (10 tests) — Round 12, the module
+  lifecycle e2e: a fake zygiskd thread serves the REAL 'L'/'C'
+  protocol, the REAL payload dlopens a REAL module .so
+  (libzs_test_module.so), a fake JavaVM (exported as
+  JNI_GetCreatedJavaVMs via -rdynamic) feeds the REAL env
+  acquisition, and the REAL setresgid/setresuid hooks dispatch
+  onLoad / pre / post into the module. Asserts the full callback
+  order, the real argument values (uid, gid, nice_name,
+  package_name, app_data_dir, multi-user), that module-rewritten
+  uid/gid are forwarded to the real privilege-drop calls (via a
+  drop-seam recorder), the server path, the legacy setuid path,
+  that denylisted children hide INSTEAD of dispatching, and that
+  FORCE_DENYLIST_UNMOUNT runs its unmount phase only after the
+  post callbacks.
 
-(Total: 113 host-side tests, plus the daemon's `cargo test` suite.)
+(Total: 123 host-side tests, plus the daemon's `cargo test` suite.)
 
 The logic suites also run clean under **ASan + UBSan with leak
 detection** — `cd tests && make run-sanitize`. That run is where
@@ -474,6 +493,58 @@ docs/ANDROID-REALISM.md. The short version:
   maps/smaps/mounts/status/environ used to pay an mmap+munmap pair
   PLUS zeroing 16 fresh pages; now the first filtered open on a
   thread pays it once for the process lifetime.
+
+### Round 12 — the module lifecycle actually runs
+
+The feature the README had flagged as "stubbed" since Round 7: the
+module dispatch layer. Modules were dlopen'd and constructed in the
+zygote, then never called — the JNIEnv was nullptr, `hookJniEnv`
+returned 0 without doing anything, `connectCompanion` returned -1,
+and none of the five zygisk.hpp lifecycle callbacks ever fired.
+Now (`native/libpayload/src/module_dispatch.{h,cpp}`):
+
+- **A real JNIEnv, sourced honestly.** At the zygote's first fork
+  (the earliest moment the VM exists and we are still pre-fork),
+  the loader resolves `JNI_GetCreatedJavaVMs` (RTLD_DEFAULT, with a
+  libart.so soname fallback) and takes the main thread's env via
+  GetEnv / AttachCurrentThreadAsDaemon. Children inherit the
+  pointer; it stays valid on the same thread through fork +
+  specialization. No ART-internal method hooking anywhere.
+- **pre/postAppSpecialize with real Zygote arguments.** The
+  setresuid/setuid hook ENTRY dispatches the pre callbacks while
+  the child is still root; the setresgid hook's argument is
+  recorded as the gid. uid and gid are POINTERS into the live
+  dispatch state — a module that writes through them changes what
+  the real privilege-drop calls receive (the payload re-applies a
+  changed gid with setresgid while CAP_SETGID is still held, then
+  calls the real setresuid with the rewritten uid). nice_name
+  comes from /proc/self/cmdline (falling back to the package name
+  when the runtime has not rewritten argv yet — gated on
+  PROCESS_UNPRIORITY so nobody-asked forks skip the read);
+  package_name from packages.list via the same parse the DenyList
+  uid map uses; app_data_dir derived as
+  /data/user/<uid/100000>/<package>. post callbacks run right
+  after the real privilege drop.
+- **pre/postServerSpecialize** for system_server (the only
+  uid-1000 zygote child).
+- **DenyList contract**: denylisted children take the hide
+  pipeline instead of module callbacks — their module .so's get
+  unmapped, so running module code there would be a crash, and
+  "no modules in hidden processes" is also the upstream semantic.
+- **FORCE_DENYLIST_UNMOUNT** (setOption): unmount everywhere
+  while still running callbacks. The mount work runs while still
+  root (before the pre callbacks, so a module can still add its
+  own mounts in the private namespace); the spoof/unmap phase
+  runs AFTER the post callbacks — the last module code that ever
+  executes in that process.
+- **hookJniEnv** is a real function-table swap: the module hands
+  in its patched copy of the table, the loader writes it into the
+  JNIEnv's table slot (per-thread ART state, writable memory) and
+  returns the original for chaining. connectCompanion() returns a
+  live fd to the daemon's 'C' channel.
+- API version bumped to 2 (zygisk.hpp) with the args structs;
+  see the header for the honest deviation from upstream v4 (only
+  the arguments this hook point can source are exposed).
 
 ### Host-side perf microbenchmarks
 
