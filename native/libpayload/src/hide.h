@@ -120,6 +120,19 @@ void hide_register_root_path_prefix(const char* prefix);
 // while the child is still root (before the real privilege drop).
 void hide_apply_for_target(const char* package_name);
 
+// ------------------------------------------------------------------------
+// Round 19 — execve-proof property spoofing.
+//
+// The daemon materializes the spoofed properties_serial file at
+// payload init (module_dispatch.cpp drives the 'P' protocol); this
+// registers the file's path + expected area magic. The hide mount
+// phase bind-mounts it over /dev/__properties__/properties_serial
+// (self-checked, fail-closed) so fork+exec'd helpers — fresh libc,
+// no hooks — re-map the SPOOFED area instead of the real one.
+// ------------------------------------------------------------------------
+void hide_props_file_set_source(const char* src, uint32_t magic);
+int  hide_props_file_ready();
+
 // Clean up any traces we left behind after apply, before user code
 // runs. The caller (entry.cpp) calls this from postAppSpecialize.
 void hide_clean_trace();
@@ -226,6 +239,11 @@ void        zs_test_set_mount_fns(ZsUnshareFn u, ZsMountSlaveFn s,
 void        zs_test_mount_log_reset();
 void        zs_test_mount_log_append(char op);
 const char* zs_test_mount_log();
+
+// Round 19 — the spoofed-properties bind-mount seams.
+void zs_test_set_bind_mount_fn(int (*bind)(const char*, const char*));
+void zs_test_props_source_clear();
+void zs_test_set_prop_serial_target(const char* target);
 #endif
 
 } // namespace zygisk_study

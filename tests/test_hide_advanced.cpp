@@ -46,6 +46,7 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 #include <vector>
+#include <map>
 
 using namespace zygisk_study;
 
@@ -55,28 +56,34 @@ using namespace zygisk_study;
 // ----------------------------------------------------------------------
 
 ZS_TEST(hidden_substrings_contains_documented_set) {
-    bool has_zygisk    = false;
-    bool has_payload   = false;
-    bool has_zn_loader = false;
-    bool has_data_adb  = false;
-    bool has_sbin      = false;
-    bool has_kernelsu  = false;
-
-    for (const HiddenSubstring& sub : kHiddenSubstrings) {
-        const char* s = sub.data;
-        if (strstr(s, "libzygisk.so")     != nullptr) has_zygisk    = true;
-        if (strstr(s, "libpayload.so")    != nullptr) has_payload   = true;
-        if (strstr(s, "libzn_loader.so")  != nullptr) has_zn_loader = true;
-        if (strstr(s, "/data/adb/")       != nullptr) has_data_adb  = true;
-        if (strstr(s, "/sbin/")           != nullptr) has_sbin      = true;
-        if (strstr(s, "ksu")              != nullptr) has_kernelsu  = true;
-    }
-    ZS_CHECK(has_zygisk);
-    ZS_CHECK(has_payload);
-    ZS_CHECK(has_zn_loader);
-    ZS_CHECK(has_data_adb);
-    ZS_CHECK(has_sbin);
-    ZS_CHECK(has_kernelsu);
+    // Round 19: the PROC_LINE matcher is token-anchored now (the old
+    // whole-path substring table was format-blind and leaked
+    // mounts/mountinfo lines — see the Round 19 audit in
+    // hide_advanced.cpp). The hidden set is now the union of:
+    //   - the fd-scanner root-path prefixes (shared table),
+    //   - exact /system/lib[64]/ bridge-library paths,
+    //   - mountinfo root-column forms.
+    // Verify the documented members exist THROUGH THE MATCHER's own
+    // behavior (zs_filter_record with a line whose only matching
+    // token is the one under test).
+    char dst[512];
+    auto drops = [&](const char* line) -> bool {
+        return zs_filter_record(dst, sizeof dst, line, strlen(line),
+                                 ZS_FILTER_PROC_LINE) == (ssize_t)-1;
+    };
+    // Root-path prefixes (via the shared fd prefix table).
+    ZS_CHECK(drops("x y z w v /data/adb/modules/foo"));
+    ZS_CHECK(drops("x y z w v /sbin/anything"));
+    ZS_CHECK(drops("x y z w v /debug_ramdisk/su"));
+    ZS_CHECK(drops("x y z w v /data/system/zygisk_study/denylist"));
+    // Exact bridge-library paths.
+    ZS_CHECK(drops("700000000000-7000001000 r-xp 00000000 00:00 1  /system/lib64/libzygisk.so"));
+    ZS_CHECK(drops("700000000000-7000001000 r-xp 00000000 00:00 1  /system/lib/libpayload.so"));
+    // App-owned libraries with the same NAME must SURVIVE (the old
+    // substring matcher dropped them — an over-match).
+    ZS_CHECK(!drops("700000000000-7000001000 r-xp 00000000 00:00 1  /data/data/com.app/lib/libpayload.so"));
+    // KernelSU module path (covered by the /data/adb/ prefix).
+    ZS_CHECK(drops("x y z w v /data/adb/ksu/bin/ksud"));
 }
 
 // ----------------------------------------------------------------------
@@ -120,13 +127,25 @@ ZS_TEST(filtered_paths_contains_proc_self_paths) {
 // passed to memmem).
 // ----------------------------------------------------------------------
 ZS_TEST(hidden_substrings_have_correct_precomputed_lengths) {
-    for (const HiddenSubstring& sub : kHiddenSubstrings) {
-        size_t actual = __builtin_strlen(sub.data);
-        ZS_CHECK_EQ(sub.len, actual);
-        // Also verify the length is non-zero (a zero-length substring
-        // would match everything, which would be a regression).
-        ZS_CHECK(sub.len > 0);
-    }
+    // Round 19: the token matcher uses __builtin_strlen at each
+    // comparison against kHiddenExactPaths/kHiddenRootFieldPrefixes,
+    // so there is no precomputed-length table to desync any more.
+    // What still matters: every entry is a well-formed non-empty
+    // absolute-ish path, and the fd prefix table (shared with the
+    // matcher) still reports sane lengths. Verify the tables through
+    // the public registration + match API.
+    char dst[512];
+    // Round 13's runtime registration API feeds the SAME table the
+    // matcher consults; prove the plumbing with a fresh prefix.
+    hide_advanced_register_root_path_prefix("/data/local/tmp/zstest/");
+    const char* reg = "a b c d e /data/local/tmp/zstest/x.so";
+    ZS_CHECK(zs_filter_record(dst, sizeof dst, reg, strlen(reg),
+                              ZS_FILTER_PROC_LINE) == (ssize_t)-1);
+    // And a path that merely CONTAINS the string does not match
+    // (token anchoring).
+    const char* contains = "a b c d e /other/data/local/tmp/zstest/x.so";
+    ZS_CHECK(zs_filter_record(dst, sizeof dst, contains, strlen(contains),
+                              ZS_FILTER_PROC_LINE) > 0);
 }
 
 // ----------------------------------------------------------------------
@@ -1106,6 +1125,54 @@ ZS_TEST(filter_record_proc_line_drops_hidden_paths) {
                             ZS_FILTER_PROC_LINE);
     ZS_CHECK_EQ(kept, (ssize_t)strlen(clean));
     ZS_CHECK(memcmp(inbuf, clean, (size_t)kept) == 0);
+}
+
+// Round 19 — THE regression test for the mounts-format leak. The
+// old matcher only understood the maps column layout; every line
+// below is a REAL format from /proc/self/{mounts,mountinfo,maps}
+// carrying a hidden path in a column the old code never scanned.
+// (All five leaked before the fix; verified empirically first, then
+// fixed, then this test locked it in.)
+ZS_TEST(filter_record_drops_hidden_paths_in_every_line_format) {
+    char dst[512];
+    auto dropped = [&](const char* line) -> bool {
+        return zs_filter_record(dst, sizeof dst, line, strlen(line),
+                                 ZS_FILTER_PROC_LINE) == (ssize_t)-1;
+    };
+
+    // /proc/self/mounts: "source target fstype opts 0 0"
+    // Hidden path in SOURCE (the magic-mount source is field 1).
+    ZS_CHECK(dropped("/data/adb/modules/zygisk_study/system /system ext4 rw,seclabel 0 0"));
+    // Hidden path in TARGET (a module bind mounted over a system dir).
+    ZS_CHECK(dropped("/dev/block/sda26 /data/adb/whatever ext4 ro,seclabel 0 0"));
+
+    // /proc/self/mountinfo:
+    // "id parent maj:min root mountpoint opts [tags] - fstype source super_opts"
+    // Hidden MOUNTPOINT (field 5) — the old code scanned field 6 (opts).
+    ZS_CHECK(dropped("37 36 253:5 / /data/adb/modules rw,relatime - ext4 /dev/block/sda26 rw"));
+    // Hidden ROOT (field 4 — the path inside the source filesystem;
+    // a bind of /data/adb/modules reports "/adb/modules").
+    ZS_CHECK(dropped("36 35 98:0 /adb/modules /system/lib64 rw,relatime master:1 - ext4 /dev/block/sda26 rw"));
+    // Hidden SOURCE (field 10, after the " - " separator).
+    ZS_CHECK(dropped("38 36 98:0 / /system/bin ext4 rw - ext4 /data/adb/modules/zygisk_study/system rw"));
+    // The session-dir (runtime-registered prefix) as SOURCE — the
+    // Round 19 properties bind-mount shape.
+    hide_advanced_register_root_path_prefix("/data/system/.deadbeef/");
+    ZS_CHECK(dropped("39 36 98:0 /system/.deadbeef/p /dev/__properties__/properties_serial rw - ext4 /data/system/.deadbeef/p rw"));
+
+    // Clean stock lines must SURVIVE in every format (over-matching
+    // would corrupt the app's view of the mount table).
+    ZS_CHECK(!dropped("/dev/block/sda26 /system ext4 ro,seclabel 0 0"));
+    ZS_CHECK(!dropped("36 35 98:0 / /system ext4 rw,relatime master:1 - ext4 /dev/block/sda26 rw"));
+    ZS_CHECK(!dropped("700000000000-7000001000 r--p 00000000 00:00 1  /system/framework/x86_64/boot.art"));
+    // mountinfo root "/" token followed by a target that merely
+    // CONTAINS a hidden substring mid-token must survive (anchoring).
+    ZS_CHECK(!dropped("40 36 98:0 / /storage/emulated/0/mydata_adb_backup ext4 rw - fuse fd:123 rw"));
+
+    // mountstats: "device target fstype opts" header lines. (Real
+    // module-mount targets always carry a deeper path than the bare
+    // prefix — the anchored table matches on "/data/adb/" + more.)
+    ZS_CHECK(dropped("/dev/block/sda26 /data/adb/modules ext4 rw,relatime"));
 }
 
 // Round 8: zs_filter_record — STATUS semantics.
@@ -3002,4 +3069,140 @@ ZS_TEST(path_normalizer_resolves_dot_and_dotdot) {
     // Capacity: exactly-fitting path succeeds, one byte short fails.
     ZS_CHECK(zs_normalize_path("/a", out, 3) > 0);
     ZS_CHECK_EQ(zs_normalize_path("/ab", out, 3), (size_t)0);
+}
+
+// ----------------------------------------------------------------------
+// Round 19 — the spoofed properties_serial builder. The REAL
+// production function (zs_build_spoofed_serial_area) runs against a
+// REAL file-backed mapping of this test process (the maps scan finds
+// it in /proc/self/maps like it would find the real area), with a
+// fake __system_property_find returning pointers INTO that mapping.
+// No format assumptions: offsets come from the mapping table, values
+// are verified by reading the built buffer back.
+// ----------------------------------------------------------------------
+
+ZS_TEST(spoofed_serial_area_builder_patches_values_at_offsets) {
+    // 1. Synthetic area: page-sized file, "PROP" magic, two fake
+    //    prop_info entries at 0x100 and 0x200 (bionic layout:
+    //    serial@0, value@4..96).
+    char area_path[] = "/tmp/zs_area_XXXXXX";
+    int fd = mkstemp(area_path);
+    ZS_CHECK(fd >= 0);
+    char page[4096];
+    memset(page, 0, sizeof page);
+    memcpy(page, "PROP", 4);
+    auto set_entry = [&](size_t off, const char* value) {
+        uint32_t serial = 2;   // even: not mid-update
+        memcpy(page + off, &serial, 4);
+        strcpy(page + off + 4, value);
+    };
+    set_entry(0x100, "orange-unlocked-rooted");
+    set_entry(0x200, "libzygisk.so");
+    ZS_CHECK(write(fd, page, sizeof page) == (ssize_t)sizeof page);
+    close(fd);
+
+    // 2. Map it read-only — the REAL mapping the maps scan locates.
+    fd = open(area_path, O_RDONLY);
+    ZS_CHECK(fd >= 0);
+    void* map = mmap(nullptr, sizeof page, PROT_READ, MAP_PRIVATE, fd, 0);
+    ZS_CHECK(map != MAP_FAILED);
+    close(fd);
+
+    // 3. Fake find: two real keys (into the mapping) and one pointer
+    //    OUTSIDE any mapping (the containing-mapping guard must skip
+    //    it, not crash).
+    static std::map<std::string, const void*> table = {
+        {"ro.boot.verifiedbootstate", (char*)map + 0x100},
+        {"ro.dalvik.vm.native.bridge", (char*)map + 0x200},
+        {"ro.not.in.mapping", (const void*)0x10},   // bogus
+    };
+    auto fake_find = [](const char* key) -> const void* {
+        auto it = table.find(key);
+        return it == table.end() ? nullptr : it->second;
+    };
+    zs_test_set_prop_find(fake_find);
+
+    // 4. Run the REAL builder.
+    size_t size = 0;
+    char* built = zs_build_spoofed_serial_area(area_path, &size);
+    ZS_CHECK(built != nullptr);
+    ZS_CHECK_EQ(size, (size_t)sizeof page);
+    if (built) {
+        // Magic passthrough.
+        ZS_CHECK(memcmp(built, "PROP", 4) == 0);
+        // Entry at 0x100: spoofed to "green", serial advanced by 2.
+        uint32_t serial = 0;
+        memcpy(&serial, built + 0x100, 4);
+        ZS_CHECK_EQ(serial, 4u);
+        ZS_CHECK(strcmp(built + 0x100 + 4, "green") == 0);
+        // Entry at 0x200: spoofed to empty (absent-style).
+        memcpy(&serial, built + 0x200, 4);
+        ZS_CHECK_EQ(serial, 4u);
+        ZS_CHECK(built[0x200 + 4] == '\0');
+        // Everything else byte-identical.
+        ZS_CHECK(memcmp(built + 8, page + 8, 0x100 - 8) == 0);
+        ZS_CHECK(memcmp(built + 0x100 + 96, page + 0x100 + 96,
+                        0x200 - 0x100 - 96) == 0);
+        free(built);
+    }
+
+    munmap(map, sizeof page);
+    unlink(area_path);
+    zs_test_reset_prop_find();
+}
+
+ZS_TEST(spoofed_serial_area_builder_fails_closed_without_hits) {
+    // find() that returns null for everything: zero patches -> the
+    // builder refuses to serve a verbatim copy of the real trie.
+    char area_path[] = "/tmp/zs_area2_XXXXXX";
+    int fd = mkstemp(area_path);
+    ZS_CHECK(fd >= 0);
+    char page[4096];
+    memset(page, 0, sizeof page);
+    memcpy(page, "PROP", 4);
+    ZS_CHECK(write(fd, page, sizeof page) == (ssize_t)sizeof page);
+    close(fd);
+
+    fd = open(area_path, O_RDONLY);
+    void* map = mmap(nullptr, sizeof page, PROT_READ, MAP_PRIVATE, fd, 0);
+    ZS_CHECK(map != MAP_FAILED);
+    close(fd);
+
+    zs_test_set_prop_find([](const char*) -> const void* {
+        return nullptr;   // captureless: converts to a fn pointer
+    });
+
+    size_t size = 0;
+    char* built = zs_build_spoofed_serial_area(area_path, &size);
+    ZS_CHECK(built == nullptr);
+    ZS_CHECK_EQ(size, (size_t)0);
+
+    munmap(map, sizeof page);
+    unlink(area_path);
+    zs_test_reset_prop_find();
+}
+
+ZS_TEST(spoofed_serial_area_builder_rejects_unmapped_paths) {
+    // No mapping of this path exists in /proc/self/maps -> no
+    // offsets -> fail closed (null), even with a working find().
+    char area_path[] = "/tmp/zs_area3_XXXXXX";
+    int fd = mkstemp(area_path);
+    ZS_CHECK(fd >= 0);
+    char page[4096];
+    memset(page, 0, sizeof page);
+    memcpy(page, "PROP", 4);
+    ZS_CHECK(write(fd, page, sizeof page) == (ssize_t)sizeof page);
+    close(fd);
+    // NOT mapped — only written. The find seam returns a pointer
+    // into an unrelated buffer.
+    static char unrelated[128];
+    zs_test_set_prop_find([](const char*) -> const void* {
+        return unrelated;
+    });
+    size_t size = 0;
+    char* built = zs_build_spoofed_serial_area(area_path, &size);
+    ZS_CHECK(built == nullptr);
+
+    unlink(area_path);
+    zs_test_reset_prop_find();
 }

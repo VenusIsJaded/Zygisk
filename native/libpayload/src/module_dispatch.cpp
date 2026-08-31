@@ -51,6 +51,56 @@ struct LoadedModule {
 static std::vector<LoadedModule> g_modules;
 static std::atomic<int>          g_modules_loaded{0};
 
+// ------------------------------------------------------------------------
+// Round 19 — daemon-dependent init is LAZY (retry at the zygote's
+// fork hook).
+//
+// REAL-DEVICE BUG this fixes (found by auditing the boot order, not
+// by any host test — the host tests start the fake daemon BEFORE
+// init, which is exactly the order real devices DO NOT have):
+//
+//   zs_module_init() runs at native-bridge initialize time, i.e. at
+//   ZYGOTE START. The daemon is launched by service.sh at the
+//   LATE SERVICE stage — which runs AFTER the zygote (and most of
+//   the system) is already up. On a real device every connect() in
+//   fetch_module_list_from_daemon() failed with ENOENT/ECONNREFUSED
+//   at init, the module list came back EMPTY, and ZERO Zygisk
+//   modules ever loaded for the whole boot — the entire Rounds 12-14
+//   dispatch layer was dead code on device while 133 host tests
+//   stayed green (the fake daemon was already listening when they
+//   ran).
+//
+// The fix: every daemon-dependent step (module list fetch, the
+// Round 19 properties-file 'P' send) is attempted at init AND retried
+// at each zygote fork (zs_impl_fork calls zs_module_lazy_daemon_init)
+// until it succeeds once. The retry is two relaxed atomic loads when
+// everything is done, and a failed connect is ~1 usec — negligible
+// even at system_server's fork rate during boot. Once the daemon
+// answers, everything latches and the per-fork cost is those two
+// loads.
+//
+// Modules that load late are inherited only by processes forked
+// AFTER the successful fetch (upstream Zygisk loads at zygote start;
+// we late-load; documented residual — system_server itself may miss
+// modules on boots where the daemon is slow to bind).
+// ------------------------------------------------------------------------
+static std::atomic<int> g_module_fetch_done{0};   // latched: daemon answered the 'L'
+static std::atomic<int> g_props_sent{0};          // latched: 'P' answered or permanently off
+
+// Round 19: the spoofed properties_serial image. Built ONCE (the
+// build reads /proc/self/maps + the real area file); held until the
+// daemon accepts it, then freed. Null + build_attempted = feature
+// permanently unavailable this boot (no bionic find / no mapping /
+// zero spoofable keys).
+static int    g_props_build_attempted = 0;
+static char*  g_props_area = nullptr;
+static size_t g_props_area_size = 0;
+
+// Forward declarations (both defined with the module-loading code
+// below; zs_module_init and the fork hook call them).
+int  zs_module_lazy_daemon_init();
+static int send_props_file_to_daemon(const char* area, size_t size);
+
 // Round 13: durable storage for a runtime-set socket path — the
 // session reader parses into a stack buffer, so the setter must COPY
 // (the first version of this code stored the stack pointer itself:
@@ -77,6 +127,31 @@ extern "C" void zs_test_set_session_file(const char* path) {
 }
 extern "C" int zs_test_load_session() {
     return zs_module_load_session_socket();
+}
+// Round 19: drive the 'P' sender directly (the builder needs a real
+// /dev/__properties__ mapping, which the host does not have — the
+// builder itself is covered by the hide_advanced tests against a
+// synthetic mapped file).
+extern "C" int zs_test_send_props_file(const char* area, size_t size) {
+    return send_props_file_to_daemon(area, size);
+}
+// Reset the lazy-init latches (and the one-shot builder state) so a
+// test can replay the boot order (daemon down at init, daemon up
+// later) starting from a clean slate.
+extern "C" void zs_test_reset_lazy_init() {
+    g_module_fetch_done.store(0, std::memory_order_release);
+    g_props_sent.store(0, std::memory_order_release);
+    if (g_props_area) {
+        free(g_props_area);
+        g_props_area = nullptr;
+    }
+    g_props_area_size = 0;
+    g_props_build_attempted = 0;
+}
+// extern "C" for the dlopen-based dispatch test (the C++ name is
+// mangled; dlsym needs the plain name).
+extern "C" int zs_module_lazy_daemon_init_c() {
+    return zs_module_lazy_daemon_init();
 }
 #endif
 
@@ -140,8 +215,15 @@ extern "C" void zs_test_set_daemon_socket(const char* path) {
 }
 #endif
 
-static std::vector<LoadedModule> fetch_module_list_from_daemon() {
+// `was_connected` (optional): set to 1 when the daemon ACCEPTED the
+// connection (an empty module list is a valid, FINAL answer — the
+// registry file is empty — while a failed connect means "daemon not
+// up yet, retry"). This is how the Round 19 lazy retry distinguishes
+// the two without a separate reachability probe.
+static std::vector<LoadedModule> fetch_module_list_from_daemon(
+        int* was_connected = nullptr) {
     std::vector<LoadedModule> out;
+    if (was_connected) *was_connected = 0;
     int sock = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (sock < 0) return out;
     struct sockaddr_un addr{};
@@ -152,6 +234,7 @@ static std::vector<LoadedModule> fetch_module_list_from_daemon() {
         close(sock);
         return out;
     }
+    if (was_connected) *was_connected = 1;
     char req = 'L';
     if (send(sock, &req, 1, 0) != 1) {
         close(sock);
@@ -327,14 +410,12 @@ static JNIEnv* zs_module_ensure_env() {
 // Module loading (payload init — zygote, native-bridge time)
 // ------------------------------------------------------------------------
 
-void zs_module_init() {
-    // Round 13: learn the daemon's randomized socket path first —
-    // the module fetch below connects through it.
-    zs_module_load_session_socket();
-
-    auto list = fetch_module_list_from_daemon();
+// Load every module in `list` (dlopen + factory + unmap-set
+// registration). Split out of zs_module_init in Round 19 so the lazy
+// retry path (zs_module_lazy_daemon_init) can run the SAME code once
+// the daemon finally answers.
+static void load_modules_from(std::vector<LoadedModule>&& list) {
     g_modules.reserve(list.size());
-    g_modules.clear();
     for (auto& m : list) {
         // Register the module .so path BEFORE dlopen'ing so the
         // record rescan below sees both the fragment and the fresh
@@ -373,6 +454,133 @@ void zs_module_init() {
     // from the daemon (per-fork socket round-trips would be a major
     // latency regression).
     g_modules_loaded.store(1, std::memory_order_release);
+}
+
+void zs_module_init() {
+    // Round 13: learn the daemon's randomized socket path first —
+    // the module fetch below connects through it.
+    zs_module_load_session_socket();
+
+    // Round 19: attempt everything once here. On a real device the
+    // daemon is NOT up yet at zygote start (see the boot-order audit
+    // above the g_module_fetch_done declaration) — the attempts fail
+    // fast and zs_module_lazy_daemon_init retries them at every
+    // zygote fork until the daemon answers. On host tests the fake
+    // daemon is already up, so this single attempt succeeds.
+    (void)zs_module_lazy_daemon_init();
+}
+
+// Round 19: one lazy-init attempt. Returns 1 when BOTH daemon-
+// dependent steps are latched (module fetch + props send), 0 when
+// something still needs a retry. Called from zs_module_init and from
+// the zygote-side fork hook (zs_impl_fork) — always in the ZYGOTE,
+// never in a forked child (children inherit the results via COW).
+int zs_module_lazy_daemon_init() {
+    if (g_module_fetch_done.load(std::memory_order_acquire) &&
+        g_props_sent.load(std::memory_order_acquire)) {
+        return 1;   // hot path: two relaxed-ish loads
+    }
+
+    // (a) Module list: retry until the daemon ANSWERS (an empty list
+    // is a valid, final answer — the registry file is empty; only a
+    // failed CONNECT means "not up yet, retry"). g_module_fetch_done
+    // is the single latch — g_modules_loaded is a legacy flag kept
+    // for the R12 hot-path contract, not a retry gate (the failed
+    // connect retry must stay cheap AND must not double-load).
+    if (!g_module_fetch_done.load(std::memory_order_acquire)) {
+        int was_connected = 0;
+        auto list = fetch_module_list_from_daemon(&was_connected);
+        if (was_connected) {
+            load_modules_from(std::move(list));
+            g_module_fetch_done.store(1, std::memory_order_release);
+        }
+        // else: connect() failed — the daemon is not up yet; a failed
+        // connect costs ~1 usec, retried on the next fork.
+    }
+
+    // (b) Properties file: build once, send when the daemon is up.
+    if (!g_props_sent.load(std::memory_order_acquire)) {
+        if (!g_props_build_attempted) {
+            g_props_build_attempted = 1;
+            g_props_area = zs_build_spoofed_serial_area(
+                "/dev/__properties__/properties_serial",
+                &g_props_area_size);
+            if (!g_props_area) {
+                // Feature unavailable on this device — final.
+                g_props_sent.store(1, std::memory_order_release);
+            }
+        }
+        if (g_props_area) {
+            if (send_props_file_to_daemon(g_props_area,
+                                          g_props_area_size)) {
+                // Sent: the buffer has been handed off in full.
+                g_props_sent.store(1, std::memory_order_release);
+                free(g_props_area);
+                g_props_area = nullptr;
+            }
+            // else: daemon not up / refused — keep the buffer and
+            // retry on the next fork (bounded by the daemon actually
+            // starting; the window is a few seconds of boot).
+        }
+    }
+    return g_module_fetch_done.load(std::memory_order_acquire) &&
+           g_props_sent.load(std::memory_order_acquire);
+}
+
+// Send the 'P' verb: <'P'><u32 LE len><bytes>. The daemon (root side)
+// writes the file into the session dir, relabels it, and replies
+// "1<session_dir>/p\n" — the payload then registers that path with
+// the hide layer, and every hidden child bind-mounts it over
+// /dev/__properties__/properties_serial at hide time.
+// Returns 1 = latched (sent OR feature acknowledged off), 0 = retry
+// later.
+static int send_props_file_to_daemon(const char* area, size_t size) {
+    if (!area || size < 4) return 1;   // nothing sane to send: final
+    int sock = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (sock < 0) return 0;
+    struct sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, g_daemon_socket, sizeof(addr.sun_path) - 1);
+    if (connect(sock, (struct sockaddr*)&addr, sizeof addr) != 0) {
+        ZS_LOGD("props send: connect(%s) failed: %s", g_daemon_socket,
+                strerror(errno));
+        close(sock);
+        return 0;   // daemon not up: retry
+    }
+    uint32_t len = (uint32_t)size;
+    char hdr[5] = {'P', (char)(len & 0xff), (char)((len >> 8) & 0xff),
+                   (char)((len >> 16) & 0xff), (char)((len >> 24) & 0xff)};
+    size_t off = 0;
+    while (off < sizeof hdr) {
+        ssize_t n = send(sock, hdr + off, sizeof hdr - off, MSG_NOSIGNAL);
+        if (n <= 0) { close(sock); return 0; }
+        off += (size_t)n;
+    }
+    off = 0;
+    while (off < size) {
+        size_t chunk = size - off;
+        if (chunk > 256 * 1024) chunk = 256 * 1024;
+        ssize_t n = send(sock, area + off, chunk, MSG_NOSIGNAL);
+        if (n <= 0) { close(sock); return 0; }
+        off += (size_t)n;
+    }
+    // Reply: "1<path>\n" or "0\n".
+    char reply[160];
+    ssize_t n = recv(sock, reply, sizeof reply - 1, 0);
+    close(sock);
+    if (n <= 0) { ZS_LOGD("props send: no reply"); return 0; }
+    reply[n] = '\0';
+    ZS_LOGD("props send: reply %s", reply);
+    if (reply[0] != '1') return 0;
+    char* nl = strchr(reply, '\n');
+    if (nl) *nl = '\0';
+    const char* path = reply + 1;
+    if (path[0] != '/') return 0;
+    uint32_t magic = 0;
+    memcpy(&magic, area, sizeof magic);
+    hide_props_file_set_source(path, magic);
+    ZS_LOGI("modules: spoofed properties file staged at %s", path);
+    return 1;
 }
 
 // ------------------------------------------------------------------------

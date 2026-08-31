@@ -762,5 +762,22 @@ filtered like the absolute path.
 **raw openat2** — `syscall(SYS_openat2, ...)` (Android 13+ kernels,
 no bionic wrapper in any release) flows through the filter.
 
+**mounts-family /proc content (Round 19)** — the line filter is
+format-agnostic now: /proc/self/mounts, mountinfo and mountstats
+lines drop when ANY token (source, target, root-column, or mapped
+path) is anchored under a hidden prefix, an exact bridge-library
+path, or a mountinfo root-field form. The Round 8-18 filter only
+understood the maps column layout and leaked every mounts-format
+line.
+
+**exec'd helpers (Round 19)** — fork+exec'd children inherit the
+private mount namespace; the hide mount phase bind-mounts a spoofed
+properties_serial over /dev/__properties__/properties_serial (self-
+checked, fail-closed), so a fresh-libc helper re-maps the spoofed
+values trie instead of the real one. `getprop` in an exec'd child
+prints the stock device's story.
+
 Still open (see ANDROID-REALISM residuals): dup'd memfd fstat size,
->383-byte traversal strings, fdopendir dirfds, exec'd helpers.
+>383-byte traversal strings, fdopendir dirfds, st_dev/st_ino of the
+mounted properties file, present-but-empty absent keys in the file
+image, on-device chcon validation.

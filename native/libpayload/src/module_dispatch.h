@@ -48,6 +48,16 @@ namespace zygisk_study {
 // connects through the randomized per-boot socket path.
 void zs_module_init();
 
+// Round 19 — one lazy-init attempt for every daemon-dependent step:
+// the module list fetch ('L') and the spoofed properties_serial file
+// send ('P'). Attempted at zs_module_init AND at every ZYGOTE fork
+// (from zs_impl_fork) until each latches — on real devices the
+// daemon (started by service.sh, late service stage) is never up at
+// native-bridge init time, so the Round 12-14 module dispatch was
+// dead code on device without this retry. Returns 1 when everything
+// is latched (or definitively unavailable), 0 = retry next fork.
+int  zs_module_lazy_daemon_init();
+
 // Round 13 — read /data/adb/modules/zygisk_study/session.sock (the
 // daemon's randomized per-boot socket path handoff; root-only
 // location). On success: switches the module-fetch/companion socket

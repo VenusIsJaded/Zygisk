@@ -706,6 +706,30 @@ wrapper in any release, `memfd_create` API 30+, aarch64 fstat-as-
 fstatat, `readdir_r` still exported) is documented in
 docs/ANDROID-REALISM.md.
 
-**158/158 host tests** (31 hide / 85 advanced / 18 stealth / 5 e2e /
-4 perf / 2 trampoline / 13 dispatch), 0 warnings, ASan+UBSan+leaks
+### Round 18 — version-research matrix
+
+Every version-sensitive claim from Rounds 15-17 recorded as a
+verifiable fact table (source file + release) in
+docs/ANDROID-REALISM.md, with the honest residuals ledger.
+
+### Round 19 — zygote research, the mounts-format leak, execve-proof properties
+
+AOSP's own Zygote.cpp (read at 9/13/15/main) proves the
+`setresgid`→`setresuid` pair this project hooks is byte-stable
+across every supported version — and that A17's JNI-signature churn
+(which ReZygisk just patched around) cannot touch this design. Two
+real device bugs found and fixed this round: the /proc line filter
+only understood the MAPS column layout, so mounts/mountinfo lines
+leaked every root path (the fail-closed unmount backstop was broken
+since Round 8); and the module dispatch fetched its list exactly
+once at zygote start — before the daemon (late service stage) ever
+exists, so zero modules ever loaded on a real device. The round's
+headline feature closes the largest standing residual class:
+exec'd helpers (`Runtime.exec("getprop ...")`) now re-map a
+SPOOFED properties_serial through a private-namespace bind mount —
+the same mechanism, in the same SELinux domain and the same boot
+window, that AOSP itself uses for appcompat property overrides.
+
+**169/169 host tests** (35 hide / 89 advanced / 18 stealth / 5 e2e /
+4 perf / 2 trampoline / 16 dispatch), 0 warnings, ASan+UBSan+leaks
 green, every test binary exits 0.

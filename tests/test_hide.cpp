@@ -442,6 +442,162 @@ ZS_TEST(hide_apply_never_umounts_in_the_init_namespace) {
 }
 
 // ----------------------------------------------------------------------
+// Round 19 — the spoofed-properties bind mount: ordering, gating,
+// self-check revert and success, all through the syscall seams.
+// ----------------------------------------------------------------------
+
+static int rec_bind_ok(const char* src, const char* dst) {
+    (void)src; (void)dst;
+    zs_test_mount_log_append('b');
+    return 0;
+}
+// A bind mount whose self-check will FAIL (the production self-check
+// opens the target and compares the magic — the test target below is
+// a file with the WRONG magic).
+static int rec_bind_ok_wrong_magic(const char* src, const char* dst) {
+    (void)src; (void)dst;
+    zs_test_mount_log_append('b');
+    return 0;
+}
+
+ZS_TEST(props_bind_mount_gated_on_source_availability) {
+    g_will_hide.store(1);
+    g_self_so_count = 0;
+    zs_test_set_mount_fns(rec_unshare_ok, rec_slave_ok, rec_umount_ok);
+    zs_test_set_bind_mount_fn(rec_bind_ok);
+    zs_test_props_source_clear();      // feature OFF: no file staged
+    zs_test_mount_log_reset();
+
+    hide_apply_for_target("test");
+
+    const char* log = zs_test_mount_log();
+    ZS_CHECK_STR_CONTAINS(log, "us");  // namespace setup ran
+    ZS_CHECK_STR_ABSENT(log, "b");     // ...but NO properties bind mount
+    zs_test_set_mount_fns(nullptr, nullptr, nullptr);
+    zs_test_set_bind_mount_fn(nullptr);
+    zs_test_props_source_clear();
+}
+
+ZS_TEST(props_bind_mount_runs_after_namespace_setup_and_unmounts) {
+    g_will_hide.store(1);
+    g_self_so_count = 0;
+    zs_test_set_mount_fns(rec_unshare_ok, rec_slave_ok, rec_umount_ok);
+    zs_test_set_bind_mount_fn(rec_bind_ok);
+
+    // Stage a source file whose magic the self-check will accept.
+    char src_path[] = "/tmp/zs_props_src_XXXXXX";
+    int fd = mkstemp(src_path);
+    ZS_CHECK(fd >= 0);
+    uint32_t magic = 0x504f5250;   // "PROP"
+    ZS_CHECK(write(fd, &magic, sizeof magic) == 4);
+    close(fd);
+    // The TARGET the self-check opens: a file with the SAME magic.
+    char tgt_path[] = "/tmp/zs_props_tgt_XXXXXX";
+    fd = mkstemp(tgt_path);
+    ZS_CHECK(fd >= 0);
+    ZS_CHECK(write(fd, &magic, sizeof magic) == 4);
+    close(fd);
+
+    hide_props_file_set_source(src_path, magic);
+    ZS_CHECK_EQ(hide_props_file_ready(), 1);
+    zs_test_set_prop_serial_target(tgt_path);
+    zs_test_mount_log_reset();
+
+    hide_apply_for_target("test");
+
+    const char* log = zs_test_mount_log();
+    // Bind mount happened, AFTER the namespace setup.
+    const char* b = strchr(log, 'b');
+    ZS_CHECK(b != nullptr);
+    ZS_CHECK((size_t)(b - log) >= 2);           // after "us"
+    // Self-check SUCCEEDED (magic matched): no trailing revert.
+    // The mount log's LAST entry is the 'b' itself.
+    ZS_CHECK_EQ((int)strlen(log) - 1, (int)(b - log));
+
+    unlink(src_path);
+    unlink(tgt_path);
+    zs_test_set_mount_fns(nullptr, nullptr, nullptr);
+    zs_test_set_bind_mount_fn(nullptr);
+    zs_test_set_prop_serial_target(nullptr);
+    zs_test_props_source_clear();
+}
+
+ZS_TEST(props_bind_mount_reverts_on_self_check_mismatch) {
+    g_will_hide.store(1);
+    g_self_so_count = 0;
+    zs_test_set_mount_fns(rec_unshare_ok, rec_slave_ok, rec_umount_ok);
+    zs_test_set_bind_mount_fn(rec_bind_ok_wrong_magic);
+
+    char src_path[] = "/tmp/zs_props_src2_XXXXXX";
+    int fd = mkstemp(src_path);
+    ZS_CHECK(fd >= 0);
+    uint32_t magic = 0x504f5250;
+    ZS_CHECK(write(fd, &magic, sizeof magic) == 4);
+    close(fd);
+    // Target with the WRONG magic: the self-check must revert.
+    char tgt_path[] = "/tmp/zs_props_tgt2_XXXXXX";
+    fd = mkstemp(tgt_path);
+    ZS_CHECK(fd >= 0);
+    uint32_t wrong = 0xdeadbeef;
+    ZS_CHECK(write(fd, &wrong, sizeof wrong) == 4);
+    close(fd);
+
+    hide_props_file_set_source(src_path, magic);
+    zs_test_set_prop_serial_target(tgt_path);
+    zs_test_mount_log_reset();
+
+    hide_apply_for_target("test");
+
+    const char* log = zs_test_mount_log();
+    const char* b = strchr(log, 'b');
+    ZS_CHECK(b != nullptr);
+    // The self-check failed -> a revert umount2 ran right after the
+    // bind: the log ends with "bm".
+    ZS_CHECK((size_t)(strlen(log)) >= 2);
+    ZS_CHECK(log[strlen(log) - 2] == 'b');
+    ZS_CHECK(log[strlen(log) - 1] == 'm');
+
+    unlink(src_path);
+    unlink(tgt_path);
+    zs_test_set_mount_fns(nullptr, nullptr, nullptr);
+    zs_test_set_bind_mount_fn(nullptr);
+    zs_test_set_prop_serial_target(nullptr);
+    zs_test_props_source_clear();
+}
+
+ZS_TEST(props_bind_mount_missing_target_reverts) {
+    // Self-check open fails (ENOENT on a path nothing mounted): the
+    // mount must be reverted, never left dangling.
+    g_will_hide.store(1);
+    g_self_so_count = 0;
+    zs_test_set_mount_fns(rec_unshare_ok, rec_slave_ok, rec_umount_ok);
+    zs_test_set_bind_mount_fn(rec_bind_ok);
+
+    char src_path[] = "/tmp/zs_props_src3_XXXXXX";
+    int fd = mkstemp(src_path);
+    ZS_CHECK(fd >= 0);
+    uint32_t magic = 0x504f5250;
+    ZS_CHECK(write(fd, &magic, sizeof magic) == 4);
+    close(fd);
+    hide_props_file_set_source(src_path, magic);
+    zs_test_set_prop_serial_target("/nonexistent/zs/no_such_props_file");
+    zs_test_mount_log_reset();
+
+    hide_apply_for_target("test");
+
+    const char* log = zs_test_mount_log();
+    const char* b = strchr(log, 'b');
+    ZS_CHECK(b != nullptr);
+    ZS_CHECK(log[strlen(log) - 1] == 'm');   // revert umount followed
+
+    unlink(src_path);
+    zs_test_set_mount_fns(nullptr, nullptr, nullptr);
+    zs_test_set_bind_mount_fn(nullptr);
+    zs_test_set_prop_serial_target(nullptr);
+    zs_test_props_source_clear();
+}
+
+// ----------------------------------------------------------------------
 // Test 8: unmount_magisk_paths() parses /proc/self/mounts correctly.
 //
 // We can't actually unmount as non-root, but we can verify the parsing

@@ -139,7 +139,14 @@ struct DaemonCfg {
     std::string path;
     int         max_serve;
     volatile int* companion_hits;
+    // Round 19: when set, this daemon also answers the 'P' verb by
+    // writing the received area to <props_dir>/p and replying
+    // "1<props_dir>/p\n" — exactly what the real Rust daemon does.
+    std::string props_dir;
 };
+static std::string g_last_props_content;
+// Round 19: directory the fake daemon materializes the props file in.
+static std::string g_props_dir;
 static DaemonCfg g_main_daemon_cfg;
 
 static void* daemon_thread(void* arg) {
@@ -181,6 +188,41 @@ static void* daemon_thread(void* arg) {
                 // Hold the connection open (the real daemon's
                 // companion channel); the client owns its fd.
                 usleep(50 * 1000);
+            } else if (verb == 'P' && !cfg->props_dir.empty()) {
+                // Round 19: mirror the Rust daemon's 'P' handler —
+                // u32-LE length, that many bytes, magic check,
+                // write to <dir>/p, reply "1<dir>/p\n".
+                unsigned char lenb[4];
+                if (read(c, lenb, 4) == 4) {
+                    uint32_t len = lenb[0] | (lenb[1] << 8) |
+                                   (lenb[2] << 16) | (lenb[3] << 24);
+                    if (len >= 4 && len < 1024 * 1024) {
+                        std::string area(len, '\0');
+                        size_t got = 0;
+                        while (got < len) {
+                            ssize_t n = read(c, &area[got], len - got);
+                            if (n <= 0) break;
+                            got += (size_t)n;
+                        }
+                        if (got == len && area.compare(0, 4, "PROP") == 0) {
+                            std::string path = cfg->props_dir + "/p";
+                            FILE* fp = fopen(path.c_str(), "wb");
+                            if (fp) {
+                                fwrite(area.data(), 1, area.size(), fp);
+                                fclose(fp);
+                                g_last_props_content = area;
+                                std::string reply = "1" + path + "\n";
+                                (void)write(c, reply.c_str(), reply.size());
+                            } else {
+                                (void)write(c, "0\n", 2);
+                            }
+                        } else {
+                            (void)write(c, "0\n", 2);
+                        }
+                    } else {
+                        (void)write(c, "0\n", 2);
+                    }
+                }
             }
         }
         close(c);
@@ -300,7 +342,13 @@ static void setup_payload() {
 
     pthread_t th;
     g_main_daemon_cfg.path = g_sock_path;
-    g_main_daemon_cfg.max_serve = 16;
+    g_main_daemon_cfg.max_serve = 32;
+    // Round 19: this daemon answers 'P' with a real file write.
+    char pd[] = "/tmp/zs_daemon_props_XXXXXX";
+    if (mkdtemp(pd)) {
+        g_props_dir = pd;
+        g_main_daemon_cfg.props_dir = g_props_dir;
+    }
     g_main_daemon_cfg.companion_hits = &g_companion_hits;
     ZS_CHECK(pthread_create(&th, nullptr, daemon_thread,
                             &g_main_daemon_cfg) == 0);
@@ -760,7 +808,94 @@ ZS_TEST(deny_decision_skip_still_hides_setuid_only_children) {
     rec_reset();
 }
 
-// // ----------------------------------------------------------------------
+
+// ----------------------------------------------------------------------
+// Round 19 — the 'P' protocol end to end against the fake daemon,
+// plus the lazy boot-order retry (daemon down at init, up later).
+// ----------------------------------------------------------------------
+
+// 1. 'P' round trip: area bytes with spoofed values are written by
+// the daemon to <dir>/p; the payload registers the replied path.
+ZS_TEST(props_file_protocol_round_trips_to_daemon) {
+    static int (*fn_send)(const char*, size_t) =
+        (int (*)(const char*, size_t))sym("zs_test_send_props_file");
+    static int (*fn_ready)() = (int (*)())sym("zs_test_props_ready_c");
+    static void (*fn_set_sock)(const char*) =
+        (void (*)(const char*))sym("zs_test_set_daemon_socket");
+    // The session-file test (registered earlier) leaves the payload
+    // pointed at the SECOND fake daemon, which does not serve 'P'.
+    // Point back at the main daemon — the one with props_dir set.
+    fn_set_sock(g_sock_path.c_str());
+
+    // Build a fake spoofed area: magic + patched-looking values.
+    std::string area;
+    area += "PROP";
+    area += "\0\0\0\0";
+    area += "ro.boot.verifiedbootstate=green;";
+    area += "ro.magisk.version=;";
+
+    g_last_props_content.clear();
+    int rc = fn_send(area.data(), area.size());
+    ZS_CHECK_EQ(rc, 1);
+    ZS_CHECK_EQ(fn_ready(), 1);
+    // The daemon wrote exactly our bytes.
+    ZS_CHECK_EQ(g_last_props_content.size(), area.size());
+    ZS_CHECK(g_last_props_content == area);
+    // The file exists on disk with the same content.
+    FILE* fp = fopen((g_props_dir + "/p").c_str(), "rb");
+    ZS_CHECK(fp != nullptr);
+    if (fp) {
+        std::string disk((size_t)0, '\0');
+        char buf[512];
+        size_t n;
+        while ((n = fread(buf, 1, sizeof buf, fp)) > 0)
+            disk.append(buf, n);
+        fclose(fp);
+        ZS_CHECK(disk == area);
+    }
+}
+
+// 2. Retry semantics: with the daemon UNREACHABLE the send returns 0
+// (retry later) — never latches a failure as final.
+ZS_TEST(props_file_send_retries_when_daemon_is_down) {
+    static int (*fn_send)(const char*, size_t) =
+        (int (*)(const char*, size_t))sym("zs_test_send_props_file");
+
+    // Point at a socket nothing is listening on.
+    static void (*fn_set_sock)(const char*) =
+        (void (*)(const char*))sym("zs_test_set_daemon_socket");
+    const char* old = g_sock_path.c_str();
+    std::string saved = old;
+    fn_set_sock("/tmp/zs_no_such_daemon_socket");
+    std::string area = "PROP\xDE\xAD";
+    ZS_CHECK_EQ(fn_send(area.data(), area.size()), 0);
+    // Restore.
+    fn_set_sock(saved.c_str());
+}
+
+// 3. The lazy boot order: init with the daemon DOWN fails and stays
+// unlatched; a later retry with the daemon UP latches everything.
+ZS_TEST(lazy_daemon_init_latches_only_after_daemon_answers) {
+    static void (*fn_reset_lazy)() = (void (*)())sym("zs_test_reset_lazy_init");
+    static int (*fn_lazy)() = (int (*)())sym("zs_module_lazy_daemon_init_c");
+    static void (*fn_set_sock)(const char*) =
+        (void (*)(const char*))sym("zs_test_set_daemon_socket");
+
+    std::string saved = g_sock_path;
+    fn_reset_lazy();
+    // Daemon down: both steps fail, nothing latches.
+    fn_set_sock("/tmp/zs_no_such_daemon_socket_2");
+    ZS_CHECK_EQ(fn_lazy(), 0);
+    ZS_CHECK_EQ(fn_lazy(), 0);   // still retrying, still cheap
+
+    // Daemon up: everything latches in ONE attempt (module list
+    // answers; the props builder is unavailable on host, which is a
+    // FINAL answer, not a retry).
+    fn_set_sock(saved.c_str());
+    ZS_CHECK_EQ(fn_lazy(), 1);
+}
+
+// ----------------------------------------------------------------------
 // main
 // ----------------------------------------------------------------------
 int main() {
@@ -768,5 +903,9 @@ int main() {
     int rc = zstest::run_all();
     if (g_rec) munmap(g_rec, sizeof(RecPage));
     if (!g_sock_path.empty()) unlink(g_sock_path.c_str());
+    if (!g_props_dir.empty()) {
+        unlink((g_props_dir + "/p").c_str());
+        rmdir(g_props_dir.c_str());
+    }
     return rc;
 }

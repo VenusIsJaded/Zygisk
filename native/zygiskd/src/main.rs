@@ -16,6 +16,20 @@
 //               "I<name>\n" after the verb. We reply '1' or '0'.
 //        'C' -> companion socket. The client wants a long-lived
 //               socket for IPC back to us.
+//        'P' -> (Round 19) properties file. The client (the
+//               in-zygote payload) streams a u32-LE length and then
+//               that many bytes: a complete spoofed
+//               properties_serial image. We materialize it as
+//               <session_dir>/p, relabel it
+//               u:object_r:properties_serial:s0 (best-effort), and
+//               reply "1<path>\n" (or "0\n" on failure). The hidden
+//               child later bind-mounts that file over
+//               /dev/__properties__/properties_serial, so fork+exec'd
+//               helpers — fresh libc, no hooks — re-map the SPOOFED
+//               area instead of the real one. This verb is handled
+//               BEFORE the uid drop: it must write into the
+//               root-only session directory and relabel, which the
+//               nobody child cannot do.
 //
 //   3. Periodically rescan the module directory so newly-installed
 //      modules show up without restarting the daemon.
@@ -121,13 +135,23 @@ enum ClientVerb {
 impl ClientVerb {
     /// Parse from a live stream. Reads exactly as many bytes as
     /// needed, in blocking fashion, then returns the parsed verb.
+    /// The FIRST byte is read by the caller in the forked connection
+    /// child (which must peek it BEFORE the privilege drop to decide
+    /// whether the connection is a 'P' — the only root-only verb)
+    /// and handed to parse_after.
     fn parse(stream: &mut UnixStream) -> std::io::Result<ClientVerb> {
         let mut buf = [0u8; 1];
         stream.read_exact(&mut buf)?;
+        Self::parse_after(buf[0], stream)
+    }
+
+    /// Parse starting from an already-consumed verb byte.
+    fn parse_after(first: u8,
+                   stream: &mut UnixStream) -> std::io::Result<ClientVerb> {
         // Delegate to the pure parser for everything except the
         // ShouldInject variant, which still needs to read more bytes
         // from the stream.
-        match buf[0] {
+        match first {
             b'L' => Ok(ClientVerb::ListModules),
             b'C' => Ok(ClientVerb::Companion),
             b'I' => {
@@ -148,6 +172,103 @@ impl ClientVerb {
             other => Ok(ClientVerb::Unknown(other)),
         }
     }
+}
+
+// ----------------------------------------------------------------------
+// Round 19 — the properties-file verb ('P').
+//
+// Handled BEFORE the privilege drop (root), because it writes into
+// the root-only randomized session directory and relabels the file.
+// The socket itself is the trust boundary: it lives in a 0700
+// root-owned directory, so only root/zygote-domain processes can
+// connect at all — an app cannot reach this handler. Input is still
+// validated (size cap + area magic) as defense in depth.
+//
+// chcon (lsetxattr security.selinux) follows ReZygisk's own pattern
+// (zygiskd/src/utils.c: chcon, logged non-fatal on failure): the
+// daemon's domain carries the relabel privileges the zygote domain
+// lacks. Without the properties_serial label, exec'd helpers
+// (untrusted_app domain) could not open the file and bionic's
+// property init would come up empty for them.
+// ----------------------------------------------------------------------
+
+/// Relabel a path (best-effort; failures are logged by the caller
+/// decision to ignore them — a wrong label degrades the feature to
+/// "exec'd helpers see no properties", never to a crash).
+fn chcon(path: &str, context: &str) -> bool {
+    use std::ffi::CString;
+    let c_path = match CString::new(path) { Ok(p) => p, Err(_) => return false };
+    let c_ctx  = match CString::new(context) { Ok(c) => c, Err(_) => return false };
+    // The xattr VALUE includes the trailing NUL (the convention
+    // lsetxattr users follow for SELinux labels; ReZygisk's chcon
+    // passes strlen+1 the same way).
+    let rv = unsafe {
+        libc::lsetxattr(
+            c_path.as_ptr(),
+            b"security.selinux\0".as_ptr() as *const libc::c_char,
+            c_ctx.as_ptr() as *const libc::c_void,
+            context.len() + 1,
+            0)
+    };
+    rv == 0
+}
+
+/// The area magic every properties_serial file starts with
+/// (PROP_AREA_MAGIC 0x504f5250, little-endian bytes "PROP").
+const PROP_AREA_MAGIC_BYTES: [u8; 4] = [0x50, 0x52, 0x4f, 0x50];
+
+/// Upper bound for a properties file image (the real serial area is
+/// ~128 KB with a full preload; 8 MB is a paranoia cap).
+const PROP_FILE_MAX: usize = 8 * 1024 * 1024;
+
+/// Handle the 'P' verb as root. Returns true when the verb was
+/// consumed here (caller must not hand the stream to the
+/// privilege-dropped handler); false when `first` was some other
+/// verb (caller continues with the normal path, passing `first`).
+fn try_handle_props_file_root(stream: &mut UnixStream, first: u8,
+                              session_dir: &str) -> bool {
+    if first != b'P' { return false; }
+    let fail = |s: &mut UnixStream| { let _ = s.write_all(b"0\n"); };
+
+    let mut lenb = [0u8; 4];
+    if stream.read_exact(&mut lenb).is_err() { fail(stream); return true; }
+    let len = u32::from_le_bytes(lenb) as usize;
+    if len < 4 || len > PROP_FILE_MAX { fail(stream); return true; }
+
+    let mut buf = vec![0u8; len];
+    if stream.read_exact(&mut buf).is_err() { fail(stream); return true; }
+
+    // Defense in depth: only ever materialize a real properties-area
+    // image. (The socket is already root/zygote-only; this guards a
+    // hypothetical future world where that stops being true.)
+    if buf[0..4] != PROP_AREA_MAGIC_BYTES { fail(stream); return true; }
+
+    let path = format!("{}/p", session_dir);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    use std::os::unix::fs::OpenOptionsExt;
+    // 0444 to match the mode init gives the REAL properties_serial
+    // (stat()-observable: a hidden child statting the mounted file
+    // must see the same mode a stock device reports).
+    opts.mode(0o444);
+    let mut f = match opts.open(&path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("zygiskd: props open({}) failed: {}", path, e);
+            fail(stream);
+            return true;
+        }
+    };
+    if f.write_all(&buf).is_err() { fail(stream); return true; }
+    if !chcon(&path, "u:object_r:properties_serial:s0") {
+        // Non-fatal, same as ReZygisk: the mount still serves the
+        // bytes to root/zygote-domain readers; exec'd helpers may be
+        // denied by their own domain (documented residual).
+        eprintln!("zygiskd: props chcon failed (non-fatal)");
+    }
+    let reply = format!("1{}\n", path);
+    let _ = stream.write_all(reply.as_bytes());
+    true
 }
 
 // ----------------------------------------------------------------------
@@ -381,9 +502,26 @@ fn read_prop(key: &str) -> std::io::Result<String> {
 // This runs in a forked child process that has already dropped to
 // CHILD_UID / CHILD_GID. If a malicious client finds a memory bug
 // here, they get nobody-level access — not root.
+//
+// Round 19: the verb's first byte was already consumed by the
+// privilege-drop fork (which needed to peek it); it arrives here as
+// `first`. The 'P' verb never reaches this function — it is handled
+// as root before the drop.
+//
+// handle_client_with_first is the real handler; handle_client is
+// kept as the self-contained entry point (reads the verb byte
+// itself) for any future caller that has not peeked the verb yet.
 // ----------------------------------------------------------------------
+#[allow(dead_code)]
 fn handle_client(mut stream: UnixStream, state: Arc<DaemonState>) {
-    let verb = match ClientVerb::parse(&mut stream) {
+    let mut first = [0u8; 1];
+    if stream.read_exact(&mut first).is_err() { return; }
+    handle_client_with_first(stream, first[0], state);
+}
+
+fn handle_client_with_first(mut stream: UnixStream, first: u8,
+                            state: Arc<DaemonState>) {
+    let verb = match ClientVerb::parse_after(first, &mut stream) {
         Ok(v) => v,
         Err(_) => return,
     };
@@ -527,22 +665,51 @@ fn set_dumpable_zero() {
 //
 // For each incoming client connection, we:
 //   1. fork()
-//   2. In the child: setresgid(CHILD_GID), setresuid(CHILD_UID)
-//   3. The child handles the connection and exits
-//   4. The parent waits for the next connection
+//   2. In the child: peek the verb byte.
+//      - 'P' (Round 19): handled AS ROOT (writes the properties
+//        file into the root-only session dir + relabel), then the
+//        child exits. Every other verb:
+//   3.   setresgid(CHILD_GID), setresuid(CHILD_UID)
+//   4.   The child handles the connection and exits
+//   5. The parent waits for the next connection
 //
 // If the child is exploited, the attacker is uid nobody, not root.
 // ----------------------------------------------------------------------
-fn spawn_privileged_child<F>(stream: UnixStream, state: Arc<DaemonState>, handler: F)
-    where F: FnOnce(UnixStream, Arc<DaemonState>) + Send + 'static
+fn spawn_privileged_child<F>(stream: UnixStream, state: Arc<DaemonState>,
+                              session_dir: &str, handler: F)
+    where F: FnOnce(UnixStream, u8, Arc<DaemonState>) + Send + 'static
 {
     match unsafe { libc::fork() } {
         -1 => {
-            // fork failed — handle in parent as a fallback.
-            let _ = thread::spawn(move || handler(stream, state));
+            // fork failed — handle in the (root) parent thread as a
+            // fallback. Read the verb byte so the handler's parse
+            // stays consistent; 'P' takes the same root path it
+            // would have taken in the child.
+            let session_dir = session_dir.to_string();
+            let _ = thread::spawn(move || {
+                let mut s = stream;
+                let mut first = [0u8; 1];
+                if s.read_exact(&mut first).is_err() { return; }
+                if !try_handle_props_file_root(&mut s, first[0],
+                                               &session_dir) {
+                    handle_client_with_first(s, first[0], state);
+                }
+            });
         }
         0 => {
-            // Child. Drop privileges.
+            // Child. Peek the verb byte BEFORE dropping privileges:
+            // 'P' must run as root (it writes into the root-only
+            // session dir and relabels); everything else drops to
+            // nobody exactly as before.
+            let mut s = stream;
+            let mut first = [0u8; 1];
+            if s.read_exact(&mut first).is_err() {
+                process::exit(0);
+            }
+            if try_handle_props_file_root(&mut s, first[0], session_dir) {
+                process::exit(0);   // consumed and answered as root
+            }
+            // Drop privileges.
             unsafe {
                 libc::setresgid(CHILD_GID, CHILD_GID, CHILD_GID);
                 libc::setresuid(CHILD_UID, CHILD_UID, CHILD_UID);
@@ -570,7 +737,7 @@ fn spawn_privileged_child<F>(stream: UnixStream, state: Arc<DaemonState>, handle
             unsafe {
                 libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
             }
-            handler(stream, state);
+            handler(s, first[0], state);
             // Exit the child explicitly so we never fall through to
             // the parent's accept loop.
             process::exit(0);
@@ -737,11 +904,18 @@ fn main() {
     eprintln!("zygiskd: listening on {}", sock_path);
 
     // Accept loop. The parent stays as root and accepts; each
-    // connection is handed off to a privileged child.
+    // connection is handed off to a privileged child. The session
+    // dir (where the 'P' verb materializes the properties file) is
+    // derived from the bound socket path.
+    let session_dir = sock_path.rfind('/')
+        .map(|i| sock_path[..i].to_string())
+        .unwrap_or_else(|| SOCKDIR.to_string());
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                spawn_privileged_child(stream, state.clone(), handle_client);
+                spawn_privileged_child(stream, state.clone(),
+                                       &session_dir,
+                                       handle_client_with_first);
             }
             Err(_) => continue,
         }

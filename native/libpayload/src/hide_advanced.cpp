@@ -433,6 +433,258 @@ static void clone_property_area_private() {
 }
 
 // ------------------------------------------------------------------------
+// 4b. Round 19 — the spoofed properties_serial FILE
+//
+// Execve-proof property spoofing. The in-process clone (above) plus
+// the find/get/foreach hooks cover every read the hidden app itself
+// makes. But a fork+exec'd helper (Runtime.exec("getprop ..."))
+// starts with a fresh libc: it re-maps properties_serial BY PATH,
+// sees the REAL trie, and prints the REAL root-indicating values.
+// That was the single largest documented residual class since
+// Round 8 ("exec'd helpers see real property values").
+//
+// The closure: the child's mount namespace is inherited across
+// execve. At hide time (still root, still in the zygote SELinux
+// domain — AOSP's own Zygote.cpp bind-mounts over /dev/__properties__
+// from exactly this point via BindMountSyspropOverride, so the
+// platform itself sanctions both the mount and the label story), we
+// bind-mount a FILE copy of the property area — with every spoof
+// value already patched in — over /dev/__properties__/properties_serial.
+//
+//   payload (zygote, root): builds the spoofed bytes. Only the
+//     payload can do this: it lets bionic's own __system_property_find
+//     walk the real trie, so we never hard-code the trie format
+//     (which has changed across Android versions). The prop_info
+//     ADDRESS gives us the byte offset in the file via the mapping
+//     table — no format assumptions, version-proof by construction.
+//
+//   daemon (root, privileged domain): writes the bytes into the
+//     randomized session directory and chcons the file to
+//     u:object_r:properties_serial:s0 — the label bionic's readers
+//     (apps and their exec'd helpers) are already allowed to read.
+//     The zygote domain cannot write there itself, so the daemon
+//     does the file I/O over the existing socket protocol (verb 'P').
+//
+//   payload (hidden child, mount phase): bind-mounts the file over
+//     /dev/__properties__/properties_serial, then self-checks by
+//     opening the mounted path and comparing the area magic; on any
+//     failure it umounts immediately (fail-closed back to the exact
+//     pre-Round-19 behavior).
+//
+// Cost accounting: the build+send happens ONCE at payload init;
+// each hidden child pays one mount(2) + one open(2) at hide time.
+// Non-hidden processes pay nothing (no hook, no mount).
+// ------------------------------------------------------------------------
+
+// Pure helper: patch one prop_info VALUE inside a raw byte buffer,
+// at a caller-computed byte offset of the prop_info header. Same
+// serial protocol as patch_prop_value (odd serial while writing,
+// +2 at the end) so readers of the FILE see a consistent value.
+// Returns 1 when patched, 0 on bounds failure.
+static int patch_prop_value_in_buffer(char* buf, size_t size,
+                                       size_t pi_off, const char* value) {
+    if (pi_off > size || size - pi_off < kPropValueOffset + kPropValueSize) {
+        return 0;
+    }
+    char* pi = buf + pi_off;
+    auto* serial_atomic =
+        reinterpret_cast<std::atomic<uint32_t>*>(pi + kPropSerialOffset);
+    char* value_field = pi + kPropValueOffset;
+    uint32_t serial = serial_atomic->load(std::memory_order_relaxed);
+    if (serial & 1u) return 0;   // mid-update entry: leave it alone
+    serial_atomic->store(serial | 1u, std::memory_order_release);
+    memset(value_field, 0, kPropValueSize);
+    size_t len = strnlen(value, kPropValueSize - 1);
+    memcpy(value_field, value, len);
+    serial_atomic->store((serial + 2) & ~1u, std::memory_order_release);
+    return 1;
+}
+
+// A mapping of a SPECIFIC property file, with its file offset (maps
+// lines carry the offset column; the serial area is normally one
+// offset-0 mapping, but the math stays correct if it ever is not).
+struct PropFileMapping { uintptr_t lo, hi; uintptr_t file_off; };
+
+// Pure function: find mappings whose maps-line path field equals
+// `want_path` exactly. Same line-parsing discipline as
+// find_prop_mappings (5th-whitespace path field, length-guarded).
+static size_t find_file_mappings(const char* buf, size_t total,
+                                 const char* want_path,
+                                 PropFileMapping* out, size_t cap) {
+    const size_t want_len = strlen(want_path);
+    size_t n = 0;
+    const char* p = buf;
+    const char* end = buf + total;
+    while (p < end && n < cap) {
+        const char* nl = (const char*)memchr(p, '\n', end - p);
+        const char* line_end = nl ? nl : end;
+        const char* fp = p;
+        const char* path_field = nullptr;
+        int col = 0;
+        while (fp < line_end) {
+            char c = *fp;
+            if (c == ' ' || c == '\t') {
+                while (fp < line_end && (*fp == ' ' || *fp == '\t')) ++fp;
+                ++col;
+                if (col == 5) { path_field = fp; break; }
+            } else {
+                ++fp;
+            }
+        }
+        if (path_field) {
+            size_t path_len = (size_t)(line_end - path_field);
+            if (path_len == want_len &&
+                memcmp(path_field, want_path, want_len) == 0) {
+                char linebuf[512];
+                size_t copy = (size_t)(line_end - p);
+                if (copy >= sizeof linebuf) copy = sizeof linebuf - 1;
+                memcpy(linebuf, p, copy);
+                linebuf[copy] = '\0';
+                unsigned long lo = 0, hi = 0, off = 0;
+                char perms[8] = {};
+                int k = sscanf(linebuf, "%lx-%lx %7s %lx",
+                               &lo, &hi, perms, &off);
+                if (k >= 4 && perms[0] == 'r' && hi > lo) {
+                    out[n].lo = (uintptr_t)lo;
+                    out[n].hi = (uintptr_t)hi;
+                    out[n].file_off = (uintptr_t)off;
+                    ++n;
+                }
+            }
+        }
+        p = line_end + (nl ? 1 : 0);
+    }
+    return n;
+}
+
+// Read the whole file at `path` into a malloc'd buffer. Returns null
+// on failure. (Root-only callers: the property area file is 0444
+// root-owned; the zygote domain is allowed to read it — bionic maps
+// it at process start.)
+static char* read_whole_file(const char* path, size_t* out_size) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return nullptr;
+    struct stat st{};
+    if (fstat(fd, &st) != 0 || st.st_size <= 0 ||
+        (size_t)st.st_size > 8 * 1024 * 1024) {
+        close(fd);
+        return nullptr;
+    }
+    size_t size = (size_t)st.st_size;
+    char* buf = (char*)malloc(size);
+    if (!buf) { close(fd); return nullptr; }
+    size_t got = 0;
+    while (got < size) {
+        ssize_t r = read(fd, buf + got, size - got);
+        if (r <= 0) break;
+        got += (size_t)r;
+    }
+    close(fd);
+    if (got != size) { free(buf); return nullptr; }
+    *out_size = size;
+    return buf;
+}
+
+// Which mapping (if any) contains the address `addr`?
+static const PropFileMapping* containing_mapping(
+        const PropFileMapping* maps, size_t n, uintptr_t addr) {
+    for (size_t i = 0; i < n; ++i) {
+        if (addr >= maps[i].lo && addr < maps[i].hi) return &maps[i];
+    }
+    return nullptr;
+}
+
+// Pure core (unit-tested on host with a synthetic area): given the
+// file bytes, the mapping table that produced them and a find()
+// function over the LIVE mapping, patch every spoof value into the
+// byte buffer at the computed file offsets. Returns the number of
+// values patched.
+static size_t zs_patch_spoofed_area_bytes(
+        char* buf, size_t size,
+        const PropFileMapping* maps, size_t n_maps,
+        const char* (*find)(const char*)) {
+    size_t patched = 0;
+    for (const ZsPropSpoof& s : kPropSpoofTable) {
+        const void* pi = find(s.key);
+        if (!pi) continue;
+        const PropFileMapping* m =
+            containing_mapping(maps, n_maps, (uintptr_t)pi);
+        if (!m) continue;
+        size_t pi_off = (size_t)(((uintptr_t)pi - m->lo) + m->file_off);
+        patched += (size_t)patch_prop_value_in_buffer(
+            buf, size, pi_off, s.value ? s.value : "");
+    }
+    return patched;
+}
+
+// Round 19 public entry (production path): build the spoofed
+// properties_serial image. Parameterized by the file path so host
+// tests can drive the REAL code against a synthetic area; production
+// passes "/dev/__properties__/properties_serial". Returns a malloc'd
+// buffer the caller owns, or null (feature disabled — callers must
+// treat null as "no file, no mount" and proceed unchanged).
+char* zs_build_spoofed_serial_area(const char* prop_file_path,
+                                   size_t* out_size) {
+    if (!prop_file_path) return nullptr;
+    if (!g_find_prop) {
+        g_find_prop = (FindPropFn)zs_resolve_libc(
+            "__system_property_find");
+        if (!g_find_prop) return nullptr;   // host/no bionic
+    }
+    // 1. The live mapping table (offsets must come from the mapping
+    //    the CURRENT find() walks, i.e. the real area — call this
+    //    before the in-process clone ever runs, or at init).
+    constexpr size_t kMapsCap = 96 * 1024;
+    static char maps_buf[kMapsCap];   // once per process; off-stack
+    int mfd = open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
+    if (mfd < 0) return nullptr;
+    ssize_t total = 0;
+    while ((size_t)total < kMapsCap) {
+        ssize_t n = read(mfd, maps_buf + total, kMapsCap - (size_t)total);
+        if (n <= 0) break;
+        total += n;
+    }
+    PropFileMapping maps[8];
+    size_t n_maps = total > 0
+        ? find_file_mappings(maps_buf, (size_t)total, prop_file_path,
+                             maps, 8)
+        : 0;
+    close(mfd);
+    if (n_maps == 0) return nullptr;
+
+    // 2. The file bytes.
+    size_t size = 0;
+    char* buf = read_whole_file(prop_file_path, &size);
+    if (!buf) return nullptr;
+
+    // 3. Patch every spoof value at its computed file offset.
+    size_t patched = zs_patch_spoofed_area_bytes(
+        buf, size, maps, n_maps,
+        (const char* (*)(const char*))g_find_prop);
+    ZS_LOGD("hide_advanced: spoofed serial area built "
+            "(%zu value(s), %zu bytes)", patched, size);
+    if (patched == 0) {
+        // Zero hits almost certainly means the offset math is wrong
+        // for this device — a file with no patches is the real trie
+        // verbatim; serving it gains nothing, so fail closed.
+        free(buf);
+        return nullptr;
+    }
+    if (out_size) *out_size = size;
+    return buf;
+}
+
+#ifdef ZS_HOST_TEST
+// Test seam: supply a fake __system_property_find (the host has no
+// bionic property area). The production builder resolves the real
+// one via zs_resolve_libc.
+void zs_test_set_prop_find(const void* (*find)(const char*)) {
+    g_find_prop = (FindPropFn)find;
+}
+void zs_test_reset_prop_find() { g_find_prop = nullptr; }
+#endif
+
+// ------------------------------------------------------------------------
 // 5. /proc file filtering (Tier B)
 // ------------------------------------------------------------------------
 
@@ -456,7 +708,76 @@ static const char* const kFilteredBaseNames[] = {
     "environ",
 };
 
-// Tier B also filters these in the maps/mounts content:
+// Round 19 — the PROC_LINE record matcher was REWRITTEN after an
+// adversarial audit found it only understood the MAPS line format.
+//
+// The old matcher located "the path field" as "whatever follows the
+// 5th whitespace run" — correct for maps/smaps (addr perms offset
+// dev inode path), but every OTHER filtered file has its paths in
+// different columns:
+//
+//   /proc/self/mounts:      source target fstype opts 0 0
+//   /proc/self/mountinfo:   id parent maj:min root mountpoint opts
+//                           ... - fstype source super_opts
+//   /proc/self/mountstats:  device target fstype opts / per-field lines
+//
+// The 5th-field logic landed on "0" (mounts) or the options column
+// (mountinfo) — so a mounts line whose SOURCE was /data/adb/... or a
+// mountinfo line whose mountpoint/root carried a module path was
+// NEVER dropped. The existing content tests only ever fed
+// maps-format lines, so 85 host tests stayed green while the mounts
+// backstop (the safety net for the fail-closed unmount path, where a
+// failed unshare leaves module mounts in the table) leaked every
+// root path to the app. (Reproduced empirically before the fix —
+// see test "filter_record_drops_hidden_paths_in_every_line_format".)
+//
+// The new matcher is format-agnostic: it tokenizes the line on
+// whitespace and tests EVERY token with the same rule the fd-scanner
+// uses (fd_target_is_root_path: anchored prefix against the static +
+// runtime root-path table), plus two additions the line formats
+// need:
+//   - exact-path match for the magic-mounted bridge libraries
+//     (/system/lib[64]/libzygisk.so|libpayload.so — these come from
+//     the systemless overlay, so no /data prefix identifies them);
+//   - the mountinfo "root" column of a /data bind mount shows the
+//     path INSIDE the source filesystem ("/adb/modules/..."), so
+//     tokens are also matched against that form.
+//
+// Token-anchored matching also FIXES a false-positive class the old
+// substring scan had: an app that ships its own libpayload.so in
+// /data/data/<pkg>/lib/ had that maps line dropped (substring
+// "libpayload.so" matched mid-path). Anchored prefixes and exact
+// /system/lib[64]/ paths never match an app's own data-dir library.
+
+// Exact full paths of the systemless (magic-mounted) copies of our
+// libraries. The module installs them under $MODPATH/system/lib[64]
+// so ART's native-bridge dlopen finds them; in maps they appear at
+// these paths, and no /data/... prefix distinguishes them.
+static const char* const kHiddenExactPaths[] = {
+    "/system/lib64/libzygisk.so",
+    "/system/lib64/libpayload.so",
+    "/system/lib64/libzn_loader.so",
+    "/system/lib/libzygisk.so",
+    "/system/lib/libpayload.so",
+    "/system/lib/libzn_loader.so",
+};
+
+// mountinfo "root" fields (the path INSIDE the source filesystem —
+// always slash-form) for bind mounts whose source lives under our
+// root paths: a bind of /data/adb/modules reports root
+// "/adb/modules/...", which no /data-anchored prefix can match.
+// Stock mountinfo root fields are "/", "/system", "/vendor",
+// "/product", "/data", ... — none of these forms, so the anchored
+// prefixes cannot false-positive on stock lines.
+static const char* const kHiddenRootFieldPrefixes[] = {
+    "/adb/modules",
+    "/adb/.zygisk_study",
+    "/system/zygisk_study",
+};
+
+// Substring helper for the unix-socket line filter (whole-line
+// memmem semantics — socket names are not path-shaped, so anchored
+// prefix matching does not apply there).
 struct HiddenSubstring {
     const char* data;
     size_t      len;
@@ -464,21 +785,56 @@ struct HiddenSubstring {
         : data(s), len(__builtin_strlen(s)) {}
 };
 
-static constexpr HiddenSubstring kHiddenSubstrings[] = {
-    // Our own .so files
-    "libzygisk.so",
-    "libpayload.so",
-    "libzn_loader.so",
-    // Standard Magisk paths
-    "/data/adb/",
-    "/sbin/",
-    "/debug_ramdisk/",
-    // KernelSU paths
-    "/data/adb/ksu/",
-    "/data/adb/modules",
-    // Zygisk Study's own working dir
-    "/data/system/zygisk_study",
-};
+// Defined with the fd scanner in section 6; forward declaration so
+// the Round 19 line matcher can share the SAME root-path table
+// (single source of truth: everything registered via
+// hide_advanced_register_root_path_prefix applies to both the fd
+// scanner and the /proc line filter).
+static int fd_target_is_root_path(const char* t, size_t len);
+
+// Round 19: does this whitespace-delimited TOKEN identify one of our
+// paths? Token-anchored (the match must start at the token's first
+// byte — never mid-path), which is what makes app-owned files named
+// libpayload.so survive while the module's own lines drop.
+static int proc_line_token_is_hidden(const char* tok, size_t len) {
+    if (len == 0) return 0;
+    if (tok[0] != '/') return 0;   // mountinfo root fields are slash-form
+    // Anchored prefix against the shared root-path table
+    // (static set + runtime session prefixes).
+    if (fd_target_is_root_path(tok, len)) return 1;
+    // Exact paths of the magic-mounted bridge libraries.
+    for (const char* p : kHiddenExactPaths) {
+        size_t n = __builtin_strlen(p);
+        if (n == len && memcmp(tok, p, n) == 0) return 1;
+    }
+    // mountinfo root-column forms (path inside the source fs).
+    for (const char* p : kHiddenRootFieldPrefixes) {
+        size_t n = __builtin_strlen(p);
+        if (len >= n && memcmp(tok, p, n) == 0) return 1;
+    }
+    return 0;
+}
+
+// Round 19: walk every whitespace-delimited token of the line and
+// apply proc_line_token_is_hidden. Format-agnostic — works for maps,
+// smaps, mounts, mountinfo and mountstats without knowing which
+// column carries a path (paths can appear as source, target, root
+// and mapped-file columns across those formats).
+static int proc_line_has_hidden_token(const char* rec, size_t rec_len) {
+    const char* p   = rec;
+    const char* end = rec + rec_len;
+    while (p < end) {
+        // Skip leading whitespace.
+        while (p < end && (*p == ' ' || *p == '\t')) ++p;
+        const char* tok = p;
+        while (p < end && *p != ' ' && *p != '\t') ++p;
+        if (p > tok &&
+            proc_line_token_is_hidden(tok, (size_t)(p - tok))) {
+            return 1;
+        }
+    }
+    return 0;
+}
 
 // Round 13 — runtime hidden substrings for the unix-socket filter:
 // the daemon's randomized per-boot socket directory. Registered at
@@ -711,31 +1067,16 @@ ssize_t zs_filter_record(char* dst, size_t dst_cap,
     }
     case ZS_FILTER_PROC_LINE:
     default: {
-        // Find the path field (after the 5th whitespace run) and
-        // search the hidden substrings only within it (P1.39/P1.40
-        // history: compile-time lengths + branch hints).
-        const char* p = rec;
-        const char* rec_end = rec + rec_len;
-        const char* path_field = nullptr;
-        int col = 0;
-        while (p < rec_end) {
-            char c = *p;
-            if (c == ' ' || c == '\t') {
-                while (p < rec_end && (*p == ' ' || *p == '\t')) ++p;
-                ++col;
-                if (col == 5) { path_field = p; break; }
-            } else {
-                ++p;
-            }
-        }
-        if (path_field && path_field < rec_end) {
-            size_t path_len = (size_t)(rec_end - path_field);
-            for (const HiddenSubstring& sub : kHiddenSubstrings) {
-                if (sub.len == 0 || sub.len > path_len) continue;
-                if (memmem(path_field, path_len, sub.data, sub.len)) {
-                    return -1;
-                }
-            }
+        // Round 19: format-agnostic token matching (see the long
+        // comment above the kHiddenExactPaths table). The old
+        // "path field = after 5th whitespace run" logic only fit the
+        // maps format — mounts/mountinfo/mountstats lines carry
+        // their paths in other columns and leaked. Every token is
+        // now tested, anchored at token start, against the shared
+        // root-path prefix table, the bridge-library exact paths and
+        // the mountinfo root-column forms.
+        if (proc_line_has_hidden_token(rec, rec_len)) {
+            return -1;
         }
         break;
     }

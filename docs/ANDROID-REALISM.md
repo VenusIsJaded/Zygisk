@@ -1197,3 +1197,132 @@ Adopted (beyond ReZygisk — their loader answers none of these):
 
 158 host tests (133 → 158), 0 warnings, ASan+UBSan+leaks green, all
 test binaries exit 0.
+
+## Round 19 — zygote specialization research, the mounts-format leak, execve-proof properties
+
+### Version research actually performed this round
+
+Per the instruction to look up how Android versions actually work
+before writing version-sensitive code, this round fetched and read
+AOSP `core/jni/com_android_internal_os_Zygote.cpp` at
+android-9.0.0_r1, android-13.0.0_r1, android-15.0.0_r1 and
+refs/heads/main, plus bionic's `libc/system_properties/` reader
+sources, plus the three NEW ReZygisk commits since the Round 9-11
+study (GrapheneOS A17 zygote signatures, dd3d608/e42886f/e10115a):
+
+| Fact | Verified from | Consequence taken |
+|---|---|---|
+| `setresgid(gid,gid,gid)` then `setresuid(uid,uid,uid)` — byte-identical call pair, in that order, in the child, while still root | Zygote.cpp @ 9, 13, 15, main | the gid-then-uid hook architecture is sound across the WHOLE supported range; no version-specific handling needed |
+| `SetUpSeccompFilter` + `SetSchedulerPolicy` run BETWEEN the two drops | same | both hooks fire before any seccomp filter exists — mount(2)/unshare(2) in the gid hook are unfiltered |
+| `selinux_android_setcontext()` (the app domain transition) runs AFTER `setresuid` | same | BOTH hook points execute in the zygote SELinux domain — the mount-capable domain AOSP itself uses to bind-mount over /dev/__properties__ (BindMountSyspropOverride, A14+) |
+| AOSP itself bind-mounts over `/dev/__properties__` during specialization and reloads (`__system_properties_zygote_reload`) | Zygote.cpp @ main/15 | a properties bind-mount in this window is platform-sanctioned behavior, not an anomaly we invent |
+| bionic readers map exactly two files: `/dev/__properties__/property_info` (metadata trie — no root indicators) and `/dev/__properties__/properties_serial` (the values trie) | `libc/system_properties/{system_properties,contexts_serialized,prop_area}.cpp` @ main | spoofing only properties_serial (file bind-mount) closes the value leak while leaving property_info stock |
+| A17 changed `nativeForkAndSpecialize`'s JNI signature (new cgroupUid-style jint between uid and gid; GrapheneOS A17 adds a leading jlongArray) | ReZygisk dd3d608/e42886f (cross-checked with NeoZygisk PR 151) | hooks on the JNI method churn per version; this project hooks the libc privilege-drop calls instead — inherently immune to A17's signature churn (the libc pair above is verified stable) |
+| `mount("/proc/self/fd/N", target, MS_BIND)` follows the fd's path structure, not the symlink text; works for file bind mounts as root | kernel semantics documented by C. Brauner + the GNOME "secure mounts" writeup; runc/LXC use the same trick | (this round binds by real path instead — the session file — even simpler; the fd-based route is documented as the fallback) |
+
+### The mounts-format leak (REAL bug, invisible to all 158 tests)
+
+The PROC_LINE record matcher located "the path field" as "whatever
+follows the 5th whitespace run" — the MAPS column layout. But the
+same filter serves /proc/self/mounts ("source target fstype opts 0
+0" — paths in fields 1-2), mountinfo (mountpoint field 5, root field
+4, source after the " - " separator) and mountstats. The 5th-field
+logic landed on "0" or the options column: every mounts-format line
+carrying a /data/adb source or module mount point was KEPT. The
+fail-closed unmount backstop (what a hidden child falls back to when
+unshare fails) leaked the entire root-framework mount table through
+/proc/self/mounts. Reproduced empirically (five real-format lines
+fed to zs_filter_record: maps dropped, all mounts/mountinfo variants
+kept), then fixed, then locked in by
+`filter_record_drops_hidden_paths_in_every_line_format`.
+
+The fix is format-agnostic: tokenize the line, test every
+slash-leading token with the SAME anchored-prefix table the fd
+scanner uses (single source of truth — runtime session prefixes
+included), plus exact paths for the magic-mounted bridge libraries
+(`/system/lib[64]/lib{zygisk,payload,zn_loader}.so`) and the
+mountinfo root-column forms ("/adb/modules", ...). Token anchoring
+also removes a false-positive class: an app shipping its own
+libpayload.so in /data/data/... had that maps line dropped by the
+old mid-path substring scan.
+
+### Execve-proof property spoofing (the Round 8 exec'd-helper residual class, closed)
+
+The in-process clone + find/get/foreach hooks cover every read the
+hidden app makes. A fork+exec'd helper (Runtime.exec("getprop"))
+starts with a fresh libc, re-maps properties_serial BY PATH, and
+printed the REAL values — the single largest documented residual
+since Round 8. The closure:
+
+1. payload (zygote, once): builds a spoofed copy of the
+   properties_serial image. bionic's own __system_property_find
+   walks the real trie, so the prop_info ADDRESS plus the mapping
+   table yields each key's file offset — zero trie-format
+   assumptions (the format has changed across versions; this is
+   version-proof by construction). Zero patches -> fail closed
+   (never serve a verbatim copy of the real trie).
+2. daemon (root, 'P' verb, handled BEFORE the per-connection uid
+   drop because it writes into the root-only session dir):
+   materializes the image as <session_dir>/p, mode 0444 to match
+   the real file's stat(), chcon u:object_r:properties_serial:s0
+   (best-effort, ReZygisk's own non-fatal pattern), replies with
+   the path.
+3. hidden child (mount phase, still root, still zygote SELinux
+   domain): bind-mounts the file over
+   /dev/__properties__/properties_serial, then self-checks (open +
+   magic compare) and umounts on any mismatch. The private mount
+   namespace is inherited across execve, so exec'd helpers re-map
+   the SPOOFED area. In-process reads were never routed through
+   the file (the zygote's mapping predates the mount) — the two
+   layers are strictly complementary.
+
+The mounts/mountinfo lines for the new mount drop in-process via
+the session-dir runtime prefix (source token); exec'd children see
+one extra mountinfo line whose target is
+/dev/__properties__/properties_serial — a shape AOSP's own
+appcompat-override mounts make plausible on A14+.
+
+### The boot-order bug (REAL, killed the whole Rounds 12-14 dispatch on device)
+
+zs_module_init ran at native-bridge initialize time (zygote start)
+and fetched the module list ONCE. The daemon is launched by
+service.sh at the LATE SERVICE stage — after the zygote is up. On a
+real device every fetch failed with ENOENT, the list came back
+empty, and zero Zygisk modules ever loaded for the boot — while the
+host tests (fake daemon started BEFORE init — exactly the order
+real devices do not have) stayed green. Fixed: every
+daemon-dependent step (module 'L' fetch, properties 'P' send) is
+attempted at init AND retried at each zygote fork until the daemon
+answers (failed connect ~1 usec; latched by two atomic loads).
+Modules that load late are inherited by processes forked after the
+fetch — system_server may miss modules on boots where the daemon is
+slow to bind (residual; upstream loads at zygote start by design).
+
+### Honest residuals (Round 19)
+
+- The chcon in the daemon is best-effort: if the daemon's SELinux
+  domain cannot relabel, the mount still serves the bytes to
+  zygote-domain readers but exec'd helpers (untrusted_app) may be
+  denied the open — bionic property init then comes up empty for
+  them (empty getprop output — an anomaly, but not one that names
+  root). The payload's self-check runs as zygote-domain and cannot
+  prove untrusted-domain readability; on-device validation decides.
+- st_dev/st_ino of the mounted properties file reflect the session
+  filesystem, not /dev's tmpfs — observable only by statting the
+  property file and cross-checking device ids (no public detector
+  does; documented).
+- Tier A absent-spoofed keys remain present-but-empty in the FILE
+  image (the trie format cannot express deletion without a full
+  re-serialization — a possible future round): exec'd `getprop`
+  shows them with empty values, exactly the in-process Tier A
+  behavior.
+- The daemon Rust changes ('P' verb, pre-drop handling, parse_after
+  refactor) are inspection-verified only — no Rust toolchain in the
+  sandbox (same caveat as R13).
+- Mount-order residual: secondary children (child-of-child) detach
+  the INHERITED properties bind in their unmount pass and re-mount
+  it fresh — correct, but that child's exec'd helpers briefly
+  window onto the real file between detach and re-mount (a
+  microseconds-wide boot-time window, no app code running).
+
+169 host tests (158 → 169), 0 warnings, ASan+UBSan+leaks green.

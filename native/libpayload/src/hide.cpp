@@ -663,9 +663,103 @@ static int zs_prod_umount2(const char* target, int flags) {
     zs_mount_log(rv == 0 ? 'm' : 'M');
     return rv;
 }
+static int zs_prod_bind_mount(const char* src, const char* dst) {
+    int rv = mount(src, dst, nullptr, MS_BIND, nullptr);
+    zs_mount_log(rv == 0 ? 'b' : 'B');
+    return rv;
+}
 static ZsUnshareFn    g_fn_unshare = zs_prod_unshare;
 static ZsMountSlaveFn g_fn_mount_slave = zs_prod_mount_slave;
 static ZsUmount2Fn    g_fn_umount2 = zs_prod_umount2;
+typedef int (*ZsBindMountFn)(const char*, const char*);
+static ZsBindMountFn g_fn_bind_mount = zs_prod_bind_mount;
+
+// ------------------------------------------------------------------------
+// Round 19 — the spoofed properties_serial bind mount.
+//
+// State set at payload init by module_dispatch (zs_module_send_props):
+//   g_props_src:  the file the daemon materialized (session dir/p).
+//                 Empty = feature unavailable this boot.
+//   g_props_magic: the first 4 bytes of the area we built (the
+//                 self-check compares against what the mount serves).
+// ------------------------------------------------------------------------
+static char    g_props_src[112];
+static uint32_t g_props_magic = 0;
+static std::atomic<int> g_props_file_ready{0};
+
+void hide_props_file_set_source(const char* src, uint32_t magic) {
+    if (!src || !*src) return;
+    strncpy(g_props_src, src, sizeof g_props_src - 1);
+    g_props_src[sizeof g_props_src - 1] = '\0';
+    g_props_magic = magic;
+    g_props_file_ready.store(1, std::memory_order_release);
+}
+
+int hide_props_file_ready() {
+    return g_props_file_ready.load(std::memory_order_acquire);
+}
+
+static const char kPropSerialTarget[] =
+    "/dev/__properties__/properties_serial";
+
+// Test override for the bind target (host tests point this at a
+// temp file so the self-check's open() can succeed without root).
+static const char* g_props_target_override = nullptr;
+
+#ifdef ZS_HOST_TEST
+void zs_test_set_prop_serial_target(const char* target) {
+    g_props_target_override = target;
+}
+#endif
+
+// Bind-mount the spoofed area over the real properties_serial, then
+// VERIFY the mount serves our bytes (open + magic compare). Any
+// failure umounts immediately — fail-closed back to the pre-Round-19
+// behavior (exec'd helpers see the real trie, exactly as before;
+// in-process reads were never affected by this mount either way).
+//
+// Runs AFTER unshare+slave, so the mount lives only in this child's
+// namespace and cannot propagate anywhere. Runs BEFORE the real
+// setresgid: still root, still in the zygote SELinux domain (the
+// domain AOSP's own Zygote.cpp uses to bind-mount over
+// /dev/__properties__ for appcompat overrides — verified from
+// AOSP 15/main sources: BindMountSyspropOverride runs before
+// setresgid too).
+static void mount_spoofed_properties_file() {
+    if (!hide_props_file_ready()) return;
+
+    const char* target = g_props_target_override
+        ? g_props_target_override
+        : kPropSerialTarget;
+    if (g_fn_bind_mount(g_props_src, target) != 0) {
+        ZS_LOGW("hide: properties bind mount failed: %s — exec'd "
+                "helpers will see real property values",
+                strerror(errno));
+        return;
+    }
+    // Self-check: open the MOUNTED path and verify the magic. A
+    // wrong magic means the mount is not serving our file (or
+    // SELinux denied the open) — revert rather than serve garbage.
+    int fd = open(target, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        ZS_LOGW("hide: properties mount self-check open failed: %s "
+                "— reverting", strerror(errno));
+        g_fn_umount2(target, MNT_DETACH);
+        return;
+    }
+    uint32_t served = 0;
+    ssize_t n = read(fd, &served, sizeof served);
+    close(fd);
+    if (n != (ssize_t)sizeof served || served != g_props_magic) {
+        ZS_LOGW("hide: properties mount self-check mismatch "
+                "(got %#x want %#x) — reverting",
+                (unsigned)served, (unsigned)g_props_magic);
+        g_fn_umount2(target, MNT_DETACH);
+        return;
+    }
+    ZS_LOGD("hide: spoofed properties_serial mounted over "
+            "/dev/__properties__ (execve-proof)");
+}
 
 // Unmount everything the root framework mounted, inside our private
 // mount namespace (caller did unshare(CLONE_NEWNS)).
@@ -932,6 +1026,16 @@ void hide_apply_for_target(const char* /*package_name*/) {
         return;
     }
     unmount_magisk_paths();
+    // Round 19: serve the spoofed property area to exec'd helpers
+    // (bind mount + self-check; no-op when the feature is off).
+    // After the unmounts, not before: for THIS child the mount lands
+    // after the scanner's pass, so the scanner never sees it. For a
+    // SECONDARY child (child-of-child, e.g. an app zygote's fork)
+    // the INHERITED bind is visible to the scan and gets detached
+    // like any other session-prefix mount — then re-mounted fresh
+    // right here, in this child's own namespace. Either way each
+    // hidden child ends up with exactly one mount of its own.
+    mount_spoofed_properties_file();
     // NOTE: no scrub_properties() and no unmap_self() here anymore.
     // Property spoofing moved to hide_advanced (per-process clone +
     // read hooks); the self-unmap is deferred to the asm trampoline
@@ -1146,6 +1250,23 @@ void zs_test_mount_log_reset() {
 void zs_test_mount_log_append(char op) { zs_mount_log(op); }
 
 const char* zs_test_mount_log() { return g_mount_log; }
+
+// Round 19: the properties-file mount seams.
+void zs_test_set_bind_mount_fn(int (*bind)(const char*, const char*)) {
+    g_fn_bind_mount = bind ? bind : zs_prod_bind_mount;
+}
+void zs_test_props_source_clear() {
+    g_props_src[0] = '\0';
+    g_props_magic = 0;
+    g_props_file_ready.store(0, std::memory_order_release);
+}
+// extern "C" so the dlopen-based dispatch test can resolve it.
+extern "C" void zs_test_props_source_clear_c() {
+    zs_test_props_source_clear();
+}
+extern "C" int zs_test_props_ready_c() {
+    return hide_props_file_ready();
+}
 #endif
 
 } // namespace zygisk_study

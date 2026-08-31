@@ -436,6 +436,11 @@ extern "C" long zs_impl_fork(void* /*wrapper_fp*/) {
     // VM exists AND we still run pre-fork — acquire the JNIEnv and
     // dispatch module onLoad there (once per process lifetime).
     if (getpid() == g_origin_pid) {
+        // Round 19: daemon-dependent init (module list fetch, the
+        // spoofed properties_serial handoff) retries here until it
+        // latches — the daemon is never up at native-bridge init on
+        // real devices (late service stage vs zygote start).
+        (void)zs_module_lazy_daemon_init();
         zs_module_on_first_fork();
     }
     // Direct libc fork; ART's pthread_atfork handlers must still run.

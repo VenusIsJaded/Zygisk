@@ -129,6 +129,29 @@ void hide_advanced_install_tier_b();
 // killed the GPU driver fds every app inherits from the zygote.
 void hide_advanced_apply_post_fork(const char* package_name);
 
+// ------------------------------------------------------------------------
+// Round 19 — execve-proof property spoofing (spoofed
+// properties_serial FILE, bind-mounted in the child's private mount
+// namespace). See the long comment block in hide_advanced.cpp
+// section 4b for the full design (payload builds, daemon writes +
+// labels, child mounts + self-checks).
+// ------------------------------------------------------------------------
+
+// Build the spoofed image of the property-area file at
+// `prop_file_path` (production: /dev/__properties__/properties_serial).
+// Returns a malloc'd buffer (caller owns, free()), or null = feature
+// unavailable (no bionic find, no mapping, no file, zero patches).
+// Called ONCE at payload init, in the zygote, while the live area is
+// still the real one.
+char* zs_build_spoofed_serial_area(const char* prop_file_path,
+                                   size_t* out_size);
+
+#ifdef ZS_HOST_TEST
+// Test seams for the builder (host has no bionic property area).
+void zs_test_set_prop_find(const void* (*find)(const char*));
+void zs_test_reset_prop_find();
+#endif
+
 // Spoof table entry (definition lives in hide_advanced.cpp).
 struct ZsPropSpoof {
     const char* key;
