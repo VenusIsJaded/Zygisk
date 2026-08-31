@@ -36,10 +36,14 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <ctype.h>
+#include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <link.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 #include <vector>
 
@@ -2080,4 +2084,318 @@ ZS_TEST(fd_scan_runtime_prefix_closes_random_dir_fds) {
     fclose(f);
     close(fd_keep);
     rmdir(d);
+}
+
+// ----------------------------------------------------------------------
+// Round 15 — fd observable parity (the fd shadow table)
+// ----------------------------------------------------------------------
+
+// A REAL procfs descriptor is the anchor for every parity claim in
+// this round: st_size 0 and mmap -> ENODEV. If a future kernel ever
+// changes that, these hooks (which impersonate it) must change with
+// it — so the anchor itself is asserted, not assumed.
+ZS_TEST(fd_observable_anchor_real_procfs_behavior) {
+    int real_fd = open("/proc/self/maps", O_RDONLY);
+    ZS_CHECK(real_fd >= 0);
+    struct stat anchor;
+    ZS_CHECK_EQ(fstat(real_fd, &anchor), 0);
+    ZS_CHECK_EQ(anchor.st_size, (off_t)0);
+    errno = 0;
+    void* m = mmap(nullptr, 4096, PROT_READ, MAP_PRIVATE, real_fd, 0);
+    ZS_CHECK(m == MAP_FAILED);
+    ZS_CHECK_EQ(errno, ENODEV);
+    close(real_fd);
+}
+
+// The full parity story: the memfd we hand out answers fstat, mmap
+// and statx(AT_EMPTY_PATH) exactly like a procfs fd, while a normal
+// file descriptor passes through completely untouched.
+ZS_TEST(fd_shadow_procfs_observable_parity) {
+    hide_advanced_set_active(1);
+
+    int fd = zygisk_study_hook_open("/proc/self/maps", O_RDONLY);
+    ZS_CHECK(fd >= 0);
+
+    // The content really is the filtered maps (first bytes are a
+    // maps line, not garbage). A maps line can run ~100 bytes, so
+    // read a full window before checking for the line shape.
+    char buf[256];
+    ssize_t rn = read(fd, buf, sizeof buf - 1);
+    ZS_CHECK(rn > 8);
+    buf[rn] = '\0';
+    ZS_CHECK(isxdigit((unsigned char)buf[0]) != 0);   // address column
+    lseek(fd, 0, SEEK_SET);
+
+    // fstat: procfs fiction (size 0, mode 0444, S_IFREG).
+    struct stat st;
+    ZS_CHECK_EQ(zygisk_study_hook_fstat(fd, &st), 0);
+    ZS_CHECK_EQ(st.st_size, (off_t)0);
+    ZS_CHECK(S_ISREG(st.st_mode));
+    ZS_CHECK_EQ(st.st_mode & 0777, (mode_t)0444);
+    ZS_CHECK_EQ(st.st_blocks, (blkcnt_t)0);
+
+    // mmap: rejected with ENODEV, exactly like procfs.
+    errno = 0;
+    void* hm = zygisk_study_hook_mmap(nullptr, 4096, PROT_READ,
+                                      MAP_PRIVATE, fd, 0);
+    ZS_CHECK(hm == MAP_FAILED);
+    ZS_CHECK_EQ(errno, ENODEV);
+
+    // statx with AT_EMPTY_PATH (the aarch64 fstat path).
+    struct statx stx;
+    memset(&stx, 0, sizeof stx);
+    int sx = zygisk_study_hook_statx(fd, "", AT_EMPTY_PATH,
+                                     (unsigned)0xffff, &stx);
+    ZS_CHECK_EQ(sx, 0);
+    ZS_CHECK_EQ(stx.stx_size, (uint64_t)0);
+    ZS_CHECK_EQ(stx.stx_mode & 0777, (uint16_t)0444);
+
+    // A regular file must NOT get the fiction: hook passthrough.
+    char tmpl[] = "/tmp/zs_r15_anchor_XXXXXX";
+    int reg = mkstemp(tmpl);
+    ZS_CHECK(reg >= 0);
+    ZS_CHECK_EQ(write(reg, "hello", 5), 5);
+    struct stat ts;
+    ZS_CHECK_EQ(zygisk_study_hook_fstat(reg, &ts), 0);
+    ZS_CHECK_EQ(ts.st_size, (off_t)5);
+    ZS_CHECK_EQ(ts.st_mode & 0777, (mode_t)0600);
+    errno = 0;
+    void* rm = zygisk_study_hook_mmap(nullptr, 4096, PROT_READ,
+                                      MAP_PRIVATE, reg, 0);
+    ZS_CHECK(rm != MAP_FAILED);
+    if (rm != MAP_FAILED) munmap(rm, 4096);
+    unlink(tmpl);
+    close(reg);
+
+    close(fd);
+    hide_advanced_set_active(0);
+}
+
+// Stale entries self-heal: after the memfd is closed and its number
+// reused by an ordinary file, the lookup invalidates the record and
+// fstat reports the REAL file — never the procfs fiction.
+ZS_TEST(fd_shadow_stale_entries_self_heal) {
+    hide_advanced_set_active(1);
+    int fd = zygisk_study_hook_open("/proc/self/maps", O_RDONLY);
+    ZS_CHECK(fd >= 0);
+    ZS_CHECK(fd_shadow_lookup(fd) != nullptr);
+    close(fd);
+
+    // Reuse the number deterministically: dup to force the SAME
+    // number is not possible after close, so just open a fresh file —
+    // if the kernel hands back the same number, the stale entry must
+    // be discarded; if not, the lookup miss is the same answer.
+    char tmpl[] = "/tmp/zs_r15_stale_XXXXXX";
+    int reg = mkstemp(tmpl);
+    ZS_CHECK(reg >= 0);
+    ZS_CHECK_EQ(write(reg, "0123456789", 10), 10);
+    struct stat st;
+    ZS_CHECK_EQ(zygisk_study_hook_fstat(reg, &st), 0);
+    ZS_CHECK_EQ(st.st_size, (off_t)10);
+    ZS_CHECK_EQ(st.st_mode & 0777, (mode_t)0600);
+    if (reg == fd) {
+        // The number WAS reused — the entry must have been dropped.
+        ZS_CHECK(fd_shadow_lookup(reg) == nullptr);
+    }
+    unlink(tmpl);
+    close(reg);
+    hide_advanced_set_active(0);
+}
+
+// The readlink spoof helper: fd-number path, dup (identity scan)
+// path, foreign targets untouched, and readlink truncation
+// semantics when the buffer is smaller than the original path.
+ZS_TEST(readlink_spoof_helper_covers_dup_and_rejects_foreign) {
+    hide_advanced_set_active(1);
+    int fd = zygisk_study_hook_open("/proc/self/maps", O_RDONLY);
+    ZS_CHECK(fd >= 0);
+    char out[256];
+
+    ssize_t n = hide_advanced_spoof_memfd_readlink(
+        fd, "memfd:scudo (deleted)", 21, out, sizeof out);
+    ZS_CHECK_EQ(n, (ssize_t)15);
+    ZS_CHECK_EQ(memcmp(out, "/proc/self/maps", 15), 0);
+
+    // dup'd descriptor: new fd number, same dev/ino — the identity
+    // scan must find the record.
+    int dup_fd = dup(fd);
+    ZS_CHECK(dup_fd >= 0);
+    n = hide_advanced_spoof_memfd_readlink(dup_fd, "memfd:scudo", 11,
+                                           out, sizeof out);
+    ZS_CHECK_EQ(n, (ssize_t)15);
+    ZS_CHECK_EQ(memcmp(out, "/proc/self/maps", 15), 0);
+
+    // Foreign target string: no spoof, caller keeps the real result.
+    n = hide_advanced_spoof_memfd_readlink(dup_fd, "/data/.../x", 12,
+                                           out, sizeof out);
+    ZS_CHECK_EQ(n, (ssize_t)0);
+
+    // Unknown memfd (real scudo-style memfd from another subsystem):
+    // no record -> no spoof (correct — we cannot know a path).
+    int other_mem = syscall_memfd_create("scudo", 0);
+    ZS_CHECK(other_mem >= 0);
+    n = hide_advanced_spoof_memfd_readlink(other_mem, "memfd:scudo", 11,
+                                           out, sizeof out);
+    ZS_CHECK_EQ(n, (ssize_t)0);
+    close(other_mem);
+
+    // Truncation: buffer smaller than "/proc/self/maps" -> exactly
+    // bufsiz bytes, POSIX style.
+    char small[4];
+    n = hide_advanced_spoof_memfd_readlink(fd, "memfd:scudo", 11,
+                                           small, sizeof small);
+    ZS_CHECK_EQ(n, (ssize_t)4);
+    ZS_CHECK_EQ(memcmp(small, "/pro", 4), 0);
+
+    close(dup_fd);
+    close(fd);
+    hide_advanced_set_active(0);
+}
+
+// The raw openat2 syscall (Android 13+ kernels, no bionic wrapper in
+// ANY release) must flow through the filter, including the open_how
+// size sanity gate.
+ZS_TEST(openat2_raw_syscall_is_filtered) {
+    hide_advanced_set_active(1);
+    struct zs_open_how how;
+    memset(&how, 0, sizeof how);
+    how.flags = O_RDONLY;
+
+    long r = zygisk_study_hook_syscall((long)SYS_openat2,
+                                       (long)AT_FDCWD,
+                                       (long)"/proc/self/maps",
+                                       (long)&how, (long)sizeof how);
+    ZS_CHECK(r >= 0);
+    struct stat st;
+    ZS_CHECK_EQ(zygisk_study_hook_fstat((int)r, &st), 0);
+    ZS_CHECK_EQ(st.st_size, (off_t)0);   // the fd is a tracked memfd
+    close((int)r);
+
+    // Size argument smaller than struct open_how: the kernel rejects
+    // it with EINVAL; our hook must pass it through, not filter it.
+    long r2 = zygisk_study_hook_syscall((long)SYS_openat2,
+                                        (long)AT_FDCWD,
+                                        (long)"/proc/self/maps",
+                                        (long)&how, 4);
+    ZS_CHECK(r2 < 0);
+    hide_advanced_set_active(0);
+}
+
+// ----------------------------------------------------------------------
+// Round 15 — linker enumeration closure (dl_iterate_phdr / dladdr)
+// ----------------------------------------------------------------------
+
+namespace {
+struct DlCountCtx {
+    int count = 0;
+    int ours = 0;
+    unsigned long long adds = 0, subs = 0;
+    uintptr_t payload_base = 0;
+};
+int dl_count_cb(struct dl_phdr_info* info, size_t, void* d) {
+    DlCountCtx* c = (DlCountCtx*)d;
+    ++c->count;
+    c->adds = info->dlpi_adds;
+    c->subs = info->dlpi_subs;
+    if (dl_name_is_ours(info->dlpi_name)) {
+        ++c->ours;
+        if (strstr(info->dlpi_name, "libpayload.so") != nullptr) {
+            c->payload_base = info->dlpi_addr;
+        }
+    }
+    return 0;
+}
+} // namespace
+
+// The hook hides our DSOs from enumeration AND keeps the
+// dlpi_adds/dlpi_subs arithmetic consistent (iterations == adds -
+// subs), so a counting detector sees a self-consistent, smaller
+// universe instead of a mismatch.
+ZS_TEST(dl_iterate_phdr_hook_hides_our_libraries_and_keeps_counters) {
+    void* h = dlopen("./libpayload.so", RTLD_NOW);
+    ZS_CHECK(h != nullptr);
+
+    // Anchor 1: the REAL iterator reports libpayload.so (it is
+    // genuinely loaded into this process).
+    DlCountCtx real;
+    dl_iterate_phdr(dl_count_cb, &real);
+    ZS_CHECK(real.count > 1);
+    ZS_CHECK(real.ours >= 1);
+    ZS_CHECK(real.payload_base != 0);
+
+    // Anchor 2 (host-libc invariant the counter fix preserves):
+    // iterations == adds - subs on the unfiltered walk.
+    ZS_CHECK_EQ(real.adds - real.subs, (unsigned long long)real.count);
+
+    // The hook must produce exactly that minus our entries.
+    hide_advanced_set_active(1);
+    DlCountCtx filt;
+    int rv = zygisk_study_hook_dl_iterate_phdr(dl_count_cb, &filt);
+    hide_advanced_set_active(0);
+    ZS_CHECK_EQ(rv, 0);
+    ZS_CHECK_EQ(filt.ours, 0);
+    ZS_CHECK_EQ(filt.count, real.count - real.ours);
+    ZS_CHECK_EQ(filt.adds - filt.subs, (unsigned long long)filt.count);
+
+    dlclose(h);
+}
+
+// dladdr on an address inside our (still mapped, for this test)
+// library: the real call names our .so path; the hook answers 0 with
+// a zeroed Dl_info — exactly what a stock process answers for an
+// anonymous mapping.
+ZS_TEST(dladdr_hook_answers_not_found_for_our_pages) {
+    void* h = dlopen("./libpayload.so", RTLD_NOW);
+    ZS_CHECK(h != nullptr);
+
+    DlCountCtx probe;
+    dl_iterate_phdr(dl_count_cb, &probe);
+    ZS_CHECK(probe.payload_base != 0);
+    // An address inside the first (always-present) page of the image.
+    void* addr = (void*)(probe.payload_base + 0x800);
+
+    Dl_info info;
+    memset(&info, 0, sizeof info);
+    ZS_CHECK_EQ(dladdr(addr, &info), 1);
+    ZS_CHECK(info.dli_fname != nullptr);
+    ZS_CHECK(dl_name_is_ours(info.dli_fname));
+
+    hide_advanced_set_active(1);
+    memset(&info, 0xAA, sizeof info);
+    ZS_CHECK_EQ(zygisk_study_hook_dladdr(addr, &info), 0);
+    ZS_CHECK(info.dli_fname == nullptr);
+    ZS_CHECK(info.dli_fbase == nullptr);
+    ZS_CHECK(info.dli_sname == nullptr);
+    hide_advanced_set_active(0);
+
+    dlclose(h);
+}
+
+// The GOT registry must contain every Round 15 hook name so the Tier
+// B install actually promotes them.
+ZS_TEST(tier_b_registry_contains_round15_hooks) {
+    struct Wanted { const char* name; bool found; };
+    Wanted wanted[] = {
+        {"fstat", false}, {"fstat64", false},
+        {"mmap", false}, {"mmap64", false},
+        {"dl_iterate_phdr", false},
+        {"dladdr", false}, {"dladdr1", false},
+    };
+    for (auto& w : wanted) {
+        // Match against the tier B registry the way
+        // hide_advanced_install_tier_b promotes it.
+        for (size_t i = 0; i < g_tier_b_hook_count; ++i) {
+            if (strcmp(g_tier_b_hooks[i].name, w.name) == 0) {
+                w.found = true;
+                break;
+            }
+        }
+    }
+    for (auto& w : wanted) {
+        if (!w.found) {
+            std::fprintf(stderr,
+                         "  [missing from tier B registry: %s]\n", w.name);
+        }
+        ZS_CHECK(w.found);
+    }
 }

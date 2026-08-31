@@ -162,6 +162,16 @@ static int path_is_proc_fd(const char* path) {
     return *p == '\0' ? 1 : 0;
 }
 
+// Extract the trailing fd number from a /proc/<pid>/fd/<n> path
+// that path_is_proc_fd has already validated. Returns -1 when the
+// digits overflow an int (never for real kernel fd numbers).
+static int proc_fd_path_number(const char* path) {
+    const char* p = path + strlen(path);
+    while (p > path && p[-1] >= '0' && p[-1] <= '9') --p;
+    long v = strtol(p, nullptr, 10);
+    return (v >= 0 && v <= 0x7fffffff) ? (int)v : -1;
+}
+
 // Rewrite the readlink result if it contains a suspicious substring.
 // `target_kind`: 0 = /proc/<pid>/exe (rewrite to the stock app_process
 // path), 1 = /proc/<pid>/fd/<n> (rewrite to /dev/null).
@@ -187,7 +197,11 @@ static ssize_t rewrite_if_suspicious(char* buf, size_t bufsiz,
     const char* replacement =
         (target_kind == 0) ? stock_exe_path() : "/dev/null";
     size_t rlen = __builtin_strlen(replacement);
-    if (rlen >= bufsiz) rlen = bufsiz - 1;
+    // Round 15 (POSIX conformance): readlink() truncates to EXACTLY
+    // bufsiz bytes and returns bufsiz — the old `bufsiz - 1` clamp
+    // made the rewritten answer one byte short, and a caller checking
+    // "return == bufsiz means truncated" could see a phantom NUL.
+    if (rlen > bufsiz) rlen = bufsiz;
     memcpy(buf, replacement, rlen);
     return (ssize_t)rlen;
 }
@@ -209,6 +223,14 @@ extern "C" ssize_t zygisk_study_hook_readlink(const char* path,
         return rewrite_if_suspicious(buf, bufsiz, n, 0);
     }
     if (path_is_proc_fd(path)) {
+        // Round 15 (fd observable parity): one of OUR filtered memfds
+        // answers "memfd:scudo" where a stock fd would answer the proc
+        // path it was opened from. Rewrite it to exactly that before
+        // the generic suspicious-substring rewrite gets a chance.
+        int fd = proc_fd_path_number(path);
+        ssize_t spoofed = hide_advanced_spoof_memfd_readlink(
+            fd, buf, (size_t)n, buf, bufsiz);
+        if (spoofed > 0) return spoofed;
         return rewrite_if_suspicious(buf, bufsiz, n, 1);
     }
     return n;
@@ -232,6 +254,11 @@ extern "C" ssize_t zygisk_study_hook_readlinkat(int dirfd,
         return rewrite_if_suspicious(buf, bufsiz, n, 0);
     }
     if (path_is_proc_fd(path)) {
+        // Round 15: same memfd-origin spoof as readlink().
+        int fd = proc_fd_path_number(path);
+        ssize_t spoofed = hide_advanced_spoof_memfd_readlink(
+            fd, buf, (size_t)n, buf, bufsiz);
+        if (spoofed > 0) return spoofed;
         return rewrite_if_suspicious(buf, bufsiz, n, 1);
     }
     return n;

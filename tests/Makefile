@@ -36,7 +36,7 @@ all: $(TESTS) libpayload.so
 test_hide: test_hide.cpp ../native/libpayload/src/hide.cpp ../native/common/log.h test_framework.h
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -o $@ $< -ldl
 
-test_hide_advanced: test_hide_advanced.cpp ../native/libpayload/src/hide_advanced.cpp ../native/common/log.h test_framework.h
+test_hide_advanced: test_hide_advanced.cpp ../native/libpayload/src/hide_advanced.cpp ../native/common/log.h test_framework.h libpayload.so
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -o $@ $< -ldl
 
 test_hide_stealth: test_hide_stealth.cpp ../native/libpayload/src/hide_stealth.cpp ../native/libpayload/src/hide_advanced.cpp ../native/common/log.h test_framework.h

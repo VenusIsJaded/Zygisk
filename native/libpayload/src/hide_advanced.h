@@ -98,6 +98,19 @@ void hide_advanced_track_fd(int fd);
 void hide_advanced_register_root_path_prefix(const char* prefix);
 void hide_advanced_register_unix_hidden_substring(const char* s);
 
+// Round 15 — fd observable parity. Called by the readlink hooks in
+// hide_stealth.cpp after the REAL readlink of /proc/<pid>/fd/<n>: if
+// the descriptor is one of our filtered memfds (identified by fd
+// number, or by dev/ino for dup'd descriptors) and the real target is
+// our "memfd:scudo" marker, writes the ORIGINAL proc path into `buf`
+// (exactly what a stock procfs fd would answer) and returns its
+// length. Returns 0 when no spoof applies — the caller then keeps the
+// real result.
+ssize_t hide_advanced_spoof_memfd_readlink(int fd,
+                                           const char* real_target,
+                                           size_t real_len, char* buf,
+                                           size_t bufsiz);
+
 // One-time init: resolve real libc symbols and register this layer's
 // Tier B hooks into the registry. Does NOT walk yet.
 void hide_advanced_init();

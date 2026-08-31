@@ -893,6 +893,194 @@ static int make_filtered_memfd(int orig_fd, const char* target_path) {
     return memfd;
 }
 
+// ------------------------------------------------------------------------
+// 5a. The fd shadow table (Round 15) — procfs observable parity
+// ------------------------------------------------------------------------
+//
+// Every filtered /proc read hands the caller a memfd instead of the
+// real procfs file. The CONTENT is right, but an fd is more than its
+// content: a suspicious app can turn the descriptor around and ask
+// questions a stock procfs fd answers differently:
+//
+//   readlink("/proc/self/fd/N")   real: "/proc/self/maps"
+//                                 ours (pre-R15): "memfd:scudo"
+//   fstat(N).st_size              real: 0      (procfs always reports 0)
+//                                 ours: filtered byte count
+//   fstat(N).st_mode              real: S_IFREG|0444
+//                                 ours: S_IFREG|0777 (shmem files)
+//   mmap(..., N, ...)             real: ENODEV (procfs has no .mmap)
+//                                 ours: works — a memfd is mmap-able
+//
+// Each mismatch is a quiet "I am being filtered" signal. This table
+// records, for every memfd we hand out, the identity (dev/ino/size —
+// captured at creation) plus the ORIGINAL path the caller asked for.
+// The fstat/statx/mmap/readlink hooks then reproduce the stock procfs
+// answer for exactly those descriptors.
+//
+// Validation without a close() hook: entries can go stale (the app
+// closes our memfd; the fd number is reused for something else). Every
+// consumer first re-stats the fd and compares dev/ino/size against the
+// record; a mismatch means the entry is stale — it is dropped and the
+// real libc behavior passes through untouched. fd reuse to a NEW file
+// cannot produce all three matches (dev+ino identify the file).
+//
+// dup()/fcntl(F_DUPFD)/pidfd_getfd() create new fd numbers pointing at
+// the SAME file: the number lookup misses, but a dev/ino scan finds
+// the record — readlink spoofing therefore covers duplicated
+// descriptors too (the fstat-size rewrite only covers the original
+// number; documented residual, both paths tested).
+//
+// Verified against Linux/Android behavior, stable across every
+// supported release: procfs regular files report st_size 0 and reject
+// mmap with ENODEV; memfd files are mode-0777 shmem files whose
+// readlink target is "memfd:<name>". (Android version research for
+// this round is in docs/ANDROID-REALISM.md.)
+
+struct FdShadow {
+    int      fd;            // -1 = free slot
+    uint64_t dev;
+    uint64_t ino;
+    uint64_t size;          // exact st_size at creation
+    char     orig_path[96]; // path the caller opened (what readlink
+                            // must answer with)
+};
+static FdShadow g_fd_shadow[32];
+static size_t   g_fd_shadow_count;   // high-water mark, scan bounded
+
+// st_dev of the procfs mount — sampled once (lazily) from a real
+// unfiltered /proc file so our spoofed stats report a believable
+// device instead of the shmem one.
+static uint64_t g_procfs_dev = 0;
+static int      g_procfs_dev_done = 0;
+
+static uint64_t zs_procfs_dev() {
+    if (ZS_UNLIKELY(!g_procfs_dev_done)) {
+        g_procfs_dev_done = 1;
+        struct stat st;
+        // /proc/self/cmdline is real procfs and NOT a filtered file —
+        // its stat passes through every hook untouched. Calling the
+        // libc symbol directly is safe from inside our own hooks: our
+        // own DSO's GOT is never patched (the walker skips our libs).
+        if (stat("/proc/self/cmdline", &st) == 0) {
+            g_procfs_dev = (uint64_t)st.st_dev;
+        }
+    }
+    return g_procfs_dev;
+}
+
+// Record the memfd we are about to hand to the caller.
+static void fd_shadow_register(int memfd, const char* orig_path) {
+    if (memfd < 0 || !orig_path) return;
+    struct stat st;
+    // g_real_fstat may not be resolved yet on the first call; use the
+    // libc fstat directly — it cannot recurse into our hooks because
+    // fstat is not intercepted at libc-internal call sites.
+    if (fstat(memfd, &st) != 0) return;
+    // Reuse the slot of a dead entry, else the next free one.
+    FdShadow* slot = nullptr;
+    for (size_t i = 0; i < g_fd_shadow_count; ++i) {
+        if (g_fd_shadow[i].fd == memfd) { slot = &g_fd_shadow[i]; break; }
+    }
+    if (!slot) {
+        for (size_t i = 0; i < g_fd_shadow_count; ++i) {
+            if (g_fd_shadow[i].fd < 0) { slot = &g_fd_shadow[i]; break; }
+        }
+    }
+    if (!slot && g_fd_shadow_count <
+                 sizeof(g_fd_shadow) / sizeof(g_fd_shadow[0])) {
+        slot = &g_fd_shadow[g_fd_shadow_count++];
+    }
+    if (!slot) return;   // table full: plain memfd behavior (documented)
+    slot->fd   = memfd;
+    slot->dev  = (uint64_t)st.st_dev;
+    slot->ino  = (uint64_t)st.st_ino;
+    slot->size = (uint64_t)st.st_size;
+    size_t n = strlen(orig_path);
+    if (n >= sizeof slot->orig_path) n = sizeof slot->orig_path - 1;
+    memcpy(slot->orig_path, orig_path, n);
+    slot->orig_path[n] = '\0';
+}
+
+// Find the shadow record whose fd matches AND whose dev/ino/size still
+// match the live descriptor. Returns nullptr for "not one of ours"
+// (including stale entries — which are invalidated here).
+static FdShadow* fd_shadow_lookup(int fd) {
+    for (size_t i = 0; i < g_fd_shadow_count; ++i) {
+        if (g_fd_shadow[i].fd != fd) continue;
+        struct stat st;
+        if (fstat(fd, &st) != 0) { g_fd_shadow[i].fd = -1; return nullptr; }
+        if ((uint64_t)st.st_dev == g_fd_shadow[i].dev &&
+            (uint64_t)st.st_ino == g_fd_shadow[i].ino &&
+            (uint64_t)st.st_size == g_fd_shadow[i].size) {
+            return &g_fd_shadow[i];
+        }
+        // fd number reused for a different file — entry is dead.
+        g_fd_shadow[i].fd = -1;
+        return nullptr;
+    }
+    return nullptr;
+}
+
+// Find the shadow record by FILE IDENTITY (dup'd descriptors have new
+// fd numbers but the same dev/ino). Caller has already fstat'd.
+static FdShadow* fd_shadow_scan_by_identity(uint64_t dev, uint64_t ino) {
+    for (size_t i = 0; i < g_fd_shadow_count; ++i) {
+        if (g_fd_shadow[i].fd >= 0 && g_fd_shadow[i].dev == dev &&
+            g_fd_shadow[i].ino == ino) {
+            return &g_fd_shadow[i];
+        }
+    }
+    return nullptr;
+}
+
+// Rewrite a filled-in `struct stat` to look like real procfs.
+static void stat_rewrite_as_procfs(struct stat* st) {
+    st->st_mode  = S_IFREG | 0444;
+    st->st_size  = 0;
+    st->st_blocks = 0;
+    st->st_rdev  = 0;
+    uint64_t pdev = zs_procfs_dev();
+    if (pdev) st->st_dev = (dev_t)pdev;
+    // st_ino: procfs inode numbers are dynamic per boot; any stable
+    // non-zero value is indistinguishable from a real one.
+    if (st->st_ino == 0) st->st_ino = 0x1000;
+}
+
+// Public helper used by the readlink hooks (hide_stealth.cpp).
+// The REAL readlink result for one of our memfds is
+// "/memfd:scudo (deleted)" — the kernel prefixes memfd targets with
+// '/' (verified on Linux host; the same format since memfd_create
+// was introduced). Accept the prefixed and bare forms. `fd` is
+// parsed from the /proc/<pid>/fd/<n> path.
+// Returns the spoofed length (>0), or 0 when no spoof applies.
+ssize_t hide_advanced_spoof_memfd_readlink(int fd, const char* real_target,
+                                           size_t real_len, char* buf,
+                                           size_t bufsiz) {
+    if (fd < 0 || !buf || bufsiz == 0) return 0;
+    static const char kMemfdMark[] = "memfd:scudo";
+    constexpr size_t kMemfdMarkLen = sizeof(kMemfdMark) - 1;
+    const char* t = real_target;
+    size_t tl = real_len;
+    if (tl > 0 && t[0] == '/') { ++t; --tl; }
+    if (tl < kMemfdMarkLen ||
+        memcmp(t, kMemfdMark, kMemfdMarkLen) != 0) {
+        return 0;   // not one of ours (or a genuinely other memfd)
+    }
+    // Direct hit by fd number, else identity scan for dups.
+    FdShadow* rec = fd_shadow_lookup(fd);
+    if (!rec) {
+        struct stat st;
+        if (fstat(fd, &st) != 0) return 0;
+        rec = fd_shadow_scan_by_identity((uint64_t)st.st_dev,
+                                         (uint64_t)st.st_ino);
+        if (!rec) return 0;
+    }
+    size_t n = strlen(rec->orig_path);
+    if (n > bufsiz) n = bufsiz;          // readlink truncation semantics
+    memcpy(buf, rec->orig_path, n);
+    return (ssize_t)n;
+}
+
 // Wrap the original open so the caller gets back either the original
 // fd (for non-filtered paths) or a filtered memfd (for filtered
 // paths).
@@ -906,10 +1094,22 @@ static int wrapped_open(const char* path, int flags, mode_t mode) {
 
     int memfd = make_filtered_memfd(real_fd, path);
     close(real_fd);
-    if (memfd >= 0) return memfd;
-    // B2 history: never return the closed fd.
-    errno = EBADF;
-    return -1;
+    if (memfd >= 0) {
+        fd_shadow_register(memfd, path);
+        return memfd;
+    }
+    // Round 15: fail-open. memfd_create exists since Linux 3.17 —
+    // every Android 8+ device kernel (3.18 floor) has it, so this
+    // branch is only reachable under ENOMEM-class pressure. The old
+    // behavior (EBADF after closing the real fd) made every /proc read
+    // fail bizarrely in exactly that situation — a louder anomaly
+    // than serving the unfiltered file. Log and hand back the real fd.
+    ZS_LOGW("hide_advanced: filter memfd unavailable; passing the real "
+            "fd for %s through unfiltered", path);
+    // B2 history: never return the closed fd — re-open instead.
+    return g_real_open
+        ? g_real_open(path, flags & ~O_TRUNC, mode)
+        : (int)syscall(SYS_openat, AT_FDCWD, path, flags & ~O_TRUNC, mode);
 }
 
 static int wrapped_openat(int dirfd, const char* path, int flags,
@@ -935,9 +1135,16 @@ static int wrapped_openat(int dirfd, const char* path, int flags,
 
     int memfd = make_filtered_memfd(real_fd, path);
     close(real_fd);
-    if (memfd >= 0) return memfd;
-    errno = EBADF;
-    return -1;
+    if (memfd >= 0) {
+        fd_shadow_register(memfd, path);
+        return memfd;
+    }
+    // Round 15 fail-open — see wrapped_open.
+    ZS_LOGW("hide_advanced: filter memfd unavailable; passing the real "
+            "fd for %s through unfiltered", path);
+    return g_real_openat
+        ? g_real_openat(dirfd, path, flags & ~O_TRUNC, mode)
+        : (int)syscall(SYS_openat, dirfd, path, flags & ~O_TRUNC, mode);
 }
 
 extern "C" int zygisk_study_hook_open(const char* path, int flags, ...) {
@@ -1000,11 +1207,15 @@ static FILE* zs_real_fopen(const char* path, const char* mode) {
     int flags = O_RDONLY;
     if (strchr(mode, 'w'))      flags = O_WRONLY | O_CREAT | O_TRUNC;
     else if (strchr(mode, 'a')) flags = O_WRONLY | O_CREAT | O_APPEND;
-    else if (strchr(mode, '+')) flags = O_RDWR;
+    else if (strchr(mode, 'r') && strchr(mode, '+')) flags = O_RDWR;
+    // Round 15: real fopen() adds O_CLOEXEC ONLY for mode strings
+    // containing 'e' (the glibc/bionic "e" extension). The old
+    // fallback added it unconditionally — an exec'd helper would
+    // silently lose the fd it should have inherited.
+    if (strchr(mode, 'e')) flags |= O_CLOEXEC;
     int fd = g_real_open
-        ? g_real_open(path, flags | O_CLOEXEC, 0666)
-        : (int)syscall(SYS_openat, AT_FDCWD, path, flags | O_CLOEXEC,
-                       0666);
+        ? g_real_open(path, flags, 0666)
+        : (int)syscall(SYS_openat, AT_FDCWD, path, flags, 0666);
     if (fd < 0) return nullptr;
     FILE* f = fdopen(fd, mode);
     if (!f) close(fd);
@@ -1027,7 +1238,13 @@ extern "C" FILE* zygisk_study_hook_fopen(const char* path,
     int fd = fileno(f);
     int memfd = make_filtered_memfd(fd, path);
     fclose(f);
-    if (memfd < 0) { errno = EBADF; return nullptr; }
+    if (memfd < 0) {
+        // Round 15 fail-open: serve the real stream rather than a
+        // broken FILE* (see wrapped_open).
+        ZS_LOGW("hide_advanced: filter memfd unavailable; fopen passthru");
+        return zs_real_fopen(path, mode);
+    }
+    fd_shadow_register(memfd, path);
     FILE* rf = fdopen(memfd, "r");
     if (!rf) close(memfd);
     return rf;
@@ -1138,6 +1355,9 @@ extern "C" int zygisk_study_hook_fstatat(int dirfd, const char* path,
 extern "C" int zygisk_study_hook_statx(int dirfd, const char* path,
                                        int flags, unsigned int mask,
                                        struct statx* stx);
+// Round 15 (section 5e, defined below the stat family): fill `st`
+// with procfs fiction when `fd` is one of our tracked memfds.
+static int fd_stat_as_procfs(int fd, struct stat* st);
 
 // Paths whose existence would reveal a root framework. We return
 // ENOENT for these.
@@ -1263,6 +1483,39 @@ extern "C" int zygisk_study_hook_fstatat(int dirfd, const char* path,
 extern "C" int zygisk_study_hook_statx(int dirfd, const char* path,
                                        int flags, unsigned int mask,
                                        struct statx* stx) {
+    // Round 15: statx(dirfd, "", AT_EMPTY_PATH, ...) stats the FD
+    // itself — and on aarch64 bionic's fstat() is IMPLEMENTED as
+    // exactly this call, so this arm runs for every fstat() on
+    // 64-bit ARM even when the app never names the empty path.
+    if ((flags & AT_EMPTY_PATH) && (!path || path[0] == '\0') &&
+        hide_advanced_is_active()) {
+        struct stat st;
+        if (fd_stat_as_procfs(dirfd, &st)) {
+            if (!stx) { errno = EFAULT; return -1; }
+            int rv = g_real_statx
+                ? g_real_statx(dirfd, path, flags, mask, stx)
+#ifdef SYS_statx
+                : (int)syscall(SYS_statx, dirfd, path, flags, mask, stx);
+#else
+                : -1;
+#endif
+            if (rv != 0) return rv;
+            // Overlay the procfs fiction onto the real statx result.
+            stx->stx_mode  = (uint16_t)(S_IFREG | 0444);
+            stx->stx_size  = 0;
+#ifdef STATX_BLOCKS
+            if (stx->stx_mask & STATX_BLOCKS) stx->stx_blocks = 0;
+#else
+            stx->__stx_padding0[0] = 0;   // bionic w/o STATX_BLOCKS
+#endif
+            uint64_t pdev = zs_procfs_dev();
+            if (pdev) {
+                stx->stx_dev_major = (uint16_t)(pdev >> 8);
+                stx->stx_dev_minor = (uint16_t)(pdev & 0xff);
+            }
+            return 0;
+        }
+    }
     if (ZS_LIKELY(!hide_advanced_is_active()) ||
         !(path && path[0] == '/' && path_is_hidden(path))) {
         if (g_real_statx) return g_real_statx(dirfd, path, flags, mask, stx);
@@ -1275,6 +1528,229 @@ extern "C" int zygisk_study_hook_statx(int dirfd, const char* path,
     }
     errno = ENOENT;
     return -1;
+}
+
+// ------------------------------------------------------------------------
+// 5e. fstat / mmap hooks (Tier B) — Round 15, fd observable parity
+// ------------------------------------------------------------------------
+//
+// The fd shadow table (section 5a) knows which descriptors are our
+// filtered memfds. These hooks make those descriptors ANSWER like
+// procfs files:
+//   fstat(N)   -> mode 0444, size 0, blocks 0, the procfs st_dev
+//   mmap(N)    -> MAP_FAILED / ENODEV (procfs files cannot be mapped)
+//
+// fstat matters doubly on aarch64: bionic implements fstat() as
+// fstatat(AT_FDCWD, "", AT_EMPTY_PATH) — but apps calling fstat()
+// directly through their PLT hit the fstat symbol, so hooking the
+// symbol covers both call styles on both architectures.
+using FstatFn = int (*)(int, struct stat*);
+static FstatFn g_real_fstat = nullptr;
+
+// Shared body: if `fd` is one of our tracked memfds, fill `st` with
+// the procfs fiction and return 1. Returns 0 (st untouched) otherwise.
+static int fd_stat_as_procfs(int fd, struct stat* st) {
+    if (fd < 0 || !st) return 0;
+    FdShadow* rec = fd_shadow_lookup(fd);
+    if (!rec) return 0;
+    struct stat raw;
+    if (fstat(fd, &raw) != 0) return 0;
+    *st = raw;
+    stat_rewrite_as_procfs(st);
+    return 1;
+}
+
+extern "C" int zygisk_study_hook_fstat(int fd, struct stat* st) {
+    if (ZS_LIKELY(!hide_advanced_is_active())) {
+        return g_real_fstat ? g_real_fstat(fd, st)
+                            : fstat(fd, st);
+    }
+    if (fd_stat_as_procfs(fd, st)) return 0;
+    return g_real_fstat ? g_real_fstat(fd, st) : fstat(fd, st);
+}
+
+using MmapFn = void* (*)(void*, size_t, int, int, int, off_t);
+static MmapFn g_real_mmap = nullptr;
+
+// Real procfs files have no mmap handler: mapping an fd opened from
+// /proc/self/maps fails with ENODEV. A memfd maps fine — so an mmap()
+// that SUCCEEDS on a descriptor the app believes is /proc/self/maps is
+// a hook detector with zero false positives. Reject mappings of our
+// tracked fds exactly like procfs would.
+extern "C" void* zygisk_study_hook_mmap(void* addr, size_t len, int prot,
+                                        int flags, int fd, off_t off) {
+    if (ZS_LIKELY(!hide_advanced_is_active()) || fd < 0 || len == 0) {
+        return g_real_mmap ? g_real_mmap(addr, len, prot, flags, fd, off)
+                           : mmap(addr, len, prot, flags, fd, off);
+    }
+    if (fd_shadow_lookup(fd)) {
+        errno = ENODEV;             // exactly what procfs answers
+        return MAP_FAILED;
+    }
+    return g_real_mmap ? g_real_mmap(addr, len, prot, flags, fd, off)
+                       : mmap(addr, len, prot, flags, fd, off);
+}
+
+// ------------------------------------------------------------------------
+// 5f. dl_iterate_phdr / dladdr hooks (Tier B) — Round 15, linker
+//     enumeration closure
+// ------------------------------------------------------------------------
+//
+// Tier A unmaps the exec/writable segments of our .so files and
+// re-maps the read-only ones as anonymous "linker_alloc" pages, but
+// the dynamic linker's internal soinfo entry SURVIVES (removing it
+// safely is the crash class Round 8 (B6) stepped back from — solist
+// surgery on the wrong Android linker version hard-crashes dlopen).
+// The surviving soinfo is observable through TWO public libc entry
+// points neither of which we hooked:
+//
+//   dl_iterate_phdr(cb, data)  hands cb every loaded DSO, ours
+//                              included, with dlpi_name =
+//                              "/data/adb/modules/<id>/libpayload.so"
+//   dladdr(addr, &info)        for any address inside our (anonymous!)
+//                              pages returns 1 and fills dli_fname
+//                              with the same path — on a stock device
+//                              an anonymous mapping answers 0.
+//
+// Hooking the enumeration instead of the solist keeps the crash
+// safety: the linker state is untouched, only its REPORTED output is
+// filtered.
+//
+// Version note (researched from AOSP bionic): dl_iterate_phdr and
+// dladdr have been exported since API 21; the dlpi_adds/dlpi_subs
+// counters exist in bionic's link.h across every supported release.
+// A detector that compares dlpi_adds against the number of callback
+// invocations would see the mismatch — so the trampoline passes each
+// entry through a COPY of dl_phdr_info with dlpi_adds decremented by
+// the number of hidden entries already skipped.
+using DlIterateFn = int (*)(int (*)(struct dl_phdr_info*, size_t, void*),
+                            void*);
+static DlIterateFn g_real_dl_iterate_phdr = nullptr;
+
+using DladdrFn = int (*)(const void*, Dl_info*);
+static DladdrFn g_real_dladdr = nullptr;
+using Dladdr1Fn = int (*)(const void*, Dl_info*, void**, int);
+static Dladdr1Fn g_real_dladdr1 = nullptr;
+
+// Is this dlpi_name / dli_fname one of ours (or a generic root
+// framework path)? Empty names are the main executable / vdso — a
+// stock process emits them and so do we.
+static int dl_name_is_ours(const char* name) {
+    if (!name || !name[0]) return 0;
+    if (strstr(name, "/data/adb/") != nullptr) return 1;
+    if (strstr(name, "zygisk_study") != nullptr) return 1;
+    static const char* const kOurSoNames[] = {
+        "libpayload.so", "libzygisk.so", "libzn_loader.so",
+    };
+    for (const char* s : kOurSoNames) {
+        size_t n = __builtin_strlen(s);
+        size_t l = strlen(name);
+        if (l >= n && strcmp(name + (l - n), s) == 0) return 1;
+    }
+    return 0;
+}
+
+struct DlIterateEntry {
+    struct dl_phdr_info info;   // copied — the callback may write to it
+    size_t size;
+    std::string name;           // copied: the linker may free the
+                                // original string (concurrent dlclose)
+                                // once the real walk ends
+};
+
+static int dl_iterate_collect_cb(struct dl_phdr_info* info, size_t size,
+                                 void* data) {
+    auto* out = (std::vector<DlIterateEntry>*)data;
+    DlIterateEntry e;
+    e.size = size;
+    if (info) {
+        e.info = *info;
+        if (info->dlpi_name) e.name = info->dlpi_name;
+    } else {
+        memset(&e.info, 0, sizeof e.info);
+    }
+    out->push_back(std::move(e));
+    return 0;   // collect everything; filtering happens at emission
+}
+
+extern "C" int zygisk_study_hook_dl_iterate_phdr(
+        int (*cb)(struct dl_phdr_info*, size_t, void*), void* data) {
+    if (ZS_LIKELY(!hide_advanced_is_active()) || !cb) {
+        return g_real_dl_iterate_phdr
+            ? g_real_dl_iterate_phdr(cb, data)
+            : dl_iterate_phdr(cb, data);
+    }
+    // Round 15 (revised after the first test run): the streaming
+    // trampoline could not fix dlpi_adds for entries that came
+    // BEFORE our (usually last-loaded) library, and emitting the
+    // caller's callback after releasing the linker lock raced a
+    // concurrent dlclose freeing dlpi_name. Collect-and-emit closes
+    // both: one walk, one consistent snapshot, names copied out, and
+    // every emitted entry carries the SAME uniformly adjusted
+    // dlpi_adds — so the caller's "iterations == adds - subs"
+    // arithmetic stays exact (verified by the host test that first
+    // exposed this).
+    try {
+        std::vector<DlIterateEntry> entries;
+        entries.reserve(16);
+        int rv = g_real_dl_iterate_phdr
+            ? g_real_dl_iterate_phdr(dl_iterate_collect_cb, &entries)
+            : dl_iterate_phdr(dl_iterate_collect_cb, &entries);
+        if (rv != 0) return rv;
+
+        size_t hidden = 0;
+        for (const DlIterateEntry& e : entries) {
+            if (dl_name_is_ours(e.name.c_str())) ++hidden;
+        }
+
+        for (DlIterateEntry& e : entries) {
+            if (dl_name_is_ours(e.name.c_str())) continue;
+            e.info.dlpi_name = e.name.c_str();
+            if (e.info.dlpi_adds >= hidden) {
+                e.info.dlpi_adds -= hidden;
+            }
+            int r = cb(&e.info, e.size, data);
+            if (r != 0) return r;   // early termination, same as the
+                                    // real iterator's contract
+        }
+        return 0;
+    } catch (...) {
+        // OOM inside the copy buffers: fall back to the unfiltered
+        // real iterator rather than unwinding through a C boundary.
+        // (Stealth loss under memory exhaustion is acceptable; a
+        // terminate() inside dl_iterate_phdr is not.)
+        return g_real_dl_iterate_phdr
+            ? g_real_dl_iterate_phdr(cb, data)
+            : dl_iterate_phdr(cb, data);
+    }
+}
+
+// dladdr: an address inside our anonymous remap answers "not found"
+// (0) on a stock process; return exactly that. The Dl_info is zeroed
+// first because a spec-conforming caller may check fields even when
+// the return is 0.
+extern "C" int zygisk_study_hook_dladdr(const void* addr, Dl_info* info) {
+    int rv = g_real_dladdr ? g_real_dladdr(addr, info)
+                           : dladdr(addr, info);
+    if (rv == 0 || !hide_advanced_is_active() || !info) return rv;
+    if (dl_name_is_ours(info->dli_fname)) {
+        memset(info, 0, sizeof *info);
+        return 0;
+    }
+    return rv;
+}
+
+extern "C" int zygisk_study_hook_dladdr1(const void* addr, Dl_info* info,
+                                         void** extra, int flags) {
+    int rv = g_real_dladdr1
+        ? g_real_dladdr1(addr, info, extra, flags)
+        : dladdr1(addr, info, extra, flags);
+    if (rv == 0 || !hide_advanced_is_active() || !info) return rv;
+    if (dl_name_is_ours(info->dli_fname)) {
+        memset(info, 0, sizeof *info);
+        return 0;
+    }
+    return rv;
 }
 
 // ------------------------------------------------------------------------
@@ -1439,6 +1915,19 @@ extern "C" int zygisk_study_hook_prop_foreach(
 using SyscallFn = long (*)(long, ...);
 static SyscallFn g_real_syscall = nullptr;
 
+// openat2's argument struct (Linux >= 5.6). Defined locally because
+// no bionic release ships <linux/openat2.h> (verified against
+// main-branch bionic libc/include/fcntl.h) and NDK sysroot headers
+// only gained it recently.
+struct zs_open_how {
+    uint64_t flags;
+    uint64_t mode;
+    uint64_t resolve;
+};
+#ifndef SYS_openat2
+#define SYS_openat2 437   // unified syscall number on all supported arches
+#endif
+
 extern "C" long zygisk_study_hook_syscall(long number, ...) {
     // Extract ALL SIX syscall arguments up front. The Round 7 version
     // forwarded only four: any caller invoking a 5- or 6-argument
@@ -1473,6 +1962,32 @@ extern "C" long zygisk_study_hook_syscall(long number, ...) {
             mode_t mode = (flags & O_CREAT) ? (mode_t)a[3] : 0;
             return wrapped_openat((int)a[0], path, flags, mode);
         }
+    }
+#endif
+#ifdef SYS_openat2
+    if (number == (long)SYS_openat2) {
+        // Round 15: openat2 (Linux 5.6+, i.e. Android 13+ kernels)
+        // has NO bionic wrapper in ANY release (verified against
+        // main-branch bionic libc/include/fcntl.h) — the only way an
+        // app reaches it is exactly this raw syscall() call, which
+        // used to sail past the open/openat arms above. open_how has
+        // carried {flags, mode, resolve} since the syscall was added.
+        const struct zs_open_how* how = (const struct zs_open_how*)a[2];
+        const char* path = (const char*)a[1];
+        if (path && path[0] == '/' && how &&
+            a[3] >= (long)sizeof(*how) && zs_path_is_filtered(path)) {
+            int flags = (int)how->flags;
+            mode_t mode = (flags & O_CREAT) ? (mode_t)how->mode : 0;
+            return wrapped_openat((int)a[0], path, flags, mode);
+        }
+    }
+#endif
+#ifdef SYS_fstat
+    if (number == (long)SYS_fstat && hide_advanced_is_active()) {
+        // x86_64-only raw path (aarch64 has no SYS_fstat — its fstat
+        // is fstatat AT_EMPTY_PATH, covered by the statx hook).
+        struct stat* st = (struct stat*)a[1];
+        if (fd_stat_as_procfs((int)a[0], st)) return 0;
     }
 #endif
 #ifdef SYS_open
@@ -2222,6 +2737,13 @@ void hide_advanced_init() {
         "android_dlopen_ext");
     g_real_dlclose    = (DlcloseFn)zs_resolve_libc("dlclose");
     g_real_opendir    = (OpendirFn)zs_resolve_libc("opendir");
+    // Round 15 — the fd-observable and linker-enumeration layers.
+    g_real_fstat      = (FstatFn)zs_resolve_libc("fstat");
+    g_real_mmap       = (MmapFn)zs_resolve_libc("mmap");
+    g_real_dl_iterate_phdr =
+        (DlIterateFn)zs_resolve_libc("dl_iterate_phdr");
+    g_real_dladdr     = (DladdrFn)zs_resolve_libc("dladdr");
+    g_real_dladdr1    = (Dladdr1Fn)zs_resolve_libc("dladdr1");
 
     // Register the Tier B hooks into the DEFERRED registry. They are
     // promoted and walked only when a hide actually lands on the
@@ -2289,6 +2811,23 @@ void hide_advanced_init() {
         (void*)&zygisk_study_hook_scandir);
     hide_advanced_register_tier_b_hook("scandirat",
         (void*)&zygisk_study_hook_scandirat);
+    // Round 15 — fd observable parity (fstat/fstat64 are one symbol
+    // on LP64; registering both names is free where one is absent).
+    hide_advanced_register_tier_b_hook("fstat",
+        (void*)&zygisk_study_hook_fstat);
+    hide_advanced_register_tier_b_hook("fstat64",
+        (void*)&zygisk_study_hook_fstat);
+    hide_advanced_register_tier_b_hook("mmap",
+        (void*)&zygisk_study_hook_mmap);
+    hide_advanced_register_tier_b_hook("mmap64",
+        (void*)&zygisk_study_hook_mmap);
+    // Round 15 — linker enumeration closure.
+    hide_advanced_register_tier_b_hook("dl_iterate_phdr",
+        (void*)&zygisk_study_hook_dl_iterate_phdr);
+    hide_advanced_register_tier_b_hook("dladdr",
+        (void*)&zygisk_study_hook_dladdr);
+    hide_advanced_register_tier_b_hook("dladdr1",
+        (void*)&zygisk_study_hook_dladdr1);
 }
 
 #ifdef ZS_HOST_TEST

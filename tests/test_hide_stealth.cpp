@@ -406,3 +406,84 @@ int main() {
     std::fprintf(stderr, "=== Zygisk Study stealth layer tests ===\n");
     return zstest::run_all();
 }
+
+// ----------------------------------------------------------------------
+// Round 15 — readlink() fd-origin spoof, end to end through the hook
+// ----------------------------------------------------------------------
+
+// The hook must answer "/proc/self/maps" when the app readlinks the
+// very descriptor it got from OUR filtered open — and the same for a
+// dup'd descriptor (identity scan), while an ordinary fd keeps its
+// real target. This is the Riru-era cross-check detector.
+extern "C" int zygisk_study_hook_open(const char* path, int flags, ...);
+
+ZS_TEST(readlink_hook_spoofs_memfd_origin_end_to_end) {
+    hide_advanced_set_active(1);
+
+    int fd = zygisk_study_hook_open("/proc/self/maps", O_RDONLY);
+    ZS_CHECK(fd >= 0);
+
+    char path[64];
+    snprintf(path, sizeof path, "/proc/self/fd/%d", fd);
+    char buf[256];
+    memset(buf, 0, sizeof buf);
+
+    ssize_t n = zygisk_study_hook_readlink(path, buf, sizeof buf - 1);
+    ZS_CHECK(n > 0);
+    ZS_CHECK_EQ((int)n, 15);
+    ZS_CHECK_EQ(strncmp(buf, "/proc/self/maps", 15), 0);
+
+    // The REAL kernel answer for that fd is "/memfd:scudo (deleted)"
+    // (leading slash — kernel format, verified on Linux host) — check
+    // the marker directly so the test fails loudly if the kernel ever
+    // changes the memfd link format.
+    char raw[64];
+    ssize_t rn = readlink(path, raw, sizeof raw - 1);
+    ZS_CHECK(rn > 0);
+    raw[rn] = '\0';
+    const char* rawmark = (raw[0] == '/') ? raw + 1 : raw;
+    ZS_CHECK(strncmp(rawmark, "memfd:scudo", 11) == 0);
+
+    // dup'd descriptor: new number, same file — still spoofed.
+    int dup_fd = dup(fd);
+    ZS_CHECK(dup_fd >= 0);
+    snprintf(path, sizeof path, "/proc/self/fd/%d", dup_fd);
+    memset(buf, 0, sizeof buf);
+    n = zygisk_study_hook_readlink(path, buf, sizeof buf - 1);
+    ZS_CHECK(n > 0);
+    ZS_CHECK_EQ((int)n, 15);
+    ZS_CHECK_EQ(strncmp(buf, "/proc/self/maps", 15), 0);
+
+    // readlinkat variant with the same fd.
+    memset(buf, 0, sizeof buf);
+    n = zygisk_study_hook_readlinkat(AT_FDCWD, path, buf, sizeof buf - 1);
+    ZS_CHECK(n > 0);
+    ZS_CHECK_EQ((int)n, 15);
+
+    // An ordinary descriptor (the test's own dirfd) is untouched.
+    int ordinary = open("/tmp", O_RDONLY);
+    if (ordinary >= 0) {
+        snprintf(path, sizeof path, "/proc/self/fd/%d", ordinary);
+        memset(buf, 0, sizeof buf);
+        n = zygisk_study_hook_readlink(path, buf, sizeof buf - 1);
+        ZS_CHECK(n > 0);
+        ZS_CHECK(strncmp(buf, "/tmp", 4) == 0);
+        close(ordinary);
+    }
+
+    close(dup_fd);
+    close(fd);
+    hide_advanced_set_active(0);
+}
+
+// POSIX readlink truncation conformance for the rewrite path: the
+// replacement is truncated to EXACTLY bufsiz bytes (not bufsiz-1).
+ZS_TEST(rewrite_if_suspicious_truncates_to_exact_bufsiz) {
+    char buf[8];
+    // Suspicious content must be discoverable within the visible
+    // window ("/sbin/" is 6 bytes <= 8).
+    memcpy(buf, "/sbin/x", 8);
+    ssize_t n = rewrite_if_suspicious(buf, sizeof buf, 8, 1);
+    ZS_CHECK_EQ(n, (ssize_t)8);
+    ZS_CHECK_EQ(memcmp(buf, "/dev/nul", 8), 0);
+}
