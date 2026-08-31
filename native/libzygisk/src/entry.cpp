@@ -227,6 +227,56 @@ static constexpr const char* kPayloadPath() {
 #endif
 }
 
+// Round 30 — randomized-soname support (STEALTH).
+//
+// customize.sh installs the bridge and the payload under per-install
+// randomized names: lib<8-hex>.so (bridge) and lib<8-hex>-p.so
+// (payload), recorded in the module's .loader_names file and mounted
+// systemlessly into /system/lib[64]. A fixed "libzygisk.so" /
+// "libpayload.so" in every process's /proc/self/maps is a trivial
+// string-match signature for name-based Zygisk detectors; a random
+// name per install defeats that class of scan (Magisk ships the
+// fixed name — topjohnwu/Magisk daemon.rs, ZYGISKLDR — and accepts
+// the exposure; we do not have to).
+//
+// The bridge learns the payload's name from ITS OWN mapped path:
+// dladdr() reports the exact file the linker resolved for this
+// library ("/system/lib64/lib<8-hex>.so"), and the payload's name
+// is the same stem with a "-p" inserted before ".so" — the coupling
+// customize.sh generates. Two fallbacks cover every other layout:
+// the legacy fixed names (manual installs, host tests) and the
+// plain soname (lets the default search path find a legacy
+// libpayload.so next to the bridge, which is what the host
+// version-compat tests do).
+static void libzygisk_ctor();   // defined below (bootstrap section)
+static void derive_payload_path(char* out, size_t cap) {
+    if (!out || cap == 0) return;
+    out[0] = '\0';
+    Dl_info info{};
+    if (dladdr((const void*)&libzygisk_ctor, &info) != 0 &&
+        info.dli_fname && info.dli_fname[0] == '/') {
+        const char* fname = info.dli_fname;
+        size_t len = strlen(fname);
+        // ".../lib<stem>.so" -> ".../lib<stem>-p.so"
+        if (len >= 4 && strcmp(fname + len - 3, ".so") == 0 &&
+            len + 2 < cap) {
+            memcpy(out, fname, len - 3);
+            memcpy(out + len - 3, "-p.so", 6);
+            return;
+        }
+        // Any other extension shape: keep the directory and try the
+        // legacy fixed name inside it.
+        const char* slash = strrchr(fname, '/');
+        if (slash && (size_t)(slash - fname) + 1 + 14 < cap) {
+            memcpy(out, fname, (size_t)(slash - fname) + 1);
+            strcpy(out + (slash - fname) + 1, "libpayload.so");
+            return;
+        }
+    }
+    strncpy(out, kPayloadPath(), cap - 1);
+    out[cap - 1] = '\0';
+}
+
 static void* g_real_native_bridge = nullptr;
 static const struct NativeBridgeCallbacks* g_real_table = nullptr;
 static void* g_payload            = nullptr;
@@ -275,10 +325,24 @@ static void try_load_real_native_bridge() {
 }
 
 static void try_load_payload() {
-    g_payload = dlopen(kPayloadPath(), RTLD_LAZY);
+    // Round 30: randomized-soname install (see derive_payload_path):
+    // try the name derived from our own mapped path first, then the
+    // plain soname (legacy layout: the payload next to the bridge in
+    // the linker search path), then the legacy absolute path. On a
+    // device with the Round 30 install layout the derived name hits;
+    // on host tests and manual installs the soname fallback resolves
+    // ./libpayload.so exactly as before.
+    char path[512];
+    derive_payload_path(path, sizeof path);
+    g_payload = dlopen(path, RTLD_LAZY);
     if (!g_payload) {
-        ZS_LOGE("libzygisk: dlopen(%s) failed: %s", kPayloadPath(),
-                dlerror());
+        g_payload = dlopen("libpayload.so", RTLD_LAZY);
+    }
+    if (!g_payload) {
+        g_payload = dlopen(kPayloadPath(), RTLD_LAZY);
+    }
+    if (!g_payload) {
+        ZS_LOGE("libzygisk: dlopen(%s) failed: %s", path, dlerror());
         return;
     }
     using InitFn = void (*)();
@@ -764,6 +828,16 @@ void zs_test_libzygisk_rescan_sdk() {
 extern "C" __attribute__((visibility("default")))
 int zs_test_libzygisk_is_compatible(uint32_t v) {
     return native_bridge_is_compatible(v) ? 1 : 0;
+}
+
+// Round 30: the randomized-soname derivation (see
+// derive_payload_path). The test dlopens this .so, calls this, and
+// asserts the derived path is our own path with "-p" before ".so".
+extern "C" __attribute__((visibility("default")))
+const char* zs_test_libzygisk_derived_payload_path() {
+    static char path[512];
+    derive_payload_path(path, sizeof path);
+    return path;
 }
 #endif  // ZS_HOST_TEST
 

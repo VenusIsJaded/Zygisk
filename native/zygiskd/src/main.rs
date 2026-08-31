@@ -944,6 +944,374 @@ fn spawn_privileged_child<F>(stream: UnixStream, state: Arc<DaemonState>,
     }
 }
 
+
+// ----------------------------------------------------------------------
+// Round 30 — the native-bridge property guard (STEALTH).
+//
+// THE DETECTION HOLE THIS CLOSES: ro.dalvik.vm.native.bridge is
+// readable by ANY app (__system_property_get needs no permission).
+// Stock devices report "0" or the property is absent (Round 29's
+// 173-device collection: 169 ship "0", 4 absent, 0 with a real
+// bridge). While the swap is installed, every property read in
+// every process sees our loader name — the single most generic
+// root/Zygisk detection vector there is. Magisk's own zygisk keeps
+// the property set for the whole boot (verified this round from
+// topjohnwu/Magisk native/src/core/zygisk/daemon.rs: set_prop()
+// runs once, restore_prop() only on rollback/stop) and accepts
+// that exposure; ReZygisk v2 abandoned the property mechanism for
+// ptrace injection entirely.
+//
+// OUR DESIGN — restore-after-consumption with crash re-arming:
+//
+//   1. post-fs-data.sh swaps the property and records BOTH the
+//      stock value (.native_bridge_backup) and the applied value
+//      (.native_bridge_applied) in the workdir.
+//   2. ART reads the property exactly once per zygote start
+//      (AndroidRuntime.cpp startVm, verified at 5.0/8.1/13/16 this
+//      round; from 10.0 a `zygote &&` guard means ONLY the zygote
+//      even sees a loadable value). The zygote dlopens the bridge
+//      during Runtime::Init — after that moment the property has
+//      no further consumer until the zygote restarts.
+//   3. This guard (a root thread) waits until the bridge library
+//      actually appears in the zygote's /proc/<pid>/maps — proof
+//      the property was consumed — then restores the STOCK value.
+//      From that point on, every app reads "0"/absent: stock.
+//   4. If the zygote dies (crash, OOM, manual restart), init
+//      re-execs it and the NEW zygote re-reads the property — so
+//      the guard re-applies the loader value as soon as it sees
+//      the old pid gone, before the new zygote's Runtime::Init
+//      gets there (250 ms poll vs. init's restart + ~hundreds of
+//      ms of zygote startup — we normally win the race). Once the
+//      new zygote loads the bridge, stock is restored again.
+//   5. Bootloop guard (Magisk's exact policy): more than 3
+//      zygote restarts in one boot = our loader is probably
+//      crashing it — restore stock permanently and stand down.
+//
+// Honest residuals (documented in ANDROID-REALISM.md):
+//   - The property is set from post-fs-data until the guard's
+//     restore lands shortly after late_start. No third-party app
+//     is running in that window (apps start after boot-complete),
+//     but a system component could theoretically read it.
+//   - If the re-apply loses the race with a restarted zygote, the
+//     module is inert for that cycle; the NEXT restart re-arms
+//     (the property stays set until a zygote actually consumes
+//     it).
+// ----------------------------------------------------------------------
+
+const PROP_KEY: &str = "ro.dalvik.vm.native.bridge";
+/// Zygote restarts tolerated before the guard stands down (Magisk's
+/// bootloop policy: 3 crashes -> rollback).
+const PROP_GUARD_MAX_RESTARTS: u32 = 3;
+
+/// What one poll cycle observed. Kept as data so the decision logic
+/// is a pure, unit-testable function.
+#[derive(Debug, Clone, PartialEq)]
+enum ZygoteObservation {
+    /// No zygote process found at all (very early boot, or the
+    /// zygote is between restarts).
+    Absent,
+    /// The zygote with `pid` was seen; `bridge_loaded` is whether
+    /// our loader library is mapped in it (proof the property was
+    /// consumed); `stable` means the observation is trustworthy
+    /// (the grace period after the pid first appeared has passed —
+    /// a brand-new zygote has not necessarily reached
+    /// Runtime::Init yet).
+    Present { pid: u32, bridge_loaded: bool, stable: bool },
+}
+
+/// The guard's decision after one observation.
+#[derive(Debug, Clone, PartialEq)]
+enum GuardAction {
+    /// Nothing to do this cycle.
+    None,
+    /// Restore the stock property value (the zygote consumed ours).
+    RestoreStock,
+    /// Re-apply the loader value (the zygote died; a new one is
+    /// coming).
+    ReapplyLoader,
+    /// Too many restarts: restore stock and stand down permanently.
+    RollbackAndStop,
+}
+
+#[derive(Debug)]
+struct GuardState {
+    /// The zygote pid the guard currently tracks.
+    known_pid: Option<u32>,
+    /// Whether the stock value has been restored for the CURRENT
+    /// zygote generation.
+    restored: bool,
+    /// Zygote restarts seen this boot.
+    restarts: u32,
+    /// The guard has given up (bootloop protection).
+    stood_down: bool,
+}
+
+impl GuardState {
+    fn new() -> Self {
+        GuardState { known_pid: None, restored: false,
+                     restarts: 0, stood_down: false }
+    }
+}
+
+/// The pure decision function. `obs` is this cycle's observation of
+/// the zygote; the state is advanced and an action returned.
+fn prop_guard_step(st: &mut GuardState, obs: ZygoteObservation) -> GuardAction {
+    if st.stood_down {
+        return GuardAction::None;
+    }
+    match obs {
+        ZygoteObservation::Absent => {
+            if let Some(_pid) = st.known_pid {
+                // The tracked zygote vanished.
+                st.known_pid = None;
+                st.restored = false;
+                st.restarts += 1;
+                if st.restarts > PROP_GUARD_MAX_RESTARTS {
+                    st.stood_down = true;
+                    return GuardAction::RollbackAndStop;
+                }
+                return GuardAction::ReapplyLoader;
+            }
+            GuardAction::None
+        }
+        ZygoteObservation::Present { pid, bridge_loaded, stable } => {
+            if st.known_pid != Some(pid) {
+                // A new (or replaced) zygote: track it. A fast
+                // replace (we missed the Absent window) also counts
+                // as a restart — but only once per generation.
+                if st.known_pid.is_some() {
+                    st.restarts += 1;
+                    if st.restarts > PROP_GUARD_MAX_RESTARTS {
+                        st.stood_down = true;
+                        return GuardAction::RollbackAndStop;
+                    }
+                }
+                st.known_pid = Some(pid);
+                st.restored = false;
+            }
+            if !st.restored && stable && bridge_loaded {
+                st.restored = true;
+                return GuardAction::RestoreStock;
+            }
+            // stable && !bridge_loaded: the zygote came up WITHOUT
+            // our loader — a lost race (it read the stock value
+            // before our re-apply) or a failed injection. Leave the
+            // property exactly as it is (if it is still set, the
+            // NEXT zygote generation re-arms; if we already
+            // restored, nothing is exposed).
+            GuardAction::None
+        }
+    }
+}
+
+/// Find the primary zygote: the process whose /proc/<pid>/cmdline
+/// contains an `--zygote` argv token (app_process64 -Xzygote ...
+/// --zygote --start-system-server; the 32-bit secondary zygote on
+/// mixed devices matches too — either is a valid consumer of the
+/// property, and the primary is preferred by the app_process64
+/// argv[0] check). Root can read every /proc entry; failures on
+/// individual entries (racing process exits) are skipped.
+fn find_zygote_pid() -> Option<u32> {
+    let dir = std::fs::read_dir("/proc").ok()?;
+    let mut fallback: Option<u32> = None;
+    for entry in dir.flatten() {
+        let name = entry.file_name();
+        let name = name.to_str()?;
+        let pid: u32 = match name.parse() { Ok(v) => v, Err(_) => continue };
+        if pid == 0 { continue; }
+        // Read cmdline; skip the current process (the daemon itself
+        // never matches, but the guard is cheap to keep honest).
+        let cmd = match std::fs::read(format!("/proc/{}/cmdline", pid)) {
+            Ok(b) => b, Err(_) => continue,
+        };
+        if cmd.is_empty() { continue; }
+        // argv is NUL-separated; look for the exact "--zygote" token.
+        let mut has_zygote_token = false;
+        let mut first_arg_app_process64 = false;
+        for (i, tok) in cmd.split(|&b| b == 0).enumerate() {
+            let tok = String::from_utf8_lossy(tok);
+            if i == 0 {
+                first_arg_app_process64 =
+                    tok.contains("app_process64") || tok.contains("app_process");
+            } else if tok == "--zygote" {
+                has_zygote_token = true;
+            }
+        }
+        if has_zygote_token {
+            if first_arg_app_process64 {
+                return Some(pid);       // the primary 64-bit zygote
+            }
+            if fallback.is_none() {
+                fallback = Some(pid);   // host tests / secondary zygote
+            }
+        }
+    }
+    fallback
+}
+
+/// Is our bridge library mapped in /proc/<pid>/maps? Only the
+/// library NAME is matched (the maps path is the full resolved
+/// /system/lib64/<name> the linker used). Reading another process's
+/// maps requires root — which the guard thread has (it runs in the
+/// daemon's parent, before any privilege drop).
+fn bridge_mapped_in(pid: u32, bridge_name: &str) -> bool {
+    let maps = match std::fs::read_to_string(format!("/proc/{}/maps", pid)) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    // Every mapped file line ends with the path; match the name as
+    // a path component ("/<name>" at a word boundary is enough —
+    // our randomized names are unique per install).
+    for line in maps.lines() {
+        if let Some(idx) = line.find('/') {
+            let path = &line[idx..];
+            if path.ends_with(bridge_name)
+                || path.contains(&format!("/{}", bridge_name))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Invoke resetprop (forced ro-property write — the same tool
+/// post-fs-data.sh used for the swap). Candidate order matches the
+/// script's: PATH first, then the well-known Magisk locations. On
+/// the host E2E the harness injects a fake `resetprop` into PATH.
+fn run_resetprop(args: &[&str]) -> bool {
+    let candidates: Vec<(String, Vec<String>)> = vec![
+        ("resetprop".to_string(), args.iter().map(|s| s.to_string()).collect()),
+        ("/data/adb/magisk/resetprop".to_string(),
+            args.iter().map(|s| s.to_string()).collect()),
+        ("/system/bin/resetprop".to_string(),
+            args.iter().map(|s| s.to_string()).collect()),
+        // Modern Magisk: resetprop is a subcommand of the magisk
+        // binary.
+        ("/data/adb/magisk/magisk".to_string(),
+            std::iter::once("resetprop".to_string())
+                .chain(args.iter().map(|s| s.to_string())).collect()),
+    ];
+    for (exe, mut argv) in candidates {
+        if exe.contains('/') && !Path::new(&exe).exists() { continue; }
+        argv.insert(0, exe.clone());
+        if let Ok(out) = process::Command::new(&exe).args(&argv[1..])
+                .output() {
+            if out.status.success() { return true; }
+        }
+    }
+    false
+}
+
+/// Restore the stock value. An EMPTY backup means the property was
+/// ABSENT on this device (Round 29's R28-verified semantics: an
+/// empty-backup restore must DELETE the property, never write an
+/// empty string — ART treats "" as a warning-worthy anomaly while
+/// absent is the genuine stock state on 4/173 real devices).
+fn guard_restore_stock(backup: &str) -> bool {
+    if backup.is_empty() {
+        run_resetprop(&["--delete", PROP_KEY])
+    } else {
+        run_resetprop(&[PROP_KEY, backup])
+    }
+}
+
+fn guard_reapply(applied: &str) -> bool {
+    run_resetprop(&[PROP_KEY, applied])
+}
+
+/// The guard thread body. Config (poll interval, zygote grace
+/// period) is overridable through the environment for the host
+/// E2E; unset = device defaults.
+fn prop_guard_thread() {
+    let workdir = remap_path(WORKDIR);
+    let applied = match std::fs::read_to_string(
+            format!("{}/.native_bridge_applied", workdir)) {
+        Ok(s) => s.trim().to_string(),
+        Err(_) => {
+            // post-fs-data did not (or could not) swap this boot:
+            // there is nothing to guard. This is the normal state
+            // on devices with a real native bridge (they were
+            // refused) and on hosts without the test fixture.
+            return;
+        }
+    };
+    if applied.is_empty() { return; }
+    let backup = std::fs::read_to_string(
+            format!("{}/.native_bridge_backup", workdir))
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+
+    let poll_ms: u64 = std::env::var("ZS_TEST_POLL_MS").ok()
+        .and_then(|v| v.parse().ok()).unwrap_or(250);
+    // How long a NEWLY SEEN zygote pid must exist before its
+    // maps are trusted (Runtime::Init + bridge dlopen complete).
+    let grace_ms: u64 = std::env::var("ZS_TEST_ZYGOTE_GRACE_MS").ok()
+        .and_then(|v| v.parse().ok()).unwrap_or(3000);
+
+    let mut st = GuardState::new();
+    let mut first_seen: std::collections::HashMap<u32, std::time::Instant> =
+        std::collections::HashMap::new();
+    loop {
+        thread::sleep(Duration::from_millis(poll_ms));
+        let obs = match find_zygote_pid() {
+            None => ZygoteObservation::Absent,
+            Some(pid) => {
+                let stable = match first_seen.get(&pid) {
+                    Some(t) => t.elapsed().as_millis() as u64 >= grace_ms,
+                    None => {
+                        first_seen.insert(pid, std::time::Instant::now());
+                        false
+                    }
+                };
+                // A zygote that has been up longer than the grace
+                // period is stable no matter when WE first noticed
+                // it (covers the daemon starting long after boot:
+                // the boot zygote's bridge loaded minutes ago).
+                let up_stable = stable || {
+                    std::fs::read(format!("/proc/{}/stat", pid))
+                        .ok()
+                        .and_then(|s| {
+                            // field 22 (starttime) — just require the
+                            // read to succeed and treat anything
+                            // readable as old enough IF it is the pid
+                            // we have tracked before.
+                            let txt = String::from_utf8_lossy(&s);
+                            let after = txt.split_once(") ").map(|x| x.1)?;
+                            let f: Vec<&str> = after.split(' ').collect();
+                            let starttime: u64 = f.get(19)?.parse().ok()?;
+                            // 100 Hz clock: 2s uptime == 200 ticks.
+                            let uptime: u64 = std::fs::read_to_string(
+                                "/proc/uptime").ok()?
+                                .split('.').next()?.parse().ok()?;
+                            Some(uptime.saturating_sub(starttime / 100) >= 2)
+                        })
+                        .unwrap_or(false)
+                };
+                let bridge_loaded =
+                    bridge_mapped_in(pid, &applied);
+                ZygoteObservation::Present {
+                    pid, bridge_loaded, stable: up_stable,
+                }
+            }
+        };
+        match prop_guard_step(&mut st, obs) {
+            GuardAction::None => {}
+            GuardAction::RestoreStock => {
+                let _ = guard_restore_stock(&backup);
+            }
+            GuardAction::ReapplyLoader => {
+                let _ = guard_reapply(&applied);
+            }
+            GuardAction::RollbackAndStop => {
+                let _ = guard_restore_stock(&backup);
+                return;
+            }
+        }
+    }
+}
+
 /// Round 13 — randomize the daemon's socket directory.
 ///
 /// WHY: /proc/net/unix is world-readable and lists the PATH STRING
@@ -1115,6 +1483,11 @@ fn main() {
             rescan_thread_main(s);
         });
     }
+
+    // Round 30 — the property guard (see the Round 30 section above
+    // for the full design). One more thread, one 250 ms poll of a
+    // single /proc read: negligible next to the rescan thread.
+    thread::spawn(prop_guard_thread);
 
     // Remove any stale socket, then bind a new one. Round 13: the
     // socket lives in a randomized per-boot directory when
@@ -1653,5 +2026,105 @@ mod tests {
         state.reload_denylist();
         // Still empty.
         assert!(!state.is_on_denylist("anything"));
+    }
+
+    // ---------------- Round 30: property guard ----------------
+
+    use super::{prop_guard_step, GuardState, ZygoteObservation, GuardAction};
+
+    fn fresh() -> GuardState { GuardState::new() }
+
+    #[test]
+    fn guard_restores_stock_once_bridge_is_loaded_and_stable() {
+        let mut st = fresh();
+        // Fresh zygote, not yet stable: nothing happens even if the
+        // bridge is already mapped (the observation is not trusted
+        // inside the grace window).
+        let a = prop_guard_step(&mut st, ZygoteObservation::Present {
+            pid: 42, bridge_loaded: true, stable: false });
+        assert_eq!(a, GuardAction::None);
+        // Stable + bridge loaded: restore, and never twice.
+        let a = prop_guard_step(&mut st, ZygoteObservation::Present {
+            pid: 42, bridge_loaded: true, stable: true });
+        assert_eq!(a, GuardAction::RestoreStock);
+        let a = prop_guard_step(&mut st, ZygoteObservation::Present {
+            pid: 42, bridge_loaded: true, stable: true });
+        assert_eq!(a, GuardAction::None);
+        assert!(st.restored);
+    }
+
+    #[test]
+    fn guard_holds_when_bridge_never_loads() {
+        let mut st = fresh();
+        // Stable zygote without our bridge: lost race or failed
+        // injection — the guard must NOT restore (if the property is
+        // still set, the next zygote generation re-arms; restoring
+        // would be pointless since this zygote already read the
+        // stock value).
+        let a = prop_guard_step(&mut st, ZygoteObservation::Present {
+            pid: 7, bridge_loaded: false, stable: true });
+        assert_eq!(a, GuardAction::None);
+        assert!(!st.restored);
+    }
+
+    #[test]
+    fn guard_reapplies_after_zygote_death() {
+        let mut st = fresh();
+        prop_guard_step(&mut st, ZygoteObservation::Present {
+            pid: 10, bridge_loaded: true, stable: true });
+        // Zygote gone: re-apply the loader value, track reset.
+        let a = prop_guard_step(&mut st, ZygoteObservation::Absent);
+        assert_eq!(a, GuardAction::ReapplyLoader);
+        assert_eq!(st.restarts, 1);
+        assert!(!st.restored);
+        // The replacement zygote appears and loads: restore again.
+        let a = prop_guard_step(&mut st, ZygoteObservation::Present {
+            pid: 11, bridge_loaded: true, stable: true });
+        assert_eq!(a, GuardAction::RestoreStock);
+    }
+
+    #[test]
+    fn guard_counts_fast_replacements_as_restarts() {
+        let mut st = fresh();
+        prop_guard_step(&mut st, ZygoteObservation::Present {
+            pid: 10, bridge_loaded: true, stable: true });
+        // The tracked pid replaced without an Absent window in
+        // between (the poll missed the gap): still one restart.
+        let a = prop_guard_step(&mut st, ZygoteObservation::Present {
+            pid: 12, bridge_loaded: false, stable: false });
+        assert_eq!(a, GuardAction::None);
+        assert_eq!(st.restarts, 1);
+        assert_eq!(st.known_pid, Some(12));
+    }
+
+    #[test]
+    fn guard_rolls_back_after_too_many_restarts_and_stays_down() {
+        let mut st = fresh();
+        for gen in 0..4 {
+            prop_guard_step(&mut st, ZygoteObservation::Present {
+                pid: 100 + gen, bridge_loaded: true, stable: true });
+            let a = prop_guard_step(&mut st, ZygoteObservation::Absent);
+            if gen < 3 {
+                assert_eq!(a, GuardAction::ReapplyLoader);
+            } else {
+                // The 4th death: restarts hits 4 > 3 — stand down.
+                assert_eq!(a, GuardAction::RollbackAndStop);
+            }
+        }
+        // Stood down: inert forever, even for a healthy new zygote.
+        let a = prop_guard_step(&mut st, ZygoteObservation::Present {
+            pid: 999, bridge_loaded: true, stable: true });
+        assert_eq!(a, GuardAction::None);
+        assert!(st.stood_down);
+    }
+
+    #[test]
+    fn guard_noop_before_any_zygote_was_tracked() {
+        let mut st = fresh();
+        // Absent without a known pid (very early boot): no restart
+        // count, no action.
+        let a = prop_guard_step(&mut st, ZygoteObservation::Absent);
+        assert_eq!(a, GuardAction::None);
+        assert_eq!(st.restarts, 0);
     }
 }

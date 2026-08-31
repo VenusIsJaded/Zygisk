@@ -79,7 +79,16 @@ fi
 #     exactly (a "0" device restores "0"; an absent-prop device
 #     deletes the prop — see uninstall.sh).
 # ---------------------------------------------------------------------------
+# Round 30: the bridge's SONAME is randomized per install (see
+# customize.sh) and recorded in $MODDIR/.loader_names. The fallback
+# covers manual/legacy layouts without the file.
 BRIDGE_LIB="libzygisk.so"
+if [ -f "$MODDIR/.loader_names" ]; then
+  LOADER_BRIDGE="$(sed -n 's/^bridge=//p' "$MODDIR/.loader_names" 2>/dev/null | head -n1)"
+  case "$LOADER_BRIDGE" in
+    lib*.so) BRIDGE_LIB="$LOADER_BRIDGE" ;;
+  esac
+fi
 RESETPROP="$(command -v resetprop || true)"
 if [ -z "$RESETPROP" ]; then
   # Magisk's resetprop lives in the busybox dir on some installs.
@@ -96,6 +105,15 @@ if [ -n "$RESETPROP" ]; then
       printf '%s' "$CURRENT" > "$WORKDIR/.native_bridge_backup" 2>/dev/null
     fi
     "$RESETPROP" ro.dalvik.vm.native.bridge "$BRIDGE_LIB"
+    # Round 30: record the value we just installed so the daemon's
+    # property guard can (a) restore the stock value once the zygote
+    # has consumed it and (b) re-apply this exact value after a
+    # zygote crash-restart. Written ONLY on a successful swap — its
+    # absence (or a mismatch with the live value) means the guard
+    # stays inert.
+    if [ "$($RESETPROP ro.dalvik.vm.native.bridge 2>/dev/null)" = "$BRIDGE_LIB" ]; then
+      printf '%s' "$BRIDGE_LIB" > "$WORKDIR/.native_bridge_applied" 2>/dev/null
+    fi
     log -t ZygiskStudy "native.bridge set to $BRIDGE_LIB (was: ${CURRENT:-<absent>})"
   else
     # A real bridge is in use — do not touch it.

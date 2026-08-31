@@ -101,6 +101,14 @@ static std::atomic<int> g_hide_done{0};
 // way g_hide_done guards the hide pipeline).
 static std::atomic<int> g_dispatch_done{0};
 
+#ifdef ZS_HOST_TEST
+// Round 30: test-only — when 1, the Tier A path skips the
+// __cxa_finalize purge so the regression proof can demonstrate the
+// dangling-entry crash it fixes. Unset = byte-identical production
+// behavior.
+static int g_disable_atexit_purge = 0;
+#endif
+
 // ------------------------------------------------------------------------
 // The hide pipeline (shared by the uid hooks and the exported
 // package-name API).
@@ -152,6 +160,31 @@ static bool hide_process_phase(void* wrapper_fp,
     if (wrapper_fp && zs_trampoline_supported() &&
         hide_trampoline_unmap_pending()) {
         // ---------------- Tier A: vanish ----------------
+        // 0. Round 30 — collect every library's __dso_handle (the
+        //    self-pointing word in its data) while ALL records are
+        //    still mapped, then purge the MODULE libraries' atexit /
+        //    pthread_atfork registrations NOW, while their
+        //    destructors can still execute (bionic's
+        //    __cxa_finalize calls them; their text is unmapped by
+        //    step 1 below). This is the exact protocol a proper
+        //    dlclose runs (crtbegin_so's __on_dlclose); skipping it
+        //    left dangling entries in libc's AtexitArray — the first
+        //    exit() or fork() in the hidden app would SIGSEGV, and
+        //    the entries are a detection surface (see hide.h's
+        //    Round 30 note for the source-verified details).
+        ZsDsoHandle dsoh[ZS_MAX_DSO_HANDLES];
+        size_t nd = 0;
+#ifdef ZS_HOST_TEST
+        if (!g_disable_atexit_purge)
+#endif
+        {
+            nd = zs_collect_dso_handles(dsoh, ZS_MAX_DSO_HANDLES);
+            for (size_t i = 0; i < nd; ++i) {
+                if (!dsoh[i].self) {
+                    zs_atexit_finalize(dsoh[i].handle);
+                }
+            }
+        }
         // 1. Preprocess the record set (hide.cpp):
         //      - every READ-ONLY segment of every record becomes a
         //        content-preserving anonymous copy (the linker's
@@ -170,14 +203,11 @@ static bool hide_process_phase(void* wrapper_fp,
         //    into soon-to-be-unmapped memory is a guaranteed crash on
         //    the app's next libc call.
         hide_advanced_uninstall_got_hooks();
-        // 3. Drop privileges for real — the specialization code that
-        //    resumes after us assumes the call succeeded.
-        long rv = real_already_ran ? rv_in : call_real(real_ctx);
-        // 4. Hand everything left to the trampoline: it unmaps our
-        //    own remaining segments (text/data — the read-only
-        //    metadata survives as anonymous pages) and returns `rv`
-        //    to the wrapper's caller without executing another
-        //    libpayload instruction.
+        // 3. PREPARE the trampoline page (Round 30 split: every
+        //    failing operation happens HERE). A failure falls back to
+        //    Tier B with the payload's C++ statics still intact —
+        //    the purge of OUR OWN handle (step 4) must only run when
+        //    the only remaining exits are the real call and the jump.
         ZsTrampRecord tramp_recs[kTrampMaxRecords];
         size_t tn = 0;
         for (size_t i = 0; i < pn && tn < kTrampMaxRecords; ++i) {
@@ -185,13 +215,46 @@ static bool hide_process_phase(void* wrapper_fp,
             tramp_recs[tn].size = prep_out[i].size;
             ++tn;
         }
-        if (zs_trampoline_unmap(tramp_recs, tn, wrapper_fp, rv) == 0) {
-            return true;  // never reached — the trampoline jumped out
+        void* tramp_page = zs_trampoline_prepare(tramp_recs, tn,
+                                                 wrapper_fp);
+        if (tramp_page) {
+            // 4. Round 30 — purge the payload's OWN registrations.
+            //    From here on NO libpayload C++ static may be
+            //    touched: the dtors just ran. The remaining steps
+            //    (the real libc call and the trampoline jump) are
+            //    static-free by design.
+#ifdef ZS_HOST_TEST
+            if (!g_disable_atexit_purge)
+#endif
+            {
+                for (size_t i = 0; i < nd; ++i) {
+                    if (dsoh[i].self) {
+                        zs_atexit_finalize(dsoh[i].handle);
+                    }
+                }
+            }
+            // 5. Drop privileges for real — the specialization code
+            //    that resumes after us assumes the call succeeded.
+            long rv = real_already_ran ? rv_in : call_real(real_ctx);
+            // 6. Hand everything left to the trampoline: it unmaps
+            //    our own remaining segments (text/data — the
+            //    read-only metadata survives as anonymous pages) and
+            //    returns `rv` to the wrapper's caller without
+            //    executing another libpayload instruction.
+            if (zs_trampoline_jump(tramp_page, rv) == 0) {
+                return true;  // never reached — jumped out
+            }
+            ZS_LOGW("payload: trampoline jump failed (impossible "
+                    "state); falling back to Tier B");
+            // Fall through: the real call already ran above; the
+            // caller's second invocation of an idempotent
+            // setres*/set* is harmless.
+        } else {
+            ZS_LOGW("payload: trampoline prepare failed; falling "
+                    "back to hook-based hiding (Tier B)");
+            // The real call has NOT run yet — the Tier B fallthrough
+            // (or the FORCE path's already-relayed rv) handles it.
         }
-        ZS_LOGW("payload: trampoline setup failed; falling back to "
-                "hook-based hiding (Tier B)");
-        // Fall through: the real call already ran above; the caller's
-        // second invocation of an idempotent setres*/set* is harmless.
     }
 
     // ---------------- Tier B: hook-based hiding ----------------
@@ -471,25 +534,30 @@ static_assert(offsetof(ZsTrampData, retval) == 528, "retval offset");
 #if defined(__aarch64__) || defined(__x86_64__)
 int zs_trampoline_supported() { return 1; }
 
-int zs_trampoline_unmap(const ZsTrampRecord* records, size_t count,
-                        void* wrapper_fp, long retval) {
+// Round 30 split: every operation that can FAIL lives in prepare();
+// jump() only writes the final retval, seals the page and enters the
+// blob. hide_process_phase runs the payload's own atexit purge
+// between the two — after the purge there is no Tier B fallback, so
+// the tail must be infallible.
+void* zs_trampoline_prepare(const ZsTrampRecord* records, size_t count,
+                            void* wrapper_fp) {
     if (!records || count == 0 || count > kTrampMaxRecords || !wrapper_fp) {
-        return -1;
+        return nullptr;
     }
     const size_t code_size = (size_t)(zs_trampoline_code_end
                                       - zs_trampoline_code_start);
-    if (code_size == 0 || code_size > 4096 - 64) return -1;
+    if (code_size == 0 || code_size > 4096 - 64) return nullptr;
 
     long page_size = sysconf(_SC_PAGESIZE);
     if (page_size <= 0) page_size = 4096;
 
-    // One private executable page. RW for the copy, then X-only.
+    // One private executable page. RW for the copy; jump() seals it.
     void* page = mmap(nullptr, (size_t)page_size,
                       PROT_READ | PROT_WRITE | PROT_EXEC,
                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (page == MAP_FAILED) {
         ZS_LOGW("trampoline: mmap failed: %s", strerror(errno));
-        return -1;
+        return nullptr;
     }
     // STEALTH: name the page so /proc/self/maps shows
     // "[anon:jit-cache]" — ART processes legitimately carry
@@ -508,7 +576,18 @@ int zs_trampoline_unmap(const ZsTrampRecord* records, size_t count,
     for (size_t i = 0; i < count; ++i) data->records[i] = records[i];
     data->count      = count;
     data->wrapper_fp = (uintptr_t)wrapper_fp;
-    data->retval     = retval;   // handed back to the wrapper's caller
+    // data->retval is written by zs_trampoline_jump() — the real
+    // privilege-drop call happens between prepare and jump.
+    return page;
+}
+
+int zs_trampoline_jump(void* page, long retval) {
+    if (!page) return -1;
+    long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) page_size = 4096;
+    ZsTrampData* data = (ZsTrampData*)((char*)page + page_size
+                                       - sizeof(ZsTrampData));
+    data->retval = retval;   // handed back to the wrapper's caller
 
     // Make the page read-execute (drop W; nothing writes it again).
     // Keep EXEC: the blob must run. (mprotect on the data area too —
@@ -524,11 +603,24 @@ int zs_trampoline_unmap(const ZsTrampRecord* records, size_t count,
     ((void(*)(void*))page)((void*)data);
     return -1;  // unreachable on success; caller falls back to Tier B
 }
+
+// The Round 7 single-call form (kept for tests and any external
+// caller): prepare + jump back to back.
+int zs_trampoline_unmap(const ZsTrampRecord* records, size_t count,
+                        void* wrapper_fp, long retval) {
+    void* page = zs_trampoline_prepare(records, count, wrapper_fp);
+    if (!page) return -1;
+    return zs_trampoline_jump(page, retval);
+}
 #else
 int zs_trampoline_supported() { return 0; }
 int zs_trampoline_unmap(const ZsTrampRecord*, size_t, void*, long) {
     return -1;
 }
+void* zs_trampoline_prepare(const ZsTrampRecord*, size_t, void*) {
+    return nullptr;
+}
+int zs_trampoline_jump(void*, long) { return -1; }
 #endif
 
 // ------------------------------------------------------------------------
@@ -710,6 +802,24 @@ int zs_test_trampoline_pending() {
 extern "C" __attribute__((visibility("default")))
 size_t zs_test_record_count() {
     return hide_unmap_record_count();
+}
+
+// Round 30 — the Tier A atexit-purge seams for the dlopen-based
+// trampoline test.
+// zs_test_disable_atexit_purge(1): prove the regression the purge
+// fixes — with the purge off, a Tier A child that calls exit()
+// SIGSEGVs on libc's walk over the dangling __cxa_atexit entries.
+extern "C" __attribute__((visibility("default")))
+void zs_test_disable_atexit_purge(int disabled) {
+    g_disable_atexit_purge = disabled ? 1 : 0;
+}
+// zs_test_collect_dso_handles(): expose the record-scan so the test
+// can learn libpayload's own __dso_handle (a hidden symbol) BEFORE
+// driving the pipeline, then register a sentinel entry against it.
+extern "C" __attribute__((visibility("default")))
+size_t zs_test_collect_dso_handles(struct ZsDsoHandle* out,
+                                   size_t cap) {
+    return zs_collect_dso_handles(out, cap);
 }
 #endif // ZS_HOST_TEST
 

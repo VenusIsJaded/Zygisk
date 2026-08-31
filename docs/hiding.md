@@ -954,3 +954,54 @@ The version research pass verified two hiding-layer facts:
   children no longer linger as zombies (SIGCHLD auto-reap) — a
   fleet of defunct processes carrying the cloak name was itself a
   signature. Both verified live by `make verify-daemon`.
+
+## Round 30 additions — the atexit trace, the property value, and the names
+
+Three hiding gaps closed, each verified against real sources:
+
+- **The atexit trace (Tier A, since Round 8).** Every bionic/glibc
+  .so registers its static destructors in libc's atexit array
+  (AtexitEntry{fn, arg, dso}) with dso = its own `__dso_handle`
+  (a self-pointing constant — bionic's `__dso_handle_so.h`). A
+  proper dlclose purges them via crtbegin_so's `__on_dlclose`
+  destructor calling `__cxa_finalize(&__dso_handle)`; our Tier A
+  unmap skipped that step, so every hidden child kept entries
+  pointing into unmapped text: the first `exit()` jumped there and
+  crashed (bionic's exit walks every entry), any module's
+  `pthread_atfork` handlers crashed every later `fork()`, and the
+  entries are exactly what public Zygisk detectors enumerate by
+  parsing libc's g_array. The Tier A path now locates every
+  library's handle (a scan for the self-pointing word in each
+  record's non-executable pages) and runs the same
+  `__cxa_finalize` protocol a dlclose would — modules before their
+  text is unmapped, the payload itself after the trampoline page is
+  prepared (the prepare/jump split keeps a prepare failure on the
+  Tier B path with the statics alive). Verified live: the
+  regression child (purge disabled) dies with SIGSEGV on the
+  modeled bionic exit walk; the fixed child survives it and its
+  sentinel destructor runs.
+- **The property value (the #1 generic detector).**
+  `ro.dalvik.vm.native.bridge` is world-readable; stock is "0" or
+  absent; ours was the loader name for the whole boot. Magisk
+  keeps it set (their daemon.rs, read this round); ReZygisk v2
+  left the property mechanism altogether. We restore the stock
+  value as soon as the bridge is observed mapped in the zygote
+  (the property has exactly one consumer per zygote start —
+  verified from AndroidRuntime.cpp at 5.0 through 16), re-apply on
+  zygote death, and roll back after 3+ restarts. The daemon-side
+  guard is fully E2E'd on this host with a fake zygote + a fake
+  resetprop: restore, re-apply, replacement cycle, rollback,
+  stand-down, and the `--delete` restore for absent-stock devices.
+- **The fixed library names.** `libzygisk.so` / `libpayload.so` in
+  every process's `/proc/self/maps` is a trivial grep. Installs now
+  use per-install random names (`lib<8-hex>.so` /
+  `lib<8-hex>-p.so`); the payload and bridge find each other via
+  `dladdr` on their own mapped paths, with the legacy fixed names
+  as fallbacks (manual layouts, host tests). The install-time flow
+  and the swap-with-random-name flow are covered by the script E2E
+  harness.
+
+GrapheneOS compatibility was researched and needs nothing (see
+compatibility.md): exec spawning is fork+specialize-then-exec, so
+the hide pipeline runs before the exec and the private mount
+namespace plus the execve-proof property spoofing survive it.

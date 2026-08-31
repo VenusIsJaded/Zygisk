@@ -40,16 +40,28 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 failures = []
 
 FAKE_RESETPROP = """#!/bin/sh
-# Fake resetprop for script E2E. Read mode prints the configured
-# value; every invocation is recorded to $ZS_FAKE_RESETPROP_LOG.
+# Fake resetprop for script E2E. Read mode prints the CURRENT value
+# (the configured one, or the last value a SET wrote — Round 30's
+# post-fs-data read-back depends on realistic get-after-set
+# semantics); every invocation is recorded to
+# $ZS_FAKE_RESETPROP_LOG.
 LOG="${ZS_FAKE_RESETPROP_LOG:?}"
+STATE="${ZS_FAKE_PROP_STATE:?}"
 if [ "$#" -eq 1 ]; then
-  printf '%s\\n' "$ZS_FAKE_PROP_VALUE"
+  if [ -s "$STATE" ]; then
+    cat "$STATE"
+  else
+    printf '%s\\n' "$ZS_FAKE_PROP_VALUE"
+  fi
   exit 0
 fi
 printf '%s\\n' "$*" >> "$LOG"
-if [ "$1" = "--delete" ] && [ -n "$ZS_FAKE_DELETE_FAIL" ]; then
-  exit 1
+# SET updates the state a subsequent GET returns.
+if [ "$1" = "--delete" ]; then
+  : > "$STATE"
+  [ -n "$ZS_FAKE_DELETE_FAIL" ] && exit 1
+elif [ "$#" -ge 2 ]; then
+  printf '%s\\n' "$2" > "$STATE"
 fi
 exit 0
 """
@@ -101,6 +113,7 @@ class FakeMagisk:
         self.stub_daemon_log = os.path.join(self.root, "stub_daemon.log")
         self.prop_value = "0"
         self.delete_fail = ""
+        self.prop_state = os.path.join(self.root, "prop_state")
 
     def env(self, extra=None):
         env = dict(os.environ)
@@ -108,6 +121,7 @@ class FakeMagisk:
         env["ZS_TEST_ROOT"] = self.sysroot
         env["ZS_FAKE_RESETPROP_LOG"] = self.resetprop_log
         env["ZS_FAKE_PROP_VALUE"] = self.prop_value
+        env["ZS_FAKE_PROP_STATE"] = self.prop_state
         env["ZS_STUB_DAEMON_LOG"] = self.stub_daemon_log
         if self.delete_fail:
             env["ZS_FAKE_DELETE_FAIL"] = self.delete_fail
@@ -209,6 +223,48 @@ def test_backup_not_overwritten(mk):
           "ro.dalvik.vm.native.bridge libzygisk.so" in mk.resetprop_calls())
 
 
+def test_round30_random_name_swap_and_applied_record(mk):
+    """Round 30: with .loader_names present, the swap uses the
+    randomized bridge name and records it in .native_bridge_applied
+    (the daemon's crash re-apply value); without a swap, no applied
+    record is written."""
+    # (a) the randomized-name swap.
+    mk.prop_value = "0"
+    with open(os.path.join(mk.moddir, ".loader_names"), "w") as fp:
+        fp.write("bridge=lib3fa2b81c.so\npayload=lib3fa2b81c-p.so\n")
+    proc = mk.run_script("post-fs-data.sh")
+    calls = mk.resetprop_calls()
+    check("post-fs-data swaps the RANDOMIZED bridge name",
+          proc.returncode == 0
+          and "ro.dalvik.vm.native.bridge lib3fa2b81c.so" in calls,
+          str(calls))
+    applied = os.path.join(mk.workdir, ".native_bridge_applied")
+    check(".native_bridge_applied records the installed name",
+          os.path.exists(applied)
+          and open(applied).read() == "lib3fa2b81c.so",
+          open(applied).read() if os.path.exists(applied) else "<missing>")
+
+    # (b) a garbage .loader_names falls back to the fixed name.
+    mk2 = FakeMagisk()
+    mk2.prop_value = "0"
+    with open(os.path.join(mk2.moddir, ".loader_names"), "w") as fp:
+        fp.write("bridge=../../evil/path\npayload=x\n")
+    mk2.run_script("post-fs-data.sh")
+    check("garbage .loader_names falls back to libzygisk.so",
+          "ro.dalvik.vm.native.bridge libzygisk.so"
+          in mk2.resetprop_calls(), str(mk2.resetprop_calls()))
+    mk2.cleanup()
+
+    # (c) no swap (real bridge): no applied record.
+    mk3 = FakeMagisk()
+    mk3.prop_value = "libhoudini.so"
+    mk3.run_script("post-fs-data.sh")
+    check("real bridge: no .native_bridge_applied written",
+          not os.path.exists(
+              os.path.join(mk3.workdir, ".native_bridge_applied")))
+    mk3.cleanup()
+
+
 def test_no_resetprop_is_survivable(mk):
     # A real Android always has `log` (system/core/logcat) even when
     # resetprop is unavailable — keep the fake log, drop resetprop.
@@ -282,18 +338,56 @@ def test_customize_creates_launcher(mk):
         check("launcher target is executable",
               os.access(os.path.join(modpath, target), os.X_OK))
     sysdir = os.path.join(modpath, "system", "lib64")
-    check("systemless /system/lib64 layout created",
-          os.path.exists(os.path.join(sysdir, "libzygisk.so"))
-          and os.path.exists(os.path.join(sysdir, "libpayload.so")))
+    # Round 30: the libraries are installed under randomized names
+    # recorded in .loader_names (STEALTH — fixed names are map-scan
+    # signatures).
+    names_p = os.path.join(modpath, ".loader_names")
+    bridge = payload = None
+    if os.path.exists(names_p):
+        with open(names_p) as fp:
+            for line in fp:
+                if line.startswith("bridge="):
+                    bridge = line.strip()[len("bridge="):]
+                elif line.startswith("payload="):
+                    payload = line.strip()[len("payload="):]
+    check(".loader_names records both names",
+          bool(bridge and payload and bridge != payload
+               and bridge.startswith("lib") and bridge.endswith(".so")
+               and payload.startswith("lib") and payload.endswith(".so")
+               and payload[:-3].endswith(bridge[:-len(".so")] + "-p")
+               or (bridge and payload and payload == bridge[:-3] + "-p.so")),
+          f"bridge={bridge} payload={payload}")
+    check("randomized bridge name is not the fixed signature",
+          bridge not in ("libzygisk.so", "libpayload.so"), str(bridge))
+    check("systemless /system/lib64 layout created (random names)",
+          bridge is not None and payload is not None
+          and os.path.exists(os.path.join(sysdir, bridge))
+          and os.path.exists(os.path.join(sysdir, payload)))
+    check("no fixed-name libraries left in the systemless tree",
+          not os.path.exists(os.path.join(sysdir, "libzygisk.so"))
+          and not os.path.exists(os.path.join(sysdir, "libpayload.so")))
+    if bridge and os.path.exists(os.path.join(sysdir, bridge)):
+        with open(os.path.join(sysdir, bridge), "rb") as fp:
+            check("randomized bridge file has ELF content",
+                  fp.read(4) == b"\x7fELF")
 
 
 def test_customize_32bit_layout(mk):
     proc, modpath = run_customize(mk, abi="armeabi-v7a", is64="false")
     check("customize.sh (armeabi-v7a) exits 0", proc.returncode == 0,
           proc.stdout[-200:])
-    check("32-bit systemless layout at /system/lib",
-          os.path.exists(os.path.join(modpath, "system", "lib",
-                                      "libzygisk.so")))
+    sysdir = os.path.join(modpath, "system", "lib")
+    names_p = os.path.join(modpath, ".loader_names")
+    bridge = None
+    if os.path.exists(names_p):
+        with open(names_p) as fp:
+            for line in fp:
+                if line.startswith("bridge="):
+                    bridge = line.strip()[len("bridge="):]
+    check("32-bit systemless layout at /system/lib (random name)",
+          bridge is not None
+          and os.path.exists(os.path.join(sysdir, bridge)),
+          f"bridge={bridge}")
 
 
 def test_customize_refuses_old_android(mk):
@@ -454,6 +548,8 @@ def main():
          test_swap_refuses_real_bridge),
         ("post-fs-data: backup preserved across re-runs",
          test_backup_not_overwritten),
+        ("post-fs-data: randomized names + applied record (Round 30)",
+         test_round30_random_name_swap_and_applied_record),
         ("post-fs-data: survives a missing resetprop",
          test_no_resetprop_is_survivable),
         ("post-fs-data: workdir/marker/denylist setup",

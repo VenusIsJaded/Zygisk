@@ -96,6 +96,28 @@ struct ZsTrampRecord {
 int zs_trampoline_unmap(const ZsTrampRecord* records, size_t count,
                         void* wrapper_fp, long retval);
 
+// Round 30 — the same machinery split into two phases so the Tier A
+// path can order its irreversible steps safely:
+//
+//   zs_trampoline_prepare()  — every FAILING operation (mmap, code
+//       copy, data fill). Returns the page pointer, or null on any
+//       failure (caller falls back to Tier B with everything still
+//       intact).
+//   zs_trampoline_jump()     — the infallible tail: writes the final
+//       retval into the data area, seals the page R+X, flushes the
+//       icache and enters the blob. Never returns on success; a
+//       return value of -1 marks an impossible-state error only
+//       (null/bad page).
+//
+// Between the two calls the caller may run MUST-SUCCEED work that can
+// no longer fall back to Tier B (the Round 30 atexit purge of the
+// payload's own statics: after __cxa_finalize the C++ statics are
+// destroyed, so the ONLY remaining exits are the real privilege-drop
+// call and the jump).
+void* zs_trampoline_prepare(const ZsTrampRecord* records, size_t count,
+                            void* wrapper_fp);
+int    zs_trampoline_jump(void* page, long retval);
+
 // 1 on architectures whose blob is compiled in (arm64, x86_64),
 // 0 otherwise (Tier B fallback).
 int zs_trampoline_supported();

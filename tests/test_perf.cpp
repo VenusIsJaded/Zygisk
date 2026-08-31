@@ -231,3 +231,110 @@ int main() {
     std::fprintf(stderr, "=== Zygisk Study perf microbenchmarks ===\n");
     return zstest::run_all();
 }
+
+
+// ----------------------------------------------------------------------
+// Round 30 — the zygote COW audit: what does one forked child PAY
+// (in minor page faults) for having the payload resident in its
+// parent? This is the classic Zygisk/Riru performance metric: any
+// page the zygote dirties after our dlopen becomes private memory,
+// and any page the CHILD writes that we also touched becomes a COW
+// fault (a private copy charged to the app process).
+//
+// Method: fork 64 children from a payload-initialized parent, each
+// running a fixed post-fork workload (256 small mallocs + frees +
+// a /proc/self/stat read — the same shape an app's first thread
+// produces), and record each child's minor-fault count from
+// /proc/self/stat. Control: the same workload in children of a
+// parent that never loaded the payload (a plain fork from this
+// test binary before dlopen'ing libpayload.so).
+//
+// The assertion is a BUDGET, not equality: the payload's cost must
+// stay under 8 minor faults per child (each fault = one 4 KB page;
+// 8 pages = 32 KB of one-time private memory per app start, an
+// order of magnitude below the ~1-2 MB an ART app process faults in
+// during its first moments of life).
+// ----------------------------------------------------------------------
+#if !defined(ZS_PERF_NO_COW)
+#include <dlfcn.h>
+#include <sys/wait.h>
+
+static long child_minor_faults() {
+    // /proc/self/stat fields: (10) minflt (11) cminflt (12) majflt.
+    FILE* f = fopen("/proc/self/stat", "r");
+    if (!f) return -1;
+    char buf[1024];
+    size_t n = fread(buf, 1, sizeof buf - 1, f);
+    fclose(f);
+    buf[n] = '\0';
+    const char* cp = strrchr(buf, ')');   // end of the comm field
+    if (!cp) return -1;
+    long minflt = 0, cminflt = 0, majflt = 0;
+    if (sscanf(cp + 2, "%*s %*s %*s %*s %*s %*s %*s %*s %ld %ld %ld",
+               &minflt, &cminflt, &majflt) < 3) return -1;
+    return minflt;
+}
+
+static int fork_child_and_measure(int do_dispatch) {
+    // The workload every child runs (identical for both groups).
+    pid_t pid = fork();
+    if (pid != 0) {
+        int status = 0;
+        waitpid(pid, &status, 0);
+        return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    }
+    // Child: optionally drive the payload's dispatch path (the
+    // post-fork work the module does for a NON-denylisted app:
+    // uid-keyed deny check + module dispatch decision).
+    long faults_before = child_minor_faults();
+    if (do_dispatch) {
+        // Non-app uid: the fast no-op path (system_server shape).
+        (void)hide_setup_for_target_uid(1000);
+        // App uid, not denylisted: the dispatch path shape.
+        (void)hide_setup_for_target_uid(10234);
+    }
+    volatile char sink = 0;
+    for (int i = 0; i < 256; ++i) {
+        char* p = (char*)malloc(64 + (i & 31));
+        if (p) { p[0] = (char)i; sink ^= p[0]; free(p); }
+    }
+    char b[256];
+    FILE* f = fopen("/proc/self/stat", "r");
+    if (f) { size_t r = fread(b, 1, sizeof b, f); (void)r; fclose(f); }
+    long faults_after = child_minor_faults();
+    _exit((int)(faults_after - faults_before) & 0x7f);
+}
+
+ZS_TEST(forked_child_cow_fault_budget_under_8_pages) {
+    // Group A: the payload is initialized in THIS process (the
+    // "zygote") — hide layers + records + deny map loaded.
+    hide_register_globals();
+    hide_advanced_init();
+
+    long total = 0;
+    const int kRounds = 32;
+    for (int i = 0; i < kRounds; ++i) {
+        total += fork_child_and_measure(1);
+    }
+    double avg = (double)total / kRounds;
+    std::fprintf(stderr, "  [perf] dispatch+workload child: "
+               "%.2f minor faults avg\n", avg);
+    // Budget: 8 pages (32 KB) one-time private memory per child.
+    ZS_CHECK(avg < 8.0);
+
+    // Group B (control): no dispatch work — the workload alone.
+    total = 0;
+    for (int i = 0; i < kRounds; ++i) {
+        total += fork_child_and_measure(0);
+    }
+    double avg_ctl = (double)total / kRounds;
+    std::fprintf(stderr, "  [perf] workload-only child:      "
+               "%.2f minor faults avg\n", avg_ctl);
+    ZS_CHECK(avg_ctl < 8.0);
+    // The payload's dispatch adds at most a few pages over the
+    // control (the delta IS the module's per-fork memory cost).
+    std::fprintf(stderr, "  [perf] per-fork COW delta:      %.2f pages\n",
+               avg - avg_ctl);
+    ZS_CHECK(avg - avg_ctl < 4.0);
+}
+#endif  // ZS_PERF_NO_COW

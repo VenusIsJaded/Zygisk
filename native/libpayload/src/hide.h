@@ -214,6 +214,75 @@ int    hide_trampoline_unmap_pending();
 // Returns the number of records written to out.
 size_t hide_prepare_tier_a_records(struct so_record* out, size_t cap);
 
+// ------------------------------------------------------------------------
+// Round 30 — atexit / pthread_atfork trace purge (the Tier A missing
+// step, verified against bionic's own sources this round).
+//
+// WHAT BUG THIS FIXES (every Tier A child, since Round 8):
+//
+//   bionic keeps __cxa_atexit registrations in libc's AtexitArray
+//   (libc/bionic/atexit.cpp: g_array; AtexitEntry {fn, arg, dso}).
+//   Every .so built with bionic's crtbegin_so carries a destructor
+//   (libc/arch-common/bionic/crtbegin_so.c: __on_dlclose) that calls
+//   __cxa_finalize(&__dso_handle) — that is how a PROPER dlclose
+//   purges its entries (and __unregister_atfork(dso) with them).
+//   Our Tier A unmaps WITHOUT that step, so every hidden child keeps:
+//
+//     - atexit entries whose `fn` points into the now-unmapped text
+//       of libpayload / the module .so's. bionic's exit() walks ALL
+//       entries (__cxa_finalize(nullptr) calls every fn != null) —
+//       the first exit() in a hidden app jumps to unmapped memory
+//       and SIGSEGVs.
+//     - pthread_atfork handlers registered by module code: bionic's
+//       fork() runs them, so every later fork() in the hidden app
+//       would crash the same way.
+//     - a forensic trace: the entries' dso handles point at our
+//       (unmapped or anonymized) segments — exactly what
+//       public Zygisk detectors (lrhtony/ZygiskDetector, read this
+//       round) enumerate by parsing libc's g_array.
+//
+// __dso_handle is a HIDDEN symbol (not dlsym-able), but bionic
+// defines it as a SELF-POINTING pointer
+// (__dso_handle_so.h: static const void* const __dso_handle_const =
+// &__dso_handle_const; with __dso_handle as an alias) — so scanning
+// each record's non-executable pages for a word W with *(void**)W ==
+// W finds every library's handle with no symbol lookups.
+//
+// Entry points (called by entry.cpp's Tier A path, in this order):
+//
+//   zs_collect_dso_handles()  — BEFORE hide_prepare_tier_a_records()
+//       (every record must still be mapped and file-backed for the
+//       scan). Returns {handle, self} pairs: SELF records yield
+//       libpayload's own handle, OTHER records (modules, bridge)
+//       yield theirs.
+//   zs_atexit_finalize(h)     — the purge for ONE library:
+//       __cxa_finalize(h) — extracts the entries (zeroing them),
+//       CALLS the destructors (so it must run while that library's
+//       text is still mapped), compacts the array and unregisters
+//       its atfork handlers: the exact protocol a proper dlclose
+//       runs. Modules are finalized BEFORE the Tier A prep unmaps
+//       their text; the payload's own handle is finalized only
+//       after the trampoline page is prepared and immediately
+//       before the jump (nothing libpayload-side may touch its C++
+//       statics afterwards).
+// ------------------------------------------------------------------------
+
+struct ZsDsoHandle {
+    uintptr_t handle;   // the __dso_handle address (self-pointing word)
+    uint32_t  self;     // 1 = found in a ZS_SO_SELF record (libpayload)
+};
+
+// Maximum handles the Tier A path tracks (the payload + up to 15
+// modules/bridge/loader records). Extras are logged and skipped.
+#define ZS_MAX_DSO_HANDLES 16
+
+size_t zs_collect_dso_handles(struct ZsDsoHandle* out, size_t cap);
+
+// Purge one library's atexit + atfork registrations. Returns 1 when
+// __cxa_finalize ran, 0 when it was unavailable/failed (logged; the
+// device then carries the documented residual).
+int zs_atexit_finalize(uintptr_t dso_handle);
+
 #ifdef ZS_HOST_TEST
 // Test-only: inject a uid into the deny set (no root access to
 // packages.list on the host).

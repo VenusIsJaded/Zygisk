@@ -335,7 +335,49 @@ static int path_is_under_app_dirs(const char* path, size_t len) {
 // basic `grep libpayload /proc/self/maps` probe still hit).
 // Round 8 (B9): the file-name match now excludes app library
 // directories (see kAppLibPathPrefixes).
+// Round 30 — randomized-soname support. When customize.sh installs
+// us as /system/lib[64]/lib<8-hex>-p.so with the bridge as
+// lib<8-hex>.so, the fixed-name literals below would never match
+// and the unmap record set would be EMPTY (Tier A silently dead).
+// The REAL paths are discovered once at init: our own via dladdr
+// (the linker's resolved path for THIS library) and the bridge's by
+// the same "-p" coupling libzygisk uses. The fixed literals are
+// kept as fallbacks — manual installs and host tests use them, and
+// a literal match outside app directories is still correct there.
+static char g_own_path[512];
+static char g_bridge_path[512];
+static int  g_paths_discovered = 0;
+
+static void discover_own_paths() {
+    if (g_paths_discovered) return;
+    g_paths_discovered = 1;
+    Dl_info info{};
+    // Any function guaranteed to live in this library.
+    if (dladdr((const void*)&hide_register_globals, &info) == 0 ||
+        !info.dli_fname) {
+        return;
+    }
+    snprintf(g_own_path, sizeof g_own_path, "%s", info.dli_fname);
+    // Payload ".../lib<stem>-p.so" -> bridge ".../lib<stem>.so" (the
+    // same coupling libzygisk's derive_payload_path uses). Anything
+    // else: same directory + the legacy bridge name.
+    size_t len = strlen(g_own_path);
+    if (len > 6 && strcmp(g_own_path + len - 6, "-p.so") == 0) {
+        // bridge = own path minus the "-p" (2 bytes before ".so")
+        memcpy(g_bridge_path, g_own_path, len - 2);
+        memcpy(g_bridge_path + len - 6, ".so", 4);
+    } else {
+        const char* slash = strrchr(g_own_path, '/');
+        if (slash) {
+            snprintf(g_bridge_path, sizeof g_bridge_path,
+                     "%.*s/libzygisk.so", (int)(slash - g_own_path),
+                     g_own_path);
+        }
+    }
+}
+
 static void scan_maps_into_records(const char* buf, size_t total) {
+    discover_own_paths();
     char linebuf[512];
     const char* line_start = buf;
     const char* end = buf + total;
@@ -353,13 +395,20 @@ static void scan_maps_into_records(const char* buf, size_t total) {
         if (parse_maps_line(linebuf, &ml, &prot) && ml.has_path) {
             const size_t plen = strnlen(ml.path, sizeof(ml.path));
             int in_app_dir = path_is_under_app_dirs(ml.path, plen);
+            // Round 30: the discovered (randomized) paths are
+            // matched as exact full-path substrings; the legacy
+            // literals remain for fixed-name layouts.
             int is_self = !in_app_dir &&
-                          strstr(ml.path, "libpayload.so") != nullptr;
+                          (strstr(ml.path, "libpayload.so") != nullptr ||
+                           (g_own_path[0] != 0 &&
+                            strstr(ml.path, g_own_path) != nullptr));
             int is_ours =
                 is_self ||
                 (!in_app_dir &&
                  (strstr(ml.path, "libzygisk.so")    != nullptr ||
-                  strstr(ml.path, "libzn_loader.so") != nullptr));
+                  strstr(ml.path, "libzn_loader.so") != nullptr ||
+                  (g_bridge_path[0] != 0 &&
+                   strstr(ml.path, g_bridge_path) != nullptr)));
             if (is_ours) {
                 add_so_record(ml.lo, ml.hi,
                               is_self ? ZS_SO_SELF : ZS_SO_OTHER, prot);
@@ -1371,6 +1420,113 @@ size_t hide_prepare_tier_a_records(struct so_record* out, size_t cap) {
         }
     }
     return n_out;
+}
+
+// ------------------------------------------------------------------------
+// Round 30 — the atexit / pthread_atfork trace purge. See hide.h for
+// the full design note (everything below was verified against
+// bionic's libc/bionic/atexit.cpp and crtbegin_so.c this round, not
+// assumed).
+// ------------------------------------------------------------------------
+
+// __cxa_finalize is resolved at first use (both bionic and glibc
+// export it; a null resolution leaves the documented residual
+// instead of crashing the hide pipeline).
+typedef void (*ZsCxaFinalizeFn)(void*);
+static ZsCxaFinalizeFn g_real_cxa_finalize = nullptr;
+static int g_cxa_finalize_resolved = 0;
+
+static ZsCxaFinalizeFn resolve_cxa_finalize() {
+    if (!g_cxa_finalize_resolved) {
+        g_cxa_finalize_resolved = 1;
+        g_real_cxa_finalize =
+            (ZsCxaFinalizeFn)dlsym(RTLD_DEFAULT, "__cxa_finalize");
+        if (!g_real_cxa_finalize) {
+            // RTLD_DEFAULT only searches the global scope; we are
+            // RTLD_LOCAL. dlopen'ing libc by soname resolves through
+            // the default namespace on both bionic and glibc hosts.
+            void* libc = dlopen("libc.so", RTLD_LAZY | RTLD_NOLOAD);
+            if (libc) {
+                g_real_cxa_finalize =
+                    (ZsCxaFinalizeFn)dlsym(libc, "__cxa_finalize");
+                // NO dlclose: the NOLOAD handle only bumps a
+                // refcount, and undoing it would be a wasted syscall
+                // on the hide path.
+            }
+        }
+        if (!g_real_cxa_finalize) {
+            ZS_LOGW("hide: __cxa_finalize unavailable; atexit purge "
+                    "disabled (documented residual)");
+        }
+    }
+    return g_real_cxa_finalize;
+}
+
+size_t zs_collect_dso_handles(struct ZsDsoHandle* out, size_t cap) {
+    if (ZS_UNLIKELY(!out || cap == 0)) return 0;
+    size_t n = 0;
+    for (size_t i = 0; i < g_self_so_count && n < cap; ++i) {
+        const so_record* rec = &g_self_so_records[i];
+        // __dso_handle lives in .data.rel.ro or .data — never in a
+        // text page. Scanning the non-executable records only keeps
+        // this linear walk tiny (a few pages per library).
+        if (rec->prot & ZS_SEG_X) continue;
+        // Guard against a zero/garbage record from tests.
+        if (!rec->base || !rec->size) continue;
+        const uintptr_t start = (rec->base + sizeof(uintptr_t) - 1) &
+                                ~(uintptr_t)(sizeof(uintptr_t) - 1);
+        const uintptr_t end = rec->base + rec->size;
+        for (uintptr_t p = start;
+             p + sizeof(uintptr_t) <= end && n < cap;
+             p += sizeof(uintptr_t)) {
+            uintptr_t w;
+            memcpy(&w, (const void*)p, sizeof w);
+            if (w == p) {
+                // A self-pointing word: bionic's __dso_handle (and
+                // glibc's, which uses the same crt trick). Deduped
+                // (several records can map the same library); an
+                // overlapping SELF classification upgrades an
+                // existing OTHER entry (production never overlaps
+                // them — one address is one library — but the
+                // upgrade keeps the classification right if a
+                // rescan ever produces odd records).
+                int found = -1;
+                for (size_t k = 0; k < n; ++k) {
+                    if (out[k].handle == p) { found = (int)k; break; }
+                }
+                if (found < 0) {
+                    out[n].handle = p;
+                    out[n].self =
+                        (rec->flags & ZS_SO_SELF) ? 1u : 0u;
+                    ++n;
+                } else if (rec->flags & ZS_SO_SELF) {
+                    out[found].self = 1u;
+                }
+                // One record yields at most one handle (the alias
+                // pair __dso_handle_const/__dso_handle shares the
+                // address).
+                break;
+            }
+        }
+    }
+    if (n == cap) {
+        ZS_LOGW("hide: dso-handle scan hit the %zu cap; extra "
+                "libraries keep their atexit entries (residual)",
+                cap);
+    }
+    return n;
+}
+
+int zs_atexit_finalize(uintptr_t dso_handle) {
+    ZsCxaFinalizeFn fn = resolve_cxa_finalize();
+    if (!fn || !dso_handle) return 0;
+    // The bionic/glibc contract: entries whose dso matches are
+    // extracted (zeroed in the array), their destructors CALLED, the
+    // array compacted, and bionic additionally unregisters the
+    // library's pthread_atfork handlers. This is exactly what a
+    // proper dlclose triggers via crtbegin_so's __on_dlclose.
+    fn((void*)dso_handle);
+    return 1;
 }
 
 #ifdef ZS_HOST_TEST

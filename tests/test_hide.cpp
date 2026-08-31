@@ -34,6 +34,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <cxxabi.h>   // __cxa_atexit / __cxa_finalize (Round 30)
+
 using namespace zygisk_study;
 
 // ----------------------------------------------------------------------
@@ -1327,4 +1329,99 @@ ZS_TEST(data_dir_for_uid_derives_canonical_per_user_path) {
 
     remove_temp(pkg_path);
     hide_test_set_packages_list_path("/data/system/packages.list");
+}
+
+// ----------------------------------------------------------------------
+// Round 30 — the Tier A atexit purge (bionic's __cxa_finalize
+// protocol, verified from libc/bionic/atexit.cpp + crtbegin_so.c this
+// round; see hide.h's design note).
+// ----------------------------------------------------------------------
+
+// A sentinel destructor: glibc/bionic __cxa_finalize CALLS the
+// entries it purges, so the counter doubles as "the purge ran".
+static int g_r30_sentinel_calls = 0;
+static void r30_sentinel_dtor(void* arg) {
+    ++g_r30_sentinel_calls;
+    (void)arg;
+}
+
+ZS_TEST(dso_handle_scan_finds_self_pointing_words_and_skips_text) {
+    // One page holding a fake __dso_handle at a known offset, plus
+    // two decoy words (zero and a non-self pointer).
+    long ps = sysconf(_SC_PAGESIZE);
+    if (ps <= 0) ps = 4096;
+    void* page = mmap(nullptr, (size_t)ps, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ZS_CHECK(page != MAP_FAILED);
+    if (page == MAP_FAILED) return;
+    memset(page, 0, (size_t)ps);
+    uintptr_t base = (uintptr_t)page;
+    // Decoy: a pointer to another address in the page (vtable-like).
+    *(uintptr_t*)((char*)page + 16) = base + 32;
+    // The self-pointing handle.
+    uintptr_t handle_addr = base + 64;
+    *(uintptr_t*)handle_addr = handle_addr;
+
+    struct so_record recs[3];
+    memset(recs, 0, sizeof recs);
+    recs[0].base = base;      recs[0].size = (size_t)ps;
+    recs[0].prot = ZS_SEG_W;  recs[0].flags = ZS_SO_OTHER;  // data seg
+    recs[1].base = base;      recs[1].size = (size_t)ps;
+    recs[1].prot = ZS_SEG_X;  recs[1].flags = ZS_SO_OTHER;  // text: skipped
+    recs[2].base = handle_addr - 8; recs[2].size = 16;
+    recs[2].prot = 0;         recs[2].flags = ZS_SO_SELF;   // relro: found + self
+    hide_test_set_records(recs, 3);
+
+    struct ZsDsoHandle out[8];
+    size_t n = zs_collect_dso_handles(out, 8);
+    // The SELF record's handle (deduped with the OTHER record's —
+    // same address) is what the scan must report; text skipped.
+    ZS_CHECK_EQ(n, (size_t)1);
+    if (n == 1) {
+        ZS_CHECK_EQ(out[0].handle, handle_addr);
+        ZS_CHECK_EQ(out[0].self, 1u);   // SELF classification wins
+    }
+
+    // Cap: with room for one, the scan reports one (dedup first).
+    struct ZsDsoHandle one[1];
+    ZS_CHECK_EQ(zs_collect_dso_handles(one, 1), (size_t)1);
+
+    hide_test_set_records(nullptr, 0);
+    munmap(page, (size_t)ps);
+}
+
+ZS_TEST(atexit_finalize_purges_matching_entries_only) {
+    // A fake dso handle (the address of a stack variable works: the
+    // value only needs to be unique and non-null).
+    alignas(sizeof(void*)) char fake_handle_area[sizeof(void*)];
+    void* fake_handle = (void*)fake_handle_area;
+
+    int before = g_r30_sentinel_calls;
+    // Register TWO sentinels against our fake handle and one against
+    // a different handle: __cxa_finalize(fake) must call exactly the
+    // two, and leave the third intact.
+    __cxxabiv1::__cxa_atexit(r30_sentinel_dtor, nullptr, fake_handle);
+    __cxxabiv1::__cxa_atexit(r30_sentinel_dtor, nullptr, fake_handle);
+    __cxxabiv1::__cxa_atexit(r30_sentinel_dtor, nullptr, (void*)&before);
+
+    ZS_CHECK_EQ(zs_atexit_finalize((uintptr_t)fake_handle), 1);
+    ZS_CHECK_EQ(g_r30_sentinel_calls, before + 2);
+
+    // A second finalize of the SAME handle must not re-call: the
+    // entries were extracted (this is the exact bionic contract the
+    // Tier A purge relies on — the hidden app's later exit() walks
+    // NOTHING of ours).
+    ZS_CHECK_EQ(zs_atexit_finalize((uintptr_t)fake_handle), 1);
+    ZS_CHECK_EQ(g_r30_sentinel_calls, before + 2);
+
+    // Zero handle / null: refused without calling anything.
+    ZS_CHECK_EQ(zs_atexit_finalize(0), 0);
+    ZS_CHECK_EQ(g_r30_sentinel_calls, before + 2);
+
+    // Purge the third sentinel too so it cannot fire at the test
+    // binary's own exit (its dso would otherwise dangle into a stack
+    // frame that is gone by then — the same class of bug, in
+    // miniature).
+    ZS_CHECK_EQ(zs_atexit_finalize((uintptr_t)&before), 1);
+    ZS_CHECK_EQ(g_r30_sentinel_calls, before + 3);
 }

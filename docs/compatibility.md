@@ -54,12 +54,53 @@ are no linker namespaces to complicate resolution), the magic-
 mounted copy is what the zygote finds.
 
 Zygisk Study's `post-fs-data.sh` performs the swap itself (Round 7):
-it writes `libzygisk.so` into `ro.dalvik.vm.native.bridge` with
+it writes the bridge's soname into `ro.dalvik.vm.native.bridge` with
 `resetprop`, but ONLY when the property currently means "no bridge"
 — devices that already run a real native bridge (x86 ARM translation
 hubs, ChromeOS-style bridges) must never be overridden, since
 breaking translation breaks the whole device. The previous value
 is saved for `uninstall.sh` to restore.
+
+**Round 30 — restore-after-consumption (the property guard).**
+The property value is readable by any app and is the single most
+generic root/Zygisk detection vector there is. Verified this round
+from the actual sources: Magisk's own zygisk keeps the property set
+for the whole boot (topjohnwu/Magisk
+native/src/core/zygisk/daemon.rs — `set_prop()` once, `restore_prop()`
+only on rollback/stop), and ReZygisk v2 abandoned the property
+mechanism entirely for ptrace injection. Zygisk Study instead
+restores it: the daemon's property-guard thread waits for the
+bridge library to appear in the zygote's `/proc/<pid>/maps` — proof
+ART consumed the value (AndroidRuntime.cpp reads it exactly once
+per zygote start; from 10.0 a `zygote &&` guard means only the
+zygote even attempts the load, verified at 5.0.0_r1 / 8.1.0_r81 /
+10.0.0_r1 / 12.0.0_r1 / 13.0.0_r1 / 16.0.0_r1) — then writes the
+stock value back with `resetprop`. On a zygote crash-restart the
+guard re-applies the loader value before the new zygote's
+Runtime::Init reads it (a 250 ms poll against init's restart
+sequence), and after more than 3 restarts in one boot it rolls
+back to stock permanently (Magisk's bootloop policy). The honest
+residual: the property is set from post-fs-data until the guard's
+restore lands shortly after `late_start` — no third-party app runs
+in that window (apps start after boot-complete), but a system
+component could theoretically read it; and a lost re-apply race
+leaves the module inert for that zygote generation (the next
+restart re-arms).
+
+**Round 30 — randomized loader names.** `customize.sh` installs the
+bridge and payload under per-install random names
+(`lib<8-hex>.so` / `lib<8-hex>-p.so`), recorded in
+`.loader_names`. A fixed `libzygisk.so` / `libpayload.so` in every
+process's `/proc/self/maps` is a trivial string signature for
+name-based Zygisk detectors; a random name per install defeats that
+class of scan. The payload discovers its own path and the bridge's
+via `dladdr` at runtime (`derive_payload_path` in libzygisk,
+`discover_own_paths` in hide.cpp), with the legacy fixed names kept
+as fallbacks for manual installs. On 5.0–9.0 the restore also stops
+every non-zygote `app_process` run (`adb shell am` and friends)
+from loading the bridge at all — those runs read the property
+through the same AndroidRuntime.cpp path with no zygote guard
+(verified: the guard first appears at 10.0).
 
 **Round 29 correction (the biggest device-side bug this module ever
 had):** "no bridge" is BOTH the empty value AND `"0"`. ART's own
@@ -375,6 +416,29 @@ are Android user 999 (community-documented, and consistent with the
 uid math above); no MIUI-specific native-bridge problems appear in
 the ReZygisk/ZygiskNext issue-tracker sweeps (their OEM-specific
 reports center on Samsung's kernel rules, not MIUI's userspace).
+
+### GrapheneOS (Round 30 research)
+
+GrapheneOS's exec-based spawning ("secure app spawning",
+`persist.security.exec_spawn`, **default ON** — verified from
+GrapheneOS/platform_frameworks_base branch 16,
+android/ext/settings/ExtSettings.java) does NOT change anything for
+this module. Reading their actual implementation
+(core/java/com/android/internal/os/ExecInit.java +
+ZygoteConnection.java): apps still fork from the zygote and run the
+full specialization — `handleChildProc` then calls
+`ExecInit.execApplication` → `Os.execv("/system/bin/app_process64",
+...)` from the ALREADY-SPECIALIZED child. The privilege drop our
+hooks key on happens before the exec, and both the private mount
+namespace and the execve-proof property spoofing survive `execve`
+by design. The exec'd app_process re-initializes a runtime and
+re-reads `ro.dalvik.vm.native.bridge` (pre-10 only — from 10.0 the
+`zygote` guard in AndroidRuntime.cpp keeps non-zygote runs from
+loading any bridge), which is exactly the second-load surface the
+Round 30 property restore eliminates. hardened_malloc
+(`DISABLE_HARDENED_MALLOC` runtime flag) is a malloc interposition
+and does not interact with our GOT-hook mechanism. Nothing in
+GrapheneOS's fork-then-exec flow requires special handling.
 
 ### What this is, and what it is not
 

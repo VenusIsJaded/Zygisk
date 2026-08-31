@@ -24,6 +24,12 @@ binary over its REAL socket:
   8. previous-boot random-dir cleanup across a restart
   9. (Round 29) the same cleanup when ONLY the workdir session
      record survives (module tree unreadable/removed)
+ 10. (Round 30) the property guard, LIVE against a fake zygote:
+     the stock value is restored once the (fake) bridge library
+     appears in the fake zygote's maps, re-applied after each
+     zygote death, and rolled back permanently after more than 3
+     restarts (Magisk's bootloop policy); an empty stock backup
+     restores via --delete (absent, not empty string)
 
 Exits 0 when every check passes, 1 on any failure, 77 when no Rust
 toolchain is available (same skip convention as verify_trampolines).
@@ -352,6 +358,201 @@ def run_checks(binary, tree, env, proc):
             proc3.wait(timeout=3)
         except subprocess.TimeoutExpired:
             proc3.kill()
+
+    # 10. Round 30 — the property guard, live. A fresh daemon with
+    # the Round 30 workdir records; a fake `resetprop` on PATH that
+    # logs every invocation; a fake zygote (a python process with an
+    # `--zygote` argv token that mmaps the fake bridge library, so
+    # the daemon's REAL /proc/<pid>/maps check sees it mapped).
+    run_prop_guard_checks(binary, tree, env)
+
+
+def start_fake_zygote(bridge_file):
+    """A process whose cmdline carries the --zygote token and whose
+    maps contain the bridge library (mmap'd read-only)."""
+    script = ("import mmap, sys, time\n"
+              "f = open(sys.argv[1], 'rb')\n"
+              "m = mmap.mmap(f.fileno(), 0, prot=mmap.PROT_READ)\n"
+              "time.sleep(600)\n")
+    return subprocess.Popen(
+        [sys.executable, "-c", script, bridge_file, "--zygote"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def run_prop_guard_checks(binary, tree, env):
+    print("== Round 30: property guard ==")
+    # The workdir records post-fs-data.sh writes after a swap.
+    backup = os.path.join(tree.workdir, ".native_bridge_backup")
+    applied = os.path.join(tree.workdir, ".native_bridge_applied")
+    with open(backup, "w") as f:
+        f.write("0")            # the stock value on 169/173 devices
+    BRIDGE = "libtest1234.so"
+    with open(applied, "w") as f:
+        f.write(BRIDGE)
+    # The fake bridge library (only needs to exist + be mappable).
+    bridge_file = os.path.join(tree.workdir, BRIDGE)
+    with open(bridge_file, "wb") as f:
+        f.write(b"\x7fELF-fake-bridge\n" * 8)
+    # The fake resetprop: logs "resetprop <args...>" and succeeds.
+    bindir = os.path.join(tree.root, "bin")
+    os.makedirs(bindir, exist_ok=True)
+    proplog = os.path.join(tree.root, "proplog.txt")
+    resetprop = os.path.join(bindir, "resetprop")
+    with open(resetprop, "w") as f:
+        f.write(f"#!/bin/sh\necho \"$@\" >> {proplog}\nexit 0\n")
+    os.chmod(resetprop, 0o755)
+
+    e = dict(env)
+    e["ZS_TEST_ROOT"] = tree.root
+    e["ZS_TEST_POLL_MS"] = "100"
+    e["ZS_TEST_ZYGOTE_GRACE_MS"] = "600"
+    e["PATH"] = bindir + ":" + e.get("PATH", "")
+    e["ZS_PROP_LOG"] = proplog
+
+    def log_lines():
+        try:
+            with open(proplog) as f:
+                return [l.strip() for l in f if l.strip()]
+        except FileNotFoundError:
+            return []
+
+    zygotes = []
+
+    def zygote_up():
+        z = start_fake_zygote(bridge_file)
+        zygotes.append(z)
+        return z
+
+    def zygote_down(z):
+        z.kill()
+        z.wait()
+        zygotes.remove(z)
+
+    def wait_for(pred, timeout=6.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if pred():
+                return True
+            time.sleep(0.1)
+        return False
+
+    proc = subprocess.Popen(
+        [binary, "--workdir", tree.workdir],
+        env=e, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        # Wait for the daemon to be up (session file).
+        deadline = time.time() + 5
+        while time.time() < deadline and not os.path.exists(tree.session_file):
+            time.sleep(0.05)
+
+        # (a) zygote #1 up with the bridge mapped -> restore stock.
+        z1 = zygote_up()
+        ok = wait_for(lambda: any(
+            l == f"ro.dalvik.vm.native.bridge 0" for l in log_lines()))
+        check("guard restores stock value once the bridge is mapped",
+              ok, str(log_lines()))
+
+        # (b) zygote death -> re-apply the loader value.
+        zygote_down(z1)
+        ok = wait_for(lambda: any(
+            l == f"ro.dalvik.vm.native.bridge {BRIDGE}" for l in log_lines()))
+        check("guard re-applies the loader value after zygote death",
+              ok, str(log_lines()))
+
+        # (c) replacement zygote -> restore again (crash-restart cycle
+        # works more than once).
+        n_restore_before = sum(1 for l in log_lines()
+                               if l.endswith(" 0"))
+        z2 = zygote_up()
+        ok = wait_for(lambda: sum(1 for l in log_lines()
+                                  if l.endswith(" 0")) > n_restore_before)
+        check("guard restores again for the replacement zygote",
+              ok, str(log_lines()))
+
+        # (d) bootloop policy: drive restarts past the limit. Each
+        # death (re-apply) + replacement (restore) is one restart;
+        # the 4th death must trigger the final rollback and stand
+        # down: NO further re-applies afterwards.
+        zygote_down(z2)                 # restart 2
+        wait_for(lambda: sum(1 for l in log_lines()
+                             if l.endswith(BRIDGE)) >= 2)
+        z3 = zygote_up()                # restored for gen 3
+        wait_for(lambda: sum(1 for l in log_lines()
+                             if l.endswith(" 0")) >= 3)
+        zygote_down(z3)                 # restart 3
+        wait_for(lambda: sum(1 for l in log_lines()
+                             if l.endswith(BRIDGE)) >= 3)
+        z4 = zygote_up()                # restored for gen 4
+        wait_for(lambda: sum(1 for l in log_lines()
+                             if l.endswith(" 0")) >= 4)
+        n_reapply = sum(1 for l in log_lines() if l.endswith(BRIDGE))
+        zygote_down(z4)                 # restart 4 -> ROLLBACK + stop
+        ok = wait_for(lambda: sum(1 for l in log_lines()
+                                  if l.endswith(" 0")) >= 5)
+        check("guard rolls back permanently after too many restarts",
+              ok, str(log_lines()))
+        time.sleep(1.0)
+        n_reapply_after = sum(1 for l in log_lines() if l.endswith(BRIDGE))
+        check("stood-down guard re-applies nothing further",
+              n_reapply_after == n_reapply,
+              f"{n_reapply} -> {n_reapply_after}")
+        z5 = zygote_up()                # a healthy 5th generation
+        time.sleep(1.0)
+        n_restore_final = sum(1 for l in log_lines() if l.endswith(" 0"))
+        check("stood-down guard stays inert for new zygotes",
+              n_restore_final == 5, f"{n_restore_final} restores")
+        zygote_down(z5)
+
+        # (e) the daemon itself is still healthy after all this.
+        reply = ask(read_session_path(tree), b"L")
+        check("daemon still serves 'L' after the guard exercised",
+              b"testmod" in reply, repr(reply))
+    finally:
+        for z in list(zygotes):
+            try:
+                z.kill()
+                z.wait()
+            except OSError:
+                pass
+        proc.send_signal(signal.SIGTERM)
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        try:
+            os.unlink(proplog)
+        except FileNotFoundError:
+            pass
+
+    # (f) empty backup -> --delete (absent, never an empty value:
+    # the R28-verified ART semantics — "" is a warning-worthy
+    # anomaly, absent is genuine stock).
+    with open(backup, "w") as f:
+        f.write("")
+    proplog2 = os.path.join(tree.root, "proplog2.txt")
+    with open(resetprop, "w") as f:
+        f.write(f"#!/bin/sh\necho \"$@\" >> {proplog2}\nexit 0\n")
+    e["ZS_PROP_LOG"] = proplog2
+    proc = subprocess.Popen(
+        [binary, "--workdir", tree.workdir],
+        env=e, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        deadline = time.time() + 5
+        while time.time() < deadline and not os.path.exists(tree.session_file):
+            time.sleep(0.05)
+        z = zygote_up()
+        ok = wait_for(lambda: os.path.exists(proplog2) and any(
+            l == "--delete ro.dalvik.vm.native.bridge"
+            for l in open(proplog2).read().splitlines()))
+        check("empty stock backup restores via --delete",
+              ok, open(proplog2).read() if os.path.exists(proplog2) else "")
+        zygote_down(z)
+    finally:
+        proc.send_signal(signal.SIGTERM)
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.kill()
 
 
 if __name__ == "__main__":

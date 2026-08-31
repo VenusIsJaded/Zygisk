@@ -101,10 +101,31 @@ else
   SYS_LIB_DIR="$MODPATH/system/lib"
 fi
 mkdir -p "$SYS_LIB_DIR"
-cp "$LIBZYGISK"  "$SYS_LIB_DIR/libzygisk.so"
-cp "$LIBPAYLOAD" "$SYS_LIB_DIR/libpayload.so"
-chmod 0644 "$SYS_LIB_DIR/libzygisk.so" "$SYS_LIB_DIR/libpayload.so"
-ui_print "- Systemless bridge layout at $SYS_LIB_DIR"
+# ROUND 30 (STEALTH): the two libraries are installed under
+# PER-INSTALL RANDOMIZED names — lib<8-hex>.so (bridge) and
+# lib<8-hex>-p.so (payload). A fixed "libzygisk.so" / "libpayload.so"
+# in every process's /proc/self/maps is a trivial string signature
+# for name-based Zygisk detectors; a random name per install defeats
+# that whole class of scan. The payload discovers its own path and
+# the bridge's via dladdr at runtime (libzygisk's
+# derive_payload_path, hide.cpp's discover_own_paths), so nothing
+# else needs the names. They are recorded in .loader_names for
+# post-fs-data.sh (the property value) and the daemon (the crash
+# re-apply value).
+RAND_STEM="$(head -c 4 /dev/urandom 2>/dev/null | od -An -tx1 2>/dev/null | tr -d ' \n')"
+# Fallback for environments without /dev/urandom or od: derive from
+# the install time + pid (still unique per install).
+if [ -z "$RAND_STEM" ] || [ "${#RAND_STEM}" -ne 8 ]; then
+  RAND_STEM="$(printf '%08x' $(( ($(date +%s 2>/dev/null || echo 0) + $$) % 2147483647 )) )"
+  RAND_STEM="${RAND_STEM:0:8}"
+fi
+BRIDGE_NAME="lib${RAND_STEM}.so"
+PAYLOAD_NAME="lib${RAND_STEM}-p.so"
+cp "$LIBZYGISK"  "$SYS_LIB_DIR/$BRIDGE_NAME"
+cp "$LIBPAYLOAD" "$SYS_LIB_DIR/$PAYLOAD_NAME"
+chmod 0644 "$SYS_LIB_DIR/$BRIDGE_NAME" "$SYS_LIB_DIR/$PAYLOAD_NAME"
+printf 'bridge=%s\npayload=%s\n' "$BRIDGE_NAME" "$PAYLOAD_NAME"   > "$MODPATH/.loader_names"
+ui_print "- Systemless bridge layout at $SYS_LIB_DIR ($BRIDGE_NAME)"
 
 # Round 29: service.sh launches the daemon from $MODPATH/zygiskd.
 # Before this round NOBODY created that path — customize.sh only

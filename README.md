@@ -299,14 +299,19 @@ What the tests cover (Round 9):
   FORCE_DENYLIST_UNMOUNT runs its unmount phase only after the
   post callbacks.
 
-(Total: 231 host-side tests, the daemon's `cargo test` suite (24
-tests), `make verify-daemon` — 19 LIVE checks against the real
-zygiskd binary — and `make verify-scripts` (Round 29) — 45 LIVE
+(Total: 237 host-side tests, the daemon's `cargo test` suite (30
+tests), `make verify-daemon` — 27 LIVE checks against the real
+zygiskd binary — and `make verify-scripts` (Round 29) — 53 LIVE
 checks that run the module's actual shell scripts against a fake
 Magisk environment. That last layer is the one that finally
 executes post-fs-data.sh/service.sh/customize.sh/uninstall.sh on
 the host, closing the "host tests green, device dead" gap for the
-install chain.)
+install chain. Round 30 adds: the Tier A atexit-purge e2e pair
+(the purge-disabled variant is a LIVE regression proof — that
+child SIGSEGVs exactly the way every hidden app used to on
+exit()), the property-guard lifecycle (restore / re-apply /
+rollback / stand-down against a fake zygote and a fake resetprop),
+and the randomized-soname install flow.)
 
 The logic suites also run clean under **ASan + UBSan with leak
 detection** — `cd tests && make run-sanitize`. That run is where
@@ -685,6 +690,44 @@ numbers will differ — see `PERFORMANCE-CLAIMS.md` for the honest
 analysis. The 44% reduction in `make_filtered_memfd` is the
 direct, measurable effect of the P1.18 batched-write + P1.39
 constexpr-lengths + P1.40 branch-hint optimizations.)
+
+### Round 30 — the atexit purge, GrapheneOS, the property guard, and randomized names
+
+Research-driven round, same discipline: every claim fetched and
+read, nothing guessed. Sources this round: GrapheneOS's actual
+exec-spawning implementation (fork+specialize-then-exec, default
+on — nothing needed for us; the exec'd app re-reads the bridge
+property only pre-10), Magisk's current zygisk daemon (they keep
+the property set all boot — the exact hole we now close), bionic's
+atexit internals (the __cxa_finalize protocol every proper dlclose
+runs; __dso_handle is a self-pointing constant), a public
+ZygiskDetector that enumerates libc's atexit array, and the
+AndroidRuntime.cpp zygote-guard boundary (5.0-9.0: every
+app_process run loads the bridge; 10.0+: zygote only).
+
+Three real fixes/improvements landed:
+
+1. **Tier A atexit purge** (device-fatal since Round 8): hidden
+   apps crashed on the first exit() — and any module's
+   pthread_atfork handlers crashed every fork() — because Tier A
+   unmapped the libraries without purging their libc atexit
+   entries (whose fn pointers then dangled into unmapped text).
+   The purge mirrors a proper dlclose exactly; the regression is
+   proven live (the seam-disabled child SIGSEGVs on the modeled
+   bionic exit walk).
+2. **The property guard**: ro.dalvik.vm.native.bridge — readable
+   by any app — now reads stock again once the zygote has consumed
+   it (observed via /proc/<zygote>/maps), with crash re-apply and
+   a 3-restart bootloop rollback. The #1 generic root detection
+   vector is closed while keeping restart reliability.
+3. **Randomized loader names per install** (lib<8-hex>.so /
+   lib<8-hex>-p.so, discovered via dladdr with legacy fallbacks):
+   fixed-name maps greps no longer match anything.
+
+Measured, not guessed: the per-fork COW audit reports a 0.00
+minor-fault delta per child on host — the module's per-fork memory
+cost is below the measurement floor, and the standing perf
+medians (41 ns hook matcher, 0 us setup/apply) are unchanged.
 
 ## License
 

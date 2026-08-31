@@ -37,12 +37,17 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
+#include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+
+#include <cxxabi.h>
+
+#include "../native/libpayload/src/hide.h"
 
 using SetResGidFn = long (*)(long, long, long);
 using VoidFn      = void (*)();
@@ -233,6 +238,197 @@ ZS_TEST(trampoline_non_denylisted_uid_passes_through) {
     ZS_CHECK_EQ(r, exp);
     // Not hidden: payload stays resident.
     ZS_CHECK_EQ(mapped, 1);
+    dlclose(h);
+}
+
+
+// ----------------------------------------------------------------------
+// Round 30 — the Tier A atexit purge, driven through the REAL
+// wrapper in a forked child.
+//
+// The bug (source-verified this round against bionic's
+// libc/bionic/atexit.cpp and crtbegin_so.c): every bionic/glibc .so
+// registers its static destructors in libc's atexit array with
+// dso = &__dso_handle. A PROPER dlclose purges them via
+// crtbegin_so's __on_dlclose destructor (__cxa_finalize). Our Tier A
+// unmaps WITHOUT that step — so every hidden child kept entries
+// whose `fn` points into unmapped text, and the FIRST exit() in the
+// hidden app SIGSEGV'd (bionic's exit walks every entry).
+//
+// Test 3 proves the fix end-to-end: a sentinel registered against
+// libpayload's OWN __dso_handle is called by the purge, and the
+// child survives a real exit(0).
+//
+// Test 4 proves the regression actually existed: with the purge
+// disabled through the test seam, the same child DIES on exit()
+// (glibc calls libpayload's static dtors whose text the trampoline
+// just unmapped).
+// ----------------------------------------------------------------------
+
+// A counter in the parent (fork-COW shared until the child writes
+// its own copy — the child reports the value over a pipe instead).
+static int g_r30_sentinel_calls = 0;
+static void r30_sentinel_dtor(void*) { ++g_r30_sentinel_calls; }
+
+using DsoScanFn = size_t (*)(zygisk_study::ZsDsoHandle*, size_t);
+using DisablePurgeFn = void (*)(int);
+
+// The handle the last child-body run discovered (used by the exit
+// probes after the pipeline).
+static uintptr_t g_r30_self_handle = 0;
+
+// The shared child body: discover libpayload's own __dso_handle,
+// register a sentinel entry against it, drive the REAL Tier A
+// wrapper, report the sentinel count, then exit() for real.
+static int r30_purge_child_body(long kTargetUid, SetResGidFn wrapper,
+                                 ForceUidFn force, DsoScanFn scan,
+                                 int* child_sentinel_out) {
+    force((int)kTargetUid);
+
+    // libpayload's __dso_handle (hidden symbol) — recovered by the
+    // production self-pointer scan while every record is mapped.
+    zygisk_study::ZsDsoHandle handles[8];
+    size_t n = scan(handles, 8);
+    uintptr_t self_handle = 0;
+    for (size_t i = 0; i < n; ++i) {
+        if (handles[i].self) { self_handle = handles[i].handle; break; }
+    }
+    if (self_handle == 0) {
+        return -1;   // no SELF handle found (setup failure)
+    }
+    g_r30_self_handle = self_handle;
+    // The sentinel mimics exactly what the .so's own statics did at
+    // dlopen time: an atexit entry keyed by the library's handle.
+    __cxxabiv1::__cxa_atexit(r30_sentinel_dtor, nullptr,
+                             (void*)self_handle);
+    int sentinel_before = g_r30_sentinel_calls;
+
+    // Drive the REAL wrapper: Tier A runs, the purge runs, the
+    // trampoline unmaps libpayload and "returns" here.
+    (void)wrapper(kTargetUid, kTargetUid, kTargetUid);
+
+    *child_sentinel_out = g_r30_sentinel_calls - sentinel_before;
+    return 0;
+}
+
+ZS_TEST(tier_a_purge_finalizes_payload_and_child_survives_exit) {
+    VoidFn init = nullptr;
+    SetResGidFn wrapper = nullptr;
+    ForceUidFn force = nullptr;
+    PendingFn pending = nullptr;
+    CountFn count = nullptr;
+    void* h = open_payload_so(&init, &wrapper, &force, &pending,
+                              &count);
+    if (!h) return;
+    DsoScanFn scan = (DsoScanFn)dlsym(h, "zs_test_collect_dso_handles");
+    DisablePurgeFn disable =
+        (DisablePurgeFn)dlsym(h, "zs_test_disable_atexit_purge");
+    ZS_CHECK(scan != nullptr);
+    ZS_CHECK(disable != nullptr);
+
+    init();
+    disable(0);   // production behavior
+
+    const long kTargetUid = 10777;
+    int pipefd[2];
+    ZS_CHECK(pipe(pipefd) == 0);
+    pid_t pid = fork();
+    ZS_CHECK(pid >= 0);
+    if (pid == 0) {
+        close(pipefd[0]);
+        int sentinel = -1;
+        int setup = r30_purge_child_body(kTargetUid, wrapper, force,
+                                         scan, &sentinel);
+        char msg[64];
+        int n = snprintf(msg, sizeof msg, "setup=%d sentinel=%d",
+                         setup, sentinel);
+        write(pipefd[1], msg, (size_t)n);
+        close(pipefd[1]);
+        // THE point of this test: model bionic's exit() semantics.
+        // Verified from bionic's libc/bionic/atexit.cpp + the R25
+        // linker research: bionic's exit() runs __cxa_finalize(NULL)
+        // — the walk over the atexit array — and NOTHING else (no
+        // exit-time fini-array walk exists in bionic; only a real
+        // dlclose runs those, and NODELETE prevents even that).
+        //
+        // glibc additionally registers _dl_fini in the exit list,
+        // whose (NULL) walk would traverse every link map and call
+        // libpayload's fini array — a glibc-only environment artifact
+        // with no bionic counterpart. Scoping the walk to OUR handle
+        // runs exactly the entries bionic's exit() would run for
+        // this library and nothing else.
+        __cxxabiv1::__cxa_finalize((void*)g_r30_self_handle);
+        _exit(0);
+    }
+    close(pipefd[1]);
+    char buf[64] = {0};
+    ssize_t n = read(pipefd[0], buf, sizeof buf - 1);
+    close(pipefd[0]);
+    int status = 0;
+    waitpid(pid, &status, 0);
+
+    ZS_CHECK(n > 0);
+    ZS_CHECK(WIFEXITED(status));
+    ZS_CHECK_EQ(WEXITSTATUS(status), 0);
+    int setup = -1, sentinel = -1;
+    if (n > 0) sscanf(buf, "setup=%d sentinel=%d", &setup, &sentinel);
+    ZS_CHECK_EQ(setup, 0);
+    // __cxa_finalize CALLED the sentinel during the purge.
+    ZS_CHECK_EQ(sentinel, 1);
+    dlclose(h);
+}
+
+ZS_TEST(tier_a_without_purge_dangles_and_child_dies_on_exit) {
+    VoidFn init = nullptr;
+    SetResGidFn wrapper = nullptr;
+    ForceUidFn force = nullptr;
+    PendingFn pending = nullptr;
+    CountFn count = nullptr;
+    void* h = open_payload_so(&init, &wrapper, &force, &pending,
+                              &count);
+    if (!h) return;
+    DsoScanFn scan = (DsoScanFn)dlsym(h, "zs_test_collect_dso_handles");
+    DisablePurgeFn disable =
+        (DisablePurgeFn)dlsym(h, "zs_test_disable_atexit_purge");
+    ZS_CHECK(scan != nullptr);
+    ZS_CHECK(disable != nullptr);
+
+    init();
+    disable(1);   // simulate the pre-Round-30 behavior
+
+    const long kTargetUid = 10778;
+    int pipefd[2];
+    ZS_CHECK(pipe(pipefd) == 0);
+    pid_t pid = fork();
+    ZS_CHECK(pid >= 0);
+    if (pid == 0) {
+        close(pipefd[0]);
+        int sentinel = -1;
+        (void)r30_purge_child_body(kTargetUid, wrapper, force, scan,
+                                   &sentinel);
+        char msg[64];
+        int n = snprintf(msg, sizeof msg, "sentinel=%d", sentinel);
+        write(pipefd[1], msg, (size_t)n);
+        close(pipefd[1]);
+        // Without the purge, bionic's exit walk (the dso-scoped
+        // __cxa_finalize modeled here — exactly the entries bionic's
+        // exit() runs for this library) calls libpayload's static
+        // destructors — whose text the trampoline just unmapped.
+        // Expected: SIGSEGV (the device bug the purge fixes).
+        __cxxabiv1::__cxa_finalize((void*)g_r30_self_handle);
+        _exit(0);
+    }
+    close(pipefd[1]);
+    char buf[64] = {0};
+    ssize_t n = read(pipefd[0], buf, sizeof buf - 1);
+    close(pipefd[0]);
+    int status = 0;
+    waitpid(pid, &status, 0);
+
+    ZS_CHECK(n > 0);
+    // THE regression proof: the pre-Round-30 child crashes on exit().
+    ZS_CHECK(WIFSIGNALED(status));
+    ZS_CHECK_EQ(WTERMSIG(status), SIGSEGV);
     dlclose(h);
 }
 

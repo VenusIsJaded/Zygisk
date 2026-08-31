@@ -2355,3 +2355,97 @@ sanitization, AOSP fallback, target-path resolution).
 verify_scripts.py 45 checks, verify_daemon.py 16 → 19 (dual
 session record + workdir-record cleanup). 0 warnings, sanitizers
 green, trampoline verification green, perf medians unchanged.
+
+## Round 30 — bugs, GrapheneOS, atexit forensics, and two stealth layers
+
+Research base (every fact fetched and READ this round, nothing
+guessed):
+
+- **GrapheneOS** (github.com/GrapheneOS/platform_frameworks_base,
+  branch 16): `ExecInit.java` + `ZygoteConnection.java` +
+  `ZygoteCommandBuffer.cpp` + `android/ext/settings/ExtSettings.java`
+  — exec spawning is fork+specialize-then-exec, default ON
+  (`persist.security.exec_spawn = true`); the exec'd app_process
+  re-reads the bridge property pre-10. Zero changes needed for us.
+- **Magisk's current zygisk** (topjohnwu/Magisk master,
+  native/src/core/zygisk/{entry.cpp,hook.cpp,daemon.rs} +
+  native/src/core/module.rs): it is native-bridge-based like us
+  ("libzygisk.so", systemless /system/lib64, the property stays set
+  all boot), with a 3-crash rollback and a ZYGOTE_RESTART request
+  path; their self-unload is a proper dlclose via a hooked
+  `pthread_attr_destroy` with `[[clang::musttail]]`.
+- **bionic atexit internals** (aosp-mirror/platform_bionic main:
+  libc/bionic/atexit.cpp + libc/arch-common/bionic/crtbegin_so.c +
+  __dso_handle_so.h): g_array / AtexitEntry{fn,arg,dso} /
+  __cxa_finalize extracts-calls-compacts + __unregister_atfork;
+  crt's __on_dlclose destructor is the purge a proper dlclose runs;
+  __dso_handle is a self-pointing constant. Also re-confirmed:
+  bionic's exit() has NO exit-time fini-array walk (only the atexit
+  array), so the glibc `_dl_fini` crash observed during host
+  testing is environment-only, not a device behavior.
+- **A public detector** (github.com/lrhtony/ZygiskDetector): reads
+  libc's g_array via the on-disk symtab, resolves every entry's dso
+  with dladdr, counts fn==0 gaps and dso==0 entries — the atexit
+  array is a real, enumerated detection surface.
+- **AndroidRuntime.cpp** at 5.0.0_r1 / 8.1.0_r81 / 9.0.0_r1 /
+  10.0.0_r1 / 12.0.0_r1 / 13.0.0_r1 / 16.0.0_r1: the native-bridge
+  property read; the `zygote &&` guard appears at 10.0 and stays.
+- **AOSP 13 Zygote JNI** (com_android_internal_os_Zygote.cpp):
+  USAP (`nativeSpecializeAppProcess`) and system_server both route
+  through SpecializeCommon's setresgid→setresuid inside
+  libandroid_runtime — our GOT hooks cover every spawn path.
+
+Fixes this round:
+
+- **Tier A atexit purge** (device-fatal class, present since Round
+  8): Tier A unmapped our libraries without the __cxa_finalize
+  protocol a proper dlclose runs, leaving libc's atexit array
+  holding entries whose fn pointed into unmapped text — the first
+  exit() in a hidden app SIGSEGV'd, and any module's
+  pthread_atfork handlers would crash every later fork(). The fix
+  scans every record's non-executable pages for the self-pointing
+  __dso_handle word, finalizes the module libraries before the
+  Tier A prep unmaps their text, and finalizes the payload itself
+  only after the trampoline page is prepared (the trampoline
+  prepare/jump split guarantees a prepare failure still falls back
+  to Tier B with the statics alive). Regression-proven live: with
+  the purge disabled through a test seam, the Tier A child dies
+  with SIGSEGV on the modeled bionic exit walk; with it enabled it
+  survives and the sentinel destructor runs.
+- **The property guard + randomized sonames** (stealth, described
+  in compatibility.md): the stock value is restored once the
+  bridge is observed in the zygote's maps, re-applied on zygote
+  death, rolled back after 3+ restarts; install-time randomized
+  bridge/payload names with dladdr-based discovery and legacy
+  fallbacks.
+
+Verification additions: the dso-handle scan unit tests + the
+purge/atexit unit tests; the Tier A purge e2e pair (survive /
+regression-crash); the version-compat derivation test; 8 live
+daemon E2E checks for the property guard (restore, re-apply, the
+bootloop rollback, stand-down, --delete semantics); 5 new script
+E2E checks for randomized names + the applied record; the COW
+audit (measured: 0.00 minor-fault delta per forked child — the
+module's per-fork memory cost is below the measurement floor).
+
+Honest residuals:
+
+- The property-set window (post-fs-data → shortly after
+  late_start) is nonzero; no third-party app runs in it, but a
+  system component could read the value there.
+- A lost crash-restart race leaves the module inert for that
+  zygote generation (the next restart re-arms; Magisk avoids this
+  by never restoring, which is exactly the detection hole we
+  close).
+- The atexit purge depends on __cxa_finalize being resolvable
+  (both bionic and glibc export it); a hypothetical platform
+  without it degrades to the documented residual, never a crash.
+- ZygiskDetector-style enumeration of g_array applies to every
+  loaded library on the device; our entries are now purged in
+  hidden children, and in non-hidden children they resolve to a
+  random name (the same residual every non-hidden-process
+  injection carries, Magisk included).
+- The COW audit is a host measurement; a device would need
+  `/proc/<pid>/stat` per-fork deltas to confirm the zero-page
+  result on real hardware. The existing perf medians (41 ns hook
+  matcher, 0 us setup/apply) remain at the floor.
