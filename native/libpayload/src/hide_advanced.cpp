@@ -559,56 +559,37 @@ static void capture_prop_line_restores(const char* buf, size_t total) {
     }
 }
 
-static void clone_property_area_private() {
-    if (g_props_cloned.exchange(1)) return;
+// Round 25 host-test seam: a GENERATOR for the maps content, invoked
+// exactly where production reads /proc/self/maps — i.e. AFTER the
+// pre-map pass above. The generator sees the process's mappings as
+// they look at scan time, which is what lets a host test PROVE the
+// ordering: a fake find() that lazily mmaps a "context area" on its
+// first call must have been called before the generator runs, or the
+// generated maps lack that area and the patch phase would write to a
+// read-only page (the crash class this round fixes).
+#ifdef ZS_HOST_TEST
+static const char* (*g_test_clone_maps_gen)(size_t* out_len) = nullptr;
+void zs_test_set_clone_maps_gen(const char* (*gen)(size_t*)) {
+    g_test_clone_maps_gen = gen;
+}
+void zs_test_clear_clone_maps_gen() {
+    g_test_clone_maps_gen = nullptr;
+}
+int zs_test_props_cloned_latched() {
+    return g_props_cloned.load(std::memory_order_acquire);
+}
+void zs_test_reset_props_cloned() {
+    g_props_cloned.store(0, std::memory_order_release);
+}
+#endif
 
-    // Resolve bionic's property lookup once. On the host there is no
-    // __system_property_find; the clone is skipped (host tests assert
-    // the pure helpers instead).
-    if (!g_find_prop) {
-        g_find_prop = (FindPropFn)zs_resolve_libc("__system_property_find");
-    }
-
-    constexpr size_t kMapsCap = 96 * 1024;
-    static char maps_buf[kMapsCap];   // static: runs once, keep it off the stack
-    int fd = open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return;
-    ssize_t total = 0;
-    int truncated = 0;
-    while ((size_t)total < kMapsCap) {
-        ssize_t n = read(fd, maps_buf + total, kMapsCap - total);
-        if (n <= 0) break;
-        total += n;
-    }
-    if ((size_t)total == kMapsCap) {
-        char probe;
-        if (read(fd, &probe, 1) > 0) truncated = 1;
-    }
-
-    PropMapping mappings[32];
-    size_t n_mappings;
-    if (truncated) {
-        // Round 8 (B5): maps larger than the static buffer. Rewind
-        // and scan in chunks so property mappings past the cap are
-        // still found (see find_prop_mappings_from_fd).
-        if (lseek(fd, 0, SEEK_SET) != (off_t)-1) {
-            n_mappings = find_prop_mappings_from_fd(fd, mappings, 32);
-        } else {
-            n_mappings = 0;
-        }
-    } else {
-        n_mappings = total > 0
-            ? find_prop_mappings(maps_buf, (size_t)total, mappings, 32)
-            : 0;
-    }
-    close(fd);
-    if (n_mappings == 0) return;
-    // Round 23: capture the stock text of every property line BEFORE
-    // the remap replaces the mappings — the filter restores these
-    // lines for Tier B maps/smaps reads (see PropLineRestore above).
-    if (!truncated) {
-        capture_prop_line_restores(maps_buf, (size_t)total);
-    }
+// The clone core shared by the production path and the host-test
+// seam: remap every mapping private, patch the spoof values through
+// find(), collect + trie-delete the absent keys, then restore
+// read-only protection and the linker_alloc name. Returns the number
+// of successfully remapped mappings (0 = the caller may retry).
+static int clone_props_core(const PropMapping* mappings,
+                            size_t n_mappings) {
     int n_remapped = 0;
     for (size_t i = 0; i < n_mappings; ++i) {
         if (remap_prop_mapping_private(mappings[i].lo,
@@ -620,10 +601,7 @@ static void clone_property_area_private() {
                     (unsigned long)mappings[i].hi, strerror(errno));
         }
     }
-    if (n_remapped == 0) {
-        g_props_cloned.store(0);  // allow a retry on a later fork
-        return;
-    }
+    if (n_remapped == 0) return 0;
 
     // Patch spoof values through bionic's own lookup. The cached trie
     // pointers still resolve (the MAP_FIXED replacement keeps every
@@ -695,6 +673,102 @@ static void clone_property_area_private() {
     }
     ZS_LOGD("hide_advanced: property area cloned (%d mapping(s))",
             n_remapped);
+    return n_remapped;
+}
+
+static void clone_property_area_private() {
+    if (g_props_cloned.exchange(1)) return;
+
+    // Resolve bionic's property lookup once. On the host there is no
+    // __system_property_find; the clone is skipped (host tests assert
+    // the pure helpers instead).
+    if (!g_find_prop) {
+        g_find_prop = (FindPropFn)zs_resolve_libc("__system_property_find");
+    }
+
+    // Round 25 — PRE-MAP PASS (a real crash class, all versions).
+    // bionic maps the per-context property files (the areas find()
+    // actually walks, on 7.x and 8.x alike) LAZILY: only contexts the
+    // zygote has already queried have mappings. A spoof key whose
+    // context file was never mapped gets mapped FRESH by this lookup —
+    // and if that happened after the remap below, patch_prop_value
+    // would write to the REAL file's read-only MAP_SHARED page:
+    // SIGSEGV in the hidden child, at launch, every time. Doing the
+    // lookups FIRST means: (a) every spoof key's context area is
+    // mapped now, while it is still the real (read-only) file; (b) the
+    // maps scan below then sees those mappings and clones them like
+    // any other; (c) the patch pointers below are inside the private
+    // writable clones. (bionic caches the context_node's area pointer,
+    // and the MAP_FIXED remap keeps every address identical, so later
+    // find() calls keep resolving into our private copies.)
+    if (g_find_prop) {
+        for (const ZsPropSpoof& s : kPropSpoofTable) {
+            (void)g_find_prop(s.key);
+        }
+    }
+
+#ifdef ZS_HOST_TEST
+    // Test seam: drive the FULL production clone path (pre-map above,
+    // scan, capture, remap, patch, delete, mprotect) against maps
+    // content supplied by a generator, invoked exactly where production
+    // reads /proc/self/maps. See the seam comment above the generator
+    // for why a generator (and not a fixed buffer) is needed.
+    if (g_test_clone_maps_gen) {
+        size_t len = 0;
+        const char* buf = g_test_clone_maps_gen(&len);
+        PropMapping mappings[32];
+        size_t n_mappings =
+            (buf && len) ? find_prop_mappings(buf, len, mappings, 32) : 0;
+        if (n_mappings == 0) return;
+        capture_prop_line_restores(buf, len);
+        clone_props_core(mappings, n_mappings);
+        return;
+    }
+#endif
+
+    constexpr size_t kMapsCap = 96 * 1024;
+    static char maps_buf[kMapsCap];   // static: runs once, keep it off the stack
+    int fd = open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return;
+    ssize_t total = 0;
+    int truncated = 0;
+    while ((size_t)total < kMapsCap) {
+        ssize_t n = read(fd, maps_buf + total, kMapsCap - total);
+        if (n <= 0) break;
+        total += n;
+    }
+    if ((size_t)total == kMapsCap) {
+        char probe;
+        if (read(fd, &probe, 1) > 0) truncated = 1;
+    }
+
+    PropMapping mappings[32];
+    size_t n_mappings;
+    if (truncated) {
+        // Round 8 (B5): maps larger than the static buffer. Rewind
+        // and scan in chunks so property mappings past the cap are
+        // still found (see find_prop_mappings_from_fd).
+        if (lseek(fd, 0, SEEK_SET) != (off_t)-1) {
+            n_mappings = find_prop_mappings_from_fd(fd, mappings, 32);
+        } else {
+            n_mappings = 0;
+        }
+    } else {
+        n_mappings = total > 0
+            ? find_prop_mappings(maps_buf, (size_t)total, mappings, 32)
+            : 0;
+    }
+    close(fd);
+    if (n_mappings == 0) return;
+    // Round 23: capture the stock text of every property line BEFORE
+    // the remap replaces the mappings — the filter restores these
+    // lines for Tier B maps/smaps reads (see PropLineRestore above).
+    if (!truncated) {
+        capture_prop_line_restores(maps_buf, (size_t)total);
+    }
+    if (clone_props_core(mappings, n_mappings) == 0) {
+        g_props_cloned.store(0);  // allow a retry on a later fork
+    }
 }
 
 // ------------------------------------------------------------------------
@@ -1487,14 +1561,27 @@ extern "C" FILE* zygisk_study_hook_fopen(const char* path, const char* mode);
 // sys_memfd_create — call the memfd_create syscall directly so we do
 // not depend on the libc wrapper (older bionic lacks it) and never
 // recurse through our own hooks.
+// ZS_HOST_TEST: zs_test_disable_memfd() forces the fallback path so
+// the data-dir scratch file can be tested on the host.
+static int g_test_memfd_disabled = 0;
 static int syscall_memfd_create(const char* name, unsigned int flags) {
+#ifdef ZS_HOST_TEST
+    if (g_test_memfd_disabled) { errno = ENOSYS; return -1; }
+#endif
 #ifdef __NR_memfd_create
     return (int)syscall(__NR_memfd_create, name, flags);
 #else
     (void)name; (void)flags;
+    errno = ENOSYS;
     return -1;
 #endif
 }
+
+#ifdef ZS_HOST_TEST
+void zs_test_disable_memfd(int disabled) {
+    g_test_memfd_disabled = disabled ? 1 : 0;
+}
+#endif
 
 // Round 8: the record filter. One record = one line (newline-
 // separated kinds) or one env entry (NUL-separated environ). Pure,
@@ -1647,12 +1734,74 @@ static char* zs_filter_scratch_acquire(size_t size) {
     return p;
 }
 
+// Round 25 — the old-kernel fallback scratch. memfd_create needs
+// Linux 3.17; Android 7.0/7.1/7.1.2 shipped on 3.4 (Nexus 5 et al.),
+// 3.10 and 3.18 kernels, so on a real slice of 7.x devices the
+// syscall answers ENOSYS and the filter has no memfd to write into.
+// The pre-Round-25 behavior in that case was the R15 "fail-open"
+// (hand back the REAL fd, contents unfiltered) — which silently
+// disabled /proc filtering on exactly those devices: a stealth hole,
+// not an edge case.
+//
+// The fallback: create a 0600 file in the HIDDEN TARGET'S OWN data
+// dir, unlink it immediately, and serve the fd. The directory entry
+// exists for microseconds (mkstemp -> unlink), the inode dies with
+// the fd, and the fd is registered in the shadow table exactly like
+// a memfd — so the readlink/fstat/statx/mmap fiction all answer the
+// stock procfs story for it as well. The child is already dropped to
+// the app uid by the time any filter runs, and the only directory
+// that uid is guaranteed writable is its own data dir (SELinux
+// included: untrusted_app may create files there).
+//
+// Test seam: zs_test_set_filter_fallback_dir() overrides the dir.
+static const char* g_filter_fallback_dir_override = nullptr;
+
+#ifdef ZS_HOST_TEST
+void zs_test_set_filter_fallback_dir(const char* dir) {
+    g_filter_fallback_dir_override = dir;
+}
+#endif
+
+static int make_filter_scratch_fd() {
+    char dir[512];
+    const char* base = g_filter_fallback_dir_override;
+    if (!base) {
+        if (hide_data_dir_for_uid(getuid(), dir, sizeof dir) != 0) {
+            return -1;   // unmapped uid (or not an app): no safe dir
+        }
+        base = dir;
+    }
+    char tmpl[576];
+    if ((size_t)snprintf(tmpl, sizeof tmpl, "%s/.zstmpXXXXXX", base) >=
+        sizeof tmpl) {
+        return -1;
+    }
+    int fd = mkstemp(tmpl);
+    if (fd < 0) {
+        ZS_LOGD("hide_advanced: filter fallback mkstemp(%s) failed: %s",
+                base, strerror(errno));
+        return -1;
+    }
+    // Gone from the directory the moment we hold the fd. The app
+    // never sees a path; readlink through our hooks answers the
+    // registered /proc path like for any filtered fd.
+    unlink(tmpl);
+    return fd;
+}
+
 static int make_filtered_memfd(int orig_fd, const char* target_path) {
     ZsFilterKind kind = zs_filter_kind_for_path(target_path ? target_path
                                                             : "");
     if (kind == ZS_FILTER_NONE) kind = ZS_FILTER_PROC_LINE;
 
     int memfd = syscall_memfd_create("scudo", 0);
+    if (memfd < 0) {
+        // Round 25: pre-3.17 kernel (Android 7.x on 3.4/3.10) or
+        // ENOMEM-class pressure — try the unlinked data-dir scratch
+        // file before giving up (the caller's fail-open path then
+        // serves the REAL file, which is the documented last resort).
+        memfd = make_filter_scratch_fd();
+    }
     if (memfd < 0) return -1;
 
     constexpr size_t kChunk = 64 * 1024;

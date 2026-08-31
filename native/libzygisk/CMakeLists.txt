@@ -36,3 +36,17 @@ target_link_libraries(zygisk
     dl
     log
 )
+
+# Round 25: -z nodelete (DF_1_NODELETE). Every same-arch zygote child
+# calls InitNonZygoteOrPostFork(kUnload) -> UnloadNativeBridge ->
+# dlclose(our handle) — on EVERY studied Android version. When the
+# refcount hits zero the linker calls DT_FINI; in a Tier A
+# (self-unmapped) hidden child that address is already unmapped .text,
+# which is a crash in every hidden Tier A child at
+# callPostForkChildHooks. NODELETE makes bionic's soinfo_unload
+# can_unload() check fail and return before any destructor call (the
+# flag is honored since the L-era linker rewrite; unload logic read
+# from the 8.1 sources this round, same lineage in 7.x). The flag
+# composes with Tier A: our unmap is a raw munmap and never consults
+# the linker's bookkeeping.
+target_link_options(zygisk PRIVATE "-Wl,-z,nodelete")

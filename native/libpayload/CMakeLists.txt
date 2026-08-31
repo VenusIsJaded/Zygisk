@@ -52,3 +52,9 @@ target_link_libraries(payload
     dl
     log
 )
+
+# Round 25: same NODELETE rationale as libzygisk (defense in depth on
+# top of the runtime self-pin in zygisk_study_payload_init): no
+# dlclose chain anywhere may ever reach DT_FINI, because Tier A
+# children no longer have that code mapped.
+target_link_options(payload PRIVATE "-Wl,-z,nodelete")

@@ -1642,3 +1642,134 @@ AttachCurrentThreadAsDaemon at slot 7 — spec-stable since Java 1.2,
 and matching the constants in module_dispatch.cpp).
 
 188 host tests (186 → 188), 0 warnings, ASan+UBSan+leaks green.
+
+## Round 25 — Android 7.0 / 7.1 / 7.1.2 / 8.0 / 8.1 support: the bootstrap and the bridge table
+
+### Version research actually performed this round
+
+Fresh AOSP sources fetched and read at **android-7.0.0_r1,
+android-7.1.2_r33, android-8.0.0_r17, android-8.1.0_r81** (plus
+android-9.0.0_r1 / android-13.0.0_r1 for boundary pinning and the
+9.0 bionic files already studied in Round 22):
+
+- `system/core/libnativebridge/include/nativebridge/native_bridge.h`
+  (7.0/7.1.2/8.0/8.1/9.0) and `native_bridge.cc` (7.0/7.1.2/8.0/8.1/9.0)
+- `frameworks/base/core/jni/com_android_internal_os_Zygote.cpp`
+  (7.0/7.1.2/8.0/8.1)
+- `bionic/libc/bionic/system_properties.cpp` (7.0/7.1.2/8.0/8.1),
+  the NDK `include/sys/_system_properties.h` (7.1.2)
+- `art/runtime/runtime.cpp` (7.1.2, 13.0) and
+  `art/runtime/native/dalvik_system_ZygoteHooks.cc` (7.1.2, 9.0, 13.0)
+
+### The facts table
+
+| Fact | Verified from | Consequence |
+|---|---|---|
+| `LoadNativeBridge` (7.0–9.x) calls `callbacks->isCompatibleWith(...)` whenever the table's `version >= 2` — 7.x asks about version 2, 8.x/9.x about version 3 | native_bridge.cc @ 7.0 (VersionCheck), @ 8.1/9.0 (isCompatibleWith wrapper + LoadNativeBridge) | a NULL `isCompatibleWith` slot is a **zygote-boot NULL call** — the pre-Round-25 table (version=2, slot NULL) crashed at boot on 7.0–9.x |
+| ART never calls `initialize()` in the zygote: `Runtime::Init` only dlopen+dlsym+version-checks the bridge; `ZygoteHooks_nativePostForkChild` → `InitNonZygoteOrPostFork` runs **in the forked child** and passes `kUnload` for every same-arch child (and the system server) | art/runtime/runtime.cpp + dalvik_system_ZygoteHooks.cc @ 7.1.2, 9.0, 13.0 | the Round 7-era claim "ART calls the table's initialize() at zygote boot" is wrong for **every** studied version — the whole payload pipeline was dead-on-arrival on real devices |
+| `kUnload` → `UnloadNativeBridge` → **`dlclose(native_bridge_handle)`** in every same-arch child | native_bridge.cc @ 7.0/8.1 | the dlclose's unload chain unrefs everything the bridge dlopen'd — including libpayload (the GOT hook code) — unless pinned |
+| The callbacks table is **15 function pointers** after the version (v1: initialize/loadLibrary/getTrampoline/isSupported/getAppEnv; v2: isCompatibleWith/getSignalHandler; v3: unloadLibrary/getError/isPathSupported/initAnonymousNamespace/createNamespace/linkNamespaces; v4: loadLibraryExt/getVendorNamespace); 8.1 == 9.0 byte-identical; 7.x's table is a strict 8-slot prefix | native_bridge.h @ 8.1/9.0 vs 7.0/7.1.2 | the pre-Round-25 struct had misaligned fantasy fields past slot 10 (initAppNamespace/getExportedNamespace/setTargetSdkVersion — none exist in ANY version's table) |
+| Zygote drop order on 7.0/7.1.2/8.0/8.1: setgroups → `setresgid(gid,gid,gid)` → `setresuid(uid,uid,uid)` → SetCapabilities → SetSchedulerPolicy; **no seccomp** between the drops | Zygote.cpp @ all four tags | the R7+ hook-point design (gid hook = mount phase, uid hook = dispatch) works unchanged on 7.x/8.x |
+| bionic properties on 7.0/7.1.2 already use the `/dev/__properties__/` **directory** with `properties_serial` + per-context files + the same trie format (magic 0x504f5250, version 0xfc6ed0ab, same serial protocol, and the **same label** `u:object_r:properties_serial:s0` — 7.1.2 bionic line 824) | system_properties.cpp @ 7.0/7.1.2 | the entire R19/R20/R22 property layer (file image, bind-mount target, chcon label, trie clone/delete) works on 7.x **unchanged**; the single-file form is only the legacy/OTA fallback |
+| 7.x `prop_bt.namelen` is `uint8_t + reserved[3]` vs 8.x `uint32_t` — same 4 bytes, same value placement | bionic 7.1.2 vs 8.1 | the trie reader/writer code is byte-compatible across the boundary |
+| `mkstemp`-creatable dirs: an app-uid process can create files only in its own data dir (SELinux included) | standard untrusted_app policy | the old-kernel filter fallback uses `/data/user/<id>/<pkg>` + immediate unlink |
+| memfd_create needs Linux 3.17; Android 7.0/7.1.2 devices shipped with 3.4 (Nexus 5 et al.), 3.10 and 3.18 kernels | kernel release history | on a real slice of 7.x devices the Tier B filter hit the R15 fail-open path (serving REAL unfiltered /proc content) — a stealth hole, now closed with the unlinked-file fallback |
+| `__system_property_read_callback`, `statx`, `faccessat2` do not exist in 7.x/8.x bionic | symbol tables of the era | all Tier B GOT registrations are name-based and null-real tolerant — verified the fallback chains (statx→SYS_statx guarded; faccessat2→faccessat; read_callback absent = no imports to hook) |
+| `dl_iterate_phdr` exists in bionic since L (5.0) | bionic history | the GOT walk and the dl_iterate_phdr/dladdr hooks work on 7.x+ |
+
+### What was actually fixed (five device-fatal/crash/leak classes)
+
+1. **Constructor bootstrap** (libzygisk): the payload now loads from
+   `__attribute__((constructor))` — the one hook point that runs in
+   the zygote on EVERY Android version (the dlopen inside
+   `Runtime::Init`). `initialize()` remains implemented (idempotent)
+   for foreign-arch children and future lifecycle changes. Without
+   this, nothing after the dlopen ever executed on a real device.
+2. **`isCompatibleWith` implemented** (true for 1..4, false above):
+   the NULL slot was a guaranteed zygote SIGSEGV during
+   `LoadNativeBridge` on 7.0–9.x. Every other v2–v4 slot is also
+   implemented now (contract-valid no-ops, forwarded to the real
+   translation bridge when one exists, version-gated) — several v1
+   slots are called UNGUARDED on foreign-arch forks.
+3. **The exact 15-slot table** replaces the misaligned struct.
+4. **`-z nodelete` + libpayload self-pin**: bionic's `dlclose` →
+   `soinfo_unload` calls `DT_FINI` when a refcount hits zero — in a
+   Tier A (self-unmapped) hidden child that address is already
+   unmapped `.text`, a crash in every hidden Tier A child at
+   `callPostForkChildHooks` (the unmap runs at the setresgid hook,
+   the dlclose at callPostForkChildHooks, both in the same child).
+   Both libraries are linked with `-z nodelete` (bionic's
+   `can_unload()` → early return, no destructor call; no exit-time
+   destructor walk exists in bionic either — verified from the 8.1
+   linker sources this round) and the payload additionally self-pins
+   (`dlopen(self, RTLD_NOLOAD)`, refcount 2). Cost, documented: the
+   bridge's pages stay resident in non-hidden children.
+5. **The pre-map ordering bug** (all versions, a real crash class):
+   bionic maps per-context property files LAZILY — a spoof key whose
+   context the zygote never queried got mapped FRESH at patch time,
+   i.e. the REAL read-only MAP_SHARED file, and `patch_prop_value`
+   wrote to it: SIGSEGV at hidden-app launch. The clone now pre-looks
+   up every spoof key BEFORE the maps scan, so every context area is
+   mapped, scanned, cloned private, and only then patched. Regression
+   test: `clone_pre_maps_lazily_mapped_context_before_scan` (the
+   crash is the failure mode — verified it faults with the old
+   ordering via the generator seam).
+6. **The old-kernel memfd fallback**: with memfd_create unavailable
+   (pre-3.17 kernels = real Android 7.x devices), the Tier B /proc
+   filter now writes the filtered bytes into an unlinked 0600 file in
+   the hidden target's own data dir instead of fail-open serving the
+   REAL file. The fd is registered in the shadow table exactly like a
+   memfd, so readlink/fstat/statx/mmap all answer the stock procfs
+   fiction.
+
+### Honest residuals (Round 25)
+
+- The bridge-table forwarding keeps translation devices (x86 +
+  houdini/ndk_translation) functional for non-hidden children, but a
+  Tier A (unmapped) denylisted FOREIGN-ARCH child could still fault
+  if the runtime calls `initialize()` after our unmap (the read-only
+  segment holding the table survives as an anon copy, the code does
+  not). Requires: translation device + denylisted foreign-arch app +
+  Tier A. Documented rather than fixed — the .text cannot survive the
+  unmap by design.
+- `PR_SET_VMA` is absent on 3.4/3.10/3.18 kernels (no android
+  backport): the linker_alloc naming of the property clone is a
+  no-op there, and stock processes have no [anon:…] names either —
+  consistent by construction (the maps-restoration capture is
+  dynamic).
+- Android 7.0/7.1.2 on 3.4/3.10 also lacks `statx` (4.11) and
+  `openat2` (5.6): the hooks' fallback chains pass through to
+  ENOSYS exactly as a stock call would; no new deviation.
+- The self-pin leaks exactly one dlopen reference per process
+  lifetime by design (the same reference every persistent GOT hook
+  requires); the Tier A unmap removes the mapped pages regardless.
+- 32-bit-only devices (Android 7.0 x86/armeabi): the 32-bit zygote
+  loads `/system/lib/libzygisk.so`; the source compiles per-ABI and
+  the CMake already selects the payload path per word size, but no
+  32-bit host test exists (the host suite is x86_64/aarch64 only).
+
+199 host tests (188 → 199: 3 property-clone/fallback + 6
+bridge/version-compat + 1 self-pin + 1 data-dir derivation), 0
+warnings, ASan+UBSan+leaks green, trampoline binary verification
+green, all test binaries exit 0.
+
+
+### Addendum — the destructor call chain (found while adversarially
+reviewing the constructor fix)
+
+Fetching bionic's `linker/linker.cpp` (8.1) closed the last hole of
+the round: `soinfo_unload` invokes `call_destructors()` (DT_FINI /
+DT_FINI_ARRAY) whenever a refcount reaches zero, and the ONLY call
+site is the dlclose path — bionic never walks loaded DSOs at `exit()`
+(the executable's own fini_array runs via `__libc_init`'s
+`__cxa_atexit(__libc_fini, ...)`; dlopen'd libraries are not in it).
+Consequence for this project: ART's child-side
+`UnloadNativeBridge` → `dlclose(bridge handle)` would have called
+libzygisk's `_fini` — on a Tier A child, unmapped `.text`. The
+`-z nodelete` link flag on both libraries is the fix (the linker's
+`can_unload()` check short-circuits the unload before any destructor
+call). The existing trampoline tests never caught this because the
+forked children exit through `_exit()` — which skips the handlers
+`exit()` would run — and nothing dlclosed the bridge in them; the
+new `self_pin_survives_the_child_side_bridge_dlclose` test drives the
+real dlclose path.

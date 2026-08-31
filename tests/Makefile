@@ -6,7 +6,8 @@ CXXFLAGS ?= -std=c++17 -O2 -g -Wall -Wextra
 INCLUDES  = -I../native/common -I.. -DZS_HOST_TEST
 
 TESTS = test_hide test_hide_advanced test_hide_stealth test_e2e_hide \
-	test_perf test_unmap_trampoline test_module_dispatch
+	test_perf test_unmap_trampoline test_module_dispatch \
+	test_version_compat
 
 # The REAL payload, built as a shared library so the trampoline test
 # can dlopen it and exercise the actual Tier A code path. Named
@@ -57,22 +58,34 @@ test_unmap_trampoline: test_unmap_trampoline.cpp libpayload.so test_framework.h
 # JNI_GetCreatedJavaVMs into the global dlsym scope so libpayload's
 # REAL env-acquisition path resolves it.
 test_module_dispatch: test_module_dispatch.cpp libzs_test_module.so \
-		      libpayload.so test_framework.h
+	libpayload.so test_framework.h
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -o $@ $< -ldl -pthread -rdynamic
 
 libzs_test_module.so: module_stub.cpp ../zygisk.hpp
 	$(CXX) $(CXXFLAGS) -fPIC -shared -I.. -o $@ $<
 
 libpayload.so: $(PAYLOAD_SRC) $(TRAMPOLINE_SRC) \
-	      ../native/libpayload/src/module_dispatch.h \
-	      ../native/common/log.h
-	$(CXX) $(CXXFLAGS) -fPIC -shared $(INCLUDES) -o $@ $(PAYLOAD_SRC) $(TRAMPOLINE_SRC) -ldl
+	../native/libpayload/src/module_dispatch.h \
+	../native/common/log.h
+	$(CXX) $(CXXFLAGS) -fPIC -shared $(INCLUDES) -o $@ $(PAYLOAD_SRC) $(TRAMPOLINE_SRC) -ldl -Wl,-z,nodelete
+
+# Round 25 — the host build of the BRIDGE library itself (libzygisk).
+# The version-compat tests dlopen it exactly the way ART's
+# Runtime::Init does, and verify the table + the constructor bootstrap
+# that this round's AOSP research established (see
+# native/libzygisk/src/entry.cpp's header comment).
+libzygisk.so: ../native/libzygisk/src/entry.cpp ../native/common/log.h
+	$(CXX) $(CXXFLAGS) -fPIC -shared $(INCLUDES) -o $@ $< -ldl -Wl,-z,nodelete
+
+test_version_compat: test_version_compat.cpp libzygisk.so \
+	test_framework.h ../native/common/log.h
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -o $@ $< -ldl
 
 run: all
 	@fail=0; \
 	for t in $(TESTS); do \
-		echo "=== $$t ==="; \
-		./$$t || fail=1; \
+	echo "=== $$t ==="; \
+	./$$t || fail=1; \
 	done; \
 	exit $$fail
 
@@ -93,20 +106,20 @@ run: all
 # the cross-instrumentation boundary (module callbacks recorded from
 # forked children through a shared mmap) produces noise, not signal.
 SAN_CXXFLAGS = -std=c++17 -O1 -g -Wall -Wextra -fno-omit-frame-pointer \
-	       -fsanitize=address,undefined
+	-fsanitize=address,undefined
 SAN_TESTS = test_hide test_hide_advanced test_hide_stealth \
-	    test_e2e_hide test_perf
+	test_e2e_hide test_perf
 
 .PHONY: run-sanitize
 
 run-sanitize:
 	@fail=0; \
 	for t in $(SAN_TESTS); do \
-		echo "=== $$t (ASan+UBSan) ==="; \
-		$(MAKE) $$t CXXFLAGS="$(SAN_CXXFLAGS)"; \
-		ASAN_OPTIONS=detect_leaks=1:abort_on_error=0 \
-		UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=0 \
-		./$$t || fail=1; \
+	echo "=== $$t (ASan+UBSan) ==="; \
+	$(MAKE) $$t CXXFLAGS="$(SAN_CXXFLAGS)"; \
+	ASAN_OPTIONS=detect_leaks=1:abort_on_error=0 \
+	UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=0 \
+	./$$t || fail=1; \
 	done; \
 	$(MAKE) clean >/dev/null; \
 	exit $$fail
@@ -119,15 +132,15 @@ run-sanitize:
 
 verify-trampolines:
 	@if command -v python3 >/dev/null 2>&1; then \
-		python3 ../scripts/verify_trampolines.py; \
-		rc=$$?; \
-		if [ $$rc -eq 77 ]; then \
-			echo "NOTE: keystone-engine missing — pip install keystone-engine to enable."; \
-		fi; \
-		exit $$rc; \
+	python3 ../scripts/verify_trampolines.py; \
+	rc=$$?; \
+	if [ $$rc -eq 77 ]; then \
+	echo "NOTE: keystone-engine missing — pip install keystone-engine to enable."; \
+	fi; \
+	exit $$rc; \
 	else \
-		echo "python3 unavailable; skipping"; \
+	echo "python3 unavailable; skipping"; \
 	fi
 
 clean:
-	rm -f $(TESTS) libpayload.so libzs_test_module.so
+	rm -f $(TESTS) libpayload.so libzs_test_module.so libzygisk.so

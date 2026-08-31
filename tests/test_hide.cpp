@@ -1126,3 +1126,54 @@ ZS_TEST(pkg_map_generation_bumps_on_reload) {
     remove_temp(path);
     hide_test_set_denylist_path("/data/system/zygisk_study/denylist");
 }
+
+// ----------------------------------------------------------------------
+// Round 25 — hide_data_dir_for_uid (the derivation the old-kernel
+// filter fallback uses to place its unlinked scratch file: the only
+// directory a dropped, app-uid child is guaranteed writable).
+// ----------------------------------------------------------------------
+ZS_TEST(data_dir_for_uid_derives_canonical_per_user_path) {
+    char tmpl[] = "/tmp/zs_pkgs_dir_XXXXXX";
+    int tfd = mkstemp(tmpl);
+    ZS_CHECK(tfd >= 0);
+    if (tfd >= 0) close(tfd);
+    std::string pkg_path(tmpl);
+    FILE* fp = fopen(pkg_path.c_str(), "w");
+    ZS_CHECK(fp != nullptr);
+    if (fp) {
+        // <package> <uid> <debugFlag> <dataDir> <seInfo> ... — the
+        // parser reads the first two fields (version-tolerant).
+        fputs("com.example.app 10234 0 /data/data/com.example.app default:targetSdk=28\n"
+              "com.other.app 10150 0 /data/user/0/com.other.app default:targetSdk=28\n"
+              "com.work.app 10577 0 /data/user/0/com.work.app default:targetSdk=28\n",
+              fp);
+        fclose(fp);
+    }
+    hide_test_set_packages_list_path(pkg_path.c_str());
+    hide_test_reset_refresh();
+
+    char out[512];
+    // User 0, straightforward appId.
+    ZS_CHECK_EQ(hide_data_dir_for_uid(10234, out, sizeof out), 0);
+    ZS_CHECK_STR_EQ(out, "/data/user/0/com.example.app");
+    // Work profile (user 10 = uid 1010234 for appId 10234): the
+    // userId comes from the FULL uid, the package from the appId
+    // family — exactly the module-args derivation.
+    ZS_CHECK_EQ(hide_data_dir_for_uid(1010234, out, sizeof out), 0);
+    ZS_CHECK_STR_EQ(out, "/data/user/10/com.example.app");
+    ZS_CHECK_EQ(hide_data_dir_for_uid(10577, out, sizeof out), 0);
+    ZS_CHECK_STR_EQ(out, "/data/user/0/com.work.app");
+    // Unknown uid: fail, no string.
+    ZS_CHECK_EQ(hide_data_dir_for_uid(10999, out, sizeof out), -1);
+    ZS_CHECK(out[0] == '\0');
+    // Non-app uid: fail (system_server, root, daemons).
+    ZS_CHECK_EQ(hide_data_dir_for_uid(1000, out, sizeof out), -1);
+    ZS_CHECK_EQ(hide_data_dir_for_uid(0, out, sizeof out), -1);
+    // Truncated buffer: fail, no partial path.
+    char tiny[8];
+    ZS_CHECK_EQ(hide_data_dir_for_uid(10234, tiny, sizeof tiny), -1);
+    ZS_CHECK(tiny[0] == '\0');
+
+    remove_temp(pkg_path);
+    hide_test_set_packages_list_path("/data/system/packages.list");
+}

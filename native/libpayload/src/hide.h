@@ -96,6 +96,7 @@ int  hide_setup_for_target_uid(uid_t uid);
 // reads). Used by the module dispatch layer to fill the real
 // specialize arguments.
 void hide_lookup_package_for_uid(uid_t uid, char* out, size_t cap);
+int hide_data_dir_for_uid(uid_t uid, char* out, size_t cap);
 
 // Round 14 — generation counter bumped on every packages.list /
 // DenyList (re)parse. Consumers (the module dispatch args cache) use

@@ -116,3 +116,35 @@ If you install Zygisk Study and the device fails to boot:
 This is the standard Magisk-module recovery procedure. The
 Zygisk Study module is no more or less dangerous than any other
 Zygisk alternative — the recovery procedure is the same.
+
+## Android version support (Round 25)
+
+The loader's Android surface was verified against AOSP sources at
+android-7.0.0_r1, android-7.1.2_r33, android-8.0.0_r17,
+android-8.1.0_r81 (plus 9.0/13.0 for boundary pinning):
+
+| Android | Status | Verified from source |
+|---|---|---|
+| 7.0 / 7.1 / 7.1.2 | Supported | nativebridge VersionCheck + isCompatibleWith(2) call; zygote setresgid→setresuid order; the /dev/__properties__/ directory + trie format; kernel floors (memfd fallback for 3.4/3.10) |
+| 8.0 / 8.1 | Supported | LoadNativeBridge isCompatibleWith(3) call; the 15-slot table; same property format; 3.18/4.4 kernels have memfd |
+| 9 – 15 | Supported (as before) | Rounds 7–24 research (9/13/15/main); Round 25 pinned the 9.x bridge lifecycle to the same constructor contract |
+
+Key version-specific mechanisms and where they are handled:
+
+- **Bootstrap**: a library constructor runs in the zygote during
+  Runtime::Init's dlopen of the native bridge — the only hook point
+  that exists on every version (ART never calls `initialize()` in
+  the zygote; same-arch children even `dlclose` the bridge, which the
+  payload's self-pin neutralizes).
+- **NativeBridgeCallbacks**: the exact 15-slot AOSP table with
+  `isCompatibleWith` implemented — 7.0–9.x call that slot during
+  `LoadNativeBridge` and a NULL slot is a boot crash.
+- **Properties**: 7.0+ all use the same `/dev/__properties__/`
+  directory + trie (magic 0x504f5250, version 0xfc6ed0ab) and the
+  same `u:object_r:properties_serial:s0` label — the execve-proof
+  file image, the bind-mount, and the in-process clone work
+  unchanged.
+- **Old kernels (3.4/3.10 on 7.x devices)**: no memfd_create — the
+  /proc filter falls back to an unlinked scratch file in the hidden
+  app's own data dir; `PR_SET_VMA`/`statx`/`openat2` absence is
+  handled by the existing best-effort/fallback chains.

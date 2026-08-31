@@ -839,3 +839,33 @@ byte-identical to a stock process's maps around the property area
 captured pre-clone line). Tier A raw maps keep the one documented
 deviation: anonymous lines at the identical address/perms/size with
 a blank path column.
+
+## Round 25 additions — version breadth
+
+- **The filter never silently turns itself off on old kernels.**
+  Android 7.0/7.1/7.1.2 devices on 3.4/3.10 kernels have no
+  memfd_create; the pre-Round-25 fail-open path handed back the REAL
+  unfiltered /proc file. The filter now falls back to an unlinked
+  0600 scratch file inside the hidden target's own data directory
+  (the only directory a dropped app-uid process is guaranteed
+  writable): create, write the filtered bytes, unlink, serve the fd.
+  The fd joins the shadow table exactly like a memfd — readlink,
+  fstat/statx and mmap all keep answering the stock procfs story.
+- **The property clone covers lazily-mapped context areas** (the
+  pre-map pass): every spoof key is looked up through bionic's own
+  find() BEFORE the maps scan, so its per-context area (mapped lazily
+  by bionic, only when first queried) exists at scan time, gets
+  cloned private+writable, and the value patch lands in the clone —
+  not on the real file's read-only page.
+- **No destructor can ever fire on unmapped code.** ART dlcloses the
+  bridge handle in every same-arch child (`InitNonZygoteOrPostFork(
+  kUnload)` — all studied versions). Bionic's `soinfo_unload` calls
+  `DT_FINI` when a refcount reaches zero — in a Tier A child that
+  address is already unmapped `.text` (our own unmap ran first), so
+  the call would crash the hidden child at `callPostForkChildHooks`.
+  Both libraries are therefore linked with `-z nodelete` (bionic's
+  `can_unload()` check makes the unload return before any destructor
+  call), plus the payload's runtime self-pin as defense in depth.
+  Cost: the bridge's file-backed pages stay resident in non-hidden
+  children (the same footprint class the payload always had); hidden
+  children still lose them to the Tier A unmap.

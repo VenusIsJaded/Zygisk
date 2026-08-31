@@ -1034,6 +1034,32 @@ void hide_lookup_package_for_uid(uid_t uid, char* out, size_t cap) {
     out[cap - 1] = '\0';
 }
 
+// Round 25 — the data dir of the package owning `uid` (the same
+// derivation fill_app_args uses: /data/user/<userId>/<pkg>, the
+// canonical per-user form). Returns 0 and fills `out` on success;
+// -1 when the uid is not a mapped app package. This feeds the
+// old-kernel filter fallback (hide_advanced's unlinked-scratch file):
+// on Android 7.x devices with pre-3.17 kernels there is no
+// memfd_create, and the only directory the (already dropped, app-uid)
+// child is guaranteed to create files in is its own data dir.
+int hide_data_dir_for_uid(uid_t uid, char* out, size_t cap) {
+    if (ZS_UNLIKELY(!out || cap == 0)) return -1;
+    out[0] = '\0';
+    if (uid < 10000) return -1;
+    char pkg[256];
+    hide_lookup_package_for_uid(uid, pkg, sizeof pkg);
+    if (pkg[0] == '\0') return -1;
+    long user_id = (long)uid / 100000L;
+    char dir[320];   // sized for the longest path + user id
+    int n = snprintf(dir, sizeof dir, "/data/user/%ld/%s", user_id, pkg);
+    if (n < 0 || (size_t)n >= sizeof dir) return -1;
+    if ((size_t)n >= cap) {          // caller buffer too small
+        return -1;
+    }
+    memcpy(out, dir, (size_t)n + 1);
+    return 0;
+}
+
 uint32_t hide_pkg_map_generation() {
     return g_pkg_map_gen.load(std::memory_order_acquire);
 }

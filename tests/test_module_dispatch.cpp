@@ -896,6 +896,38 @@ ZS_TEST(lazy_daemon_init_latches_only_after_daemon_answers) {
 }
 
 // ----------------------------------------------------------------------
+// Round 25 — the self-pin. On every Android version studied (7.0
+// through 13), each same-arch zygote child calls
+// InitNonZygoteOrPostFork(kUnload), which dlclose()s the bridge
+// handle ART holds; the linker's unload chain then unrefs everything
+// the bridge dlopen'd — including libpayload, whose code every GOT
+// slot in the process points into. The payload's init self-pins
+// (dlopen(self, RTLD_NOLOAD)), so ONE dlclose of the caller's handle
+// leaves it mapped. Simulated here exactly: close OUR handle (the
+// role ART's UnloadNativeBridge plays) and prove the code is still
+// alive by calling through a cached pointer.
+//
+// Runs LAST (registration order): it closes the test's own handle on
+// purpose; everything after would only use cached pointers — which is
+// precisely the contract being verified.
+// ----------------------------------------------------------------------
+ZS_TEST(self_pin_survives_the_child_side_bridge_dlclose) {
+    ZS_CHECK(g_payload != nullptr);
+    // The role of ART's UnloadNativeBridge: drop the loader's
+    // reference. Pre-Round-25 this was the refcount hitting zero.
+    dlclose(g_payload);
+    g_payload = nullptr;   // never dlsym through it again
+    // The GOT-slot contract: a cached code pointer must still work.
+    // (If the library had been unmapped this is a SEGV, not a check
+    // failure — the test binary crashing is the regression signal.)
+    int w = fn_dispatch_wanted();
+    ZS_CHECK(w == 0 || w == 1);
+    // And a second entry point through another cached pointer.
+    int od = fn_onload_done();
+    ZS_CHECK(od == 0 || od == 1);
+}
+
+// ----------------------------------------------------------------------
 // main
 // ----------------------------------------------------------------------
 int main() {

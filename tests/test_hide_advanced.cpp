@@ -4456,3 +4456,272 @@ ZS_TEST(prop_restore_containment_matching) {
 
     g_prop_line_restore_count = 0;
 }
+
+// ----------------------------------------------------------------------
+// Round 25 — Android 7.x/8.x support + version-compat fixes
+// ----------------------------------------------------------------------
+
+// Build a synthetic REAL-format property area (the header bionic's
+// readers validate: bytes_used@0, serial@4, magic@8 == 0x504f5250,
+// version@12 == 0xfc6ed0ab) and map it read-only at a FIXED address —
+// exactly what the device's properties_serial / per-context mappings
+// look like. `pi_off` is the data-relative offset of a prop_info the
+// test places inside the area.
+struct TestArea {
+    void*    addr = nullptr;
+    size_t   size = 0;
+    char     path[64];
+    int      fd = -1;      // backing temp file (kept alive)
+    void*    file_map = nullptr;  // the ORIGINAL read-only file mapping
+};
+
+static int build_test_prop_area(TestArea* ta, uintptr_t fixed_addr,
+                                size_t size, const char* name) {
+    *ta = TestArea{};   // zero-init (NSDMIs make memset() a -Wclass-memaccess)
+    snprintf(ta->path, sizeof ta->path, "/tmp/zs_pa_%s_XXXXXX", name);
+    ta->fd = mkstemp(ta->path);
+    if (ta->fd < 0) return -1;
+    ta->size = size;
+    std::vector<char> img(size, 0);
+    uint32_t bytes_used = (uint32_t)(size - kPropAreaHeaderSize);
+    memcpy(img.data() + 0, &bytes_used, 4);
+    uint32_t serial = 1;
+    memcpy(img.data() + 4, &serial, 4);
+    uint32_t magic = kPropAreaMagic;
+    memcpy(img.data() + 8, &magic, 4);
+    uint32_t version = kPropAreaVersion;
+    memcpy(img.data() + 12, &version, 4);
+    if (write(ta->fd, img.data(), size) != (ssize_t)size) return -1;
+    // Map the file read-only MAP_SHARED at the fixed address — the
+    // exact guise a bionic context area has when the clone scans it.
+    int mfd = open(ta->path, O_RDONLY);
+    if (mfd < 0) return -1;
+    ta->file_map = mmap((void*)fixed_addr, size, PROT_READ, MAP_SHARED,
+                        mfd, 0);
+    close(mfd);
+    if (ta->file_map == MAP_FAILED) { ta->file_map = nullptr; return -1; }
+    ta->addr = ta->file_map;
+    return 0;
+}
+
+static void drop_test_prop_area(TestArea* ta) {
+    if (ta->addr) munmap(ta->addr, ta->size);
+    if (ta->fd >= 0) close(ta->fd);
+    if (ta->path[0]) unlink(ta->path);
+}
+
+// Seed a prop_info (serial 0 + value) at file offset `off` through
+// the backing fd: the read-only MAP_SHARED mapping reflects pwrite
+// through the same page cache, so the area's mapped view updates
+// without ever writing the mapping itself.
+static int set_area_pi(TestArea* ta, size_t off, const char* value) {
+    uint32_t s = 0;
+    if (pwrite(ta->fd, &s, 4, (off_t)off) != 4) return -1;
+    size_t len = strlen(value) + 1;
+    if (pwrite(ta->fd, value, len, (off_t)off + 4) != (ssize_t)len) {
+        return -1;
+    }
+    return 0;
+}
+
+// THE Round 25 regression: the pre-map pass must call find() for
+// every spoof key BEFORE the maps scan, so a lazily-mapped context
+// area (mapped by find() itself on first lookup — bionic's real
+// behavior for contexts the zygote never queried) is already present
+// when the scan runs, gets cloned private+writable, and the patch
+// writes into the CLONE instead of the read-only file page.
+//
+// The lazy mapping is simulated by the fake find; the ORDERING is
+// proven by the maps GENERATOR: it emits the context area's line only
+// if the fake find has mapped it by the time production would read
+// /proc/self/maps. Pre-Round-25 code (find first called at patch
+// time) leaves the area unmapped at scan time -> it is not in the
+// mappings -> not remapped -> patch_prop_value writes to the
+// read-only MAP_SHARED page -> SIGSEGV. The test would crash, not
+// merely fail.
+ZS_TEST(clone_pre_maps_lazily_mapped_context_before_scan) {
+    // Two areas at fixed, non-conflicting addresses.
+    static TestArea serial_area;      // "properties_serial"
+    static TestArea context_area;     // lazily mapped per-context area
+    ZS_CHECK_EQ(build_test_prop_area(&serial_area, 0x500000000000ul,
+                                     0x2000, "serial"), 0);
+    // prop_info for a VALUE-spoofed key inside the serial area
+    // (seeded through the backing fd; the mapping stays read-only,
+    // exactly like the device's real file mapping).
+    ZS_CHECK_EQ(set_area_pi(&serial_area,
+                            kPropAreaHeaderSize + 0x40,
+                            "orange-unlocked-rooted"), 0);
+    ZS_CHECK_EQ(build_test_prop_area(&context_area, 0x500000020000ul,
+                                     0x2000, "ctx"), 0);
+    ZS_CHECK_EQ(set_area_pi(&context_area,
+                            kPropAreaHeaderSize + 0x80, "0"), 0);
+
+    // Fake find with LAZY mapping for the context-resident key.
+    static int lazy_mapped = 0;
+    static int find_calls = 0;
+    lazy_mapped = 0;
+    find_calls = 0;
+    auto fake_find = [](const char* key) -> const void* {
+        ++find_calls;
+        if (strcmp(key, "ro.boot.verifiedbootstate") == 0) {
+            return (const char*)serial_area.addr +
+                   kPropAreaHeaderSize + 0x40;
+        }
+        if (strcmp(key, "ro.boot.flash.locked") == 0) {
+            if (!lazy_mapped) {
+                // bionic's context_node::open() moment: the REAL
+                // mapping appears here, lazily, on first lookup.
+                lazy_mapped = 1;
+            }
+            return (const char*)context_area.addr +
+                   kPropAreaHeaderSize + 0x80;
+        }
+        return nullptr;
+    };
+    zs_test_set_prop_find(fake_find);
+
+    // Maps generator: called where production reads /proc/self/maps —
+    // AFTER the pre-map pass. Records whether the lazy context area
+    // existed at scan time (the ordering proof).
+    static std::string maps_text;
+    static int lazy_at_scan = -1;
+    lazy_at_scan = -1;
+    auto gen = [](size_t* out_len) -> const char* {
+        maps_text.clear();
+        char line[256];
+        snprintf(line, sizeof line,
+                 "%lx-%lx r--p 00000000 00:0c 8401      "
+                 "/dev/__properties__/properties_serial\n",
+                 (unsigned long)(uintptr_t)serial_area.addr,
+                 (unsigned long)(uintptr_t)serial_area.addr +
+                     serial_area.size);
+        maps_text += line;
+        lazy_at_scan = lazy_mapped;
+        if (lazy_mapped) {
+            snprintf(line, sizeof line,
+                     "%lx-%lx r--p 00000000 00:0c 8402      "
+                     "/dev/__properties__/u:object_r:default_prop:s0\n",
+                     (unsigned long)(uintptr_t)context_area.addr,
+                     (unsigned long)(uintptr_t)context_area.addr +
+                         context_area.size);
+            maps_text += line;
+        }
+        *out_len = maps_text.size();
+        return maps_text.c_str();
+    };
+    zs_test_set_clone_maps_gen(gen);
+
+    zs_test_reset_props_cloned();
+    clone_property_area_private();   // the FULL production path
+
+    // 1. The ordering proof: the context area was mapped BEFORE the
+    //    scan ran (pre-map pass first). -1 would mean the generator
+    //    never ran; 0 would mean find had not been called yet.
+    ZS_CHECK_EQ(lazy_at_scan, 1);
+    // 2. Every spoof key was looked up (the pre-map pass is
+    //    table-driven, not best-effort).
+    ZS_CHECK(find_calls >= 2);
+    // 3. The patch landed in the PRIVATE CLONES (the write below the
+    //    original read-only pages would have been a SIGSEGV):
+    //    - serial area entry now reads "green"
+    ZS_CHECK(strcmp((char*)serial_area.addr + kPropAreaHeaderSize + 0x40 + 4,
+                    "green") == 0);
+    //    - lazily-mapped context entry now reads "1"
+    ZS_CHECK(strcmp((char*)context_area.addr + kPropAreaHeaderSize + 0x80 + 4,
+                    "1") == 0);
+    // 4. The serial top byte carries the new value length (R22 rule).
+    {
+        uint32_t s = 0;
+        memcpy(&s, (char*)serial_area.addr + kPropAreaHeaderSize + 0x40, 4);
+        ZS_CHECK_EQ(s >> 24, 5u);   // "green"
+        memcpy(&s, (char*)context_area.addr + kPropAreaHeaderSize + 0x80, 4);
+        ZS_CHECK_EQ(s >> 24, 1u);   // "1"
+    }
+    // 5. The clone latched.
+    ZS_CHECK(zs_test_props_cloned_latched() == 1);
+
+    // Cleanup.
+    zs_test_clear_clone_maps_gen();
+    zs_test_reset_prop_find();
+    g_prop_line_restore_count = 0;
+    drop_test_prop_area(&serial_area);
+    drop_test_prop_area(&context_area);
+    zs_test_reset_props_cloned();
+}
+
+// Round 25 — the old-kernel memfd fallback (Android 7.x on 3.4/3.10
+// kernels has no memfd_create). With memfd forced off and a fallback
+// directory configured, the filter must serve the SAME filtered bytes
+// from an unlinked regular file: seekable, regular-file fstat, and
+// the directory holds no leftovers.
+ZS_TEST(memfd_fallback_file_serves_filtered_content) {
+    std::string fake_maps =
+        "7f8a0c000000-7f8a0c010000 r--p 00000000 fd:00 1234   /system/lib64/libc.so\n"
+        "7f8a0c100000-7f8a0c110000 r-xp 00000000 fd:00 1234   /data/adb/libpayload.so\n"
+        "7f8a0c300000-7f8a0c310000 r-xp 00000000 fd:00 1234   /system/lib64/libart.so\n";
+
+    char dir[] = "/tmp/zs_fallback_XXXXXX";
+    ZS_CHECK(mkdtemp(dir) != nullptr);
+
+    int input_fd = write_text_to_memfd(fake_maps);
+    ZS_CHECK(input_fd >= 0);
+
+    zs_test_disable_memfd(1);
+    zs_test_set_filter_fallback_dir(dir);
+
+    int filtered_fd = make_filtered_memfd(input_fd, "/proc/self/maps");
+    ZS_CHECK(filtered_fd >= 0);
+
+    // Content: filtered exactly like the memfd path.
+    std::string out = read_fd_to_string(filtered_fd);
+    ZS_CHECK_STR_CONTAINS(out, "libc.so");
+    ZS_CHECK_STR_CONTAINS(out, "libart.so");
+    ZS_CHECK_STR_ABSENT(out, "libpayload.so");
+
+    // It is a seekable regular file (an app reading it twice gets the
+    // same bytes — a pipe would break lseek).
+    ZS_CHECK_EQ(lseek(filtered_fd, 0, SEEK_SET), (off_t)0);
+    struct stat st{};
+    ZS_CHECK_EQ(fstat(filtered_fd, &st), 0);
+    ZS_CHECK(S_ISREG(st.st_mode));
+    ZS_CHECK_EQ((size_t)st.st_size, out.size());
+    std::string second = read_fd_to_string(filtered_fd);
+    ZS_CHECK(second == out);
+
+    // The directory is EMPTY — the scratch file was unlinked at
+    // creation; no forensic trace survives.
+    DIR* d = opendir(dir);
+    ZS_CHECK(d != nullptr);
+    int entries = 0;
+    while (d && readdir(d)) ++entries;
+    if (d) closedir(d);
+    ZS_CHECK_EQ(entries, 2);   // "." and ".." only
+
+    close(filtered_fd);
+    close(input_fd);
+    zs_test_set_filter_fallback_dir(nullptr);
+    zs_test_disable_memfd(0);
+    rmdir(dir);
+}
+
+// Round 25 — with memfd off AND no usable fallback dir, the filter
+// reports failure (the caller's documented fail-open takes over) —
+// it must never serve unfiltered content on its own.
+ZS_TEST(memfd_fallback_fails_closed_without_a_dir) {
+    std::string fake_maps =
+        "7f8a0c000000-7f8a0c010000 r--p 00000000 fd:00 1234   /system/lib64/libc.so\n"
+        "7f8a0c100000-7f8a0c110000 r-xp 00000000 fd:00 1234   /data/adb/libpayload.so\n";
+    int input_fd = write_text_to_memfd(fake_maps);
+    ZS_CHECK(input_fd >= 0);
+
+    zs_test_disable_memfd(1);
+    zs_test_set_filter_fallback_dir(nullptr);   // no override: real
+                                                // path -> getuid() of
+                                                // the test -> no data
+                                                // dir -> -1
+    int filtered_fd = make_filtered_memfd(input_fd, "/proc/self/maps");
+    ZS_CHECK(filtered_fd < 0);
+
+    close(input_fd);
+    zs_test_disable_memfd(0);
+}

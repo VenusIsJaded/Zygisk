@@ -840,3 +840,49 @@ JNI spec.
 
 **188/188 host tests**, 0 warnings, ASan+UBSan+leaks green, trampoline
 binary verification green.
+
+### Round 25 — Android 7.0/7.1/7.1.2/8.0/8.1 support: the bootstrap was never real
+
+The round's version research (AOSP fetched at android-7.0.0_r1,
+7.1.2_r33, 8.0.0_r17, 8.1.0_r81, plus 9.0/13.0 for boundaries)
+found **two device-fatal defects that affected every Android
+version, not just 7/8**:
+
+1. **ART never calls the native bridge's `initialize()` in the
+   zygote** — on every version studied (7.0 through 13), `Runtime::Init`
+   only dlopen+dlsym+version-checks the bridge; the initialize call
+   lives in `ZygoteHooks_nativePostForkChild` and only fires for
+   foreign-arch children, while every same-arch child takes `kUnload`
+   and **dlcloses** the bridge handle. The pre-Round-25 bootstrap
+   (load the payload from `initialize()`) therefore never executed
+   on real hardware: no hooks, no modules, nothing. The payload now
+   bootstraps from a library **constructor** (runs inside the zygote
+   at the dlopen, on every version), and both libraries are linked
+   with **`-z nodelete`** plus a runtime self-pin in the payload —
+   because bionic's `dlclose` calls `DT_FINI` when a refcount hits
+   zero, and a Tier A (self-unmapped) hidden child no longer has that
+   code mapped: without NODELETE that destructor call crashes every
+   hidden Tier A child at `callPostForkChildHooks`.
+2. **7.0–9.x call `isCompatibleWith()` during `LoadNativeBridge`**
+   whenever the table's version >= 2 — our slot was NULL: a zygote
+   SIGSEGV at boot. The table is now the exact 15-slot AOSP layout
+   with every slot implemented (contract-valid no-ops, forwarded to
+   the real translation bridge when present, version-gated).
+
+For Android 7.x/8.x specifically, the research also confirmed the
+zygote drop order (setgroups → setresgid → setresuid, no seccomp
+between) and that 7.0+ already use the `/dev/__properties__/`
+directory + trie property format with the same label — the whole
+R19/R20/R22 execve-proof property layer works on 7.x unchanged.
+Two more real bugs closed in the same pass: the property-clone
+**pre-map ordering crash** (bionic maps per-context property files
+lazily; a spoof key whose context the zygote never queried was
+patched on the REAL read-only page — SIGSEGV at hidden-app launch,
+all versions) and the **old-kernel memfd fallback** (Android 7.x
+devices on 3.4/3.10 kernels have no memfd_create; the /proc filter
+silently fail-opened — serving unfiltered content — it now writes
+to an unlinked file in the hidden target's own data dir).
+
+**199/199 host tests** (36 hide / 109 advanced / 20 stealth / 5 e2e /
+4 perf / 2 trampoline / 17 dispatch / 6 version-compat), 0 warnings,
+ASan+UBSan+leaks green, trampoline binary verification green.

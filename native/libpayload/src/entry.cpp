@@ -532,9 +532,48 @@ int zs_trampoline_unmap(const ZsTrampRecord*, size_t, void*, long) {
 #endif
 
 // ------------------------------------------------------------------------
-// One-time initialization. Called from libzygisk's NativeBridge hook.
+// One-time initialization. Called from libzygisk's constructor (Round
+// 25: the bridge library's __attribute__((constructor)), which runs in
+// the zygote during Runtime::Init's dlopen — the only hook point that
+// exists on EVERY Android version; ART itself never calls initialize()
+// in the zygote, see native/libzygisk/src/entry.cpp's header comment).
 // ------------------------------------------------------------------------
 
+// Round 25 — self-pin. On every Android version studied (7.0 through
+// 13), each same-arch child calls InitNonZygoteOrPostFork(kUnload),
+// which dlclose()s the bridge handle ART holds (libzygisk.so). The
+// linker's unload chain then walks libzygisk's dlopen-children — which
+// includes THIS library — and would unmap the very GOT-hook code every
+// future setresgid/setresuid call in that child jumps through. One
+// extra reference on ourselves makes the chain stop one short:
+//   zygote:  libzygisk dlopen(libpayload)  -> refcount 1
+//            libpayload dlopen(self, RTLD_NOLOAD) -> refcount 2
+//   child:   ART dlclose(libzygisk) -> NODELETE makes the linker
+//            return before any destructor/unmap; libpayload's count
+//            is untouched anyway: STILL MAPPED (defense in depth —
+//            the -z nodelete link flag on both .so's is the primary
+//            guard; see the CMakeLists and libzygisk's entry.cpp).
+// RTLD_NOLOAD returns the existing handle without touching disk, so
+// this is a pure refcount bump. If the path lookup somehow misses, a
+// plain dlopen of the same path resolves to the same soinfo anyway.
+extern "C" void zygisk_study_payload_init();   // defined below
+static void self_pin() {
+    Dl_info info{};
+    if (dladdr((const void*)&zygisk_study_payload_init, &info) == 0 ||
+        !info.dli_fname) {
+        ZS_LOGW("payload: dladdr(self) failed; relying on the bridge "
+                "handle alone");
+        return;
+    }
+    void* pin = dlopen(info.dli_fname, RTLD_NOLOAD | RTLD_LAZY);
+    if (!pin) {
+        pin = dlopen(info.dli_fname, RTLD_LAZY);
+    }
+    if (!pin) {
+        ZS_LOGW("payload: self-pin failed (%s): a child-side bridge "
+                "dlclose could unmap our hooks", dlerror());
+    }
+}
 
 extern "C"
 __attribute__((visibility("default")))
@@ -546,6 +585,11 @@ void zygisk_study_payload_init() {
 
     g_origin_pid = getpid();
     ZS_LOGI("payload: init (pid %d)", (int)g_origin_pid);
+
+    // Round 25: pin ourselves before anything else (see self_pin()) —
+    // it must happen before any hook is installed, so the hook code is
+    // guaranteed to stay mapped for the process lifetime.
+    self_pin();
 
     // Resolve the libc functions our hooks delegate to. dlsym on
     // libc.so directly — we are RTLD_LOCAL and not in the global

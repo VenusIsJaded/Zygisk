@@ -158,6 +158,22 @@ char* zs_build_spoofed_serial_area(const char* prop_file_path,
 // Test seams for the builder (host has no bionic property area).
 void zs_test_set_prop_find(const void* (*find)(const char*));
 void zs_test_reset_prop_find();
+
+// Round 25 test seams: force the memfd path off (simulates a
+// pre-3.17 kernel / ENOMEM) and point the unlinked-file fallback at
+// a host directory.
+void zs_test_disable_memfd(int disabled);
+void zs_test_set_filter_fallback_dir(const char* dir);
+
+// Round 25 test seam: drive the FULL production property-clone path
+// (pre-map pass, scan, capture, remap, patch, delete, mprotect)
+// against maps content from a GENERATOR, invoked exactly where
+// production reads /proc/self/maps (i.e. after the pre-map pass).
+// The fake find is supplied through zs_test_set_prop_find.
+void zs_test_set_clone_maps_gen(const char* (*gen)(size_t* out_len));
+void zs_test_clear_clone_maps_gen();
+int  zs_test_props_cloned_latched();
+void zs_test_reset_props_cloned();
 #endif
 
 // Spoof table entry (definition lives in hide_advanced.cpp).

@@ -5,7 +5,11 @@ tests/test_hide_stealth
 tests/test_e2e_hide
 tests/test_perf
 tests/test_unmap_trampoline
+tests/test_module_dispatch
+tests/test_version_compat
 tests/libpayload.so
+tests/libzs_test_module.so
+tests/libzygisk.so
 tests/*.orig
 build/
 target/
