@@ -45,13 +45,14 @@ on:
   push:            # every commit on every branch + tags
   workflow_dispatch:
 
-permissions:
-  contents: write  # required only for the tag-release job
+permissions: {}  # jobs declare exactly what they need
 
 jobs:
   build:
     name: Flashable zip (NDK cross-build)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read  # checkout + test gates only — no write access needed
     steps:
       - name: Checkout (full history for versionCode)
         uses: actions/checkout@v7
@@ -97,8 +98,15 @@ jobs:
           # Prefer the runner's default NDK (stable), fall back to the
           # newest (ANDROID_NDK_LATEST_HOME). build_module.sh accepts
           # both; the discovery order is documented in the script.
+          #
+          # Round 33 (the first live CI run died here): the script was
+          # committed WITHOUT the executable git mode (100644), and
+          # `./scripts/build_module.sh` failed with "Permission denied"
+          # on the runner. Invoked through `bash` it is immune to a lost
+          # exec bit; the bit itself is also fixed in git (and
+          # verify_scripts.py now FAILS if it ever regresses).
           NDK="${ANDROID_NDK_HOME:-${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_ROOT:-}}}" \
-            ./scripts/build_module.sh
+            bash ./scripts/build_module.sh
 
       - name: Upload the zip (every commit)
         uses: actions/upload-artifact@v7
@@ -113,6 +121,8 @@ jobs:
     needs: build
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
+    permissions:
+      contents: write  # creating the GitHub release (this job only)
     steps:
       - name: Download the zip built by this tag
         uses: actions/download-artifact@v7

@@ -316,9 +316,9 @@ What the tests cover (Round 9):
   FORCE_DENYLIST_UNMOUNT runs its unmount phase only after the
   post callbacks.
 
-(Total: 237 host-side tests, the daemon's `cargo test` suite (30
-tests), `make verify-daemon` — 27 LIVE checks against the real
-zygiskd binary — and `make verify-scripts` (Round 29) — 53 LIVE
+(Total: 251 host-side tests, the daemon's `cargo test` suite (45
+tests), `make verify-daemon` — 32 LIVE checks against the real
+zygiskd binary — and `make verify-scripts` (Round 29) — 106 LIVE
 checks that run the module's actual shell scripts against a fake
 Magisk environment. That last layer is the one that finally
 executes post-fs-data.sh/service.sh/customize.sh/uninstall.sh on
@@ -870,6 +870,88 @@ warnings, perf medians unchanged, and a locally verified 4-ABI
 flashable zip pipeline. The full research trail with every source cited:
 `docs/ANDROID-REALISM.md` (Round 32) and `docs/compatibility.md`
 (custom ROM section).
+
+### Round 33 — the CI permission bug, and closing the file-content fingerprint
+
+The first live CI run of the flashable-zip workflow died at
+`./scripts/build_module.sh: Permission denied` — the script had
+been committed with git mode 100644, and a runner checkout
+faithfully reproduced the missing exec bit. Fixed three ways: the
+git mode is now 100755, the workflow invokes the script through
+`bash` (immune to any future bit loss), and `make verify-scripts`
+gains a CI-hygiene case that FAILS the build if either the mode or
+the invocation regresses.
+
+The stealth half of the round: Round 30 gave the two
+`/system/lib[64]`-resident libraries randomized FILE names, but the
+FILES themselves are world-readable, and every string constant
+shipped verbatim inside — the full `/data/system/zygisk_study` path
+map, "libpayload.so"/"libzygisk.so" needles, the root-manager
+property keys, a `DT_SONAME` saying `libzygisk.so` inside a file
+named `lib<8hex>.so`, ~1 MB of DWARF, a complete `.symtab`, and 528
+exported libc++ symbols. A one-line `grep zygisk` over
+`/system/lib64/*.so` fingerprinted us regardless of the file name.
+Round 33 closes the CONTENT vector:
+
+- Release builds are now the stealth artifact: `-O2`, no debug
+  info, `llvm-strip --strip-all` on every packaged ELF,
+  `-Wl,--exclude-libs,ALL` (the libc++_static symbols stop
+  flooding `.dynsym`), `NO_SONAME` (bionic tolerates the absence —
+  verified from its linker source: silent for targetSdk >= 23,
+  dedup is by inode), and the `ZS_STEALTH` compile-out of every
+  log site. Debug builds keep `-g` and full logs: that is the
+  readable-for-study flavor now.
+- `native/common/obfstr.h`: compile-time XOR obfuscation
+  (constexpr-encrypted `.rodata`, runtime stack decode,
+  `volatile` reads so LLVM cannot fold the decode back into a
+  plaintext constant) with expression, holder and decode-once
+  forms. Every signature literal in the bridge and payload now
+  flows through it. The decode-once form initializes at
+  `init_array` — NOT a magic static: magic statics reference
+  `__cxa_guard_*`, which drags libc++abi's demangling terminate
+  handler and its ~180 KB demangler into the library (measured:
+  libzn_loader 9 KB -> 357 KB before the fix).
+- The payload's internal export names are renamed to neutral
+  `zs_entry_*` symbols (export names are the one leak vector
+  obfuscation cannot cover — `.dynstr` must stay plaintext for
+  dlsym); `-fno-rtti` removes the mangled typeinfo names from
+  `.rodata` (verified empirically: virtual dispatch,
+  `dynamic_cast<void*>` and module-side RTTI all keep working
+  across the DSO boundary).
+- `build_module.sh` verifies the result on every CI build: the
+  packaged ELFs must be stripped, soname-free, and free of the
+  banned-string set ("zygisk", "libpayload", "session.sock",
+  ... — the two app-readable libraries only; the root-only daemon
+  and the documented-API libzn_loader are out of scope by design).
+
+Measured result: libpayload 1.70 MB -> 343 KB, libzygisk 37 KB ->
+12 KB, libzn_loader 28 KB -> 8.3 KB, zip 2.9 MB -> 1.5 MB; the
+remaining payload bulk is libc++abi's demangler, reachable only
+from the exception-terminate path — generic content every NDK C++
+library carries, pages that are never touched in a normal process.
+Perf on the same machine, before/after: filter medians 29->31 us
+and 1526->1499 us, matcher 63->65 ns — jitter-level; the hot-path
+table loops kept their {ptr,len} memcmp shape.
+
+Two more bugs found on the way: the `verify_zip` `set -e` trap
+(a no-match `grep` inside a command substitution silently aborted
+the whole script — the R32 header warned about exactly this class)
+and the `service.sh` pid file, which recorded the PID of the
+`setsid` wrapper — a process that forks and exits under shell job
+control — so the file named a dead pid from the first millisecond.
+The daemon now writes its own pid after the socket bind (verified
+live: the E2E asserts the file names the running daemon).
+
+Final state: **251/251 host tests** (8 obfstr / 41 hide / 112
+advanced / 20 stealth / 5 e2e / 6 perf / 4 trampoline / 23
+dispatch / 11 version-compat / 16 zn_loader / 5 race) + `make
+race` TSan zero + `make run-sanitize` green + 45/45 cargo tests +
+clippy clean + `make verify-daemon` 32 live checks + `make
+verify-scripts` 106 live checks + trampoline binary verification
+green (keystone) + the 4-ABI cross-build with all gates green,
+built locally with the runner's exact NDK (r27d, 27.3.13750724).
+The research trail: `docs/ANDROID-REALISM.md` (Round 33) and
+`docs/hiding.md` (Round 33).
 
 ## License
 

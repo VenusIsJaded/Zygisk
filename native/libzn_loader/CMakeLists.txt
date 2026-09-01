@@ -32,6 +32,17 @@ target_link_libraries(zn_loader
     log
 )
 
+# Round 33 (stealth release): --exclude-libs,ALL so libc++_static
+# symbols stop flooding .dynsym, and NO_SONAME so the file does not
+# carry a fixed "libzn_loader.so" soname string (same rationale as
+# the other two libraries — see native/libzygisk/CMakeLists.txt).
+# Unlike the bridge/payload this library is NOT installed into
+# /system (it stays under /data/adb/modules, root-only-readable),
+# so its exported API names intentionally remain descriptive.
+target_link_options(zn_loader PRIVATE
+    "-Wl,--exclude-libs,ALL")
+set_target_properties(zn_loader PROPERTIES NO_SONAME ON)
+
 # Round 27: 16 KB page-size alignment for the same reason as the
 # other two libraries (Android 15+/16+ 16 KB-kernel devices; see
 # native/libzygisk/CMakeLists.txt for the full rationale).

@@ -376,7 +376,7 @@ static void setup_payload() {
         std::exit(2);
     }
 
-    fn_init            = (Fn_init)sym("zygisk_study_payload_init");
+    fn_init            = (Fn_init)sym("zs_entry_init");
     fn_set_sock        = (Fn_set_sock)sym("zs_test_set_daemon_socket");
     fn_set_drop_seam   = (Fn_set_drop_seam)sym("zs_test_set_drop_seam");
     fn_drop_seam       = (Fn_drop_seam)sym("zs_test_drop_seam");

@@ -45,12 +45,28 @@ set(CMAKE_CXX_VISIBILITY_PRESET hidden)
 set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)
 set(CMAKE_C_VISIBILITY_PRESET hidden)
 
-# Debug-friendly flags even in Release — we want the disassembly to be
-# readable. -O1 is enough to remove obviously-bad code paths but not
-# so much that a reverse engineer can't follow control flow.
+# ROUND 33 (stealth release — the -g/-O1 philosophy flips): the two
+# libraries this build places in /system/lib[64] are world-readable by
+# every app, and until this round the Release build shipped full DWARF
+# (~1 MB of a 1.7 MB libpayload), a complete .symtab/.strtab, absolute
+# build-host paths in .debug_str, and 500+ libc++_static symbols in
+# .dynsym — a gift to any file-scanning detector. Release is now the
+# STEALTH artifact: -O2, no debug info, logs compiled out (ZS_STEALTH,
+# see native/common/log.h), string constants obfuscated (obfstr.h),
+# static-archive symbols excluded from .dynsym (--exclude-libs,ALL),
+# and no DT_SONAME. Debug builds (CMAKE_BUILD_TYPE=Debug) keep -g and
+# full logs — that is the readable-for-study flavor now.
 if(CMAKE_BUILD_TYPE STREQUAL "Release")
-    set(CMAKE_CXX_FLAGS_RELEASE "-O1 -g -DNDEBUG")
-    set(CMAKE_C_FLAGS_RELEASE   "-O1 -g -DNDEBUG")
+    set(CMAKE_CXX_FLAGS_RELEASE "-O2 -DNDEBUG")
+    set(CMAKE_C_FLAGS_RELEASE   "-O2 -DNDEBUG")
+endif()
+
+# ROUND 33: ZS_STEALTH compiles the ZS_LOG* macros to nothing in the
+# Android Release build (see native/common/log.h). Host unit tests and
+# Debug builds never define it, so the study logs stay available where
+# a human is looking.
+if(ANDROID AND CMAKE_BUILD_TYPE STREQUAL "Release")
+    add_compile_definitions(ZS_STEALTH)
 endif()
 
 # Android-specific tweak: link against libdl and liblog (Android ships

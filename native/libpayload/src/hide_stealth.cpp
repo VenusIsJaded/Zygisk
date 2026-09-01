@@ -35,6 +35,7 @@
 #include "hide_stealth.h"
 #include "hide_advanced.h"
 #include "log.h"
+#include "obfstr.h"
 #include "resolve_libc.h"
 
 #include <dlfcn.h>
@@ -83,24 +84,27 @@ extern "C" ssize_t zygisk_study_hook_readlinkat(int dirfd,
                                                 char* buf, size_t bufsiz);
 
 // Substrings that, if present in the resolved path, trigger a rewrite.
-static const char* const kRewriteSubstrings[] = {
-    "magisk",
-    "zygisk",
-    "/sbin/",
-    "/data/adb/",
-    "/debug_ramdisk/",
-    "zygisk_study",
-};
+// ROUND 33: decode-once obfuscated (see obfstr.h) — the plaintext list
+// inside the world-readable libpayload.so was a direct fingerprint.
+static const zsst::StrTable rewrite_substrings_g = [] {
+        zsst::StrTable b;
+        b.add(ZS_OBFS("magisk"));
+        b.add(ZS_OBFS("zygisk"));
+        b.add(ZS_OBFS("/sbin/"));
+        b.add(ZS_OBFS("/data/adb/"));
+        b.add(ZS_OBFS("/debug_ramdisk/"));
+        b.add(ZS_OBFS("zygisk_study"));
+        return b;
+    }();;
+static const zsst::StrTable& rewrite_substrings() { return rewrite_substrings_g; }
 
 // The stock zygote binary — chosen by ABI so 32-bit processes report
 // app_process32 like a real 32-bit fork would.
-static const char* stock_exe_path() {
 #if __SIZEOF_POINTER__ == 4
-    return "/system/bin/app_process32";
+ZS_OBFS_PATH(stock_exe_path, "/system/bin/app_process32")
 #else
-    return "/system/bin/app_process64";
+ZS_OBFS_PATH(stock_exe_path, "/system/bin/app_process64")
 #endif
-}
 
 // Round 8 (S5): skip the "<pid>|self|thread-self" component and any
 // following "task/<tid>/" component (per-thread paths:
@@ -184,10 +188,10 @@ static ssize_t rewrite_if_suspicious(char* buf, size_t bufsiz,
     if (n > bufsiz) n = bufsiz;
 
     int suspicious = 0;
-    for (const char* s : kRewriteSubstrings) {
-        size_t slen = __builtin_strlen(s);
+    for (const auto& rs : rewrite_substrings()) {
+        size_t slen = rs.n;
         if (slen == 0 || slen > n) continue;
-        if (memmem(buf, n, s, slen) != nullptr) {
+        if (memmem(buf, n, rs.p, slen) != nullptr) {
             suspicious = 1;
             break;
         }

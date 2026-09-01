@@ -75,7 +75,7 @@ static void* open_payload_so(VoidFn* init_out, SetResGidFn* wrapper_out,
     ZS_CHECK(h != nullptr);
     if (!h) return nullptr;
 
-    *init_out    = (VoidFn)dlsym(h, "zygisk_study_payload_init");
+    *init_out    = (VoidFn)dlsym(h, "zs_entry_init");
     *wrapper_out = (SetResGidFn)dlsym(h, "zs_setresgid_wrapper");
     *force_out   = (ForceUidFn)dlsym(h, "zs_test_force_deny_uid");
     *pending_out = (PendingFn)dlsym(h, "zs_test_trampoline_pending");

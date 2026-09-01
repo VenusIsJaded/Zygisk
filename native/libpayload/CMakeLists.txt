@@ -3,10 +3,14 @@
 #
 # libpayload.so — the in-process trampoline + hide layer.
 #
-# Public ABI: exactly three symbols.
-#   - zygisk_study_payload_init   (one-time setup, called by libzygisk)
-#   - zygisk_study_payload_pre_fork   (called by our fork hook)
-#   - zygisk_study_payload_post_fork  (called by our fork hook)
+# Public ABI: exactly three symbols (ROUND 33: renamed from the
+# zygisk_study_payload_* names — export NAMES are the one leak vector
+# string obfuscation cannot cover, since .dynstr must carry them in
+# plaintext for dlsym to find them; the neutral zs_entry_* names say
+# nothing to a signature scanner):
+#   - zs_entry_init   (one-time setup, called by libzygisk)
+#   - zs_entry_pre_fork   (called by our fork hook)
+#   - zs_entry_post_fork  (called by our fork hook)
 # Everything else is hidden.
 #
 # Round 12: module_dispatch.cpp owns the module-facing machinery
@@ -63,7 +67,25 @@ target_link_libraries(payload
 # payload's own page math already uses sysconf(_SC_PAGESIZE) at every
 # spot that matters (trampoline page, prop_info page roundings), so
 # only the ELF alignment needed fixing.
-target_link_options(payload PRIVATE "-Wl,-z,nodelete")
+# Round 33 (stealth release) + ROUND 33b: --exclude-libs,ALL and
+# NO_SONAME (same rationale as libzygisk's CMakeLists), plus
+# -fno-rtti: the module-API classes (zygisk::Api and the internal
+# PayloadApi) carried their mangled typeinfo NAMES as plaintext
+# .rodata strings ("N12zygisk_study10PayloadApiE", "N6zygisk3ApiE")
+# inside the world-readable library — exactly the fingerprint the
+# banned-string gate rejects. Verified empirically this round
+# (scripts/rtti-test): a -fno-rtti DSO consumed by RTTI-compiled
+# module code keeps virtual dispatch, dynamic_cast<void*> and the
+# module's own dynamic_cast/typeid fully functional (the only
+# breakage would be cross-DSO dynamic_cast DOWN into OUR internal
+# classes, which no module can name); the one catch(...) in this
+# library is typeless. The public zygisk:: namespace itself stays —
+# it is the documented module-API compat surface.
+target_compile_options(payload PRIVATE -fno-rtti)
+target_link_options(payload PRIVATE
+    "-Wl,--exclude-libs,ALL"
+    "-Wl,-z,nodelete")
+set_target_properties(payload PROPERTIES NO_SONAME ON)
 if(ANDROID)
     target_link_options(payload PRIVATE
         "-Wl,-z,max-page-size=16384"

@@ -53,7 +53,10 @@ ZS_TEST(rewrite_substrings_contains_documented_set) {
     bool has_data_adb = false;
     bool has_zygisk = false;
 
-    for (const char* s : kRewriteSubstrings) {
+    // ROUND 33: the array became a decode-once obfuscated StrTable
+    // (the test #includes the .cpp, so the static accessor is visible).
+    for (const auto& e : rewrite_substrings()) {
+        const char* s = e.p;
         if (strstr(s, "magisk") != nullptr) has_magisk = true;
         if (strstr(s, "/sbin/") != nullptr) has_sbin = true;
         if (strstr(s, "/data/adb/") != nullptr) has_data_adb = true;

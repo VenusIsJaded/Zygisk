@@ -1623,6 +1623,21 @@ fn main() {
     let _ = std::fs::set_permissions(&sock_path,
         std::fs::Permissions::from_mode(0o600));
 
+    // Round 33 — write the pid file OURSELVES. service.sh previously
+    // recorded $! after `setsid ... &`, but the setsid wrapper may
+    // fork (it does whenever the backgrounded job is already a
+    // process-group leader, which Android's shell job control makes
+    // the common case), in which case $! is the wrapper's pid and the
+    // wrapper exits immediately — the file named a dead process from
+    // the first millisecond and nothing could trust it. The daemon
+    // knows its own pid; written after the bind so the file only ever
+    // appears for a fully-started daemon.
+    let pid_path = format!("{}/zygiskd.pid", workdir);
+    let _ = std::fs::write(&pid_path,
+        format!("{}\n", std::process::id()));
+    let _ = std::fs::set_permissions(&pid_path,
+        std::fs::Permissions::from_mode(0o600));
+
     eprintln!("zygiskd: listening on {}", sock_path);
 
     // Accept loop. The parent stays as root and accepts; each

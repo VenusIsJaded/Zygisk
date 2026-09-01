@@ -50,7 +50,28 @@ target_link_libraries(zygisk
 # from the 8.1 sources this round, same lineage in 7.x). The flag
 # composes with Tier A: our unmap is a raw munmap and never consults
 # the linker's bookkeeping.
-target_link_options(zygisk PRIVATE "-Wl,-z,nodelete")
+# ROUND 33 (stealth release): two link-level changes.
+#
+# -Wl,--exclude-libs,ALL — libc++_static's own symbols (exception
+# types, __ndk1 string internals; 500+ of them in the pre-Round-33
+# build) stopped leaking into .dynsym. They remain available to our
+# code (the archive is still linked), they are just no longer
+# EXPORTED — the dynamic symbol table now contains only the contract.
+#
+# NO_SONAME — the file previously carried DT_SONAME "libzygisk.so"
+# even though Round 30 installs it under a per-install random name:
+# a fixed soname inside a randomized file is a one-grep fingerprint
+# for any app scanning /system/lib64. Verified from bionic's linker
+# (linker.cpp:3318-3337 and load_library's find_loaded_library_by_inode
+# path): a missing DT_SONAME is silently tolerated for every
+# targetSdkVersion >= 23 (the basename fallback runs only below 23),
+# and dedup is by inode, not soname — nothing NEEDEDs this library,
+# and the runtime dlopens it by FILENAME through the namespace search
+# path, which never consults DT_SONAME.
+target_link_options(zygisk PRIVATE
+    "-Wl,--exclude-libs,ALL"
+    "-Wl,-z,nodelete")
+set_target_properties(zygisk PROPERTIES NO_SONAME ON)
 
 # Round 27: 16 KB page-size alignment (Android 15+ supports 16 KB
 # kernels; Pixel 9a and later ship them with Android 16+). The

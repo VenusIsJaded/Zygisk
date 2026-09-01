@@ -598,8 +598,15 @@ def test_service_starts_symlink_daemon(mk):
               argv == "--workdir " + mk.workdir, argv)
     else:
         check("daemon launched with --workdir", False, "stub not invoked")
-    check("pid file written", os.path.exists(
-        os.path.join(mk.workdir, "zygiskd.pid")))
+    # Round 33: the script NO LONGER writes zygiskd.pid — the old
+    # `echo $!` recorded the setsid wrapper's pid, which forks+exits
+    # under shell job control (a dead pid from the first millisecond).
+    # The real daemon writes its own pid after the socket bind; that
+    # contract is E2E-verified in scripts/verify_daemon.py ("zygiskd.pid
+    # names the LIVE daemon pid"). With the stub daemon (which does not
+    # self-write), the file must simply be absent.
+    check("no dead-pid file written by the script",
+          not os.path.exists(os.path.join(mk.workdir, "zygiskd.pid")))
 
 
 def test_service_finds_legacy_layout(mk):
@@ -1182,6 +1189,53 @@ def test_uninstall_removes_hook(mk):
     check("uninstall leaves FOREIGN hooks alone", os.path.exists(foreign))
 
 
+def test_ci_script_hygiene(mk):  # noqa: ARG001 — signature per harness
+    """Round 33 — the permission-denied CI bug can never return.
+
+    The first live GitHub Actions run of the flashable-zip workflow
+    (Round 32's push) died at './scripts/build_module.sh: Permission
+    denied': the script had been committed with git mode 100644, and a
+    runner checkout faithfully reproduced the missing exec bit. The
+    workflow now invokes it through `bash` (immune to the bit), but
+    these checks make the repository itself fail loudly if the mode
+    ever regresses.
+    """
+    # 1. Git modes (the thing the runner reproduces).
+    want = {
+        "scripts/build_module.sh": "100755",
+        "scripts/installer/update-binary": "100755",
+    }
+    if os.path.isdir(os.path.join(REPO_ROOT, ".git")):
+        out = subprocess.run(
+            ["git", "ls-files", "-s"] + list(want),
+            cwd=REPO_ROOT, capture_output=True, text=True)
+        listed = {}
+        for line in out.stdout.splitlines():
+            parts = line.split()
+            if len(parts) >= 4:
+                listed[parts[3]] = parts[0]
+        for path, mode in want.items():
+            check(f"git mode of {path} is {mode}",
+                  listed.get(path) == mode,
+                  f"got {listed.get(path)!r} — run: "
+                  f"git update-index --chmod=+x {path}")
+            # 2. The on-disk bit in a real checkout follows the index.
+            full = os.path.join(REPO_ROOT, path)
+            if os.path.exists(full):
+                check(f"{path} is executable on disk",
+                      os.access(full, os.X_OK),
+                      "on-disk mode lost the exec bit")
+    # 3. The workflow must keep the bash- invocation (belt and braces
+    #    for any future exec-bit loss, e.g. a zip round-trip).
+    wf = os.path.join(REPO_ROOT, ".github", "workflows", "build.yml")
+    if os.path.exists(wf):
+        body = open(wf, encoding="utf-8").read()
+        check("build.yml invokes the build script through bash",
+              "bash ./scripts/build_module.sh" in body,
+              "the workflow must not execute ./scripts/build_module.sh "
+              "directly — a lost exec bit kills CI at that line")
+
+
 def main():
     cases = [
         ("post-fs-data: current=0 swaps (Round 29 core fix)",
@@ -1245,6 +1299,8 @@ def main():
          test_customize_root_manager_envs),
         ("Round 31: uninstall removes the post-mount hook",
          test_uninstall_removes_hook),
+        ("Round 33: CI script hygiene (exec bits, bash invocation)",
+         test_ci_script_hygiene),
     ]
     for title, fn in cases:
         print(f"\n== {title}")

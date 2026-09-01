@@ -59,8 +59,14 @@ if [ -f "$WORKDIR/.mount_pending" ]; then
   fi
 fi
 
+# ROUND 33 (bug): the old `echo $! > zygiskd.pid` recorded the PID of
+# the setsid WRAPPER — which forks (and exits) whenever the backgrounded
+# job is already a process-group leader, exactly what shell job control
+# produces on Android — so the file named a dead pid from the first
+# millisecond. The daemon now writes its own pid AFTER the socket bind
+# (native/zygiskd/src/main.rs), so the file only ever exists for a
+# fully-started daemon.
 setsid "$DAEMON" --workdir "$WORKDIR" >/dev/null 2>&1 &
-echo $! > "$WORKDIR/zygiskd.pid"
 
 # Give it a moment to come up, then sanity-check the socket. Round 13:
 # the socket path is randomized per boot — the daemon hands it to the

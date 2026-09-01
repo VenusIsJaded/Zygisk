@@ -30,6 +30,7 @@
 #include "hide_advanced.h"
 #include "hide.h"
 #include "log.h"
+#include "obfstr.h"
 #include "resolve_libc.h"
 
 #include <cctype>
@@ -121,45 +122,72 @@ static void close_tracked_fds() {
 // report "absent"; Tier A leaves them present-but-empty (Java's
 // SystemProperties.get() returns "" for both cases, which covers the
 // overwhelming majority of real-world probes).
-static const ZsPropSpoof kPropSpoofTable[] = {
-    {"ro.boot.verifiedbootstate",   "green"},
-    {"ro.boot.vbmeta.device_state", "locked"},
-    {"ro.boot.veritymode",          "enforcing"},
-    {"ro.bootmanager.veritymode",   "enforcing"},
-    {"ro.boot.flash.locked",        "1"},
-    {"ro.boot.warrantybit",         "0"},
-    {"ro.warranty.bits",            "0"},
-    {"ro.boot.vbmeta.hash_algo",    ""},
-    {"ro.boot.vbmeta.digest",       ""},
-    // Magisk / KernelSU / our own keys: no stock device has them.
-    {"init.svc.magisk",             ""},
-    {"init.svc.magisk_pfsd",        ""},
-    {"ro.magisk.version",           ""},
-    {"ro.magisk.versioncode",       ""},
-    {"persist.sys.magisk_denylist", ""},
-    {"persist.magisk.hide",         ""},
-    {"service.magisk.rootdir",      ""},
-    {"persist.sys.rootdir",         ""},
-    {"ro.kernelsu.version",         ""},
-    {"ro.kernelsu.exposed",         ""},
-    {"ro.zygisk_study.version",     ""},
-    // Round 8 (B10): ro.dalvik.vm.native.bridge IS "libzygisk.so" on
-    // every process while we are loaded (post-fs-data.sh swaps it —
-    // that is the injection mechanism). It is also the single most
-    // greppable property in the entire design: every root-detection
-    // writeup checks it. We are only ever loaded when the original
-    // value was EMPTY (the swap is guarded), so a stock arm64 device
-    // reports this property as absent — spoof it to empty + report
-    // absence in the find()/get() hooks below, which is what the
-    // property looked like before we touched the device.
-    {"ro.dalvik.vm.native.bridge",   ""},
-    // init.svc.adbd is deliberately NOT spoofed: adbd exists on stock
-    // devices and "running"/"stopped" are both normal values.
+// ROUND 33 (stealth): the table is decoded once per process from
+// obfuscated literals (see obfstr.h) — the plaintext key list is a
+// direct root-management fingerprint inside the world-readable
+// libpayload.so. begin()/end() preserve the range-for loops below.
+struct SpoofStore {
+    static constexpr size_t kMax = 32;
+    static constexpr size_t kKeyLen = 63;
+    static constexpr size_t kValLen = 39;
+    ZsPropSpoof entries[kMax] = {};
+    size_t count = 0;
+    char key_store[kMax][kKeyLen + 1] = {};
+    char val_store[kMax][kValLen + 1] = {};
+
+    void add(const char* k, const char* v) {
+        if (count >= kMax) return;
+        snprintf(key_store[count], sizeof key_store[count], "%s", k);
+        snprintf(val_store[count], sizeof val_store[count], "%s", v);
+        entries[count] = ZsPropSpoof{key_store[count], val_store[count]};
+        ++count;
+    }
+    const ZsPropSpoof* begin() const { return entries; }
+    const ZsPropSpoof* end() const { return entries + count; }
 };
+static const SpoofStore prop_spoof_store_g = [] {
+        SpoofStore b;
+        b.add(ZS_OBFS("ro.boot.verifiedbootstate"),   ZS_OBFS("green"));
+        b.add(ZS_OBFS("ro.boot.vbmeta.device_state"), ZS_OBFS("locked"));
+        b.add(ZS_OBFS("ro.boot.veritymode"),          ZS_OBFS("enforcing"));
+        b.add(ZS_OBFS("ro.bootmanager.veritymode"),   ZS_OBFS("enforcing"));
+        b.add(ZS_OBFS("ro.boot.flash.locked"),        ZS_OBFS("1"));
+        b.add(ZS_OBFS("ro.boot.warrantybit"),         ZS_OBFS("0"));
+        b.add(ZS_OBFS("ro.warranty.bits"),            ZS_OBFS("0"));
+        b.add(ZS_OBFS("ro.boot.vbmeta.hash_algo"),    "");
+        b.add(ZS_OBFS("ro.boot.vbmeta.digest"),       "");
+        // Magisk / KernelSU / our own keys: no stock device has them.
+        b.add(ZS_OBFS("init.svc.magisk"),             "");
+        b.add(ZS_OBFS("init.svc.magisk_pfsd"),        "");
+        b.add(ZS_OBFS("ro.magisk.version"),           "");
+        b.add(ZS_OBFS("ro.magisk.versioncode"),       "");
+        b.add(ZS_OBFS("persist.sys.magisk_denylist"), "");
+        b.add(ZS_OBFS("persist.magisk.hide"),         "");
+        b.add(ZS_OBFS("service.magisk.rootdir"),      "");
+        b.add(ZS_OBFS("persist.sys.rootdir"),         "");
+        b.add(ZS_OBFS("ro.kernelsu.version"),         "");
+        b.add(ZS_OBFS("ro.kernelsu.exposed"),         "");
+        b.add(ZS_OBFS("ro.zygisk_study.version"),     "");
+        // Round 8 (B10): ro.dalvik.vm.native.bridge IS the loader name
+        // on every process while we are loaded (post-fs-data.sh swaps
+        // it — that is the injection mechanism). It is also the single
+        // most greppable property in the entire design: every
+        // root-detection writeup checks it. We are only ever loaded
+        // when the original value was EMPTY (the swap is guarded), so
+        // a stock arm64 device reports this property as absent —
+        // spoof it to empty + report absence in the find()/get()
+        // hooks below, which is what the property looked like before
+        // we touched the device.
+        b.add(ZS_OBFS("ro.dalvik.vm.native.bridge"),   "");
+        // init.svc.adbd is deliberately NOT spoofed: adbd exists on
+        // stock devices and "running"/"stopped" are both normal values.
+        return b;
+    }();;
+static const SpoofStore& prop_spoof_store() { return prop_spoof_store_g; }
 
 const ZsPropSpoof* zs_prop_spoof_table(size_t* count) {
-    if (count) *count = sizeof(kPropSpoofTable) / sizeof(kPropSpoofTable[0]);
-    return kPropSpoofTable;
+    if (count) *count = prop_spoof_store().count;
+    return prop_spoof_store().entries;
 }
 
 static std::atomic<int> g_props_cloned{0};
@@ -645,7 +673,7 @@ static int clone_props_core(const PropMapping* mappings,
     // address identical), so find() now walks OUR private copy.
     if (g_find_prop) {
         size_t n_spoof = 0;
-        for (const ZsPropSpoof& s : kPropSpoofTable) {
+        for (const ZsPropSpoof& s : prop_spoof_store()) {
             const void* pi = g_find_prop(s.key);
             if (pi) {
                 patch_prop_value(pi, s.value ? s.value : "");
@@ -677,7 +705,7 @@ static int clone_props_core(const PropMapping* mappings,
             uint8_t* base = reinterpret_cast<uint8_t*>(mappings[i].lo);
             size_t msize = (size_t)(mappings[i].hi - mappings[i].lo);
             if (!pa_header_valid(base, msize)) continue;  // contexts area etc.
-            for (const ZsPropSpoof& s : kPropSpoofTable) {
+            for (const ZsPropSpoof& s : prop_spoof_store()) {
                 if (s.value && s.value[0] != '\0') continue;
                 if (pa_trie_delete_key(base, msize, s.key)) ++n_unlinked;
             }
@@ -739,7 +767,7 @@ static void clone_property_area_private() {
     // and the MAP_FIXED remap keeps every address identical, so later
     // find() calls keep resolving into our private copies.)
     if (g_find_prop) {
-        for (const ZsPropSpoof& s : kPropSpoofTable) {
+        for (const ZsPropSpoof& s : prop_spoof_store()) {
             (void)g_find_prop(s.key);
         }
     }
@@ -1187,7 +1215,7 @@ static size_t zs_patch_spoofed_area_bytes(
         const PropFileMapping* maps, size_t n_maps,
         const char* (*find)(const char*)) {
     size_t patched = 0;
-    for (const ZsPropSpoof& s : kPropSpoofTable) {
+    for (const ZsPropSpoof& s : prop_spoof_store()) {
         const void* pi = find(s.key);
         if (!pi) continue;
         const PropFileMapping* m =
@@ -1254,7 +1282,7 @@ char* zs_build_spoofed_serial_area(const char* prop_file_path,
     //    Fail-closed: a malformed area keeps the patch-only image.
     size_t deleted = 0;
     if (pa_header_valid((const uint8_t*)buf, size)) {
-        for (const ZsPropSpoof& s : kPropSpoofTable) {
+        for (const ZsPropSpoof& s : prop_spoof_store()) {
             if (s.value && s.value[0] != '\0') continue;  // value spoof
             if (pa_trie_delete_key((uint8_t*)buf, size, s.key)) {
                 ++deleted;
@@ -1364,15 +1392,20 @@ struct HiddenPathEntry {
 };
 // sizeof(literal) - 1 is compile-time-exact (hand-counted lengths
 // were wrong twice — the hidden-path tests caught both).
-#define ZS_HIDDEN_PATH(s) {s, sizeof(s) - 1}
-static constexpr HiddenPathEntry kHiddenExactPaths[] = {
-    ZS_HIDDEN_PATH("/system/lib64/libzygisk.so"),
-    ZS_HIDDEN_PATH("/system/lib64/libpayload.so"),
-    ZS_HIDDEN_PATH("/system/lib64/libzn_loader.so"),
-    ZS_HIDDEN_PATH("/system/lib/libzygisk.so"),
-    ZS_HIDDEN_PATH("/system/lib/libpayload.so"),
-    ZS_HIDDEN_PATH("/system/lib/libzn_loader.so"),
-};
+// ROUND 33 (stealth): decode-once obfuscated (same content and the
+// same {ptr,len} entry shape the Round-31 profiled loop expects; the
+// lengths are computed once at decode time, never per call).
+static const zsst::StrTable hidden_exact_paths_g = [] {
+        zsst::StrTable b;
+        b.add(ZS_OBFS("/system/lib64/libzygisk.so"));
+        b.add(ZS_OBFS("/system/lib64/libpayload.so"));
+        b.add(ZS_OBFS("/system/lib64/libzn_loader.so"));
+        b.add(ZS_OBFS("/system/lib/libzygisk.so"));
+        b.add(ZS_OBFS("/system/lib/libpayload.so"));
+        b.add(ZS_OBFS("/system/lib/libzn_loader.so"));
+        return b;
+    }();;
+static const zsst::StrTable& hidden_exact_paths() { return hidden_exact_paths_g; }
 
 // mountinfo "root" fields (the path INSIDE the source filesystem —
 // always slash-form) for bind mounts whose source lives under our
@@ -1381,12 +1414,14 @@ static constexpr HiddenPathEntry kHiddenExactPaths[] = {
 // Stock mountinfo root fields are "/", "/system", "/vendor",
 // "/product", "/data", ... — none of these forms, so the anchored
 // prefixes cannot false-positive on stock lines.
-static constexpr HiddenPathEntry kHiddenRootFieldPrefixes[] = {
-    ZS_HIDDEN_PATH("/adb/modules"),
-    ZS_HIDDEN_PATH("/adb/.zygisk_study"),
-    ZS_HIDDEN_PATH("/system/zygisk_study"),
-};
-#undef ZS_HIDDEN_PATH
+static const zsst::StrTable hidden_root_field_prefixes_g = [] {
+        zsst::StrTable b;
+        b.add(ZS_OBFS("/adb/modules"));
+        b.add(ZS_OBFS("/adb/.zygisk_study"));
+        b.add(ZS_OBFS("/system/zygisk_study"));
+        return b;
+    }();;
+static const zsst::StrTable& hidden_root_field_prefixes() { return hidden_root_field_prefixes_g; }
 
 // Substring helper for the unix-socket line filter (whole-line
 // memmem semantics — socket names are not path-shaped, so anchored
@@ -1416,11 +1451,11 @@ static int proc_line_token_is_hidden(const char* tok, size_t len) {
     // (static set + runtime session prefixes).
     if (fd_target_is_root_path(tok, len)) return 1;
     // Exact paths of the magic-mounted bridge libraries.
-    for (const HiddenPathEntry& e : kHiddenExactPaths) {
+    for (const auto& e : hidden_exact_paths()) {
         if (e.n == len && memcmp(tok, e.p, e.n) == 0) return 1;
     }
     // mountinfo root-column forms (path inside the source fs).
-    for (const HiddenPathEntry& e : kHiddenRootFieldPrefixes) {
+    for (const auto& e : hidden_root_field_prefixes()) {
         if (len >= e.n && memcmp(tok, e.p, e.n) == 0) return 1;
     }
     return 0;
@@ -1487,22 +1522,30 @@ void hide_advanced_register_unix_hidden_substring(const char* s) {
 // We drop lines naming root-framework sockets. Bare "magisk"/
 // "zygisk" matter here because socket names (abstract or path) are
 // the actual thing detectors grep for.
-static const HiddenSubstring kUnixHiddenSubstrings[] = {
-    "/data/system/zygisk_study",
-    "/data/adb/",
-    "magisk",
-    "zygisk",
-    "riru",
-};
+// ROUND 33: decode-once obfuscated (Entry::p/.n take the role of
+// HiddenSubstring::data/.len).
+static const zsst::StrTable unix_hidden_substrings_g = [] {
+        zsst::StrTable b;
+        b.add(ZS_OBFS("/data/system/zygisk_study"));
+        b.add(ZS_OBFS("/data/adb/"));
+        b.add(ZS_OBFS("magisk"));
+        b.add(ZS_OBFS("zygisk"));
+        b.add(ZS_OBFS("riru"));
+        return b;
+    }();;
+static const zsst::StrTable& unix_hidden_substrings() { return unix_hidden_substrings_g; }
 
 // Environment entries we strip from /proc/self/environ (and scrub
 // via unsetenv — see scrub_env()). Defined here, before the filter
 // engine, because zs_filter_record() needs them.
-static const char* const kOurEnvVars[] = {
-    "ZYGISK_STUDY_DEBUG",
-    "ZYGISK_STUDY_LOG_TAG",
-    "ZYGISK_STUDY_WORKDIR",
-};
+static const zsst::StrTable our_env_vars_g = [] {
+        zsst::StrTable b;
+        b.add(ZS_OBFS("ZYGISK_STUDY_DEBUG"));
+        b.add(ZS_OBFS("ZYGISK_STUDY_LOG_TAG"));
+        b.add(ZS_OBFS("ZYGISK_STUDY_WORKDIR"));
+        return b;
+    }();;
+static const zsst::StrTable& our_env_vars() { return our_env_vars_g; }
 
 // True if `rest` (the part after "/proc/") names a file we filter.
 static int basename_is_filtered(const char* rest) {
@@ -1683,9 +1726,9 @@ ssize_t zs_filter_record(char* dst, size_t dst_cap,
         // the environ ARRAY — /proc/self/environ keeps serving the
         // ORIGINAL stack block, so this is the only place the
         // ZYGISK_STUDY_* variables actually disappear from.
-        for (const char* v : kOurEnvVars) {
-            size_t n = __builtin_strlen(v);
-            if (rec_len > n && memcmp(rec, v, n) == 0 && rec[n] == '=') {
+        for (const auto& ev : our_env_vars()) {
+            size_t n = ev.n;
+            if (rec_len > n && memcmp(rec, ev.p, n) == 0 && rec[n] == '=') {
                 return -1;
             }
         }
@@ -1694,9 +1737,9 @@ ssize_t zs_filter_record(char* dst, size_t dst_cap,
     case ZS_FILTER_NET_UNIX: {
         // Whole-line scan: socket names, not path fields, are what
         // carries the signal here.
-        for (const HiddenSubstring& sub : kUnixHiddenSubstrings) {
-            if (sub.len == 0 || sub.len > rec_len) continue;
-            if (memmem(rec, rec_len, sub.data, sub.len)) return -1;
+        for (const auto& sub : unix_hidden_substrings()) {
+            if (sub.n == 0 || sub.n > rec_len) continue;
+            if (memmem(rec, rec_len, sub.p, sub.n)) return -1;
         }
         for (int i = 0; i < g_rt_unix_sub_count; ++i) {
             if (g_rt_unix_sub_lens[i] == 0 ||
@@ -2923,18 +2966,21 @@ static int fd_stat_as_procfs(int fd, struct stat* st);
 // untrusted_app probe already gets EACCES there — the hooks are
 // defense-in-depth for ROMs with looser permissions and for the
 // /system overlay paths some frameworks use.
-static const char* const kHiddenStatPaths[] = {
-    "/data/adb/magisk",
-    "/data/adb/modules",
-    "/data/adb/modules_update",
-    "/data/adb/ksu",
-    "/data/adb/zygisk_study",
-    "/sbin/magisk",
-    "/sbin/zygisk_study",
-    "/system/bin/magisk",
-    "/debug_ramdisk",
-    "/data/system/zygisk_study",
-};
+static const zsst::StrTable hidden_stat_paths_g = [] {
+        zsst::StrTable b;
+        b.add(ZS_OBFS("/data/adb/magisk"));
+        b.add(ZS_OBFS("/data/adb/modules"));
+        b.add(ZS_OBFS("/data/adb/modules_update"));
+        b.add(ZS_OBFS("/data/adb/ksu"));
+        b.add(ZS_OBFS("/data/adb/zygisk_study"));
+        b.add(ZS_OBFS("/sbin/magisk"));
+        b.add(ZS_OBFS("/sbin/zygisk_study"));
+        b.add(ZS_OBFS("/system/bin/magisk"));
+        b.add(ZS_OBFS("/debug_ramdisk"));
+        b.add(ZS_OBFS("/data/system/zygisk_study"));
+        return b;
+    }();;
+static const zsst::StrTable& hidden_stat_paths() { return hidden_stat_paths_g; }
 
 static int path_is_hidden(const char* path) {
     if (ZS_UNLIKELY(!path || path[0] != '/')) return 0;
@@ -2946,17 +2992,17 @@ static int path_is_hidden(const char* path) {
         strncmp(path, "/debug_ramdisk", 14) != 0) {
         return 0;
     }
-    for (const char* h : kHiddenStatPaths) {
-        if (strcmp(path, h) == 0) return 1;
+    for (const auto& h : hidden_stat_paths()) {
+        if (strcmp(path, h.p) == 0) return 1;
     }
     // Prefix match (hidden path + '/' + anything), with the B1
     // bounds check fixed in Round 6.
     size_t plen = strlen(path);
-    for (const char* h : kHiddenStatPaths) {
-        size_t hlen = __builtin_strlen(h);
-        if (hlen > 0 && h[hlen-1] == '/') hlen--;
+    for (const auto& h : hidden_stat_paths()) {
+        size_t hlen = h.n;
+        if (hlen > 0 && h.p[hlen-1] == '/') hlen--;
         if (hlen < plen && path[hlen] == '/' &&
-            strncmp(path, h, hlen) == 0) return 1;
+            strncmp(path, h.p, hlen) == 0) return 1;
     }
     return 0;
 }
@@ -3308,17 +3354,25 @@ static Dladdr1Fn g_real_dladdr1 = nullptr;
 // Is this dlpi_name / dli_fname one of ours (or a generic root
 // framework path)? Empty names are the main executable / vdso — a
 // stock process emits them and so do we.
+// ROUND 33: decode-once obfuscated so-name table (file scope: an
+// init_array-initialized global, not a guarded function-local static —
+// see obfstr.h's ZS_OBFS_PATH rationale).
+static const zsst::StrTable so_names_g = [] {
+    zsst::StrTable b;
+    b.add(ZS_OBFS("libpayload.so"));
+    b.add(ZS_OBFS("libzygisk.so"));
+    b.add(ZS_OBFS("libzn_loader.so"));
+    return b;
+}();
+
 static int dl_name_is_ours(const char* name) {
     if (!name || !name[0]) return 0;
-    if (strstr(name, "/data/adb/") != nullptr) return 1;
-    if (strstr(name, "zygisk_study") != nullptr) return 1;
-    static const char* const kOurSoNames[] = {
-        "libpayload.so", "libzygisk.so", "libzn_loader.so",
-    };
-    for (const char* s : kOurSoNames) {
-        size_t n = __builtin_strlen(s);
+    if (strstr(name, ZS_OBFS("/data/adb/")) != nullptr) return 1;
+    if (strstr(name, ZS_OBFS("zygisk_study")) != nullptr) return 1;
+    for (const auto& se : so_names_g) {
+        size_t n = se.n;
         size_t l = strlen(name);
-        if (l >= n && strcmp(name + (l - n), s) == 0) return 1;
+        if (l >= n && strcmp(name + (l - n), se.p) == 0) return 1;
     }
     return 0;
 }
@@ -3484,7 +3538,7 @@ static size_t      g_absent_prop_count = 0;
 
 static int prop_key_is_absent(const char* key) {
     if (!key) return 0;
-    for (const ZsPropSpoof& s : kPropSpoofTable) {
+    for (const ZsPropSpoof& s : prop_spoof_store()) {
         if (s.value == nullptr || s.value[0] == '\0') {
             if (strcmp(key, s.key) == 0) return 1;
         }
@@ -3510,7 +3564,7 @@ static int prop_pi_is_absent(const void* pi) {
 static void collect_absent_prop_infos() {
     if (!g_find_prop) return;
     g_absent_prop_count = 0;
-    for (const ZsPropSpoof& s : kPropSpoofTable) {
+    for (const ZsPropSpoof& s : prop_spoof_store()) {
         if (s.value != nullptr && s.value[0] != '\0') continue;
         const void* pi = g_find_prop(s.key);
         if (pi && g_absent_prop_count <
@@ -3644,6 +3698,17 @@ static void zs_futex_wake(uint32_t* addr) {
 // On 6.x the single area IS the wait_any area, so this fully closes
 // the round-trip there; on 7.x it closes it for props whose area is
 // the serial area (default context) — context-area props keep the
+// ROUND 33b: computed once at init_array — a file-scope global with
+// no guard variable (see obfstr.h's rationale: magic statics pull
+// libc++abi's cxa_guard -> demangling-terminate-handler chain, ~180 KB
+// of dead demangler into the library). sysconf(_SC_PAGESIZE) is a pure
+// libc query, safe to run at load time.
+static const long g_pagesize_once = [] {
+    long ps = sysconf(_SC_PAGESIZE);
+    return ps > 0 ? ps : 4096;
+}();
+static long got_pagesize() { return g_pagesize_once; }
+
 // documented wait residual (a context write does not bump the
 // context area's header on stock either).
 static void bump_clone_area_serial(const void* pi) {
@@ -3657,8 +3722,7 @@ static void bump_clone_area_serial(const void* pi) {
         if (!pa_header_valid(base, msize)) return;   // fail closed
         auto* serial = reinterpret_cast<std::atomic<uint32_t>*>(
             base + kPropAreaSerialOffset);
-        static long psz = sysconf(_SC_PAGESIZE);
-        if (psz <= 0) psz = 4096;
+        long psz = got_pagesize();
         uintptr_t page = (uintptr_t)base & ~(uintptr_t)(psz - 1);
         if (mprotect((void*)page, (size_t)psz,
                      PROT_READ | PROT_WRITE) != 0) {
@@ -3703,9 +3767,8 @@ extern "C" int zygisk_study_hook_prop_set(const char* key,
     const void* pi = g_find_prop ? g_find_prop(key) : nullptr;
     if (!pi) return rc;
     // Page span of the 96 bytes we may touch (value + serial can
-    // straddle a page boundary).
-    static long page_size = sysconf(_SC_PAGESIZE);
-    if (page_size <= 0) page_size = 4096;
+    // straddle a page boundary). ROUND 33b: the guard-free accessor.
+    long page_size = got_pagesize();
     uintptr_t start = (uintptr_t)pi & ~(uintptr_t)(page_size - 1);
     uintptr_t end = ((uintptr_t)pi + kPropValueOffset + kPropValueSize +
                      (uintptr_t)(page_size - 1)) & ~(uintptr_t)(page_size - 1);
@@ -4165,10 +4228,6 @@ static int zs_page_original_prot(const struct dl_phdr_info* info,
     return PROT_READ | PROT_WRITE;   // not in any segment: safe default
 }
 
-static long got_pagesize() {
-    static long ps = sysconf(_SC_PAGESIZE);
-    return ps > 0 ? ps : 4096;
-}
 
 // Resolve a registered hook by symbol name. Hash-indexed since
 // Round 8 (P1); the name is still verified with strcmp so a hash
@@ -4217,10 +4276,10 @@ static int patch_got_all_for_phdr(struct dl_phdr_info* info,
 
     // Skip our own .so files — never patch ourselves (our internal
     // calls must keep resolving to the real libc functions, or the
-    // hooks would recurse).
-    if (strstr(info->dlpi_name, "libpayload.so")   != nullptr ||
-        strstr(info->dlpi_name, "libzygisk.so")    != nullptr ||
-        strstr(info->dlpi_name, "libzn_loader.so") != nullptr) {
+    // hooks would recurse). ROUND 33: obfuscated needles.
+    if (strstr(info->dlpi_name, ZS_OBFS("libpayload.so"))   != nullptr ||
+        strstr(info->dlpi_name, ZS_OBFS("libzygisk.so"))    != nullptr ||
+        strstr(info->dlpi_name, ZS_OBFS("libzn_loader.so")) != nullptr) {
         return 0;
     }
 
@@ -4743,13 +4802,23 @@ extern "C" int zygisk_study_hook_readdir_r(DIR* dirp,
 // hides a legitimate app file. Exact matches of framework binaries
 // and our own artifacts only; everything else stays visible.
 
-static const char* const kHiddenDirentNames[] = {
-    "magisk", "magisk32", "magisk64", "magiskinit", "magiskboot",
-    ".magisk",
-    "ksu", "zygiskd",
-    "zygisk_study",
-    "libzygisk.so", "libpayload.so", "libzn_loader.so",
-};
+static const zsst::StrTable hidden_dirent_names_g = [] {
+        zsst::StrTable b;
+        b.add(ZS_OBFS("magisk"));
+        b.add(ZS_OBFS("magisk32"));
+        b.add(ZS_OBFS("magisk64"));
+        b.add(ZS_OBFS("magiskinit"));
+        b.add(ZS_OBFS("magiskboot"));
+        b.add(ZS_OBFS(".magisk"));
+        b.add(ZS_OBFS("ksu"));
+        b.add(ZS_OBFS("zygiskd"));
+        b.add(ZS_OBFS("zygisk_study"));
+        b.add(ZS_OBFS("libzygisk.so"));
+        b.add(ZS_OBFS("libpayload.so"));
+        b.add(ZS_OBFS("libzn_loader.so"));
+        return b;
+    }();;
+static const zsst::StrTable& hidden_dirent_names() { return hidden_dirent_names_g; }
 
 static int zs_dirent_name_is_hidden(const char* name) {
     if (!name) return 0;
@@ -4766,8 +4835,8 @@ static int zs_dirent_name_is_hidden(const char* name) {
         default:
             return 0;
     }
-    for (const char* h : kHiddenDirentNames) {
-        if (strcmp(name, h) == 0) return 1;
+    for (const auto& h : hidden_dirent_names()) {
+        if (strcmp(name, h.p) == 0) return 1;
     }
     return 0;
 }
@@ -4894,12 +4963,32 @@ extern "C" int zygisk_study_hook_scandirat(
 struct FdRootPrefix { const char* p; size_t n; };
 static char g_fd_rt_prefix_store[4][96];
 static FdRootPrefix g_fd_root_prefixes[] = {
-    {"/data/adb/",                 10},
-    {"/sbin/",                      6},
-    {"/debug_ramdisk/",            15},
-    {"/data/system/zygisk_study/", 26},
+    // ROUND 33: slots 0..3 (the static entries) are decoded ONCE from
+    // obfuscated literals on first use (see ensure_fd_static_prefixes);
+    // slots 4..7 remain runtime registrations (Round 13's randomized
+    // daemon-socket dir). Slot 0 doubles as the host-test seam.
+    {nullptr, 0}, {nullptr, 0}, {nullptr, 0}, {nullptr, 0},
     {nullptr, 0}, {nullptr, 0}, {nullptr, 0}, {nullptr, 0},
 };
+static char g_fd_static_prefix_store[4][32];
+static void ensure_fd_static_prefixes() {
+    if (g_fd_root_prefixes[3].p != nullptr) return;
+    auto&& a = ZS_OBFS_H("/data/adb/");
+    auto&& b = ZS_OBFS_H("/sbin/");
+    auto&& c = ZS_OBFS_H("/debug_ramdisk/");
+    auto&& d = ZS_OBFS_H("/data/system/zygisk_study/");
+    snprintf(g_fd_static_prefix_store[0], sizeof g_fd_static_prefix_store[0], "%s", a.c_str());
+    snprintf(g_fd_static_prefix_store[1], sizeof g_fd_static_prefix_store[1], "%s", b.c_str());
+    snprintf(g_fd_static_prefix_store[2], sizeof g_fd_static_prefix_store[2], "%s", c.c_str());
+    snprintf(g_fd_static_prefix_store[3], sizeof g_fd_static_prefix_store[3], "%s", d.c_str());
+    for (int i = 0; i < 4; ++i) {
+        if (g_fd_root_prefixes[i].p == nullptr) {
+            g_fd_root_prefixes[i] = FdRootPrefix{
+                g_fd_static_prefix_store[i],
+                strlen(g_fd_static_prefix_store[i])};
+        }
+    }
+}
 
 void hide_advanced_register_root_path_prefix(const char* prefix) {
     if (!prefix || !*prefix) return;
@@ -4916,6 +5005,7 @@ void hide_advanced_register_root_path_prefix(const char* prefix) {
 }
 
 static int fd_target_is_root_path(const char* t, size_t len) {
+    ensure_fd_static_prefixes();
     for (const auto& pre : g_fd_root_prefixes) {
         if (pre.n == 0 || pre.p == nullptr) continue;
         if (len >= pre.n && memcmp(t, pre.p, pre.n) == 0) return 1;
@@ -4975,12 +5065,12 @@ static void close_leaked_root_fds() {
 // Env scrub
 // ------------------------------------------------------------------------
 
-// kOurEnvVars is defined next to the /proc filter engine (it is
+// our_env_vars() is defined next to the /proc filter engine (it is
 // shared with zs_filter_record's ZS_FILTER_ENVIRON handling).
 
 static void scrub_env() {
-    for (const char* v : kOurEnvVars) {
-        unsetenv(v);
+    for (const auto& ev : our_env_vars()) {
+        unsetenv(ev.p);
     }
 }
 
@@ -5187,6 +5277,7 @@ int zs_test_filter_scratch_allocs() {
 // Round 9 (S2): point the fd-link scan at a host-creatable directory
 // so the getdents64 walk + readlink resolution run for real.
 void zs_test_set_fd_root_prefix(const char* prefix) {
+    ensure_fd_static_prefixes();   // keep slots 1..3 real
     g_fd_root_prefixes[0] = FdRootPrefix{prefix, strlen(prefix)};
 }
 

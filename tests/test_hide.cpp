@@ -261,15 +261,16 @@ ZS_TEST(hide_register_globals_is_idempotent) {
 // ----------------------------------------------------------------------
 
 ZS_TEST(property_scrub_list_contains_expected_keys) {
-    // The array is now at file scope in hide.cpp (still static), so
-    // our #include of hide.cpp gives us direct access.
-    const size_t count = sizeof(kMagiskRevealingProps)
-                         / sizeof(kMagiskRevealingProps[0]);
+    // ROUND 33: the array became a decode-once obfuscated table; the
+    // public accessor returns the decoded entries + count.
+    size_t count = 0;
+    const char* const* props = hide_revealing_props(&count);
     ZS_CHECK(count >= 10);
 
     // Verify a representative subset.
     bool has_vbstate = false, has_magisk = false, has_kernelsu = false;
-    for (const char* k : kMagiskRevealingProps) {
+    for (size_t pi = 0; pi < count; ++pi) {
+        const char* k = props[pi];
         if (strcmp(k, "ro.boot.verifiedbootstate") == 0) has_vbstate = true;
         if (strcmp(k, "ro.magisk.version")        == 0) has_magisk  = true;
         if (strcmp(k, "ro.kernelsu.version")      == 0) has_kernelsu= true;
@@ -299,7 +300,10 @@ ZS_TEST(property_scrub_list_contains_round5_additions) {
     bool has_persist_sys_rootdir  = false;
     bool has_warrantybit          = false;
     bool has_warranty_bits        = false;
-    for (const char* k : kMagiskRevealingProps) {
+    size_t r5count = 0;
+    const char* const* r5props = hide_revealing_props(&r5count);
+    for (size_t pi = 0; pi < r5count; ++pi) {
+        const char* k = r5props[pi];
         if (strcmp(k, "init.svc.magisk")         == 0) has_init_svc_magisk      = true;
         if (strcmp(k, "init.svc.magisk_pfsd")    == 0) has_init_svc_magisk_pfsd = true;
         if (strcmp(k, "persist.magisk.hide")     == 0) has_persist_magisk_hide  = true;

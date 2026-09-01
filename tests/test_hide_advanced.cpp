@@ -412,7 +412,10 @@ ZS_TEST(path_is_hidden_recognizes_documented_magisk_paths) {
 ZS_TEST(hidden_stat_paths_contains_documented_set) {
     bool has_magisk = false, has_ksu = false, has_modules = false;
     bool has_sbin_magisk = false, has_debug_ramdisk = false;
-    for (const char* p : kHiddenStatPaths) {
+    // Round 33: the table became a decode-once obfuscated StrTable;
+    // its begin()/end() iterate the decoded entries.
+    for (const auto& e : hidden_stat_paths()) {
+        const char* p = e.p;
         if (strstr(p, "/data/adb/magisk") != nullptr) has_magisk = true;
         if (strstr(p, "/data/adb/ksu")    != nullptr) has_ksu = true;
         if (strstr(p, "/data/adb/modules")!= nullptr) has_modules = true;

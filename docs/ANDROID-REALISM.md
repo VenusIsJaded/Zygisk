@@ -2774,3 +2774,116 @@ Honest residuals:
 - The clean-room update-binary follows the documented protocol but
   has only been executed against a stub util_functions on the host;
   no custom recovery was available in this environment.
+
+## Round 33 — the CI permission bug, the content fingerprint, and two more real bugs
+
+The user's report that opened this round was the first live GitHub
+Actions run: `./scripts/build_module.sh: Permission denied`. The
+script had been committed with git mode 100644 (the one fact a
+runner checkout reproduces exactly), and the build step — the only
+step after every test gate had passed — could not execute it. Three
+fixes: the mode is 100755 in the index, the workflow invokes
+`bash ./scripts/build_module.sh` (immune to any future bit loss,
+e.g. through a zip round-trip), and verify_scripts.py gained a
+CI-hygiene case (git modes + on-disk exec bits + the bash
+invocation must all hold, or the suite fails).
+
+The round's research question: what does an app actually see in the
+two libraries Round 30 left world-readable in /system/lib[64]?
+Built with the runner's exact NDK (r27d, 27.3.13750724 — fetched
+from Google's repository XML by build id, matching the
+actions/runner-images Ubuntu 24.04 readme fetched live), the
+pre-round answer was: everything. Full DWARF with absolute build
+paths (~1 MB of a 1.7 MB libpayload), complete .symtab/.strtab,
+528 libc++_static exports in .dynsym, DT_SONAME "libzygisk.so"
+inside a randomized file, the entire /data/system/zygisk_study path
+map, the root-manager property keys, and the payload's mangled
+typeinfo names. Facts verified while fixing it:
+
+- bionic linker.cpp:3322-3337 (fetched and read): a missing
+  DT_SONAME leaves soname_ empty and silently tolerated for
+  targetSdkVersion >= 23 (the basename fallback and its
+  DL_ERROR_AFTER live inside the `< 23` guard); load_library dedups
+  by inode (find_loaded_library_by_inode: "Already loaded under
+  different name/path"), so the soname never mattered for our load
+  paths anyway.
+- art/libnativebridge/native_bridge.cc:79 (fetched and read):
+  kNativeBridgeInterfaceSymbol = "NativeBridgeItf" — the single
+  required bridge export; nothing else in our export table is
+  load-bearing.
+- The -fno-rtti DSO-boundary question was answered empirically, not
+  from memory: a no-rtti-built interface DSO consumed by
+  RTTI-compiled module code keeps virtual dispatch,
+  dynamic_cast<void*> and the module's own dynamic_cast/typeid; the
+  only broken case is a cross-DSO dynamic_cast DOWN into internal
+  classes no module can name.
+- The magic-static -> libc++abi chain was measured, not assumed:
+  __cxa_guard_* pulls cxa_guard.cpp.o, which drags the demangling
+  terminate handler and the ~180 KB itanium demangler (libzn_loader
+  9 KB -> 357 KB). The decode-once obfuscation therefore
+  initializes from init_array (globals initialize unconditionally
+  at load; no guard; trivially destructible so no __cxa_atexit
+  either — which also keeps the Round 30 Tier A purge story exact).
+
+Changes: see docs/hiding.md (Round 33) for the full stealth design
+(obfstr.h, ZS_STEALTH log compile-out, --exclude-libs,NO_SONAME,
+strip, export renames, -fno-rtti, and the three new build gates:
+stripped-sections / no-soname / banned-strings). Sizes: libpayload
+1.70 MB -> 343 KB, libzygisk 37 KB -> 12 KB, libzn_loader 28 KB ->
+8.3 KB, zip 2.9 MB -> 1.5 MB; the payload's remaining bulk is
+libc++abi's demangler (reachable only from the exception-terminate
+path — generic content, pages never touched).
+
+Two more real bugs fixed on the way:
+
+- verify_zip's `set -e` + pipefail trap: a no-match grep inside a
+  command substitution (`sec=$(readelf | grep ... | awk ...)`)
+  aborts the whole script silently — the exact class the R32 header
+  warned about for the SIGPIPE case. The new gates were written
+  with `|| true` inside every substitution after the first silent
+  death.
+- service.sh's pid file recorded `$!` after `setsid ... &` — the
+  setsid wrapper's pid, which forks and exits under shell job
+  control, so the file named a dead process from the first
+  millisecond (nothing read it yet, which is the only reason this
+  was latent). The daemon now writes its own pid after the socket
+  bind (mode 0600), and the daemon E2E asserts the file names the
+  live process.
+
+Performance, measured on the same machine before/after (the
+environment was rebuilt this round, so R30-era medians are not
+comparable): 500-line filter 29 -> 31 us, 2 MB smaps filter
+1526 -> 1499 us, hook matcher 63 -> 65 ns, setup/apply 0 -> 0 us,
+per-fork COW delta 0.00 pages — all jitter-level; the table loops
+kept their {ptr,len} memcmp shape. The honest perf win of the round
+is artifact size: 80% fewer bytes to map for the payload at zygote
+dlopen, 48% smaller zip.
+
+Verification state: 251/251 C++ host tests (the new test_obfstr
+suite pins the obfuscator's decode correctness, varargs safety,
+decode-once semantics and StrTable integrity — including the
+stride-8 ptrs[] view whose &entries[0].p predecessor crashed the
+suite and became a regression test), TSan zero (make race),
+run-sanitize green, 45/45 cargo tests, clippy 0 warnings, daemon
+E2E 32/32, script E2E 106/106 (the CI-hygiene case included),
+trampoline binary verification green (keystone installed and run),
+and the 4-ABI cross-build + zip self-verification green locally
+against the runner's exact NDK. The workflow now also scopes its
+permissions: the build job needs only contents:read; only the
+tag-release job holds contents:write.
+
+Honest residuals:
+
+- The CI run itself still has to happen on GitHub — every input
+  (runner software facts from the live readme, action versions
+  fetched, the exact build command executed locally with the same
+  NDK) is verified, but the proof is the next push's green check.
+- The payload keeps ~180 KB of libc++abi demangler reachable from
+  the terminate path (libc++'s container code can throw; the
+  handler chain comes with it). Generic content, never-touched
+  pages; removing it would mean ABI surgery on the C++ runtime for
+  marginal gain.
+- String obfuscation defeats signature scanning, not a determined
+  reverse engineer — the decode loops are visible in any
+  disassembler. Documented as the threat model in hiding.md.
+- The 32-bit execution gap from R32 stands (host is 64-bit only).

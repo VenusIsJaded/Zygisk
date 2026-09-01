@@ -39,6 +39,7 @@
 // Everything else is hidden.
 
 #include "log.h"
+#include "obfstr.h"
 #include "zygisk_study_api.h"
 
 #include <dlfcn.h>
@@ -69,32 +70,29 @@ static constexpr uint32_t kApiMagic = 0x5A535354u; // "ZSST" (Zygisk STudy)
 // api_open_companion_fd() always returned -1 — the init-oriented API
 // was dead on real devices while the host tests stayed green (nothing
 // exercised the path).
-static constexpr const char* kDaemonSocketLegacy =
-    "/data/system/zygisk_study/sock/sock";
+ZS_OBFS_PATH(kDaemonSocketLegacy, "/data/system/zygisk_study/sock/sock")
 
 // The session file the daemon writes before binding (root-only
 // directory; see module_dispatch.cpp for the full stealth rationale
 // for why the path is handed over in a file instead of a fixed name).
-static constexpr const char* kSessionFile =
-    "/data/adb/modules/zygisk_study/session.sock";
+ZS_OBFS_PATH(kSessionFileDefault, "/data/adb/modules/zygisk_study/session.sock")
 // Round 29 — the daemon's second session record (in the /data/system
 // workdir). Fallback when the module tree cannot be opened from this
 // process (the ReZygisk #380 Samsung class: kernel path rules
 // blocking app_process64's /data/adb/modules opens). See
 // module_dispatch.cpp's kSessionFileAlt — same content, same parser.
-static constexpr const char* kSessionFileAlt =
-    "/data/system/zygisk_study/session.sock";
+ZS_OBFS_PATH(kSessionFileAltDefault, "/data/system/zygisk_study/session.sock")
 
 #ifdef ZS_HOST_TEST
 // Test seam: point the resolver at temp "session files".
-static const char* g_session_file = kSessionFile;
-static const char* g_session_file_alt = kSessionFileAlt;
+static const char* g_session_file = nullptr;   // lazy -> default
+static const char* g_session_file_alt = nullptr; // lazy -> default
 extern "C" void zs_test_zn_set_session_file(const char* path) {
-    g_session_file = path ? path : kSessionFile;
+    g_session_file = path;   // null restores the obfuscated default
 }
 // Round 29: pin the ALTERNATE record for tests.
 extern "C" void zs_test_zn_set_session_file_alt(const char* path) {
-    g_session_file_alt = path ? path : kSessionFileAlt;
+    g_session_file_alt = path; // null restores the obfuscated default
 }
 // Test seam: run the resolver directly (the static function below
 // is not otherwise visible outside the TU).
@@ -123,9 +121,11 @@ static int resolve_daemon_socket(char* out, size_t outsz) {
     const char* session = g_session_file;
     const char* session_alt = g_session_file_alt;
 #else
-    const char* session = kSessionFile;
-    const char* session_alt = kSessionFileAlt;
+    const char* session = kSessionFileDefault();
+    const char* session_alt = kSessionFileAltDefault();
 #endif
+    if (!session) session = kSessionFileDefault();       // null -> default
+    if (!session_alt) session_alt = kSessionFileAltDefault();
     int fd = open(session, O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
         // Round 29: the module tree is unreadable from here — the
@@ -159,7 +159,7 @@ static int resolve_daemon_socket(char* out, size_t outsz) {
             }
         }
     }
-    snprintf(out, outsz, "%s", kDaemonSocketLegacy);
+    snprintf(out, outsz, "%s", kDaemonSocketLegacy());
     return 0;
 }
 
@@ -239,15 +239,15 @@ static void api_post_fork(const struct zygisk_study_api* /*self*/,
     const char* pkg = info ? info->process_name : nullptr;
     int is_server = info ? info->is_system_server : 0;
 
-    void* h = dlopen("libpayload.so", RTLD_NOLOAD | RTLD_LAZY);
-    if (!h) h = dlopen("libpayload.so", RTLD_LAZY);
+    void* h = dlopen(ZS_OBFS("libpayload.so"), RTLD_NOLOAD | RTLD_LAZY);
+    if (!h) h = dlopen(ZS_OBFS("libpayload.so"), RTLD_LAZY);
     if (!h) {
         ZS_LOGW("libzn_loader: cannot find libpayload at post_fork");
         return;
     }
 
     using PostForkFn = void (*)(const char*, int);
-    auto post_fork = (PostForkFn)dlsym(h, "zygisk_study_payload_post_fork");
+    auto post_fork = (PostForkFn)dlsym(h, "zs_entry_post_fork");
     if (post_fork) {
         post_fork(pkg, is_server);
     } else {
@@ -294,12 +294,12 @@ int zygisk_study_loader_entry(const char* workdir) {
 
     // Try to bring up libpayload as well, so the standard Zygisk
     // module surface is available alongside the init-oriented API.
-    void* h = dlopen("libpayload.so", RTLD_LAZY);
+    void* h = dlopen(ZS_OBFS("libpayload.so"), RTLD_LAZY);
     if (!h) {
         ZS_LOGW("libzn_loader: cannot dlopen libpayload: %s", dlerror());
     } else {
         using InitFn = void (*)();
-        auto init = (InitFn)dlsym(h, "zygisk_study_payload_init");
+        auto init = (InitFn)dlsym(h, "zs_entry_init");
         if (init) init();
     }
 

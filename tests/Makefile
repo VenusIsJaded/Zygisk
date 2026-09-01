@@ -5,7 +5,7 @@ CXX      ?= g++
 CXXFLAGS ?= -std=c++17 -O2 -g -Wall -Wextra
 INCLUDES  = -I../native/common -I.. -DZS_HOST_TEST
 
-TESTS = test_hide test_hide_advanced test_hide_stealth test_e2e_hide \
+TESTS = test_obfstr test_hide test_hide_advanced test_hide_stealth test_e2e_hide \
 	test_perf test_unmap_trampoline test_module_dispatch \
 	test_version_compat test_zn_loader test_race
 
@@ -110,6 +110,11 @@ race: test_race.cpp ../native/libpayload/src/hide_advanced.cpp \
 	    echo "TSAN: no data races"; \
 	fi
 	@./test_race
+
+# Round 33 — the compile-time string obfuscator's own unit tests
+# (decode correctness, decode-once semantics, StrTable integrity).
+test_obfstr: test_obfstr.cpp ../native/common/obfstr.h test_framework.h
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -o $@ $<
 
 # Round 28 — libzn_loader (the init-oriented API bridge) gets its
 # first dedicated test binary. Compiles the REAL entry.cpp with

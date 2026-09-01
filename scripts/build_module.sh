@@ -186,6 +186,18 @@ build_cpp() {
         -DCMAKE_BUILD_TYPE="$BUILD_TYPE" \
         > /dev/null
     cmake --build "$build_dir" -j"$(nproc)"
+    # ROUND 33 (stealth release): strip the shared objects. The
+    # pre-Round-33 artifacts shipped a full .symtab/.strtab and (via
+    # the old "-g in Release" flags) complete DWARF — over half of
+    # libpayload's bytes, and a fingerprint banquet for any app that
+    # can read /system/lib64. --strip-all keeps the DYNAMIC symbol
+    # table (the dlsym contract) and removes everything else. The
+    # verify_zip step below asserts the result.
+    local strip_bin="$TOOLCHAIN/bin/llvm-strip"
+    [[ -x "$strip_bin" ]] || strip_bin="strip"
+    "$strip_bin" --strip-all         "$build_dir/libzygisk.so" \
+        "$build_dir/libpayload.so" \
+        "$build_dir/libzn_loader.so"
     # native/CMakeLists.txt sets CMAKE_LIBRARY_OUTPUT_DIRECTORY to the
     # build dir (flat); tolerate the classic per-target subdirectory
     # layout too for out-of-tree builds made by other tooling.
@@ -243,11 +255,22 @@ build_rust() {
     # ever shipped (official NDK page-size guidance).
     local env_prefix="CARGO_TARGET_$(echo "$target" | tr 'a-z-' 'A-Z_')"
     export "${env_prefix}_LINKER=$TOOLCHAIN/bin/clang"
-    export "${env_prefix}_RUSTFLAGS=-C link-arg=--target=${triple}${API_LEVEL} -C link-arg=--sysroot=$SYSROOT -C link-arg=-Wl,-z,max-page-size=16384 -C link-arg=-Wl,-z,common-page-size=16384"
+    # ROUND 33 adds --remap-path-prefix (keeps the build host's
+    # absolute paths out of the daemon binary; folded into the
+    # per-target RUSTFLAGS — cargo ignores the generic RUSTFLAGS when
+    # the per-target variable is set).
+    export "${env_prefix}_RUSTFLAGS=-C link-arg=--target=${triple}${API_LEVEL} -C link-arg=--sysroot=$SYSROOT -C link-arg=-Wl,-z,max-page-size=16384 -C link-arg=-Wl,-z,common-page-size=16384 --remap-path-prefix=$REPO_ROOT=."
     (cd "$REPO_ROOT/native/zygiskd" &&
         cargo build --release --target "$target")
     [[ -f "$REPO_ROOT/native/zygiskd/target/$target/release/zygiskd" ]] \
         || { echo "ERROR: zygiskd missing for $target" >&2; exit 1; }
+    # ROUND 33: strip the symbol table (the daemon lives
+    # root-only-readable under /data/adb, so this is size/hygiene,
+    # not stealth-critical).
+    local strip_bin="$TOOLCHAIN/bin/llvm-strip"
+    [[ -x "$strip_bin" ]] || strip_bin="strip"
+    "$strip_bin" --strip-all \
+        "$REPO_ROOT/native/zygiskd/target/$target/release/zygiskd"
 }
 
 # ---------------------------------------------------------------------------
@@ -454,11 +477,85 @@ verify_zip() {
         done
     fi
 
+    # 7. ROUND 33 (stealth release): no symtab, no DWARF, no
+    #    .comment-side leftovers in ANY packaged ELF. The
+    #    pre-Round-33 artifacts shipped ~1 MB of debug info and full
+    #    symbol tables inside world-readable files.
+    if [[ -n "$readelf_bin" ]]; then
+        local sec
+        for abi in $ABIS; do
+            for f in libzygisk.so libpayload.so libzn_loader.so zygiskd; do
+                [[ -f "$MODULE_DIR/libs/$abi/$f" ]] || continue
+                sec="$("$readelf_bin" -SW "$MODULE_DIR/libs/$abi/$f" 2>/dev/null \
+                       | grep -E '\.(symtab|strtab)\b|\.debug_' \
+                       | awk '{print $2}' || true)"
+                if [[ -n "$sec" ]]; then
+                    echo "  FAIL: libs/$abi/$f still carries $sec (not stripped)" >&2
+                    fail=1
+                fi
+            done
+        done
+    fi
+
+    # 8. ROUND 33: no DT_SONAME on the three libraries. A fixed
+    #    soname inside a per-install randomized file name (Round 30)
+    #    is a one-grep fingerprint; bionic tolerates the absence
+    #    (linker.cpp: missing DT_SONAME is silent for targetSdk >= 23;
+    #    dedup is by inode — see the CMakeLists comments).
+    if [[ -n "$readelf_bin" ]]; then
+        local soname
+        for abi in $ABIS; do
+            for f in libzygisk.so libpayload.so libzn_loader.so; do
+                soname="$("$readelf_bin" -d "$MODULE_DIR/libs/$abi/$f" 2>/dev/null \
+                          | grep SONAME || true)"
+                if [[ -n "$soname" ]]; then
+                    echo "  FAIL: libs/$abi/$f carries a SONAME: $soname" >&2
+                    fail=1
+                fi
+            done
+        done
+    fi
+
+    # 9. ROUND 33: banned-string scan over the two APP-READABLE
+    #    libraries (libzygisk + libpayload live world-readable in
+    #    /system/lib[64] after the magic mount). The daemon
+    #    (root-only under /data/adb) and libzn_loader (root-only, and
+    #    its documented API export names intentionally say what they
+    #    are) are NOT in scope — documented, deliberate.
+    local strings_bin="$TOOLCHAIN/bin/llvm-strings"
+    [[ -x "$strings_bin" ]] || strings_bin="$(command -v strings || true)"
+    if [[ -n "$strings_bin" ]]; then
+        local banned hit
+        for abi in $ABIS; do
+            for f in libzygisk.so libpayload.so; do
+                [[ -f "$MODULE_DIR/libs/$abi/$f" ]] || continue
+                # Case-insensitive whole-token bans: any occurrence of
+                # our signature vocabulary is a file-scan hit. The
+                # generic strings that remain (libc.so NEEDED entries,
+                # the AOSP-mandated NativeBridgeItf export, the
+                # compiler .comment) are allowed by construction.
+                for banned in zygisk zygiskd zygisk_study ZygiskStudy \
+                              libpayload libzn_loader session.sock \
+                              denylist ro.zygisk_study; do
+                    hit="$("$strings_bin" -a "$MODULE_DIR/libs/$abi/$f" 2>/dev/null \
+                           | grep -i -m1 "$banned" || true)"
+                    if [[ -n "$hit" ]]; then
+                        echo "  FAIL: libs/$abi/$f leaks banned string '$banned': $hit" >&2
+                        fail=1
+                    fi
+                done
+            done
+        done
+    else
+        echo "  NOTE: no strings tool available — skipping the banned-string scan"
+    fi
+
     if [[ $fail -ne 0 ]]; then
         echo "ERROR: zip verification failed" >&2
         exit 1
     fi
-    echo "  OK: layout, module.prop, updater-script, legacy-trap, ELF classes all verified"
+    echo "  OK: layout, module.prop, updater-script, legacy-trap, ELF classes,"
+    echo "      16 KB alignment, stripped sections, no SONAME, banned-strings all verified"
 }
 
 # ---------------------------------------------------------------------------

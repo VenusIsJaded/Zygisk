@@ -40,9 +40,9 @@
 //
 // Public ABI (all explicitly exported with visibility=default):
 //
-//   zygisk_study_payload_init         — one-time setup
-//   zygisk_study_payload_pre_fork     — module pre-fork dispatch
-//   zygisk_study_payload_post_fork    — package-name-keyed hide pipeline
+//   zs_entry_init         — one-time setup
+//   zs_entry_pre_fork     — module pre-fork dispatch
+//   zs_entry_post_fork    — package-name-keyed hide pipeline
 //   (test-only exports under ZS_HOST_TEST at the bottom)
 
 #include "hide.h"
@@ -685,10 +685,10 @@ extern "C" long zs_setuid_wrapper(long a0) {
 // RTLD_NOLOAD returns the existing handle without touching disk, so
 // this is a pure refcount bump. If the path lookup somehow misses, a
 // plain dlopen of the same path resolves to the same soinfo anyway.
-extern "C" void zygisk_study_payload_init();   // defined below
+extern "C" void zs_entry_init();   // defined below
 static void self_pin() {
     Dl_info info{};
-    if (dladdr((const void*)&zygisk_study_payload_init, &info) == 0 ||
+    if (dladdr((const void*)&zs_entry_init, &info) == 0 ||
         !info.dli_fname) {
         ZS_LOGW("payload: dladdr(self) failed; relying on the bridge "
                 "handle alone");
@@ -706,7 +706,7 @@ static void self_pin() {
 
 extern "C"
 __attribute__((visibility("default")))
-void zygisk_study_payload_init() {
+void zs_entry_init() {
     int expected = 0;
     if (!g_initialized.compare_exchange_strong(expected, 1)) {
         return; // already initialized
@@ -773,7 +773,7 @@ void zygisk_study_payload_init() {
 
 extern "C"
 __attribute__((visibility("default")))
-void zygisk_study_payload_pre_fork(const char* package_name,
+void zs_entry_pre_fork(const char* package_name,
                                    int is_system_server) {
     (void)is_system_server;
     // Decide now so the post-fork side is a single flag check.
@@ -782,7 +782,7 @@ void zygisk_study_payload_pre_fork(const char* package_name,
 
 extern "C"
 __attribute__((visibility("default")))
-void zygisk_study_payload_post_fork(const char* package_name,
+void zs_entry_post_fork(const char* package_name,
                                     int is_system_server) {
     (void)is_system_server;
     if (g_hide_done.load(std::memory_order_acquire)) return; // uid path ran

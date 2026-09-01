@@ -132,6 +132,7 @@
 #include <unistd.h>
 
 #include "log.h"
+#include "obfstr.h"
 
 // ---------------------------------------------------------------------------
 // NativeBridge — the Android native-bridge interface (AOSP
@@ -217,14 +218,23 @@ struct NativeBridgeCallbacks {
 typedef bool (*InitializeFn)(const struct NativeBridgeCallbacks*,
                              const char*, const char*);
 
-// Path to libpayload.so, by word size. The daemon bind-mounts both
-// libraries into the systemless /system tree.
-static constexpr const char* kPayloadPath() {
+// Path to the payload, by word size. The daemon bind-mounts both
+// libraries into the systemless /system tree. ROUND 33: the literals
+// are obfuscated (ZS_OBFS) — this file is world-readable in
+// /system/lib[64], and a plaintext "libpayload" inside a randomized
+// file name would undo Round 30's rename entirely. The directory is
+// a macro (not a ternary) so ZS_OBFS sees a true string literal and
+// sizeof() yields the array size, not a pointer size.
 #if defined(__LP64__)
-    return "/system/lib64/libpayload.so";
+#  define ZS_BRIDGE_DIR_LITERAL "/system/lib64"
 #else
-    return "/system/lib/libpayload.so";
+#  define ZS_BRIDGE_DIR_LITERAL "/system/lib"
 #endif
+
+// Copy the legacy fixed payload path for this bitness into `out`.
+static void copy_legacy_payload_path(char* out, size_t cap) {
+    snprintf(out, cap, "%s/%s",
+             ZS_OBFS(ZS_BRIDGE_DIR_LITERAL), ZS_OBFS("libpayload.so"));
 }
 
 // Round 30 — randomized-soname support (STEALTH).
@@ -265,16 +275,16 @@ static void derive_payload_path(char* out, size_t cap) {
             return;
         }
         // Any other extension shape: keep the directory and try the
-        // legacy fixed name inside it.
+        // legacy fixed name inside it (Round 33: obfuscated).
         const char* slash = strrchr(fname, '/');
         if (slash && (size_t)(slash - fname) + 1 + 14 < cap) {
+            auto&& legacy = ZS_OBFS_H("libpayload.so");
             memcpy(out, fname, (size_t)(slash - fname) + 1);
-            strcpy(out + (slash - fname) + 1, "libpayload.so");
+            strcpy(out + (slash - fname) + 1, legacy.c_str());
             return;
         }
     }
-    strncpy(out, kPayloadPath(), cap - 1);
-    out[cap - 1] = '\0';
+    copy_legacy_payload_path(out, cap);
 }
 
 static void* g_real_native_bridge = nullptr;
@@ -286,30 +296,34 @@ static int   g_initialized        = 0;
 // Helpers
 // ---------------------------------------------------------------------------
 
+// Round 33: probe helper — combines an obfuscated directory and
+// candidate name into `path` and checks readability. The ZS_OBFS
+// temporaries live through the snprintf inside this function (they
+// are arguments of the full expression that is this call).
+static bool probe_bridge_candidate(char* path, size_t cap,
+                                    const char* name) {
+    snprintf(path, cap, "%s/%s", ZS_OBFS(ZS_BRIDGE_DIR_LITERAL), name);
+    return access(path, R_OK) == 0;
+}
+
 static void try_load_real_native_bridge() {
-    const char* path = nullptr;
-#if defined(__LP64__)
-    if (access("/system/lib64/libndk_translation.so", R_OK) == 0)
-        path = "/system/lib64/libndk_translation.so";
-    else if (access("/system/lib64/libnativebridge.so", R_OK) == 0)
-        path = "/system/lib64/libnativebridge.so";
-    else if (access("/system/lib64/libhoudini.so", R_OK) == 0)
-        path = "/system/lib64/libhoudini.so";
-#else
-    if (access("/system/lib/libndk_translation.so", R_OK) == 0)
-        path = "/system/lib/libndk_translation.so";
-    else if (access("/system/lib/libnativebridge.so", R_OK) == 0)
-        path = "/system/lib/libnativebridge.so";
-    else if (access("/system/lib/libhoudini.so", R_OK) == 0)
-        path = "/system/lib/libhoudini.so";
-#endif
-    if (!path) {
-        ZS_LOGD("libzygisk: no real native bridge present");
-        return;
+    // Round 33: candidate names obfuscated — plaintext "houdini" /
+    // "ndk_translation" references inside a /system/lib64 resident
+    // are an obvious tell for anyone comparing against the stock
+    // library list.
+    char path[64];
+    if (probe_bridge_candidate(path, sizeof path,
+                               ZS_OBFS("libndk_translation.so")) ||
+        probe_bridge_candidate(path, sizeof path,
+                               ZS_OBFS("libnativebridge.so")) ||
+        probe_bridge_candidate(path, sizeof path,
+                               ZS_OBFS("libhoudini.so"))) {
+        g_real_native_bridge = dlopen(path, RTLD_LAZY);
+    } else {
+        path[0] = '\0';
     }
-    g_real_native_bridge = dlopen(path, RTLD_LAZY);
     if (!g_real_native_bridge) {
-        ZS_LOGW("libzygisk: dlopen(%s) failed: %s", path, dlerror());
+        ZS_LOGD("libzygisk: no real native bridge present");
         return;
     }
     // Round 25: keep the real bridge's TABLE so every bridge-ish slot
@@ -318,7 +332,7 @@ static void try_load_real_native_bridge() {
     // unload story (a same-arch child never needs it; a foreign-arch
     // child kInitialize's the bridge instead of unloading it).
     g_real_table = (const struct NativeBridgeCallbacks*)dlsym(
-        g_real_native_bridge, "NativeBridgeItf");
+        g_real_native_bridge, ZS_OBFS("NativeBridgeItf"));
     if (g_real_table && g_real_table->version < 1) {
         g_real_table = nullptr;   // refuse a garbage table
     }
@@ -336,17 +350,19 @@ static void try_load_payload() {
     derive_payload_path(path, sizeof path);
     g_payload = dlopen(path, RTLD_LAZY);
     if (!g_payload) {
-        g_payload = dlopen("libpayload.so", RTLD_LAZY);
+        g_payload = dlopen(ZS_OBFS("libpayload.so"), RTLD_LAZY);
     }
     if (!g_payload) {
-        g_payload = dlopen(kPayloadPath(), RTLD_LAZY);
+        char legacy[64];
+        copy_legacy_payload_path(legacy, sizeof legacy);
+        g_payload = dlopen(legacy, RTLD_LAZY);
     }
     if (!g_payload) {
         ZS_LOGE("libzygisk: dlopen(%s) failed: %s", path, dlerror());
         return;
     }
     using InitFn = void (*)();
-    auto init = (InitFn)dlsym(g_payload, "zygisk_study_payload_init");
+    auto init = (InitFn)dlsym(g_payload, ZS_OBFS("zs_entry_init"));
     if (init) {
         init();
         ZS_LOGI("libzygisk: libpayload initialized");

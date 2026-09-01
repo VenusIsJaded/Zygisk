@@ -18,6 +18,7 @@
 #include "hide.h"
 #include "hide_advanced.h"
 #include "log.h"
+#include "obfstr.h"
 #include "resolve_libc.h"
 
 #include <dlfcn.h>
@@ -145,10 +146,16 @@ static int send_props_file_to_daemon(const char* area, size_t size);
 // session reader parses into a stack buffer, so the setter must COPY
 // (the first version of this code stored the stack pointer itself:
 // a use-after-return the session e2e test caught immediately).
+// ROUND 33: the default paths are decode-once obfuscated constants
+// (see obfstr.h) — plaintext "/data/system/zygisk_study" inside the
+// world-readable libpayload.so undid Round 30's randomized FILE
+// names for any content-scanning detector.
 static char g_daemon_socket_buf[96];
-static const char* kDaemonSocketDefault =
-    "/data/system/zygisk_study/sock/sock";
-static const char* g_daemon_socket = kDaemonSocketDefault;
+ZS_OBFS_PATH(kDaemonSocketDefault, "/data/system/zygisk_study/sock/sock")
+static const char* g_daemon_socket = nullptr;   // lazy -> default
+static const char* daemon_socket() {
+    return g_daemon_socket ? g_daemon_socket : kDaemonSocketDefault();
+}
 
 // Round 13 — the daemon's socket lives in a randomized per-boot
 // directory (neutral name, so /proc/net/unix — a WORLD-READABLE file
@@ -157,17 +164,21 @@ static const char* g_daemon_socket = kDaemonSocketDefault;
 // hands the actual path to the payload through a session file inside
 // our own module directory (root-only, never listed in any
 // world-readable proc file).
-static constexpr const char* kSessionFile =
-    "/data/adb/modules/zygisk_study/session.sock";
+ZS_OBFS_PATH(kSessionFile, "/data/adb/modules/zygisk_study/session.sock")
 // Round 29 — the daemon's SECOND session record, in the /data/system
 // workdir. Fallback when the module tree cannot be opened from the
 // zygote (ReZygisk #380: Samsung kernel path rules blocking
 // app_process64's /data/adb/modules opens). Same 0700 root-only dir
 // as packages.list/denylist, which the hide pipeline already reads.
-static constexpr const char* kSessionFileAlt =
-    "/data/system/zygisk_study/session.sock";
-static const char* g_session_file = kSessionFile;
-static const char* g_session_file_alt = kSessionFileAlt;
+ZS_OBFS_PATH(kSessionFileAlt, "/data/system/zygisk_study/session.sock")
+static const char* g_session_file = nullptr;       // lazy -> default
+static const char* g_session_file_alt = nullptr;   // lazy -> default
+static const char* session_file() {
+    return g_session_file ? g_session_file : kSessionFile();
+}
+static const char* session_file_alt() {
+    return g_session_file_alt ? g_session_file_alt : kSessionFileAlt();
+}
 
 #ifdef ZS_HOST_TEST
 // Round 26: pin the platform form for tests (-1 = restore auto).
@@ -195,11 +206,11 @@ extern "C" const char* zs_test_last_props_build_path() {
 
 #ifdef ZS_HOST_TEST
 extern "C" void zs_test_set_session_file(const char* path) {
-    g_session_file = path ? path : kSessionFile;
+    g_session_file = path;   // null restores the obfuscated default
 }
 // Round 29: pin the ALTERNATE session record for tests.
 extern "C" void zs_test_set_session_file_alt(const char* path) {
-    g_session_file_alt = path ? path : kSessionFileAlt;
+    g_session_file_alt = path;   // null restores the obfuscated default
 }
 extern "C" int zs_test_load_session() {
     return zs_module_load_session_socket();
@@ -251,11 +262,11 @@ void zs_module_set_daemon_socket(const char* path) {
 // module tree is blocked falls back transparently. The parser
 // (96-byte cap, absolute-path check, trim) is shared by both.
 int zs_module_load_session_socket() {
-    int fd = open(g_session_file, O_RDONLY | O_CLOEXEC);
+    int fd = open(session_file(), O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
         // Round 29: the module tree is unreadable from here — try
         // the daemon's workdir record before giving up.
-        fd = open(g_session_file_alt, O_RDONLY | O_CLOEXEC);
+        fd = open(session_file_alt(), O_RDONLY | O_CLOEXEC);
     }
     if (fd < 0) return 0;                  // pre-R13 daemon: fallback
     // Round 28: read up to 96 bytes into a 97-byte buffer. A path
@@ -304,7 +315,7 @@ extern "C" void zs_test_set_daemon_socket(const char* path) {
         g_daemon_socket_buf[sizeof g_daemon_socket_buf - 1] = '\0';
         g_daemon_socket = g_daemon_socket_buf;
     } else {
-        g_daemon_socket = kDaemonSocketDefault;
+        g_daemon_socket = nullptr;   // restores the obfuscated default
     }
 }
 #endif
@@ -322,7 +333,7 @@ static std::vector<LoadedModule> fetch_module_list_from_daemon(
     if (sock < 0) return out;
     struct sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, g_daemon_socket, sizeof(addr.sun_path) - 1);
+    strncpy(addr.sun_path, daemon_socket(), sizeof(addr.sun_path) - 1);
 
     if (connect(sock, (struct sockaddr*)&addr, sizeof addr) != 0) {
         close(sock);
@@ -377,7 +388,7 @@ public:
         if (sock < 0) return -1;
         struct sockaddr_un addr{};
         addr.sun_family = AF_UNIX;
-        strncpy(addr.sun_path, g_daemon_socket,
+        strncpy(addr.sun_path, daemon_socket(),
                 sizeof(addr.sun_path) - 1);
         if (connect(sock, (struct sockaddr*)&addr, sizeof addr) != 0 ||
             send(sock, "C", 1, 0) != 1) {
@@ -388,12 +399,11 @@ public:
     }
 
     void getModuleDir(char* out, size_t cap) override {
-        strncpy(out, "/data/system/zygisk_study/modules", cap - 1);
-        out[cap - 1] = '\0';
+        snprintf(out, cap, "%s", ZS_OBFS("/data/system/zygisk_study/modules"));
     }
 
     void getProcessName(char* out, size_t cap) override {
-        int fd = open("/proc/self/cmdline", O_RDONLY | O_CLOEXEC);
+        int fd = open(ZS_OBFS("/proc/self/cmdline"), O_RDONLY | O_CLOEXEC);
         if (fd < 0) { out[0] = '\0'; return; }
         ssize_t n = read(fd, out, cap - 1);
         close(fd);
@@ -522,7 +532,7 @@ static void load_modules_from(std::vector<LoadedModule>&& list) {
             continue;
         }
         using FactoryFn = zygisk::Module* (*)(zygisk::Api*, JNIEnv*);
-        auto factory = (FactoryFn)dlsym(m.dl_handle, "zygisk_module");
+        auto factory = (FactoryFn)dlsym(m.dl_handle, ZS_OBFS("zygisk_module"));
         if (!factory) {
             ZS_LOGW("modules: %s: no zygisk_module symbol", m.id.c_str());
             dlclose(m.dl_handle);
@@ -647,9 +657,9 @@ static int send_props_file_to_daemon(const char* area, size_t size) {
     if (sock < 0) return 0;
     struct sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, g_daemon_socket, sizeof(addr.sun_path) - 1);
+    strncpy(addr.sun_path, daemon_socket(), sizeof(addr.sun_path) - 1);
     if (connect(sock, (struct sockaddr*)&addr, sizeof addr) != 0) {
-        ZS_LOGD("props send: connect(%s) failed: %s", g_daemon_socket,
+        ZS_LOGD("props send: connect(%s) failed: %s", daemon_socket(),
                 strerror(errno));
         close(sock);
         return 0;   // daemon not up: retry
@@ -709,7 +719,7 @@ static std::atomic<int> g_onload_done{0};
 static char g_zygote_name[64] = {0};
 
 static void capture_zygote_name() {
-    int fd = open("/proc/self/cmdline", O_RDONLY | O_CLOEXEC);
+    int fd = open(ZS_OBFS("/proc/self/cmdline"), O_RDONLY | O_CLOEXEC);
     if (fd < 0) return;
     ssize_t n = read(fd, g_zygote_name, sizeof g_zygote_name - 1);
     close(fd);
@@ -834,7 +844,7 @@ static void fill_app_args(uid_t uid) {
         if (g_child.package_name[0] != '\0') {
             long user_id = (long)uid / 100000L;
             snprintf(g_child.app_data_dir, sizeof g_child.app_data_dir,
-                     "/data/user/%ld/%s", user_id, g_child.package_name);
+                     ZS_OBFS("/data/user/%ld/%s"), user_id, g_child.package_name);
         }
         g_args_cache.key = uid;
         g_args_cache.gen = gen;
@@ -854,7 +864,7 @@ static void fill_app_args(uid_t uid) {
         }
     }
     if (wants_names) {
-        int fd = open("/proc/self/cmdline", O_RDONLY | O_CLOEXEC);
+        int fd = open(ZS_OBFS("/proc/self/cmdline"), O_RDONLY | O_CLOEXEC);
         if (fd >= 0) {
             ssize_t n = read(fd, g_child.nice_name,
                              sizeof g_child.nice_name - 1);

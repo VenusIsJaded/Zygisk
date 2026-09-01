@@ -552,7 +552,7 @@ ZS_TEST(bridge_derives_the_payload_path_from_its_own_location) {
     // next to the bridge in this directory: the ctor's
     // try_load_payload() must have resolved ./libpayload.so through
     // the soname fallback.
-    ZS_CHECK(dlsym(g_bridge, "zygisk_study_payload_init") == nullptr
+    ZS_CHECK(dlsym(g_bridge, "zs_entry_init") == nullptr
              ? true : true);   // the payload handle is internal; the
                                // derivation contract is what we
                                // assert here.

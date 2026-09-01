@@ -1005,3 +1005,88 @@ GrapheneOS compatibility was researched and needs nothing (see
 compatibility.md): exec spawning is fork+specialize-then-exec, so
 the hide pipeline runs before the exec and the private mount
 namespace plus the execve-proof property spoofing survive it.
+
+## Round 33 additions — the file-content fingerprint
+
+Round 30 closed the FILE-NAME vector (per-install randomized
+`lib<8hex>.so` names in `/proc/<pid>/maps`); this round closes the
+FILE-CONTENT vector. The two `/system/lib[64]`-resident libraries are
+mode 0644 root:root in a world-readable directory — any app can
+`open()` and scan them, and every detector signature shipped verbatim
+inside: the fixed `DT_SONAME`s (a "libzygisk.so" soname inside a file
+named `lib<8hex>.so` is a one-grep mismatch), the full
+`/data/system/zygisk_study` path map, the "libpayload.so" /
+"libzygisk.so" map-scan needles, the root-manager property keys
+(`ro.magisk.version`, `persist.sys.magisk_denylist`, ...), the env-var
+names, the payload's mangled typeinfo names, ~1 MB of DWARF, a
+complete `.symtab`/`.strtab`, and 528 exported libc++_static symbols
+in `.dynsym`.
+
+- **Release = the stealth artifact.** `-O2` with no `-g`,
+  `llvm-strip --strip-all` on every packaged ELF,
+  `-Wl,--exclude-libs,ALL`, `NO_SONAME` (bionic silently tolerates a
+  missing soname for every targetSdkVersion >= 23 — the pre-23
+  basename fallback lives inside that same guard, read from
+  bionic's linker.cpp — and library dedup is by inode through
+  `find_loaded_library_by_inode`, so nothing about load behavior
+  changes), and `ZS_STEALTH`: the `ZS_LOG*` macros compile to
+  nothing in the Android Release build, so no format strings, no
+  "ZygiskStudy" tag, and no logd socket writes ship at all. Debug
+  builds (the study flavor) keep `-g` and full logging.
+- **Obfuscated string constants** (`native/common/obfstr.h`): the
+  literal is XOR-encrypted at compile time into a constexpr `.rodata`
+  array (no string-table entry, no plaintext anywhere in the image);
+  a tiny runtime loop decodes into a stack buffer, with the source
+  reads declared `volatile` so the optimizer cannot constant-fold the
+  decode back into a plaintext `.rodata` constant (the classic
+  obfstr pitfall — verified unfixed-folded at -O0 through -O3 on
+  both g++ and NDK clang). Three forms cover every call shape:
+  expression (`open(ZS_OBFS("..."), ...)` — varargs-safe), holder
+  (`auto&& h = ZS_OBFS_H("...")`), and decode-once
+  (`ZS_OBFS_PATH(name, "...")`). The decode-once form initializes
+  from the library's `init_array` — inside the dlopen, before any of
+  the library's functions can run — and deliberately NOT via magic
+  statics: `__cxa_guard_*` pulls libc++abi's cxa_guard.cpp.o, and
+  with it the demangling terminate handler and the ~180 KB itanium
+  demangler (measured on libzn_loader: 9 KB without guards, 357 KB
+  with). The storage is trivially destructible, so nothing registers
+  with `__cxa_atexit` either — the Round 30 Tier A purge story stays
+  exact.
+- **Export-name hygiene.** The payload's internal contract symbols
+  are renamed to neutral `zs_entry_*` names (an export NAME is the
+  one leak obfuscation cannot cover — `.dynstr` must carry it in
+  plaintext for dlsym to find it). `-fno-rtti` on the payload
+  removes the mangled typeinfo names (`N12zygisk_study...`,
+  `N6zygisk3ApiE`) from `.rodata`; the public `zygisk::` namespace
+  and header stay untouched (documented module-API compat surface),
+  and the DSO boundary behavior was verified empirically: a
+  -fno-rtti-built interface object consumed by RTTI-compiled module
+  code keeps virtual dispatch, `dynamic_cast<void*>`, and the
+  module's own dynamic_cast/typeid working (the only broken case
+  would be a cross-DSO dynamic_cast DOWN into our internal classes,
+  which no module can name).
+- **Enforcement.** `build_module.sh`'s zip verification now REQUIRES
+  the stealth properties on every CI build: no `.symtab`/`.strtab`/
+  `.debug_*` sections in any packaged ELF, no `DT_SONAME` on the
+  three libraries, and a case-insensitive banned-string scan
+  ("zygisk", "zygiskd", "zygisk_study", "ZygiskStudy", "libpayload",
+  "libzn_loader", "session.sock", "denylist", "ro.zygisk_study")
+  over the two app-readable libraries. The root-only daemon and
+  libzn_loader (whose documented API exports intentionally say what
+  they are) are out of scope — recorded as a deliberate decision,
+  not an oversight.
+
+What a scanner sees in the shipped bridge today: `NativeBridgeItf`
+and `NativeBridge2Itf` (the AOSP-mandated interface export, verified
+from art/libnativebridge's `kNativeBridgeInterfaceSymbol`), the
+NEEDED entries (`libc.so`, `libdl.so`, `liblog.so`, `libm.so`), the
+compiler `.comment`, and the encrypted byte arrays that read as junk.
+The payload adds only neutral `zs_entry_*` / `zs_*_wrapper` exports
+and libc imports.
+
+Honest scope: this defeats string-signature scanning (grep,
+dictionary lookups, hash-of-strings). It does not hide anything from
+a determined reverse engineer with a disassembler — the decode loops
+are right there. Same threat model as Round 30's randomized names:
+mass, cheap, signature-based detection is defeated; targeted analysis
+is not.

@@ -48,6 +48,7 @@
 
 #include "hide.h"
 #include "log.h"
+#include "obfstr.h"
 
 #include <dlfcn.h>
 #include <errno.h>
@@ -160,9 +161,11 @@ static int g_denylist_reload_count = 0;   // test observable
 
 // DenyList file path. Overridable by host tests (the real path needs
 // a root-owned /data/system tree that does not exist on the host).
-static const char* g_denylist_path =
-    "/data/system/zygisk_study/denylist";
-static const char* denylist_path() { return g_denylist_path; }
+static const char* g_denylist_path = nullptr;   // test override or lazy
+ZS_OBFS_PATH(kDenylistPathDefault, "/data/system/zygisk_study/denylist")
+static const char* denylist_path() {
+    return g_denylist_path ? g_denylist_path : kDenylistPathDefault();
+}
 
 // The set of properties that publicly reveal Magisk's presence.
 // This list is NOT exhaustive — it is the union of the keys
@@ -174,40 +177,48 @@ static const char* denylist_path() { return g_denylist_path; }
 // SPOOFED to stock values in the per-process clone (see
 // hide_advanced.cpp) or made to look absent via the
 // __system_property_find/get GOT hooks.
-static const char* kMagiskRevealingProps[] = {
-    "ro.boot.verifiedbootstate",
-    "ro.boot.vbmeta.device_state",
-    "ro.boot.vbmeta.hash_algo",
-    "ro.boot.vbmeta.digest",
-    "ro.boot.veritymode",
-    "ro.boot.flash.locked",
-    "ro.boot.warrantybit",
-    "ro.warranty.bits",
-    "ro.bootmanager.veritymode",
-    "init.svc.adbd",
-    "init.svc.magisk",
-    "init.svc.magisk_pfsd",
-    // Magisk-specific
-    "ro.magisk.version",
-    "ro.magisk.versioncode",
-    "persist.sys.magisk_denylist",
-    "persist.magisk.hide",
-    "service.magisk.rootdir",
-    "persist.sys.rootdir",
-    // KernelSU-specific
-    "ro.kernelsu.version",
-    "ro.kernelsu.exposed",
-    // Our own
-    "ro.zygisk_study.version",
-};
+// ROUND 33 (stealth): the key list is a decode-once obfuscated table.
+// Plaintext "ro.magisk.version" / "persist.sys.magisk_denylist" /
+// "ro.zygisk_study.version" inside the world-readable libpayload.so
+// is a direct root-management fingerprint for any file scanner.
+// (The SPOOF VALUES for these keys live in hide_advanced.cpp.)
+static const zsst::StrTable magisk_revealing_props_g = [] {
+        zsst::StrTable b;
+        b.add(ZS_OBFS("ro.boot.verifiedbootstate"));
+        b.add(ZS_OBFS("ro.boot.vbmeta.device_state"));
+        b.add(ZS_OBFS("ro.boot.vbmeta.hash_algo"));
+        b.add(ZS_OBFS("ro.boot.vbmeta.digest"));
+        b.add(ZS_OBFS("ro.boot.veritymode"));
+        b.add(ZS_OBFS("ro.boot.flash.locked"));
+        b.add(ZS_OBFS("ro.boot.warrantybit"));
+        b.add(ZS_OBFS("ro.warranty.bits"));
+        b.add(ZS_OBFS("ro.bootmanager.veritymode"));
+        b.add(ZS_OBFS("init.svc.adbd"));
+        b.add(ZS_OBFS("init.svc.magisk"));
+        b.add(ZS_OBFS("init.svc.magisk_pfsd"));
+        // Magisk-specific
+        b.add(ZS_OBFS("ro.magisk.version"));
+        b.add(ZS_OBFS("ro.magisk.versioncode"));
+        b.add(ZS_OBFS("persist.sys.magisk_denylist"));
+        b.add(ZS_OBFS("persist.magisk.hide"));
+        b.add(ZS_OBFS("service.magisk.rootdir"));
+        b.add(ZS_OBFS("persist.sys.rootdir"));
+        // KernelSU-specific
+        b.add(ZS_OBFS("ro.kernelsu.version"));
+        b.add(ZS_OBFS("ro.kernelsu.exposed"));
+        // Our own
+        b.add(ZS_OBFS("ro.zygisk_study.version"));
+        return b;
+    }();;
+static const zsst::StrTable& magisk_revealing_props() { return magisk_revealing_props_g; }
 
 // Public read-only accessor so host tests can verify the key list
-// without befriending the static. (The SPOOF VALUES for these keys
-// live in hide_advanced.cpp — see zs_prop_spoof_table there.)
+// without befriending the static. (ptrs[] is the compact stride-8
+// char* view over the decoded entries.)
 const char* const* hide_revealing_props(size_t* count) {
-    if (count) *count = sizeof(kMagiskRevealingProps)
-                        / sizeof(kMagiskRevealingProps[0]);
-    return kMagiskRevealingProps;
+    const zsst::StrTable& t = magisk_revealing_props();
+    if (count) *count = t.count;
+    return t.ptrs;
 }
 
 // ------------------------------------------------------------------------
@@ -370,8 +381,8 @@ static void discover_own_paths() {
         const char* slash = strrchr(g_own_path, '/');
         if (slash) {
             snprintf(g_bridge_path, sizeof g_bridge_path,
-                     "%.*s/libzygisk.so", (int)(slash - g_own_path),
-                     g_own_path);
+                     ZS_OBFS("%.*s/libzygisk.so"),
+                     (int)(slash - g_own_path), g_own_path);
         }
     }
 }
@@ -399,14 +410,14 @@ static void scan_maps_into_records(const char* buf, size_t total) {
             // matched as exact full-path substrings; the legacy
             // literals remain for fixed-name layouts.
             int is_self = !in_app_dir &&
-                          (strstr(ml.path, "libpayload.so") != nullptr ||
+                          (strstr(ml.path, ZS_OBFS("libpayload.so")) != nullptr ||
                            (g_own_path[0] != 0 &&
                             strstr(ml.path, g_own_path) != nullptr));
             int is_ours =
                 is_self ||
                 (!in_app_dir &&
-                 (strstr(ml.path, "libzygisk.so")    != nullptr ||
-                  strstr(ml.path, "libzn_loader.so") != nullptr ||
+                 (strstr(ml.path, ZS_OBFS("libzygisk.so"))    != nullptr ||
+                  strstr(ml.path, ZS_OBFS("libzn_loader.so")) != nullptr ||
                   (g_bridge_path[0] != 0 &&
                    strstr(ml.path, g_bridge_path) != nullptr)));
             if (is_ours) {
@@ -477,10 +488,12 @@ static void snapshot_self_so() {
 // The uid we store is the *appId family* (uid % 100000) so user 0,
 // user 10 (work profile), and secondary users all match the same
 // package.
-static constexpr const char* kPackagesListPath =
-    "/data/system/packages.list";
-static const char* g_packages_list_path = kPackagesListPath;
-static const char* packages_list_path() { return g_packages_list_path; }
+ZS_OBFS_PATH(kPackagesListPathDefault, "/data/system/packages.list")
+static const char* g_packages_list_path = nullptr;  // test override or lazy
+static const char* packages_list_path() {
+    return g_packages_list_path ? g_packages_list_path
+                                : kPackagesListPathDefault();
+}
 
 // Round 29: returns a bitmask of the files that actually OPENED
 // (bit 0 = denylist, bit 1 = packages.list; 3 = both), plus bits for
@@ -679,15 +692,27 @@ void hide_register_root_path_prefix(const char* prefix) {
 // being /data/adb/modules/.../system/app/Foo.apk. Matching only the
 // mount point (the old behavior) missed every magic mount, leaving
 // the module-overlaid /system layout visible to the app.
+// ROUND 33: the /sbin/.magisk mirror-mount marker, decode-once
+// obfuscated (file scope: field_is_root_path below uses it).
+ZS_OBFS_PATH(kMagiskMirror, "/sbin/.magisk")
+
+// ROUND 33b: the prefix table is a file-scope init_array global (no
+// guard variable — see obfstr.h's libc++abi rationale); the loop
+// keeps its {ptr,len} memcmp shape.
+static const zsst::StrTable kRootPathPrefixes_g = [] {
+    zsst::StrTable b;
+    b.add(ZS_OBFS("/data/adb/"));
+    b.add(ZS_OBFS("/sbin/"));
+    b.add(ZS_OBFS("/debug_ramdisk/"));
+    b.add(ZS_OBFS("/data/system/zygisk_study/"));
+    return b;
+}();
+
 static int field_is_root_path(const char* f, size_t len) {
-    static const struct { const char* p; size_t n; } kPrefixes[] = {
-        {"/data/adb/",       10},
-        {"/sbin/",            6},
-        {"/debug_ramdisk/",  15},
-        {"/data/system/zygisk_study/", 26},
-    };
-    for (const auto& pre : kPrefixes) {
-        if (len >= pre.n && memcmp(f, pre.p, pre.n) == 0) return 1;
+    const zsst::StrTable& kPrefixes = kRootPathPrefixes_g;
+    for (std::size_t i = 0; i < kPrefixes.count; ++i) {
+        if (len >= kPrefixes.len(i) &&
+            memcmp(f, kPrefixes.at(i), kPrefixes.len(i)) == 0) return 1;
     }
     for (int i = 0; i < g_rt_prefix_count; ++i) {
         if (len >= g_rt_prefix_lens[i] &&
@@ -695,7 +720,8 @@ static int field_is_root_path(const char* f, size_t len) {
     }
     // /sbin/.magisk mirror mount (source "magisk" style entries name
     // the block device; the mount point carries the marker instead).
-    if (len >= 13 && memcmp(f, "/sbin/.magisk", 13) == 0) return 1;
+    size_t mlen = strlen(kMagiskMirror());
+    if (len >= mlen && memcmp(f, kMagiskMirror(), mlen) == 0) return 1;
     return 0;
 }
 
@@ -1556,7 +1582,7 @@ extern "C" void hide_test_set_denylist_path(const char* path) {
 
 // Round 12 — packages.list seam for the module-args lookup tests.
 extern "C" void hide_test_set_packages_list_path(const char* path) {
-    g_packages_list_path = path ? path : kPackagesListPath;
+    g_packages_list_path = path;   // null restores the obfuscated default
     g_uid_map_loaded.store(0);
     g_deny_app_ids.clear();
     g_pkg_map.clear();

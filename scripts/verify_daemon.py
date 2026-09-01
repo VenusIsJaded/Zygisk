@@ -316,6 +316,22 @@ def run_checks(binary, tree, env, proc):
     n = count_zombies(pid)
     check("no zombie children after 10 connections", n == 0, f"{n} zombies")
 
+    # 7b. Round 33: the daemon writes its OWN pid file after the bind
+    # (the old service.sh `echo $!` recorded the setsid wrapper's pid,
+    # which forks+exits under shell job control — a dead pid from the
+    # first millisecond).
+    pid_file = os.path.join(tree.workdir, "zygiskd.pid")
+    try:
+        with open(pid_file) as f:
+            file_pid = int(f.read().strip())
+        check("zygiskd.pid names the LIVE daemon pid",
+              file_pid == pid, f"file={file_pid} live={pid}")
+        check("zygiskd.pid is 0600-root-ish (not world-writable)",
+              (os.stat(pid_file).st_mode & 0o022) == 0,
+              oct(os.stat(pid_file).st_mode))
+    except (OSError, ValueError) as e:
+        check("zygiskd.pid names the LIVE daemon pid", False, repr(e))
+
     # 8. previous-boot random-dir cleanup across a restart.
     prev_dir = os.path.dirname(sock_path)
     proc.send_signal(signal.SIGTERM)
