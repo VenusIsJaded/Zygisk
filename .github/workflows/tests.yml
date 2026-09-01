@@ -4,6 +4,12 @@
 # GitHub Actions CI for the Zygisk Study project.
 # Runs the host-side unit tests against every push and pull request.
 #
+# NOTE (Round 32): .github/workflows/build.yml additionally runs the
+# full gate suite (C++ + script E2E + daemon E2E + cargo) on EVERY
+# push to ANY branch before cross-building the flashable module zip
+# with the Android NDK. This file remains the lean main/PR test
+# signal; the zip pipeline lives in build.yml.
+#
 # What this workflow verifies:
 #
 #   - The five C++ test binaries (test_hide, test_hide_advanced,

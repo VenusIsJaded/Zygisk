@@ -2961,6 +2961,56 @@ static int path_is_hidden(const char* path) {
     return 0;
 }
 
+// ROUND 32 (found by actually cross-compiling against the NDK — the
+// first time this tree was ever built for Android): the legacy
+// stat/lstat/access syscall NUMBERS do not exist on every architecture.
+// Verified from the kernel UAPI headers shipped in the NDK sysroot:
+//   aarch64 (asm-generic/unistd.h): NO __NR_stat / __NR_lstat /
+//     __NR_access — only newfstatat(79), fstat, faccessat(48),
+//     statx(291), faccessat2(439).
+//   arm32 / i686 / x86_64: all three legacy numbers exist.
+// The #ifdef ladder keeps the legacy syscall where it exists (identical
+// behavior to every previous round on host and 32-bit/x86_64) and uses
+// the equivalent new-style syscall on aarch64 — newfstatat with
+// AT_FDCWD (and AT_SYMLINK_NOFOLLOW for lstat) is the exact stat/lstat
+// semantic; faccessat with AT_FDCWD is the exact access semantic.
+// The whole fallback only runs if the dlsym of the libc wrapper failed,
+// which does not happen on any real Android — but if it ever did, the
+// raw-syscall path now compiles and works on every ABI we ship.
+static inline int zs_raw_stat(const char* path, struct stat* st) {
+#if defined(SYS_stat)
+    return (int)syscall(SYS_stat, path, st);
+#elif defined(SYS_newfstatat)
+    return (int)syscall(SYS_newfstatat, AT_FDCWD, path, st, 0);
+#else
+    errno = ENOSYS;
+    return -1;
+#endif
+}
+
+static inline int zs_raw_lstat(const char* path, struct stat* st) {
+#if defined(SYS_lstat)
+    return (int)syscall(SYS_lstat, path, st);
+#elif defined(SYS_newfstatat)
+    return (int)syscall(SYS_newfstatat, AT_FDCWD, path, st,
+                        AT_SYMLINK_NOFOLLOW);
+#else
+    errno = ENOSYS;
+    return -1;
+#endif
+}
+
+static inline int zs_raw_access(const char* path, int mode) {
+#if defined(SYS_access)
+    return (int)syscall(SYS_access, path, mode);
+#elif defined(SYS_faccessat)
+    return (int)syscall(SYS_faccessat, AT_FDCWD, path, mode, 0);
+#else
+    errno = ENOSYS;
+    return -1;
+#endif
+}
+
 extern "C" int zygisk_study_hook_stat(const char* path, struct stat* st) {
     // Round 20: the mounted properties file answers the REAL file's
     // identity (stock st_dev/st_ino), never the session file's.
@@ -2972,7 +3022,7 @@ extern "C" int zygisk_study_hook_stat(const char* path, struct stat* st) {
     if (ZS_LIKELY(!hide_advanced_is_active()) || !path_is_hidden(path)) {
         return g_real_stat
             ? g_real_stat(path, st)
-            : (int)syscall(SYS_stat, path, st);
+            : zs_raw_stat(path, st);
     }
     errno = ENOENT;
     return -1;
@@ -2989,7 +3039,7 @@ extern "C" int zygisk_study_hook_lstat(const char* path, struct stat* st) {
     if (ZS_LIKELY(!hide_advanced_is_active()) || !path_is_hidden(path)) {
         return g_real_lstat
             ? g_real_lstat(path, st)
-            : (int)syscall(SYS_lstat, path, st);
+            : zs_raw_lstat(path, st);
     }
     errno = ENOENT;
     return -1;
@@ -2999,7 +3049,7 @@ extern "C" int zygisk_study_hook_access(const char* path, int mode) {
     if (ZS_LIKELY(!hide_advanced_is_active()) || !path_is_hidden(path)) {
         return g_real_access
             ? g_real_access(path, mode)
-            : (int)syscall(SYS_access, path, mode);
+            : zs_raw_access(path, mode);
     }
     errno = ENOENT;
     return -1;
@@ -3365,15 +3415,27 @@ extern "C" int zygisk_study_hook_dladdr(const void* addr, Dl_info* info) {
 
 extern "C" int zygisk_study_hook_dladdr1(const void* addr, Dl_info* info,
                                          void** extra, int flags) {
-    int rv = g_real_dladdr1
-        ? g_real_dladdr1(addr, info, extra, flags)
-        : dladdr1(addr, info, extra, flags);
-    if (rv == 0 || !hide_advanced_is_active() || !info) return rv;
-    if (dl_name_is_ours(info->dli_fname)) {
-        memset(info, 0, sizeof *info);
-        return 0;
+    // ROUND 32 (found by cross-compiling against the NDK): bionic's
+    // public dlfcn.h does NOT declare dladdr1 at any API level (only
+    // dladdr), so a direct call does not compile for Android; and a
+    // direct reference would add an undefined symbol to our .so that
+    // pre-load-time linking could not satisfy on old devices anyway.
+    // The real function (where it exists — resolved at runtime through
+    // zs_resolve_libc) is still preferred; when the resolution fails
+    // we degrade to the dladdr semantics: fill info, report the same
+    // post-filtering, leave *extra untouched (NULL), which is exactly
+    // what a caller without a linkmap request loses — nothing.
+    if (g_real_dladdr1) {
+        int rv = g_real_dladdr1(addr, info, extra, flags);
+        if (rv == 0 || !hide_advanced_is_active() || !info) return rv;
+        if (dl_name_is_ours(info->dli_fname)) {
+            memset(info, 0, sizeof *info);
+            return 0;
+        }
+        return rv;
     }
-    return rv;
+    if (extra) *extra = nullptr;
+    return zygisk_study_hook_dladdr(addr, info);
 }
 
 // ------------------------------------------------------------------------

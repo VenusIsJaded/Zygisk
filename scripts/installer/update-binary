@@ -1,0 +1,68 @@
+#!/sbin/sh
+# SPDX-License-Identifier: Apache-2.0
+# scripts/installer/update-binary — clean-room recovery installation shim.
+#
+# PROTOCOL (documented interface; this file is our own implementation,
+# written for this project — Magisk's module_installer.sh is GPL-3.0 and
+# is deliberately NOT copied into this Apache-2.0 repository):
+#
+#   A custom recovery executing a flashable zip invokes
+#   META-INF/com/google/android/update-binary with three arguments:
+#     $1 = recovery API version
+#     $2 = the fd to write ui_print commands to
+#     $3 = the path of this zip file
+#   and reads META-INF/com/google/android/updater-script (ours carries
+#   the "#MAGISK" marker so Magisk-aware recoveries pass it through).
+#
+#   Installing a MODULE from recovery therefore only means: make /data
+#   available, load Magisk's own installation machinery
+#   (/data/adb/magisk/util_functions.sh — the file the official module
+#   documentation tells module authors the environment provides), check
+#   it is new enough to have install_module, and hand over via
+#   install_module with OUTFD/ZIPFILE exported. Everything else
+#   (extraction, permission defaults, customize.sh sourcing) is
+#   Magisk's logic, not ours to re-implement.
+#
+#   Flashing through the Magisk/KSU/APatch APP does not execute this
+#   file at all (the app handles the zip itself), so this shim exists
+#   purely for the custom-recovery path.
+
+umask 022
+
+# Pre-source ui_print: once util_functions.sh is loaded below, its own
+# ui_print (fd-aware for recovery, echo for app installs) replaces this
+# one — this definition only covers the failure paths before that. We
+# still try the recovery fd first so the messages are visible in the
+# recovery UI, falling back to stdout for logging.
+ui_print() {
+  if [ -n "$OUTFD" ] && [ -w "/proc/self/fd/$OUTFD" ] 2>/dev/null; then
+    printf 'ui_print %s\nui_print\n' "$1" >> "/proc/self/fd/$OUTFD" 2>/dev/null || echo "$1"
+  else
+    echo "$1"
+  fi
+}
+
+OUTFD=$2
+ZIPFILE=$3
+
+mount /data 2>/dev/null
+
+if [ ! -f /data/adb/magisk/util_functions.sh ]; then
+  ui_print "*******************************"
+  ui_print " Magisk not found on this device "
+  ui_print " Install Magisk v20.4+ first! "
+  ui_print "*******************************"
+  exit 1
+fi
+
+. /data/adb/magisk/util_functions.sh
+
+if [ -z "$MAGISK_VER_CODE" ] || [ "$MAGISK_VER_CODE" -lt 20400 ]; then
+  ui_print "*******************************"
+  ui_print " Please update Magisk to v20.4+! "
+  ui_print "*******************************"
+  exit 1
+fi
+
+install_module
+exit 0

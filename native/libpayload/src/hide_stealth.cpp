@@ -206,18 +206,36 @@ static ssize_t rewrite_if_suspicious(char* buf, size_t bufsiz,
     return (ssize_t)rlen;
 }
 
+// ROUND 32 (found by cross-compiling against the NDK): aarch64's
+// kernel UAPI has no __NR_readlink (only readlinkat, verified in the
+// NDK sysroot's asm-generic/unistd.h) — the raw-syscall fallback now
+// uses readlinkat(AT_FDCWD, ...) on such arches, which is the exact
+// readlink semantic. This path only runs if the dlsym of libc's
+// readlink failed, which does not happen on real Android.
+static inline ssize_t zs_raw_readlink(const char* path, char* buf,
+                                       size_t bufsiz) {
+#if defined(SYS_readlink)
+    return (ssize_t)syscall(SYS_readlink, path, buf, bufsiz);
+#elif defined(SYS_readlinkat)
+    return (ssize_t)syscall(SYS_readlinkat, AT_FDCWD, path, buf, bufsiz);
+#else
+    errno = ENOSYS;
+    return -1;
+#endif
+}
+
 extern "C" ssize_t zygisk_study_hook_readlink(const char* path,
                                               char* buf, size_t bufsiz) {
     ssize_t n;
     if (ZS_UNLIKELY(!hide_advanced_is_active())) {
         n = g_real_readlink
             ? g_real_readlink(path, buf, bufsiz)
-            : (ssize_t)syscall(SYS_readlink, path, buf, bufsiz);
+            : zs_raw_readlink(path, buf, bufsiz);
         return n;
     }
     n = g_real_readlink
         ? g_real_readlink(path, buf, bufsiz)
-        : (ssize_t)syscall(SYS_readlink, path, buf, bufsiz);
+        : zs_raw_readlink(path, buf, bufsiz);
     if (n < 0) return n;
     // Round 23: a RELATIVE path with the cwd inside a tracked /proc
     // directory resolves to the same symlink the absolute path would

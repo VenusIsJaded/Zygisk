@@ -314,8 +314,21 @@ def test_installed_marker_and_denylist(mk):
 # customize.sh — the Round 29 launcher symlink.
 # ---------------------------------------------------------------------------
 
-def run_customize(mk, abi="arm64-v8a", api="30", is64="true",
-                  make_libs=True, missing_artifact=False):
+def run_customize(mk, arch="arm64", abi=None, api="30", is64="true",
+                  make_libs=True, missing_artifact=False, extra_env=None):
+    """Run customize.sh the way a REAL installer does.
+
+    ROUND 32: `arch` is the value Magisk/KernelSU/APatch actually set
+    (arm64 | arm | x86 | x64 — verified from their api_level_arch_detect
+    functions); `abi` is the NDK-style directory name under libs/ (for
+    arm64 that is arm64-v8a). The two are DIFFERENT names: the old test
+    harness passed "arm64-v8a" as ARCH, which no installer ever does —
+    the exact bug that made customize.sh abort on every real device
+    while the host tests stayed green.
+    """
+    if abi is None:
+        abi = {"arm64": "arm64-v8a", "arm": "armeabi-v7a",
+               "x64": "x86_64", "x86": "x86"}[arch]
     modpath = os.path.join(mk.root, "modpath")
     shutil.rmtree(modpath, ignore_errors=True)
     os.makedirs(modpath)
@@ -332,10 +345,13 @@ def run_customize(mk, abi="arm64-v8a", api="30", is64="true",
         "ui_print() { echo \"$*\"; }\n"
         "abort() { echo \"ABORT:$*\"; exit 1; }\n"
         f". {os.path.join(mk.moddir, 'customize.sh')}\n")
+    env = mk.env({"MODPATH": modpath, "ARCH": arch, "API": api,
+                  "IS64BIT": is64})
+    if extra_env:
+        env.update(extra_env)
     proc = subprocess.run(
         ["sh", "-c", wrapper],
-        env=mk.env({"MODPATH": modpath, "ARCH": abi, "API": api,
-                    "IS64BIT": is64}),
+        env=env,
         capture_output=True, text=True, timeout=60)
     return proc, modpath
 
@@ -389,8 +405,9 @@ def test_customize_creates_launcher(mk):
 
 
 def test_customize_32bit_layout(mk):
-    proc, modpath = run_customize(mk, abi="armeabi-v7a", is64="false")
-    check("customize.sh (armeabi-v7a) exits 0", proc.returncode == 0,
+    proc, modpath = run_customize(mk, arch="arm", abi="armeabi-v7a",
+                                  is64="false")
+    check("customize.sh (ARCH=arm, 32-bit) exits 0", proc.returncode == 0,
           proc.stdout[-200:])
     sysdir = os.path.join(modpath, "system", "lib")
     names_p = os.path.join(modpath, ".loader_names")
@@ -404,6 +421,139 @@ def test_customize_32bit_layout(mk):
           bridge is not None
           and os.path.exists(os.path.join(sysdir, bridge)),
           f"bridge={bridge}")
+
+
+def test_customize_real_installer_arch_values(mk):
+    """ROUND 32 regression test: the installer-provided $ARCH values.
+
+    Magisk's api_level_arch_detect() (scripts/util_functions.sh) and the
+    identical logic in KernelSU's ksud installer.sh and APatch's
+    installer.sh set ARCH to arm64/arm/x86/x64 — never the NDK-style
+    names. Every entry must install from its matching libs/<abi> dir.
+    """
+    for arch, abi, is64 in (("arm64", "arm64-v8a", "true"),
+                            ("x64", "x86_64", "true"),
+                            ("x86", "x86", "false")):
+        proc, modpath = run_customize(mk, arch=arch, abi=abi, is64=is64)
+        ok = proc.returncode == 0
+        check(f"customize.sh accepts real ARCH={arch}", ok,
+              (proc.stdout[-200:] + proc.stderr[-200:]))
+        link = os.path.join(modpath, "zygiskd")
+        if ok:
+            check(f"ARCH={arch}: launcher points at libs/{abi}",
+                  os.path.islink(link)
+                  and os.readlink(link) == f"libs/{abi}/zygiskd",
+                  str(os.readlink(link)) if os.path.islink(link) else "no link")
+    # riscv64: Magisk can report it (util_functions.sh api_level_arch_detect)
+    # but we ship no build for it — must refuse cleanly, not install garbage.
+    proc, _ = run_customize(mk, arch="riscv64", abi="x86", make_libs=False)
+    check("customize.sh refuses riscv64 cleanly",
+          proc.returncode != 0 and "ABORT:" in proc.stdout
+          and "riscv64" in proc.stdout, proc.stdout[-200:])
+
+
+def test_customize_no_getprop_on_path(mk):
+    """ROUND 32 regression test: plain-recovery install (no getprop).
+
+    customize.sh runs under `set -e`; before the zs_getprop fix a missing
+    getprop binary made `X=$(getprop ...)` exit 127 and abort the whole
+    install mid-way (after the 64-bit libs were copied, before the
+    conflict checks / launcher / marker). With no getprop AND no readable
+    build.prop the abilist is simply empty — 32-bit pairing is skipped
+    and the install must still complete.
+    """
+    # Populate the module path exactly like run_customize does (libs,
+    # artifacts, stub daemon) but run with a PATH that contains NO fake
+    # getprop — the plain-recovery environment.
+    modpath = os.path.join(mk.root, "modpath")
+    shutil.rmtree(modpath, ignore_errors=True)
+    libs = os.path.join(modpath, "libs", "arm64-v8a")
+    os.makedirs(libs)
+    for f in ("libzygisk.so", "libpayload.so", "libzn_loader.so"):
+        with open(os.path.join(libs, f), "wb") as fp:
+            fp.write(b"\x7fELF" + b"\x00" * 64)
+    write_exec(os.path.join(libs, "zygiskd"), STUB_DAEMON)
+    proc = subprocess.run(
+        ["sh", "-c",
+         "ui_print() { echo \"$*\"; }\n"
+         "abort() { echo \"ABORT:$*\"; exit 1; }\n"
+         f". {os.path.join(mk.moddir, 'customize.sh')}\n"],
+        env={"PATH": "/usr/bin:/bin",
+             "MODPATH": modpath,
+             "ARCH": "arm64", "IS64BIT": "true", "API": "30",
+             "ZS_TEST_ADB_ROOT": str(mk.root)},
+        capture_output=True, text=True, timeout=60)
+    check("no-getprop install completes (no set -e death)",
+          proc.returncode == 0,
+          (proc.stdout[-300:] + proc.stderr[-300:]))
+    check("no-getprop: nothing fatal in the output",
+          "ABORT:" not in proc.stdout, proc.stdout[-300:])
+    # The install must have gotten all the way through: launcher symlink
+    # is one of the LAST steps (after the getprop call sites) — its
+    # presence proves the script survived the property lookups.
+    check("no-getprop: launcher symlink created (script ran to the end)",
+          os.path.islink(os.path.join(modpath, "zygiskd")),
+          "no launcher symlink")
+
+
+def test_customize_buildprop_fallback(mk):
+    """ROUND 32: zs_getprop's build.prop fallback (the grep_get_prop
+    pattern from Magisk's util_functions.sh). getprop is absent, the
+    abilist comes from build.prop instead — including CRLF line ends
+    (some OEM images ship Windows-ended build.prop files). The proof is
+    behavioral: with a dual-arch abilist in build.prop AND 32-bit
+    artifacts present (EI_CLASS=1 stubs), the 32-bit pair must be
+    installed into system/lib."""
+    modpath = os.path.join(mk.root, "modpath")
+    shutil.rmtree(modpath, ignore_errors=True)
+    for abi, elf_cls in (("arm64-v8a", 2), ("armeabi-v7a", 1)):
+        libs = os.path.join(modpath, "libs", abi)
+        os.makedirs(libs)
+        for f in ("libzygisk.so", "libpayload.so", "libzn_loader.so"):
+            with open(os.path.join(libs, f), "wb") as fp:
+                # ELF magic + EI_CLASS (offset 4): 2 = ELF64, 1 = ELF32
+                fp.write(b"\x7fELF" + bytes([elf_cls]) + b"\x00" * 59)
+        write_exec(os.path.join(libs, "zygiskd"), STUB_DAEMON)
+    propdir = os.path.join(mk.root, "props")
+    os.makedirs(propdir, exist_ok=True)
+    bp = os.path.join(propdir, "build.prop")
+    with open(bp, "wb") as fp:
+        fp.write(b"ro.build.version.sdk=30\r\n"
+                 b"ro.product.cpu.abilist=arm64-v8a,armeabi-v7a\r\n"
+                 b"ro.dalvik.vm.native.bridge=0\r\n")
+    proc = subprocess.run(
+        ["sh", "-c",
+         "ui_print() { echo \"$*\"; }\n"
+         "abort() { echo \"ABORT:$*\"; exit 1; }\n"
+         f". {os.path.join(mk.moddir, 'customize.sh')}\n"],
+        env={"PATH": "/usr/bin:/bin",
+             "MODPATH": modpath,
+             "ARCH": "arm64", "IS64BIT": "true", "API": "30",
+             "ZS_TEST_ADB_ROOT": str(mk.root),
+             "ZS_PROP_FILES": bp},
+        capture_output=True, text=True, timeout=60)
+    check("build.prop fallback: install completes",
+          proc.returncode == 0,
+          (proc.stdout[-300:] + proc.stderr[-300:]))
+    # The abilist came from build.prop (no getprop exists): the 32-bit
+    # pair must have been installed under system/lib with the randomized
+    # names from .loader_names.
+    names_p = os.path.join(modpath, ".loader_names")
+    bridge = None
+    if os.path.exists(names_p):
+        with open(names_p) as fp:
+            for line in fp:
+                if line.startswith("bridge="):
+                    bridge = line.strip()[len("bridge="):]
+    lib32 = os.path.join(modpath, "system", "lib")
+    check("build.prop fallback: dual-arch pair installed via abilist",
+          bridge is not None and os.path.exists(os.path.join(lib32, bridge)),
+          f"bridge={bridge}")
+    check("build.prop fallback: CRLF stripped from the parsed value",
+          # If CRLF leaked, abilist would not match the case patterns and
+          # the 32-bit branch would have printed the NOTE instead.
+          "32-bit zygote apps will NOT be injected" not in proc.stdout,
+          proc.stdout[-300:])
 
 
 def test_customize_refuses_old_android(mk):
@@ -887,7 +1037,9 @@ def _run_customize(mk, modpath, extra_env=None, abilist=None, bridge="0"):
     """Shared customize.sh runner with a remapped /data/adb."""
     env = mk.env(extra_env or {})
     env["MODPATH"] = str(modpath)
-    env["ARCH"] = "arm64-v8a"
+    # ROUND 32: the REAL installer value (Magisk/KSU/APatch
+    # api_level_arch_detect), not the NDK-style ABI name.
+    env["ARCH"] = "arm64"
     env["IS64BIT"] = "true"
     env["API"] = "30"
     env["ZS_TEST_ADB_ROOT"] = str(mk.root)  # remap /data/adb
@@ -1048,6 +1200,12 @@ def main():
         ("customize: launcher symlink (Round 29 core fix)",
          test_customize_creates_launcher),
         ("customize: 32-bit layout", test_customize_32bit_layout),
+        ("customize: real installer ARCH values (Round 32 core fix)",
+         test_customize_real_installer_arch_values),
+        ("customize: no getprop on PATH (recovery, Round 32)",
+         test_customize_no_getprop_on_path),
+        ("customize: build.prop fallback for properties",
+         test_customize_buildprop_fallback),
         ("customize: API gate (< 21 refused)",
          test_customize_refuses_old_android),
         ("customize: ABI gate", test_customize_refuses_bad_abi),

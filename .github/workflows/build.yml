@@ -1,0 +1,127 @@
+# SPDX-License-Identifier: Apache-2.0
+# .github/workflows/build.yml
+#
+# Flashable-zip builds for EVERY commit.
+#
+# Every push (any branch, any commit), every tag, and manual dispatch
+# builds the complete module with the Android NDK and uploads the
+# flashable Magisk-module zip as a workflow artifact:
+#
+#     zygisk_study-v0.1.0-<shortsha>-<commit-count>.zip
+#
+# The zip is installable through:
+#   - the Magisk / KernelSU / APatch app ("Install from storage"; no
+#     META-INF needed for that path), and
+#   - custom recoveries (TWRP-class), via our clean-room
+#     META-INF/com/google/android/update-binary.
+#
+# Tag pushes (v*) additionally publish a GitHub Release with the zip
+# attached.
+#
+# VERIFIED FACTS this workflow relies on (fetched and read, not guessed):
+#   - GitHub's ubuntu-latest (Ubuntu 24.04) images ship the Android NDK
+#     preinstalled and export ANDROID_NDK_HOME (the default NDK) and
+#     ANDROID_NDK_LATEST_HOME — actions/runner-images
+#     images/ubuntu/Ubuntu2404-Readme.md. No NDK setup action needed.
+#   - The NDK supports armeabi-v7a / arm64-v8a / x86 / x86_64 with a
+#     minimum API level of 21 (r26+; the revision history), which is
+#     exactly this module's minimum (Android 5.0).
+#   - Rust ships first-class Android targets (aarch64-linux-android,
+#     armv7-linux-androideabi, i686-linux-android, x86_64-linux-android,
+#     Tier 2) — rustc platform support docs.
+#   - actions/checkout@v7 / actions/upload-artifact@v7 /
+#     softprops/action-gh-release@v3 exist as the current releases.
+#   - The whole build is driven by scripts/build_module.sh, the same
+#     script a developer runs locally with NDK=/path/to/ndk — CI never
+#     duplicates build logic.
+#
+# The build is GATED: the zip is only produced after the full host-side
+# test suite passes (C++ unit tests + the script E2E harness + the
+# daemon E2E + cargo tests). A red test tree produces no artifact.
+
+name: build
+
+on:
+  push:            # every commit on every branch + tags
+  workflow_dispatch:
+
+permissions:
+  contents: write  # required only for the tag-release job
+
+jobs:
+  build:
+    name: Flashable zip (NDK cross-build)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (full history for versionCode)
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install host test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++ make cmake zip unzip
+
+      # ---- Test gates: no zip leaves a red tree --------------------
+      - name: C++ host test suite
+        working-directory: tests
+        run: make run
+
+      - name: Script E2E suite (fake Magisk environment)
+        working-directory: tests
+        run: make verify-scripts
+
+      - name: Daemon E2E (real zygiskd against a remapped /data)
+        working-directory: tests
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          make verify-daemon
+
+      - name: Rust unit tests
+        working-directory: native/zygiskd
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cargo test
+
+      # ---- Cross-build + packaging ----------------------------------
+      - name: Add Rust Android targets
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          rustup target add aarch64-linux-android armv7-linux-androideabi \
+              i686-linux-android x86_64-linux-android
+
+      - name: Build the flashable module zip
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          # Prefer the runner's default NDK (stable), fall back to the
+          # newest (ANDROID_NDK_LATEST_HOME). build_module.sh accepts
+          # both; the discovery order is documented in the script.
+          NDK="${ANDROID_NDK_HOME:-${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_ROOT:-}}}" \
+            ./scripts/build_module.sh
+
+      - name: Upload the zip (every commit)
+        uses: actions/upload-artifact@v7
+        with:
+          name: zygisk_study-flashable-zip
+          path: build/out/zygisk_study-*.zip
+          if-no-files-found: error
+          archive: false
+
+  release:
+    name: Tag release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download the zip built by this tag
+        uses: actions/download-artifact@v7
+        with:
+          name: zygisk_study-flashable-zip
+          path: dist/
+
+      - name: Create the GitHub release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: dist/zygisk_study-*.zip
+          generate-release-notes: true

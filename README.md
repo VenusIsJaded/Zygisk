@@ -131,15 +131,32 @@ zygisk_study/
 
 ## How to build (when you want your own `.so` files)
 
+The one-command path (Round 32) — builds all four ABIs and assembles
+the flashable Magisk-module zip:
+
+```bash
+# from the repo root (NDK discovery: ANDROID_NDK_HOME /
+# ANDROID_NDK_LATEST_HOME / ANDROID_NDK_ROOT / $ANDROID_HOME/ndk/*)
+NDK=/path/to/android-ndk ./scripts/build_module.sh
+
+# output: build/out/zygisk_study-v<sha>-<count>.zip
+# (self-verified: layout, module.prop, ELF classes per ABI)
+```
+
+The same script is what GitHub Actions runs on every commit
+(`.github/workflows/build.yml`) — CI never duplicates build logic.
+
 Requirements:
 
-- Android NDK r25 or newer (clang, libc++, `aarch64-linux-android` and
-  `armv7-linux-androideabi` targets)
-- Rust toolchain with the `aarch64-linux-android` and
-  `armv7-linux-androideabi` targets installed (`rustup target add ...`)
-- CMake 3.18+ and Ninja
+- Android NDK r26 or newer (clang + the CMake toolchain file; r26+ is
+  the first release whose minimum API level, 21, matches this module's
+  Android 5.0 floor)
+- Rust toolchain with the Android targets installed
+  (`rustup target add aarch64-linux-android armv7-linux-androideabi
+  i686-linux-android x86_64-linux-android`)
+- CMake 3.18+ and `zip`
 
-Then:
+Manual per-ABI CMake path (equivalent to what the script does):
 
 ```bash
 # from the repo root
@@ -149,7 +166,7 @@ mkdir build && cd build
 cmake -G Ninja \
   -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake \
   -DANDROID_ABI=arm64-v8a \
-  -DANDROID_PLATFORM=android-26 \
+  -DANDROID_PLATFORM=android-21 \
   -DCMAKE_BUILD_TYPE=Release \
   ../native
 ninja
@@ -774,15 +791,84 @@ without messing anything up." All three, verified the usual way:
    function **49%**. A new perf test locks the realistic 2 MB smaps
    contract; the standing medians are unchanged.
 
+### Round 32 — flashable zips for every commit, and the bugs the build exposed
+
+The user's brief: "find more bugs and optimizations and also make the
+workflow make a .zip for every commit in actions. A flashable .zip."
+
+1. **Every commit now produces a flashable zip.** `.github/workflows/build.yml`
+   runs on every push (any branch), every tag, and manual dispatch: it
+   gates on the full host suite (C++ + script E2E + daemon E2E + cargo),
+   cross-builds all four ABIs (arm64-v8a, armeabi-v7a, x86_64, x86 —
+   exactly the NDK's supported set at the module's minimum API 21) with
+   the runner's preinstalled NDK, and uploads
+   `zygisk_study-v0.1.0-<shortsha>-<commit-count>.zip` as an artifact.
+   Tag pushes additionally publish a GitHub Release. The whole pipeline
+   is `scripts/build_module.sh` — the identical script runs locally with
+   `NDK=/path/to/ndk ./scripts/build_module.sh` — and the finished zip
+   is SELF-VERIFIED (layout, module.prop's strict format, the
+   `#MAGISK` updater-script marker, the install.sh legacy-installer
+   trap, per-ABI ELF classes) before it can leave a green build. The
+   recovery install path uses OUR OWN clean-room `update-binary`
+   (Magisk's module_installer.sh is GPL-3.0 and is not vendored into
+   this Apache-2.0 tree); Magisk/KSU/APatch app installs need no
+   META-INF at all.
+
+2. **Six real bugs the build flushed out** (five of them "the Android
+   build had never actually worked" class — every previous round
+   verified logic against AOSP sources, but nothing had ever compiled
+   this tree with a real NDK):
+   - `customize.sh` cased on NDK-style ABI names (`arm64-v8a`, ...) —
+     but Magisk, KernelSU AND APatch all pass `ARCH=arm64|arm|x86|x64`
+     (verified from all three `api_level_arch_detect` functions). Every
+     real install aborted with "does not support arm64". Since Round 1.
+   - `customize.sh` runs under `set -e`, and `X=$(getprop ...)` with a
+     missing getprop binary (plain-recovery installs) exits 127 through
+     the assignment — killing the install mid-way. Fixed with an
+     installer-safe `zs_getprop` (getprop first, build.prop grep
+     fallback — the same `grep_get_prop` pattern Magisk itself uses).
+   - `project(... LANGUAGES C CXX)` — no ASM: CMake silently dropped
+     both trampoline `.S` files, so libpayload.so could never link on
+     Android (undefined `zs_fork_wrapper` & co.).
+   - The raw-syscall fallbacks referenced `SYS_stat`/`SYS_lstat`/
+     `SYS_access`/`SYS_readlink` — syscall numbers that DO NOT EXIST on
+     aarch64's kernel UAPI (verified in the NDK sysroot headers).
+     Now an `#ifdef` ladder: legacy syscall where it exists, the
+     equivalent new-style syscall (`newfstatat`/`faccessat`/
+     `readlinkat` with `AT_FDCWD`) where it does not.
+   - 32-bit ABIs never linked: the GOT-hook wrappers existed only in
+     the aarch64/x86_64 assembly. Plain C wrappers (the documented
+     Tier-B contract — `hide_process_phase` accepts a null frame
+     pointer, which is the Tier B input) now compile for every no-blob
+     arch.
+   - `dladdr1` is not declared by bionic's public `dlfcn.h` at ANY API
+     level (verified in the sysroot) — the direct-call fallback could
+     never compile for Android. When the runtime-resolved real
+     `dladdr1` is unavailable the hook now degrades to dladdr
+     semantics instead.
+   Plus one clippy warning (identical test blocks) cleaned up.
+
+3. **Verification additions**: the script E2E suite grew to **101
+   checks** — the fake installer environment now feeds the REAL
+   `ARCH` values (the old harness fed `arm64-v8a`, which is exactly why
+   the ARCH bug survived 31 rounds of green tests), plus regression
+   tests for the recovery no-getprop install and the build.prop
+   fallback. The full cross-build was executed locally against NDK
+   r27b before the workflow was written, and the produced zip was
+   flash-simulated end-to-end on the host (arm64 dual-arch and 32-bit
+   ARM installs, real ELF artifacts, randomized names, post-mount
+   hook).
+
 Final state: **243/243 host tests** (41 hide / 112 advanced / 20
 stealth / 5 e2e / 6 perf / 4 trampoline / 23 dispatch / 11
 version-compat / 16 zn_loader / 5 race) + `make race` (TSan: zero
 data races — the old code's 8 are reproducible via the proof
 harness) + `make run-sanitize` green, 45/45 cargo tests, `make
 verify-daemon` 30 live checks (incl. the engine-driven guard with
-no resetprop on PATH), `make verify-scripts` 88 live checks, 0
-warnings, perf medians unchanged. The full research trail with every source cited:
-`docs/ANDROID-REALISM.md` (Round 31) and `docs/compatibility.md`
+no resetprop on PATH), `make verify-scripts` 101 live checks, 0
+warnings, perf medians unchanged, and a locally verified 4-ABI
+flashable zip pipeline. The full research trail with every source cited:
+`docs/ANDROID-REALISM.md` (Round 32) and `docs/compatibility.md`
 (custom ROM section).
 
 ## License

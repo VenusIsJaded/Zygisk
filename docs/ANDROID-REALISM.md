@@ -2613,3 +2613,164 @@ Honest residuals:
 - The 50-ROM sweep reads frameworks/base + the root managers; a
   ROM could still patch its own kernel/sepolicy in ways that only
   device testing would surface (the boot chain degrades closed).
+
+## Round 32 — the flashable zip, and what actually building for Android revealed
+
+The brief: "find more bugs and optimizations and also make the workflow
+make a .zip for every commit in actions. A flashable .zip." The CI work
+forced the one verification step this project had never taken: compiling
+the tree with a real Android NDK. That single step found five build-level
+defects that 31 rounds of AOSP-source research and 243 host tests could
+not see, because the host tests compile the sources with g++ directly
+and the research rounds verified LOGIC against upstream code.
+
+Research base (every fact fetched and read; nothing guessed):
+
+- GitHub Actions runner images (actions/runner-images,
+  images/ubuntu/Ubuntu2404-Readme.md): ubuntu-latest ships the NDK
+  preinstalled — ANDROID_NDK_HOME (27.3, the default) and
+  ANDROID_NDK_LATEST_HOME (29.0) — plus Rust 1.98/rustup, CMake, g++,
+  zip. The workflow needs no NDK setup action (cross-checked against
+  ReZygisk's own .github/workflows/ci.yml, which sets
+  NDK_PATH=$ANDROID_NDK_LATEST_HOME and builds the same C + zip stack).
+- NDK r26+ revision history: KitKat (API 19/20) dropped; the minimum
+  API level is 21 — exactly this module's Android 5.0 floor. The
+  supported ABIs are armeabi-v7a, arm64-v8a, x86, x86_64 (MIPS and
+  ARMv5 long gone; the ABIs doc enumerates the four).
+- NDK docs (guides/cmake + guides/other_build_systems):
+  -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake with
+  -DANDROID_ABI/-DANDROID_PLATFORM; the generic clang with
+  --target=<triple><api> is the recommended invocation ("more
+  reliable" than the target-prefixed wrappers). ReZygisk's common.mk
+  uses the identical table (armv7a-linux-androideabi for the clang
+  triple vs rustc's armv7-linux-androideabi target — both verified).
+- rustc platform-support (android): the four targets are Tier 2,
+  cross-compiled with the NDK; per-target linker config via
+  CARGO_TARGET_<triple>_LINKER / _RUSTFLAGS (Cargo book, config
+  chapter — both env var names verified).
+- The Magisk module installer contract (docs/guides.md + the actual
+  scripts/util_functions.sh at master): the app-install path needs
+  nothing but module.prop + the module files ("The simplest Magisk
+  module installer is just a Magisk module packed as a zip file");
+  only custom-recovery flashing needs META-INF/com/google/android/
+  update-binary + an updater-script containing exactly "#MAGISK".
+  customize.sh is SOURCED; install_module() extracts everything but
+  META-INF, applies set_default_perm (dirs 0755 / files 0644,
+  u:object_r:system_file:s0), and is_legacy_script() switches to the
+  legacy installer if the zip contains a root install.sh. Magisk is
+  GPL-3.0 (repo license field) — their module_installer.sh is NOT
+  vendored; ours is a clean-room shim implementing the documented
+  protocol (source util_functions.sh, require >= 20400, install_module).
+- SELinux: /system/lib(64)/* is system_lib_file (file_contexts), but
+  module magic-mounted files are system_file — and AOSP main's
+  zygote.te grants r_dir_file(zygote, system_file) (expanded:
+  allow zygote system_file:{ file lnk_file } r_file_perms), so the
+  zygote can read the magic-mounted bridge. Empirically the same
+  label under which the entire Riru ecosystem worked 2017-2021.
+- The installer $ARCH contract: Magisk's api_level_arch_detect()
+  (scripts/util_functions.sh at master) and the byte-identical
+  functions in KernelSU's userspace/ksud/src/installer.sh and
+  APatch's apd/assets/installer.sh set
+  ARCH=arm64|arm|x86|x64|riscv64 and ABI32=<ndk-name>, IS64BIT=true/
+  false. NONE of them ever pass an NDK-style ABI name.
+- The busybox that all three root managers run module scripts under:
+  Magisk's ndk-box-kitchen busybox.config has CONFIG_DESKTOP=y (the
+  full od with -t/-j/-N/-A, verified from od_bloaty.c's usage string);
+  KernelSU's and APatch's embedded busybox binaries are byte-identical
+  topjohnwu builds ("BusyBox v1.36.1.1 topjohnwu" — fetched both and
+  compared), so the od-based EI_CLASS check is safe everywhere.
+- NDK sysroot headers (r27b, downloaded and unpacked locally): the
+  per-arch syscall tables. aarch64 (asm-generic/unistd.h): NO
+  __NR_stat/__NR_lstat/__NR_access/__NR_readlink — only newfstatat(79),
+  faccessat(48), readlinkat(78), statx(291), faccessat2(439). arm32 /
+  i686 / x86_64 have the legacy numbers. bionic's public dlfcn.h
+  declares dladdr1 NOWHERE (any API level).
+
+The build-level bugs (all found by running the real NDK build; each
+fixed with a regression guard where possible):
+
+1. customize.sh cased on NDK-style ABI names — the installers pass
+   arm64/arm/x86/x64. Every real install aborted ("does not support
+   arm64") since Round 1. The host harness fed the NDK-style names,
+   the exact "tests green, device dead" class from Round 29. Fixed
+   with a real-value mapping + the harness now feeds the REAL values
+   (+ arm/x64/x86 installs, riscv64 clean-refusal, 7 new checks).
+2. customize.sh runs under set -e; `X=$(getprop ...)` with getprop
+   missing (plain-recovery installs) propagates 127 through the
+   assignment (verified on dash/bash) and killed the install mid-way.
+   New zs_getprop(): getprop first, then the CRLF-safe build.prop
+   grep fallback (the same grep_get_prop pattern Magisk uses for the
+   same reason). Regression tests: no-getprop PATH completes the
+   install through the last step; the build.prop fallback installs
+   the dual-arch pair from a CRLF-ended file.
+3. native/CMakeLists.txt: project(... LANGUAGES C CXX) — no ASM, so
+   CMake silently dropped both trampoline .S files; libpayload.so
+   could never link (undefined zs_fork_wrapper/zs_setres*/zs_set*
+   wrappers). The host suite compiled the .S directly with g++ and
+   never saw it. Fixed: ASM added; also flat output dirs.
+4. The raw-syscall fallbacks used SYS_stat/SYS_lstat/SYS_access
+   (hide_advanced.cpp) and SYS_readlink (hide_stealth.cpp) — numbers
+   that do not exist on aarch64. #ifdef ladders now: legacy syscall
+   where it exists, the exact-equivalent new-style syscall
+   (newfstatat with AT_FDCWD / AT_SYMLINK_NOFOLLOW, faccessat with
+   AT_FDCWD, readlinkat with AT_FDCWD) where it does not. These
+   fallbacks only run if the libc dlsym failed (which does not happen
+   on real Android), but they now compile and are correct everywhere.
+5. The GOT-hook wrappers existed only in the aarch64/x86_64 assembly;
+   every 32-bit build failed to link. Plain C wrappers now compile on
+   no-blob arches (the documented Tier B contract: hide_process_phase
+   accepts a null frame pointer and runs the full spoofing pipeline
+   before the trampoline gate — verified by reading the function).
+6. dladdr1: bionic never declares it publicly; the direct-call
+   fallback could not compile (and an undefined reference would break
+   pre-28 loading). When the runtime-resolved real dladdr1 is
+   missing, the hook degrades to dladdr semantics (*extra = NULL).
+7. The daemon shipped 4 KB LOAD alignment: the Round 27 note in the
+   README said Rust "needs the same alignment" but nothing enforced
+   it (nothing had ever built the daemon for Android). 16 KB-kernel
+   devices (Android 16+, Pixel 9a onward) refuse to load it. The
+   build now passes -Wl,-z,max-page-size=16384 to all four targets
+   and the zip self-verification rejects any ELF below 0x4000.
+
+The pipeline (scripts/build_module.sh — one source of truth, called
+identically by the workflow and by developers): NDK discovery
+(ANDROID_NDK_HOME -> ANDROID_NDK_LATEST_HOME -> ANDROID_NDK_ROOT ->
+SDK scan), per-ABI CMake cross-build, per-target cargo cross-build
+(linker + target + sysroot + 16 KB flags via CARGO_TARGET_* env vars),
+module assembly (scripts, per-commit module.prop via rev-list count,
+libs/<abi>/, our clean-room META-INF), and a self-verifying zip:
+required files, module.prop's strict format, the #MAGISK marker, the
+install.sh legacy-installer trap, per-ABI ELF classes, and 16 KB LOAD
+alignment on all 16 packaged ELFs. .github/workflows/build.yml gates
+the zip on the full host suite and uploads it for every push on every
+branch; tags additionally publish a release. Everything was executed
+locally against a downloaded NDK r27b before the workflow was written
+(the same rule as every round: verify the real thing, not the idea of
+it), and the produced zip was flash-simulated on the host: extracted,
+installed through customize.sh with the REAL installer env (ARCH=
+arm64 with a dual-arch abilist, and ARCH=arm on a 32-bit-only device),
+verifying the randomized-name systemless layout for both bitnesses
+with the real ELF artifacts.
+
+Verification state: 243/243 C++ host tests, TSan zero (make race),
+run-sanitize green, 45/45 cargo tests, clippy 0 warnings, daemon E2E
+30/30, script E2E 101/101 (was 88: +14 R32 checks), the 4-ABI
+cross-build + zip self-verification green locally, perf medians
+unchanged (no hot path was touched this round; the runtime cost work
+is R31's gprofng-driven filter optimization, which stands).
+
+Honest residuals:
+
+- The 32-bit Tier B path (the new plain C wrappers) is exercised by
+  the host suite only through the 64-bit Tier B code paths; no 32-bit
+  execution environment exists on the host. The wrappers are two-line
+  delegations to functions the 64-bit suite covers, but an armv7
+  device test remains the honest gap.
+- The GitHub Actions workflow itself can only be proven by a run on
+  GitHub; every input to it (runner software, env vars, action
+  versions, script behavior) was verified from sources, and the exact
+  build command was executed locally, but the first real CI run will
+  happen on the next push.
+- The clean-room update-binary follows the documented protocol but
+  has only been executed against a stub util_functions on the host;
+  no custom recovery was available in this environment.

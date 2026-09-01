@@ -7,12 +7,46 @@
 
 # Magisk-provided variables:
 #   MODPATH       — module install directory
-#   ARCH          — device primary arch (arm64-v8a / armeabi-v7a / x86_64 / x86)
+#   ARCH          — device primary arch: arm64 | arm | x86 | x64 | riscv64
+#                   (ROUND 32: verified from Magisk's api_level_arch_detect
+#                   in scripts/util_functions.sh and the identical logic in
+#                   KernelSU's userspace/ksud/src/installer.sh and APatch's
+#                   apd/assets/installer.sh — NOT the NDK-style ABI names
+#                   this script previously cased on)
 #   IS64BIT       — "true" if 64-bit
 #   API           — Android API level
 #   ZYGISK_*      — Magisk Zygisk state vars (we don't depend on these)
 
 set -e
+
+# zs_getprop <prop>: an installer-safe property lookup.
+#
+# ROUND 32 (recovery-install bug): this script runs under `set -e`, and
+# a bare `X="$(getprop ...)"` line makes the whole installer EXIT when
+# the getprop binary is missing (the command substitution's failure
+# status propagates through the assignment — verified on dash/bash
+# locally). Plain-recovery installs (no Magisk app environment) are
+# exactly the case where getprop does not exist — that is why Magisk's
+# own util_functions.sh defines grep_get_prop with a build.prop
+# fallback. We do the same, self-contained: getprop first, then a
+# CRLF-safe grep over the standard build.prop locations. Every
+# substitution is `|| true`-guarded so no failure path can abort the
+# install.
+zs_getprop() {
+  local v="" bp
+  v="$(getprop "$1" 2>/dev/null || true)"
+  if [ -z "$v" ]; then
+    # ZS_PROP_FILES is a host-test seam only (scripts/verify_scripts.py
+    # points it at temp files); unset on a real device the list is the
+    # standard build.prop locations.
+    for bp in ${ZS_PROP_FILES:-/system/build.prop /vendor/build.prop /odm/etc/build.prop}; do
+      [ -f "$bp" ] || continue
+      v="$(grep -m1 "^$1=" "$bp" 2>/dev/null | cut -d= -f2- | tr -d '\r' || true)"
+      [ -n "$v" ] && break
+    done
+  fi
+  printf '%s\n' "$v"
+}
 
 # Round 27/28: minimum supported Android version gate. The property
 # area (trie format + contexts), the native-bridge interface and the
@@ -32,47 +66,49 @@ if [ -n "$API" ] && [ "$API" -lt 21 ] 2>/dev/null; then
   abort "! Zygisk Study requires Android 5.0 or newer."
 fi
 
-# Pick the right subdirectory for our prebuilt .so files. The user is
-# expected to build these themselves from the source in this repo (see
-# README.md) and place them under libs/<abi>/ before packaging the
-# module. We do NOT ship binaries here.
-
+# Pick the right subdirectory for our prebuilt .so files.
+#
+# ROUND 32 (device-fatal bug, found while building the CI flashable
+# zip): the installers do NOT pass NDK-style ABI names in $ARCH.
+# Magisk's api_level_arch_detect() (scripts/util_functions.sh,
+# verified at master AND the same logic in KernelSU's
+# userspace/ksud/src/installer.sh and APatch's apd/assets/installer.sh)
+# sets:
+#     $ARCH   = arm64 | arm | x86 | x64 | riscv64
+#     $ABI32  = armeabi-v7a | x86 (the NDK-style 32-bit ABI)
+#     $IS64BIT= true | false
+# This script had cased on arm64-v8a/armeabi-v7a/x86_64/x86 since the
+# first round — values no installer ever provides — so every real
+# install fell into the *) branch and aborted with "does not support
+# arm64". The host script tests never caught it because their fake
+# environment fed the NDK-style names (the same "host green, device
+# dead" class as the Round 29 install bugs).
 case "$ARCH" in
-  arm64-v8a)
-    NATIVE_DIR="$MODPATH/libs/arm64-v8a"
-    DAEMON_BIN="$MODPATH/libs/arm64-v8a/zygiskd"
-    LIBZYGISK="$MODPATH/libs/arm64-v8a/libzygisk.so"
-    LIBPAYLOAD="$MODPATH/libs/arm64-v8a/libpayload.so"
-    LIBLOADER="$MODPATH/libs/arm64-v8a/libzn_loader.so"
+  arm64)
+    ZS_ABI="arm64-v8a"
     ;;
-  armeabi-v7a)
-    NATIVE_DIR="$MODPATH/libs/armeabi-v7a"
-    DAEMON_BIN="$MODPATH/libs/armeabi-v7a/zygiskd"
-    LIBZYGISK="$MODPATH/libs/armeabi-v7a/libzygisk.so"
-    LIBPAYLOAD="$MODPATH/libs/armeabi-v7a/libpayload.so"
-    LIBLOADER="$MODPATH/libs/armeabi-v7a/libzn_loader.so"
+  arm)
+    ZS_ABI="armeabi-v7a"
     ;;
-  x86_64)
-    NATIVE_DIR="$MODPATH/libs/x86_64"
-    DAEMON_BIN="$MODPATH/libs/x86_64/zygiskd"
-    LIBZYGISK="$MODPATH/libs/x86_64/libzygisk.so"
-    LIBPAYLOAD="$MODPATH/libs/x86_64/libpayload.so"
-    LIBLOADER="$MODPATH/libs/x86_64/libzn_loader.so"
+  x64)
+    ZS_ABI="x86_64"
     ;;
   x86)
-    NATIVE_DIR="$MODPATH/libs/x86"
-    DAEMON_BIN="$MODPATH/libs/x86/zygiskd"
-    LIBZYGISK="$MODPATH/libs/x86/libzygisk.so"
-    LIBPAYLOAD="$MODPATH/libs/x86/libpayload.so"
-    LIBLOADER="$MODPATH/libs/x86/libzn_loader.so"
+    ZS_ABI="x86"
     ;;
   *)
-    ui_print "- Unsupported ABI: $ARCH"
+    ui_print "- Unsupported ARCH: $ARCH"
     abort "! Zygisk Study does not support $ARCH"
     ;;
 esac
 
-ui_print "- Target ABI: $ARCH"
+NATIVE_DIR="$MODPATH/libs/$ZS_ABI"
+DAEMON_BIN="$NATIVE_DIR/zygiskd"
+LIBZYGISK="$NATIVE_DIR/libzygisk.so"
+LIBPAYLOAD="$NATIVE_DIR/libpayload.so"
+LIBLOADER="$NATIVE_DIR/libzn_loader.so"
+
+ui_print "- Target ABI: $ZS_ABI (ARCH=$ARCH)"
 
 # Sanity check: the user must have built and packaged the .so files
 # themselves. We never ship binaries from upstream.
@@ -137,9 +173,12 @@ ui_print "- Systemless bridge layout at $SYS_LIB_DIR ($BRIDGE_NAME)"
 # whose search paths are per-bitness (/system/${LIB}). The two
 # zygotes each search their own directory, so the SAME soname must
 # exist in both. Install the 32-bit pair when the device's abilist
-# includes a 32-bit ABI AND the user built the 32-bit artifacts.
+# includes a 32-bit ABI AND the packaging included the 32-bit
+# artifacts. (ROUND 32: the lookup now goes through zs_getprop — safe
+# under `set -e` and functional in plain-recovery installs where
+# getprop does not exist.)
 if [ "$IS64BIT" = "true" ]; then
-  ABILIST="$(getprop ro.product.cpu.abilist 2>/dev/null)"
+  ABILIST="$(zs_getprop ro.product.cpu.abilist)"
   ZS32_SRC=""
   case "$ABILIST" in
     *armeabi-v7a*) ZS32_SRC="$MODPATH/libs/armeabi-v7a" ;;
@@ -196,7 +235,9 @@ for wd in "$ZS_ADB_ROOT/neozygisk" "$ZS_ADB_ROOT/rezygisk"; do
   [ -d "$wd" ] && [ -z "$CONFLICT" ] && CONFLICT="$wd (another zygisk implementation)"
 done
 if [ -z "$CONFLICT" ]; then
-  LIVE_BRIDGE="$(getprop ro.dalvik.vm.native.bridge 2>/dev/null)"
+  # ROUND 32: zs_getprop — safe under `set -e` when getprop is missing
+  # (plain-recovery installs) and falls back to build.prop grep.
+  LIVE_BRIDGE="$(zs_getprop ro.dalvik.vm.native.bridge)"
   if [ "$LIVE_BRIDGE" = "libzygisk.so" ]; then
     CONFLICT="the live native-bridge value libzygisk.so (Magisk Zygisk or a fixed-name loader)"
   fi
@@ -242,8 +283,8 @@ fi
 # because the fake daemon there is started by the test harness, not
 # by service.sh. Create the expected symlink (relative, so it stays
 # valid wherever Magisk mounts the module dir).
-ln -sfn "libs/$ARCH/zygiskd" "$MODPATH/zygiskd"
-ui_print "- Daemon launcher: $MODPATH/zygiskd -> libs/$ARCH/zygiskd"
+ln -sfn "libs/$ZS_ABI/zygiskd" "$MODPATH/zygiskd"
+ui_print "- Daemon launcher: $MODPATH/zygiskd -> libs/$ZS_ABI/zygiskd"
 
 # Pick the right libzygisk.so for the system property trick (see
 # service.sh). Magisk's standard pattern is to swap ro.dalvik.vm.native.bridge
@@ -252,7 +293,7 @@ ZYGISK_STUDY_LIB="$LIBZYGISK"
 
 # Write a small marker the daemon will read at runtime.
 cat > "$MODPATH/.zygisk_study_info" <<EOF
-arch=$ARCH
+arch=$ZS_ABI
 api=$API
 libzygisk=$LIBZYGISK
 libpayload=$LIBPAYLOAD

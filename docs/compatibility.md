@@ -590,3 +590,55 @@ So the module now carries its own compatibility chain:
 * Legacy ROM branches below Android 5.0 have no native-bridge
   mechanism at all (verified, R28) — the installer's API gate
   already refuses them.
+
+## Round 32 — the installer $ARCH contract, and the flashable zip
+
+Two install-chain corrections and one new delivery mechanism, all
+verified from the actual installer sources (Magisk's
+scripts/util_functions.sh at master, KernelSU's
+userspace/ksud/src/installer.sh, APatch's apd/assets/installer.sh —
+the three byte-identical api_level_arch_detect functions):
+
+- **$ARCH is `arm64 | arm | x86 | x64 | riscv64`** (with `$ABI32` and
+  `$IS64BIT` alongside). It is NOT the NDK-style ABI name. customize.sh
+  now maps the real values to the `libs/<abi>` directories; before
+  Round 32 it cased on `arm64-v8a`/`armeabi-v7a`/`x86_64`/`x86` and
+  aborted every real install with "does not support arm64" — since the
+  first round, invisible to the host harness because the harness fed
+  the NDK-style names. The harness now feeds the real values, and
+  riscv64 (which Magisk can report on newest devices) is refused
+  cleanly because no riscv64 build ships.
+- **Plain-recovery installs** have no `getprop` binary. customize.sh
+  runs under `set -e`, and a bare `X=$(getprop ...)` with a missing
+  binary exits 127 through the assignment — which killed the install
+  mid-way (after the libraries were copied, before the conflict
+  checks / launcher / marker). The `zs_getprop` helper now tries
+  getprop first and falls back to a CRLF-safe grep over
+  /system/build.prop, /vendor/build.prop and /odm/etc/build.prop —
+  the same `grep_get_prop` pattern Magisk's own util_functions.sh
+  uses for the same reason. The dual-arch abilist lookup and the
+  live-bridge conflict check both go through it.
+
+The **flashable zip** (Round 32): every commit on every branch builds
+`zygisk_study-v<shortsha>-<count>.zip` in GitHub Actions
+(.github/workflows/build.yml) — all four NDK ABIs at API 21, gated on
+the full host test suite, self-verified (layout, module.prop format,
+ELF classes, 16 KB LOAD alignment on every packaged ELF), uploaded as
+a workflow artifact, and released on tag pushes. It installs through:
+
+- the **Magisk / KernelSU / APatch app** ("Install from storage") —
+  no META-INF is needed on this path; the app runs its own extraction
+  and sources customize.sh;
+- **custom recoveries** (TWRP-class) — via
+  `META-INF/com/google/android/update-binary`, a clean-room
+  implementation of the documented recovery protocol (source
+  /data/adb/magisk/util_functions.sh, require v20.4+, call
+  install_module; updater-script is the conventional "#MAGISK"
+  marker). Magisk's own module_installer.sh is GPL-3.0 and is not
+  vendored into this Apache-2.0 tree.
+
+Locally the same zip is produced by
+`NDK=/path/to/ndk ./scripts/build_module.sh` — the workflow runs the
+identical script (all runner assumptions — preinstalled NDK via
+ANDROID_NDK_HOME, Rust, CMake, zip — are verified from the
+actions/runner-images documentation).

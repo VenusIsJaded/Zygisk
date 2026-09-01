@@ -520,16 +520,26 @@ extern "C" long zs_impl_fork(void* /*wrapper_fp*/) {
 //   [512]         count
 //   [520]         wrapper_fp
 //   [528]         retval      (returned to the wrapper's caller)
+//
+// ROUND 32 (found by cross-compiling for armeabi-v7a with the NDK):
+// the offsets above are a contract with the .S blobs, which exist ONLY
+// for aarch64/x86_64 (64-bit pointers). The layout asserts used to be
+// unconditional, which made every 32-bit ABI build fail to compile —
+// the 32-bit path uses the stub trampoline functions below and never
+// touches this struct. Gate the contract to the arches that ship a
+// blob; on 32-bit the struct is inert.
 struct ZsTrampData {
-    ZsTrampRecord records[kTrampMaxRecords];  // 512 bytes
+    ZsTrampRecord records[kTrampMaxRecords];  // 512 bytes (64-bit)
     size_t    count;        // offset 512
     uintptr_t wrapper_fp;   // offset 520
     long      retval;       // offset 528
 };
+#if defined(__aarch64__) || defined(__x86_64__)
 static_assert(sizeof(ZsTrampData) == 512 + 8 + 8 + 8, "trampoline data layout");
 static_assert(offsetof(ZsTrampData, count) == 512, "count offset");
 static_assert(offsetof(ZsTrampData, wrapper_fp) == 520, "fp offset");
 static_assert(offsetof(ZsTrampData, retval) == 528, "retval offset");
+#endif
 
 #if defined(__aarch64__) || defined(__x86_64__)
 int zs_trampoline_supported() { return 1; }
@@ -621,6 +631,33 @@ void* zs_trampoline_prepare(const ZsTrampRecord*, size_t, void*) {
     return nullptr;
 }
 int zs_trampoline_jump(void*, long) { return -1; }
+
+// ROUND 32 (found by cross-compiling for armeabi-v7a / x86 with the
+// NDK): the GOT hooks install these five wrapper addresses on EVERY
+// arch, but the wrappers themselves only existed in the aarch64/x86_64
+// assembly — every 32-bit build failed to link. On a no-blob arch the
+// wrapper has nothing special to do: no frame has to be captured for a
+// self-unmap that cannot happen, and hide_process_phase() already
+// accepts a null frame pointer (it is the documented Tier B input —
+// see the public pre-fork API passing nullptr). The plain C ABI is
+// call-compatible with the real libc functions on every 32-bit ABI
+// (args and return ride the same registers/stack slots; long and int
+// are the same size there).
+extern "C" long zs_fork_wrapper(void) {
+    return zs_impl_fork(nullptr);
+}
+extern "C" long zs_setresgid_wrapper(long a0, long a1, long a2) {
+    return zs_impl_setresgid(nullptr, a0, a1, a2);
+}
+extern "C" long zs_setresuid_wrapper(long a0, long a1, long a2) {
+    return zs_impl_setresuid(nullptr, a0, a1, a2);
+}
+extern "C" long zs_setgid_wrapper(long a0) {
+    return zs_impl_setgid(nullptr, a0);
+}
+extern "C" long zs_setuid_wrapper(long a0) {
+    return zs_impl_setuid(nullptr, a0);
+}
 #endif
 
 // ------------------------------------------------------------------------

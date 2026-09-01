@@ -1875,11 +1875,11 @@ mod tests {
     fn rejects_degenerate_or_short_stat_lines() {
         assert_eq!(parse_arg_extent(""), None);
         assert_eq!(parse_arg_extent("1 (zygiskd) S"), None);
-        // arg_end <= arg_start is refused even with full length.
+        // arg_end <= arg_start is refused even with full length
+        // (both fields deliberately equal — the degenerate case).
         let mut rest = Vec::new();
         for i in 0..47 {
-            let v = if i == 45 { 0x2000 } else if i == 46 { 0x2000 }
-                    else { 3 + i };
+            let v = if i >= 45 { 0x2000 } else { 3 + i };
             rest.push(v.to_string());
         }
         let stat_line = format!("1 (zygiskd) {}", rest.join(" "));

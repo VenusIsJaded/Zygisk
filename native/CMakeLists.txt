@@ -12,9 +12,26 @@
 cmake_minimum_required(VERSION 3.18)
 
 project(zygisk_study
-    LANGUAGES C CXX
+    LANGUAGES C CXX ASM
     VERSION 0.1.0
 )
+
+# ROUND 32 (found by actually cross-compiling with the NDK — the first
+# time this tree was ever built for Android): the payload's self-unmap
+# trampoline is assembly (unmap_trampoline_aarch64.S /
+# unmap_trampoline_x86_64.S), and CMake only compiles .S files when ASM
+# is an enabled language. Without it the trampoline sources were
+# silently DROPPED from the payload target — libpayload.so linked with
+# undefined zs_fork_wrapper / zs_setresuid_wrapper / zs_setgid_wrapper /
+# zs_setresgid_wrapper / zs_setuid_wrapper and could never build. The
+# host test suite never caught this because tests/Makefile compiles the
+# .cpp/.S sources directly with g++ instead of through CMake.
+
+# All library outputs land directly in the build directory (not in
+# per-target subdirectories) — scripts/build_module.sh and humans both
+# expect <build>/libzygisk.so, <build>/libpayload.so, ...
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 
 # Common compile flags. We target C++17 for the standard library and
 # insist on visibility=hidden so that only the symbols we explicitly
