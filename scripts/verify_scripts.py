@@ -38,6 +38,7 @@ import time
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 failures = []
+skips = []    # Round 34: optional-toolchain skips (cargo absent, etc.)
 
 FAKE_RESETPROP = """#!/bin/sh
 # Fake resetprop for script E2E. Read mode prints the CURRENT value
@@ -98,6 +99,15 @@ def check(name, ok, detail=""):
     print(f"  [{status}] {name}" + (f"  ({detail})" if detail and not ok else ""))
     if not ok:
         failures.append(f"{name}: {detail}")
+
+
+def skip(name, reason=""):
+    # Round 34: a SKIP is neither pass nor fail — used when an optional
+    # toolchain (cargo) is genuinely absent. Previously a missing cargo
+    # was reported as a FAIL ("cargo build failed"), which misreported
+    # a toolchain-absent host as a code regression. See find_real_daemon.
+    print(f"  [SKIP] {name}" + (f"  ({reason})" if reason else ""))
+    skips.append(f"{name}: {reason}")
 
 
 def write_exec(path, contents):
@@ -756,7 +766,7 @@ def build_prop_area_file(path, props, a10=True, total=8192):
             name = bytes(buf[128 + cur + 20:128 + cur + 20 + namelen]).decode()
             if (len(frag), frag) == (len(name), name):
                 return cur
-            field = 8 if frag < name else 12
+            field = 8 if (len(frag), frag) < (len(name), name) else 12  # ROUND 34: bionic cmp_prop_name is (len, bytes)
             child = struct.unpack_from("<I", buf, 128 + cur + field)[0]
             if child:
                 cur = child
@@ -812,7 +822,7 @@ def read_prop_from_area(path, name):
             nm2, prop2, left2, right2, children2 = node(scan)
             if nm2 == frag:
                 return scan, prop2
-            scan = left2 if frag < nm2 else right2
+            scan = left2 if (len(frag), frag) < (len(nm2), nm2) else right2  # ROUND 34: bionic cmp_prop_name is (len, bytes)
         return None, 0
 
     cur = 0
@@ -843,18 +853,32 @@ def read_prop_from_area(path, name):
 
 
 REAL_DAEMON = None
+# Round 34: distinguishes "toolchain absent" (SKIP) from "toolchain
+# present but the build actually failed" (FAIL — a real regression).
+REAL_DAEMON_ABSENT_TOOLCHAIN = None
 
 
 def find_real_daemon():
     """Build (once) the real zygiskd for the property-engine E2E."""
-    global REAL_DAEMON
+    global REAL_DAEMON, REAL_DAEMON_ABSENT_TOOLCHAIN
     if REAL_DAEMON is not None:
         return REAL_DAEMON
     import shutil as _sh
-    cargo = _sh.which("cargo") or os.path.expanduser("~/.cargo/bin/cargo")
+    # BUG (found R34): os.path.expanduser() returns a non-empty path
+    # even when the file does not exist, so `which() or expanduser()`
+    # could NEVER evaluate falsy — a host without Rust fell into the
+    # subprocess below, died with FileNotFoundError, and was reported
+    # as "cargo build failed" (a FAIL). Existence must be tested.
+    cargo = _sh.which("cargo")
+    if not cargo:
+        cand = os.path.expanduser("~/.cargo/bin/cargo")
+        if os.path.exists(cand):
+            cargo = cand
     if not cargo:
         REAL_DAEMON = ""
+        REAL_DAEMON_ABSENT_TOOLCHAIN = True
         return ""
+    REAL_DAEMON_ABSENT_TOOLCHAIN = False
     zygd = os.path.join(REPO_ROOT, "native", "zygiskd")
     try:
         subprocess.run([cargo, "build", "--release"], cwd=zygd,
@@ -902,7 +926,12 @@ def test_real_engine_swap_without_resetprop(mk):
     property area."""
     daemon = find_real_daemon()
     if not daemon:
-        check("real daemon built (cargo available)", False, "cargo build failed")
+        if REAL_DAEMON_ABSENT_TOOLCHAIN:
+            skip("real daemon built (cargo absent on host)",
+                 "no Rust toolchain: engine E2E skipped, not failed")
+        else:
+            check("real daemon built (cargo available)", False,
+                  "cargo build failed")
         return
     check("real daemon built (cargo available)", True)
     # Remove resetprop from PATH: only log/getprop fakes remain.
@@ -1318,7 +1347,11 @@ def main():
         for f in failures:
             print(f"  - {f}")
         sys.exit(1)
-    print("SCRIPT E2E: ALL CHECKS GREEN")
+    if skips:
+        print(f"SCRIPT E2E: ALL CHECKS GREEN ({len(skips)} skipped, "
+              "see [SKIP] lines above)")
+    else:
+        print("SCRIPT E2E: ALL CHECKS GREEN")
     sys.exit(0)
 
 

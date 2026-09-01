@@ -65,6 +65,9 @@
 //      offset 512: size_t count
 //      offset 520: uintptr_t wrapper_fp
 //      offset 528: long retval (returned to the wrapper's caller)
+//      offset 536: uintptr_t page_base (ROUND 34: the scrub's own
+//                  mprotect needs it; the blob unprotects its page,
+//                  zeroes this whole area, and re-seals R|X)
 
 #pragma once
 

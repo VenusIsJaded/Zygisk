@@ -95,19 +95,38 @@ test_race: test_race.cpp ../native/libpayload/src/hide_advanced.cpp \
 		../native/libpayload/src/hide.cpp -ldl -pthread
 
 .PHONY: race
+# ROUND 34 (C6 — the false-green TSan): the build line had
+# `2>/dev/null || true` and the target executed /tmp/test_race_tsan
+# unconditionally: a FAILED TSan compile left a MISSING (or STALE
+# from an earlier run — /tmp is shared) binary, and both cases piped
+# "not found"/old output through grep, matched nothing, and printed
+# "TSAN: no data races" with exit 0. Exactly the R34 lesson
+# (toolchain absence misreported as success) repeated one target
+# over. Now: build into ./ (never /tmp), remove the `|| true`,
+# verify the binary exists and is FRESH (newer than its sources), and
+# treat a missing/broken TSan toolchain as an explicit SKIP, not a
+# silent pass.
 race: test_race.cpp ../native/libpayload/src/hide_advanced.cpp \
 	../native/libpayload/src/hide.cpp race_fixture.c test_framework.h
+	$(MAKE) test_race
 	$(CC) -shared -fPIC -o race_fixture.so race_fixture.c
-	$(CXX) -std=c++17 -O1 -g -fsanitize=thread $(INCLUDES) -o \
-		/tmp/test_race_tsan $< ../native/libpayload/src/hide.cpp \
-		-ldl -pthread 2>/dev/null || true
-	@echo "== TSan race suite =="
-	@if /tmp/test_race_tsan 2>&1 | tee /tmp/zs_tsan_out.txt | \
-		grep -q "WARNING: ThreadSanitizer"; then \
-	    echo "TSAN: DATA RACES FOUND"; \
-	    grep -c "WARNING: ThreadSanitizer" /tmp/zs_tsan_out.txt; exit 1; \
+	rm -f ./test_race_tsan
+	@if $(CXX) -std=c++17 -O1 -g -fsanitize=thread $(INCLUDES) -o \
+		./test_race_tsan $< ../native/libpayload/src/hide.cpp \
+		-ldl -pthread 2>/tmp/zs_tsan_build.log; then \
+	    echo "== TSan race suite =="; \
+	    if ./test_race_tsan 2>&1 | tee /tmp/zs_tsan_out.txt | \
+	        grep -q "WARNING: ThreadSanitizer"; then \
+	        echo "TSAN: DATA RACES FOUND"; \
+	        grep -c "WARNING: ThreadSanitizer" /tmp/zs_tsan_out.txt; exit 1; \
+	    else \
+	        echo "TSAN: no data races"; \
+	    fi; \
+	elif grep -q "cannot find -ltsan\|-fsanitize=thread" /tmp/zs_tsan_build.log 2>/dev/null; then \
+	    echo "TSAN: toolchain absent — SKIP (install libtsan to enable; NOT reported as clean)"; \
 	else \
-	    echo "TSAN: no data races"; \
+	    echo "TSAN: BUILD FAILED (source regression, not a skip):"; \
+	    cat /tmp/zs_tsan_build.log; exit 1; \
 	fi
 	@./test_race
 
@@ -126,7 +145,13 @@ test_zn_loader: test_zn_loader.cpp ../native/libzn_loader/src/entry.cpp \
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -o $@ $< \
 	../native/libzn_loader/src/entry.cpp -ldl -pthread
 
-run: all verify-public-header verify-scripts
+# ROUND 34: verify-trampolines is now a HARD dependency of `run` —
+# the arm64 arg-register bug (base/size loaded into x23/x24 instead
+# of the syscall argument registers x0/x1) shipped precisely because
+# this verification existed but nothing in CI invoked it. Its
+# arg-register and scrub gates are the only automated check of the
+# arm64 blob's syscall ABI (the host executes only the x86_64 blob).
+run: all verify-public-header verify-scripts verify-trampolines
 	@fail=0; \
 	for t in $(TESTS); do \
 	echo "=== $$t ==="; \
@@ -217,7 +242,8 @@ verify-trampolines:
 	python3 ../scripts/verify_trampolines.py; \
 	rc=$$?; \
 	if [ $$rc -eq 77 ]; then \
-	echo "NOTE: keystone-engine missing — pip install keystone-engine to enable."; \
+	echo "NOTE: keystone-engine missing — pip install keystone-engine to enable (SKIP, not a failure — Round 34: CI installs it, so the gate is enforced there)."; \
+	rc=0; \
 	fi; \
 	exit $$rc; \
 	else \

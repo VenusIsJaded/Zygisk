@@ -359,15 +359,31 @@ static size_t find_prop_mappings(const char* buf, size_t total,
 // spoofing quietly did NOTHING — a detection, not a failure. This
 // chunked scan (8 KB chunk + carry) finds every mapping at any file
 // size with bounded stack use.
+// Forward declaration — defined with the Round-23 restore machinery
+// below; the ROUND 34 chunked scan calls it per region.
+static void capture_prop_line_restores(const char* buf, size_t total,
+                                        int reset = 1);
+
 static size_t find_prop_mappings_from_fd(int fd, PropMapping* out,
-                                         size_t cap) {
+                                         size_t cap,
+                                         int capture_lines = 0) {
     constexpr size_t kChunk = 8 * 1024;
     char buf[kChunk + 1024];
     size_t carry = 0;
     size_t n = 0;
     off_t off = 0;
+    int first_region = 1;   // ROUND 34: capture reset happens once
     for (;;) {
-        ssize_t r = pread(fd, buf + carry, kChunk, off);
+        // ROUND 34: bound the read to the REMAINING buffer, not the
+        // fixed chunk size. `carry` is the trailing partial line; the
+        // old `pread(fd, buf + carry, kChunk, off)` wrote up to
+        // kChunk bytes at buf+carry and overflowed the kChunk+1024
+        // stack buffer whenever carry exceeded 1024 (a no-newline
+        // stretch of 1025..9215 bytes, or any final partial line
+        // > 1 KB — a kernel-data stack smash on any maps line with a
+        // long path). The sibling streaming filter
+        // (make_filtered_memfd) already used this exact form.
+        ssize_t r = pread(fd, buf + carry, sizeof buf - carry, off);
         if (r <= 0) break;
         off += r;
         size_t have = carry + (size_t)r;
@@ -388,12 +404,28 @@ static size_t find_prop_mappings_from_fd(int fd, PropMapping* out,
         if (n < cap) {
             n += find_prop_mappings(buf, last_nl, out + n, cap - n);
         }
+        // ROUND 34: capture the stock text of the /dev/__properties__
+        // lines in THIS region (reset only on the first region —
+        // later regions append). Truncation is the NORMAL case on
+        // real devices (a zygote's maps run ~110 KB vs the 96 KB
+        // buffer, per the file's own Round-8 research) — the pre-R34
+        // code only captured on the single-read path, so every Tier B
+        // child on a large-maps process emitted BLANK anonymous lines
+        // where stock shows the two property file lines: a
+        // detector-visible deviation on typical hardware.
+        if (capture_lines) {
+            capture_prop_line_restores(buf, last_nl, first_region);
+            first_region = 0;
+        }
         memmove(buf, buf + last_nl, have - last_nl);
         carry = have - last_nl;
     }
     // Final unterminated line.
     if (carry > 0 && n < cap) {
         n += find_prop_mappings(buf, carry, out + n, cap - n);
+        if (capture_lines) {
+            capture_prop_line_restores(buf, carry, first_region);
+        }
     }
     return n;
 }
@@ -562,8 +594,13 @@ static const PropLineRestore* prop_line_restore_for(const char* rec,
 // devices there is exactly ONE such line, the single-file area; on
 // 7.x there are two: properties_serial + the default context).
 // Pure function over the maps buffer (host-testable directly).
-static void capture_prop_line_restores(const char* buf, size_t total) {
-    g_prop_line_restore_count = 0;
+// ROUND 34: `reset` (default 1) clears the table first — the
+// single-read callers own the whole pass. The chunked scanner passes
+// 0 for every region after the first so its captures APPEND (the
+// reset would otherwise wipe earlier chunks' lines).
+static void capture_prop_line_restores(const char* buf, size_t total,
+                                        int reset) {
+    if (reset) g_prop_line_restore_count = 0;
     static const char kPropPath[] = "/dev/__properties__";
     constexpr size_t kPropPathLen = sizeof(kPropPath) - 1;
     const char* p = buf;
@@ -813,8 +850,13 @@ static void clone_property_area_private() {
         // Round 8 (B5): maps larger than the static buffer. Rewind
         // and scan in chunks so property mappings past the cap are
         // still found (see find_prop_mappings_from_fd).
+        // ROUND 34: capture_lines=1 — the chunked scan now ALSO
+        // captures the stock property-line text (truncation is the
+        // normal case on real devices; the pre-R34 skip left blank
+        // anonymous lines in the Tier B maps fiction).
         if (lseek(fd, 0, SEEK_SET) != (off_t)-1) {
-            n_mappings = find_prop_mappings_from_fd(fd, mappings, 32);
+            n_mappings = find_prop_mappings_from_fd(fd, mappings, 32,
+                                                    /*capture_lines=*/1);
         } else {
             n_mappings = 0;
         }
@@ -828,6 +870,7 @@ static void clone_property_area_private() {
     // Round 23: capture the stock text of every property line BEFORE
     // the remap replaces the mappings — the filter restores these
     // lines for Tier B maps/smaps reads (see PropLineRestore above).
+    // (The truncated path already captured inside the chunked scan.)
     if (!truncated) {
         capture_prop_line_restores(maps_buf, (size_t)total);
     }
@@ -4274,10 +4317,22 @@ static int patch_got_all_for_phdr(struct dl_phdr_info* info,
                                   size_t /*size*/, void* /*data*/) {
     if (!info || !info->dlpi_name || info->dlpi_name[0] == '\0') return 0;
 
-    // Skip our own .so files — never patch ourselves (our internal
-    // calls must keep resolving to the real libc functions, or the
-    // hooks would recurse). ROUND 33: obfuscated needles.
-    if (strstr(info->dlpi_name, ZS_OBFS("libpayload.so"))   != nullptr ||
+    // Skip our own .so files — never patch ourselves: the hooks'
+    // own internal libc calls (fd_shadow_lookup_view's fstat, the
+    // open-hook's fd_shadow_register, ...) resolve through OUR PLT,
+    // so a patched own GOT makes them re-enter the hooks and recurse
+    // to a stack overflow.
+    //
+    // ROUND 34: identity by ADDRESS first — hide_is_self_load_addr
+    // matches the DSO's dlpi_addr against the self-record ranges the
+    // hide layer registered at init, which works under the Round 30
+    // randomized install names (lib<8hex>-p.so). The pre-R34
+    // name-needle skip NEVER matched those, so the walker patched
+    // libpayload's own GOT on every randomized install (all Tier B
+    // children). The legacy literals stay as the fallback for manual
+    // / host-test layouts where the record set was never filled.
+    if (hide_is_self_load_addr((uintptr_t)info->dlpi_addr) ||
+        strstr(info->dlpi_name, ZS_OBFS("libpayload.so"))   != nullptr ||
         strstr(info->dlpi_name, ZS_OBFS("libzygisk.so"))    != nullptr ||
         strstr(info->dlpi_name, ZS_OBFS("libzn_loader.so")) != nullptr) {
         return 0;
@@ -4971,23 +5026,47 @@ static FdRootPrefix g_fd_root_prefixes[] = {
     {nullptr, 0}, {nullptr, 0}, {nullptr, 0}, {nullptr, 0},
 };
 static char g_fd_static_prefix_store[4][32];
+// ROUND 34 (the TSan-visible race): the old guard was a PLAIN read of
+// g_fd_root_prefixes[3].p against a plain struct write — the
+// open-hook fires on ANY app thread, so two threads could run the
+// lazy decode concurrently: a formally-UB torn publication (p set,
+// n stale) AND a guaranteed TSan report. The `|| true` in the old
+// `make race` target had been masking it since the lazy decode
+// landed. Fixed the standard way: a constant-initialized mutex
+// (PTHREAD_MUTEX_INITIALIZER — no __cxa_guard, no magic static, no
+// demangler pull-in; the R33 trap) serializes the one-time init,
+// and an acquire/release flag publishes it. Fast path after init:
+// one acquire-load.
+static std::atomic<int> g_fd_prefixes_ready{0};
 static void ensure_fd_static_prefixes() {
-    if (g_fd_root_prefixes[3].p != nullptr) return;
-    auto&& a = ZS_OBFS_H("/data/adb/");
-    auto&& b = ZS_OBFS_H("/sbin/");
-    auto&& c = ZS_OBFS_H("/debug_ramdisk/");
-    auto&& d = ZS_OBFS_H("/data/system/zygisk_study/");
-    snprintf(g_fd_static_prefix_store[0], sizeof g_fd_static_prefix_store[0], "%s", a.c_str());
-    snprintf(g_fd_static_prefix_store[1], sizeof g_fd_static_prefix_store[1], "%s", b.c_str());
-    snprintf(g_fd_static_prefix_store[2], sizeof g_fd_static_prefix_store[2], "%s", c.c_str());
-    snprintf(g_fd_static_prefix_store[3], sizeof g_fd_static_prefix_store[3], "%s", d.c_str());
-    for (int i = 0; i < 4; ++i) {
-        if (g_fd_root_prefixes[i].p == nullptr) {
-            g_fd_root_prefixes[i] = FdRootPrefix{
-                g_fd_static_prefix_store[i],
-                strlen(g_fd_static_prefix_store[i])};
-        }
+    if (g_fd_prefixes_ready.load(std::memory_order_acquire) != 0) {
+        return;
     }
+    static pthread_mutex_t init_mu = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&init_mu);
+    if (g_fd_prefixes_ready.load(std::memory_order_acquire) == 0) {
+        char tmp[4][32];
+        auto&& a = ZS_OBFS_H("/data/adb/");
+        auto&& b = ZS_OBFS_H("/sbin/");
+        auto&& c = ZS_OBFS_H("/debug_ramdisk/");
+        auto&& d = ZS_OBFS_H("/data/system/zygisk_study/");
+        snprintf(tmp[0], sizeof tmp[0], "%s", a.c_str());
+        snprintf(tmp[1], sizeof tmp[1], "%s", b.c_str());
+        snprintf(tmp[2], sizeof tmp[2], "%s", c.c_str());
+        snprintf(tmp[3], sizeof tmp[3], "%s", d.c_str());
+        for (int i = 0; i < 4; ++i) {
+            if (g_fd_root_prefixes[i].p == nullptr) {
+                memcpy(g_fd_static_prefix_store[i], tmp[i],
+                       strlen(tmp[i]) + 1);
+                g_fd_root_prefixes[i] = FdRootPrefix{
+                    g_fd_static_prefix_store[i],
+                    strlen(g_fd_static_prefix_store[i])};
+            }
+        }
+        // Release: everything above is visible to acquire readers.
+        g_fd_prefixes_ready.store(1, std::memory_order_release);
+    }
+    pthread_mutex_unlock(&init_mu);
 }
 
 void hide_advanced_register_root_path_prefix(const char* prefix) {

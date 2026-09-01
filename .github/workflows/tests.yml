@@ -4,11 +4,12 @@
 # GitHub Actions CI for the Zygisk Study project.
 # Runs the host-side unit tests against every push and pull request.
 #
-# NOTE (Round 32): .github/workflows/build.yml additionally runs the
-# full gate suite (C++ + script E2E + daemon E2E + cargo) on EVERY
-# push to ANY branch before cross-building the flashable module zip
-# with the Android NDK. This file remains the lean main/PR test
-# signal; the zip pipeline lives in build.yml.
+# NOTE (Round 34): .github/workflows/build.yml runs the full gate
+# suite (C++ + script E2E + daemon E2E + cargo + trampoline binary
+# verification) on EVERY push and EVERY pull request before
+# cross-building the flashable module zip with the Android NDK. This
+# file is the lean main-branch badge signal; the zip pipeline and the
+# PR gates live in build.yml.
 #
 # What this workflow verifies:
 #
@@ -38,10 +39,17 @@
 
 name: tests
 
+# ROUND 34 (B3 + B12): build.yml now runs the FULL gate suite (C++,
+# script E2E, daemon E2E, cargo, trampoline verification) on every
+# push AND every pull_request, so this file no longer duplicates PR
+# coverage (it predated that trigger and covered PRs with C++ only —
+# the gap that let daemon/script PRs merge on a green C++ signal).
+# What remains here: the lean C++ badge signal for main pushes, with
+# the dead `if: false` Rust job removed (it ran `cargo test --no-run`
+# guarded off — pure dead weight) and the preinstalled-only deps (the
+# apt-get step bought nothing: g++/make ship on ubuntu-latest).
 on:
   push:
-    branches: [ main, master ]
-  pull_request:
     branches: [ main, master ]
 
 jobs:
@@ -50,29 +58,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install build deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y g++ make
+      - name: Install keystone-engine (trampoline binary verification)
+        run: python3 -m pip install --user keystone-engine
       - name: Build & run tests
         working-directory: tests
         run: make run
-
-  rust-tests:
-    name: Rust daemon unit tests
-    runs-on: ubuntu-latest
-    # We don't run the Rust tests in CI because the daemon depends on
-    # getprop which doesn't exist on the host. The pure-logic parser
-    # tests will pass on any Rust toolchain. Uncomment the steps below
-    # if you want to run them locally; CI's job is just to verify the
-    # C++ tests pass.
-    if: false
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-      - name: Run Rust tests
-        working-directory: native/zygiskd
-        run: cargo test --no-run

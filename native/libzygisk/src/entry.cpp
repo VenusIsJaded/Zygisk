@@ -306,36 +306,60 @@ static bool probe_bridge_candidate(char* path, size_t cap,
     return access(path, R_OK) == 0;
 }
 
+// ROUND 34: confirm a candidate BEFORE accepting it — dlopen the
+// file and require NativeBridgeItf with a sane table version. A
+// candidate that exists but is not a bridge is closed again and the
+// search continues (returns false).
+static bool confirm_bridge_candidate(const char* path) {
+    void* h = dlopen(path, RTLD_LAZY);
+    if (!h) return false;
+    const struct NativeBridgeCallbacks* t =
+        (const struct NativeBridgeCallbacks*)dlsym(
+            h, ZS_OBFS("NativeBridgeItf"));
+    if (t && t->version >= 1) {
+        // Round 25 semantics: keep the real bridge's TABLE so every
+        // bridge-ish slot can forward to it (translation devices keep
+        // working); the handle pins it against our child-side unload.
+        g_real_native_bridge = h;
+        g_real_table = t;
+        return true;   // confirmed bridge — keep it loaded
+    }
+    dlclose(h);
+    return false;
+}
+
 static void try_load_real_native_bridge() {
     // Round 33: candidate names obfuscated — plaintext "houdini" /
     // "ndk_translation" references inside a /system/lib64 resident
     // are an obvious tell for anyone comparing against the stock
     // library list.
+    //
+    // ROUND 34 (the probe-order bug): the old chain took the FIRST
+    // existing FILE and never tried the rest. Verified from AOSP
+    // (system/core/libnativebridge/native_bridge.cc, read at 5.0.0,
+    // 6.0.0 and 16.0.0): "NativeBridgeItf" is dlsym'd OUT of the
+    // BRIDGE library; libnativebridge.so is the CLIENT-side loader —
+    // it exists on essentially every device and never exports the
+    // symbol. Probing it (a) pinned a useless client lib in the
+    // zygote on EVERY device and (b) on houdini/x86 devices shadowed
+    // libhoudini.so — the first-candidate dlopen "succeeded", the
+    // dlsym came back null, and the REAL bridge was never loaded:
+    // every foreign-arch app lost its native libraries. It is
+    // removed from the list, and every remaining candidate is now
+    // CONFIRMED by dlsym before being accepted.
+    // (The ZS_OBFS temporaries live through each full call
+    // expression — argument position, never bound to a local.)
     char path[64];
-    if (probe_bridge_candidate(path, sizeof path,
-                               ZS_OBFS("libndk_translation.so")) ||
-        probe_bridge_candidate(path, sizeof path,
-                               ZS_OBFS("libnativebridge.so")) ||
-        probe_bridge_candidate(path, sizeof path,
-                               ZS_OBFS("libhoudini.so"))) {
-        g_real_native_bridge = dlopen(path, RTLD_LAZY);
-    } else {
-        path[0] = '\0';
+    if ((probe_bridge_candidate(path, sizeof path,
+                                ZS_OBFS("libndk_translation.so"))
+         && confirm_bridge_candidate(path))
+        ||
+        (probe_bridge_candidate(path, sizeof path,
+                                ZS_OBFS("libhoudini.so"))
+         && confirm_bridge_candidate(path))) {
+        return;   // a confirmed bridge is pinned
     }
-    if (!g_real_native_bridge) {
-        ZS_LOGD("libzygisk: no real native bridge present");
-        return;
-    }
-    // Round 25: keep the real bridge's TABLE so every bridge-ish slot
-    // can forward to it (translation devices keep working). The handle
-    // we keep ALSO pins the real bridge against our own child-side
-    // unload story (a same-arch child never needs it; a foreign-arch
-    // child kInitialize's the bridge instead of unloading it).
-    g_real_table = (const struct NativeBridgeCallbacks*)dlsym(
-        g_real_native_bridge, ZS_OBFS("NativeBridgeItf"));
-    if (g_real_table && g_real_table->version < 1) {
-        g_real_table = nullptr;   // refuse a garbage table
-    }
+    ZS_LOGD("libzygisk: no real native bridge present");
 }
 
 static void try_load_payload() {
@@ -383,6 +407,14 @@ static void try_load_payload() {
 //       VersionCheck/isCompatibleWith accepts any version >= 2 as long
 //       as our isCompatibleWith(their version) says true — and 16/17
 //       only expose their v5..v8 features when we claim those versions.
+//       ROUND 34 RE-VERIFIED AT 6.0.0_r1 specifically (the one release
+//       previously cited only by extrapolation): system/core/
+//       libnativebridge/native_bridge.cc:144-160 — "Libnativebridge
+//       is now designed to be forward-compatible. So only \"0\" is an
+//       unsupported version." ... version==1 accepted unconditionally;
+//       version>=2 calls callbacks->isCompatibleWith(2) and is
+//       rejected only if THAT returns false. Our table (version=8,
+//       isCompatibleWith(1..8) == true) passes.
 //
 // So the version field is 1 on SDK 21/22 and 8 (the newest layout we
 // implement) everywhere else. The write happens inside the constructor

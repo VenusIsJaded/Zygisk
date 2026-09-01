@@ -1090,3 +1090,56 @@ a determined reverse engineer with a disassembler — the decode loops
 are right there. Same threat model as Round 30's randomized names:
 mass, cheap, signature-based detection is defeated; targeted analysis
 is not.
+
+## Round 34 — the residual-page scrub, the logcat closure, and the mounts closure
+
+Three stealth gaps closed, each previously defeating a Round 30+
+layer built on top of it:
+
+1. **The trampoline page's forensic payload** (Tier A's residual).
+   After the self-unmap, the `[anon:jit-cache]` page stayed
+   readable carrying the full record table — the exact address
+   ranges where every module library used to be mapped — plus the
+   wrapper's stack frame pointer and the relayed retval. Any
+   detector reading its own maps-adjacent memory
+   (process_vm_readv, /proc/self/mem) found a fingerprint no
+   stock JIT page carries. The blob now unprotects its page with
+   an mprotect R|W|X syscall (EXEC must stay — the blob executes
+   from that page; plain RW faults the next instruction fetch),
+   zeroes the entire 544-byte data area, and re-seals R|X. The
+   host test reads the residual page through /proc/self/mem and
+   asserts all zeros; the binary verifier pins the scrub's
+   syscall number and PROT constants from the assembled encodings.
+
+2. **The logcat identity** (the script layer). Every boot script
+   wrote `log -t ZygiskStudy` with the RANDOMIZED bridge soname
+   and the workdir path in the message — the exact strings the
+   R30/R33 layers exist to hide, readable by anything holding
+   READ_LOGS or `adb logcat`. All diagnostics are now gated
+   behind a per-install `<module>/.debug` marker (silent by
+   default) and never print the soname even when enabled.
+
+3. **The /proc/mounts path** (the KSU/APatch self-mount layer).
+   The overlayfs upper/work pair lived under the module dir, so
+   world-readable /proc/mounts advertised the full module path on
+   every line — the same exposure the R7 workdir move was made to
+   avoid. The scratch directory is randomized per install
+   (`/data/system/.<8-hex>.o`, the daemon's Round-13 naming
+   class), recorded root-only for idempotence, and uninstalled
+   with the module (along with the recorded direct /system
+   copies — an orphaned `lib<rand>.so` in a real RW /system was
+   both a leak and litter).
+
+Also closed this round, stealth-adjacent: the zygote-side daemon
+sockets are bounded (a stalled daemon can no longer freeze every
+app launch — an availability signature), and the GOT walker's
+address-based self-skip stops the Tier B recursion crash that
+randomized names introduced (a crashing hidden app is the loudest
+detection there is).
+
+Residuals: the jit-cache page itself is still a residual (one
+anonymous r-x page per hidden child — documented since Round 7);
+string obfuscation still defeats scanning, not reverse
+engineering; and the overlay mount line still shows an overlayfs
+on /system/lib64 (inherent to the strategy, shared with KernelSU's
+own metamodule).

@@ -106,6 +106,104 @@ static int child_maps_contains_libpayload() {
     return memmem(buf, (size_t)total, "libpayload", 10) != nullptr;
 }
 
+// ROUND 34 (A9 regression gate): after the trampoline ran, find the
+// residual jit-cache page and verify the scrub zeroed it. The blob
+// mprotects its page R|W|X, zeroes 544 bytes (the record table +
+// count + wrapper_fp + retval + page_base) and re-seals R|X — a
+// populated forensic table would be a signature readable by the app
+// itself. Reads the page through /proc/self/mem (the page is mapped
+// r-x; mem access is not restricted for one's own process... it IS
+// restricted by ptrace_may_access for OTHER processes, ours is fine).
+static int child_jit_page_scrubbed() {
+    // Find the jit-cache mapping's address range from maps.
+    int fd = open("/proc/self/maps", O_RDONLY);
+    if (fd < 0) return -1;
+    char buf[256 * 1024];
+    ssize_t total = 0;
+    while ((size_t)total < sizeof buf) {
+        ssize_t n = read(fd, buf + total, sizeof buf - total);
+        if (n <= 0) break;
+        total += n;
+    }
+    close(fd);
+    if (total <= 0) return -1;
+    // Find the trampoline page: an UNNAMED anonymous r-x mapping (the
+    // "jit-cache" name only exists on Android kernels with PR_SET_VMA;
+    // the host leaves the page unnamed). [vdso]/[vvar]/[stack] carry
+    // bracket names and are excluded by the "unnamed" filter; so are
+    // file-backed mappings. Every candidate's tail must be scrubbed.
+    char* line = buf;
+    char* end = buf + total;
+    int checked = 0;
+    int all_zero = 1;
+    long ps = sysconf(_SC_PAGESIZE);
+    if (ps <= 0) ps = 4096;
+    while (line < end) {
+        char* nl = (char*)memchr(line, '\n', end - line);
+        char* stop = nl ? nl : end;
+        // NUL-terminate a copy of the line: sscanf's %s skips
+        // NEWLINES, so on a nameless maps line it would swallow the
+        // NEXT line's address as the "name" (got==4, non-empty) and
+        // the candidate filter would reject the trampoline page.
+        char lcopy[512];
+        size_t lc = (size_t)(stop - line);
+        if (lc >= sizeof lcopy) lc = sizeof lcopy - 1;
+        memcpy(lcopy, line, lc);
+        lcopy[lc] = '\0';
+        uintptr_t lo = 0, hi = 0;
+        char perms[8] = {0};
+        // addr perms offset dev inode name?
+        char name[128] = {0};
+        int got = sscanf(lcopy, "%lx-%lx %7s %*x %*s %*lu %127s",
+                         &lo, &hi, perms, name);
+        (void)stop;
+        if (got >= 3 && perms[0] == 'r' && perms[2] == 'x'
+            && (got < 4 || name[0] == '\0') && hi > lo) {
+            // Unnamed executable anon page. Check its page tail.
+            uintptr_t page_end = lo + (size_t)ps;
+            if (page_end > hi) page_end = hi;
+            if ((size_t)(page_end - lo) >= 544) {
+                uintptr_t data = page_end - 544;
+                int mem = open("/proc/self/mem", O_RDONLY);
+                if (mem >= 0) {
+                    unsigned char got544[544];
+                    if (pread(mem, got544, sizeof got544,
+                              (off_t)data) == (ssize_t)sizeof got544) {
+                        for (size_t i = 0; i < sizeof got544; ++i) {
+                            if (got544[i] != 0) { all_zero = 0; break; }
+                        }
+                        ++checked;
+                    }
+                    close(mem);
+                }
+            }
+        }
+        line = nl ? nl + 1 : end;
+    }
+    if (checked == 0) {
+        // DEBUG: dump maps + parse diagnostics.
+        FILE* df = fopen("/tmp/zs_maps_debug.txt", "w");
+        if (df) {
+            fwrite(buf, 1, total, df);
+            fprintf(df, "=== checked=0; scanning lines ===\n");
+            for (char* l2 = buf; l2 < end; ) {
+                char* nl2 = (char*)memchr(l2, '\n', end - l2);
+                size_t ll = (nl2 ? nl2 : end) - l2;
+                char copy[512];
+                size_t cl = ll < sizeof copy - 1 ? ll : sizeof copy - 1;
+                memcpy(copy, l2, cl); copy[cl] = '\0';
+                unsigned long lo2 = 0, hi2 = 0; char pr2[8] = {0};
+                int g2 = sscanf(copy, "%lx-%lx %7s", &lo2, &hi2, pr2);
+                fprintf(df, "parse got=%d [%s] perms=[%s]\n", g2, copy, pr2);
+                l2 = nl2 ? nl2 + 1 : end;
+            }
+            fclose(df);
+        }
+        return -1;      // no trampoline page found
+    }
+    return all_zero ? 1 : 0;
+}
+
 // ----------------------------------------------------------------------
 // Test 1: the full Tier A path in a forked child, through the REAL
 // asm wrapper. The child must survive, libpayload must be gone from
@@ -153,9 +251,11 @@ ZS_TEST(trampoline_full_tier_a_unmaps_payload_and_child_survives) {
 
         // We are still alive and executing: the trampoline worked.
         int still_mapped = child_maps_contains_libpayload();
-        char msg[96];
-        int n = snprintf(msg, sizeof msg, "r=%ld exp=%ld mapped=%d",
-                         r, expected, still_mapped);
+        // ROUND 34: the scrub must have zeroed the residual page.
+        int scrubbed = child_jit_page_scrubbed();
+        char msg[128];
+        int n = snprintf(msg, sizeof msg, "r=%ld exp=%ld mapped=%d scrub=%d",
+                         r, expected, still_mapped, scrubbed);
         write(pipefd[1], msg, (size_t)n);
         close(pipefd[1]);
         _exit(0);
@@ -175,9 +275,14 @@ ZS_TEST(trampoline_full_tier_a_unmaps_payload_and_child_survives) {
 
     long r = 0, exp = 0;
     int mapped = -1;
+    int scrub = -1;
     if (n > 0) {
-        sscanf(buf, "r=%ld exp=%ld mapped=%d", &r, &exp, &mapped);
+        sscanf(buf, "r=%ld exp=%ld mapped=%d scrub=%d",
+               &r, &exp, &mapped, &scrub);
     }
+    // ROUND 34 (A9): the residual [anon:jit-cache] page must carry NO
+    // forensic data (record table, wrapper fp, retval, page base).
+    ZS_CHECK_EQ(scrub, 1);
     // The wrapper must have reported the REAL call's result.
     ZS_CHECK_EQ(r, exp);
     // libpayload must be GONE from the child's maps.

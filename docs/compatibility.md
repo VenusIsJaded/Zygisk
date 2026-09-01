@@ -642,3 +642,35 @@ Locally the same zip is produced by
 identical script (all runner assumptions — preinstalled NDK via
 ANDROID_NDK_HOME, Rust, CMake, zip — are verified from the
 actions/runner-images documentation).
+
+## Round 34 — verified 6.0 negotiation, bounded sockets, and the guard back-off
+
+- **Android 6.0 re-verified from the actual source** (the one
+  release the bridge table's version comment previously covered
+  only by extrapolation): system/core/libnativebridge/
+  native_bridge.cc:144-160 at android-6.0.0_r1 — version==1 is
+  accepted unconditionally, version>=2 requires
+  `callbacks->isCompatibleWith(2)` to return true. Our version=8
+  table with `isCompatibleWith(1..8) == true` is accepted; the
+  5.x exact-match pin stays.
+- **Zygote-side daemon sockets are bounded** (100 ms connect
+  handshake via non-blocking connect + poll; 100/250 ms
+  SO_RCVTIMEO/SO_SNDTIMEO on the single-shot request sockets —
+  AF_UNIX honors both, kernel af_unix.c). A stalled daemon can no
+  longer freeze the zygote's fork hook (i.e. every app launch);
+  timeouts behave exactly like "daemon not up" and retry on the
+  next fork through the existing latch machinery. Long-lived
+  companion fds keep plain blocking semantics — the module owns
+  them after the handshake.
+- **The property guard's steady-state cost** dropped from a full
+  /proc census + zygote maps re-read 4x/second to one stat() every
+  2 s after the stock value is restored (death watch on the known
+  pid, with a periodic full census re-sync for pid reuse), and the
+  guard thread survives its own rollback as the zombie sweeper.
+- **The 5.x tool question closed with sources**: Magisk runs every
+  module script under busybox ash standalone mode (docs/guides.md —
+  full command suite regardless of Android version), so `setsid`
+  and `od` exist there; the 5.0.0_r1 toolbox applet list (fetched)
+  contains neither, which only matters for non-Magisk managers —
+  the scripts guard `command -v setsid` and degrade to a plain
+  background launch.

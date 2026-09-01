@@ -104,6 +104,27 @@ struct AreaMap {
     writable: bool,
 }
 
+// ROUND 34 — the mapping leak fix. AreaMap had NO Drop impl: every
+// successful `AreaMap::open` left its MAP_SHARED mapping live when the
+// value was dropped. Every PropEngine::set/get/delete walks area files
+// (dozens on a real device), opens the found area TWICE (see
+// find_area_ro), plus the writable re-open and serial_area — and
+// run_resetprop builds a fresh engine per guard transition, so the
+// long-lived root daemon leaked several MB of VMAs/RSS per boot
+// (mlockall made the touched pages un-evictable, compounding it).
+// The ONLY munmap in the file was the bad-magic error path. With
+// Drop, every scope exit unmaps exactly what it mapped.
+impl Drop for AreaMap {
+    fn drop(&mut self) {
+        if !self.addr.is_null() {
+            unsafe {
+                libc::munmap(self.addr as *mut libc::c_void, self.len)
+            };
+        }
+        self.addr = std::ptr::null_mut();
+    }
+}
+
 // The mapping is process-global shared memory; AreaMap is used from one
 // thread at a time (CLI one-shot, or the guard thread). Raw pointers are
 // not Send by default; the mapping is valid for the lifetime of the
@@ -615,11 +636,18 @@ impl PropEngine {
             if let Ok(a) = AreaMap::open(&f, false) {
                 if let Ok(Some(node)) = a.find_node(name, false) {
                     if a.prop_of(node).ok().flatten().is_some() {
-                        return Some(
-                            AreaMap::open(&f, false).ok().unwrap_or(a),
-                        );
+                        // ROUND 34: return the ALREADY-OPEN mapping.
+                        // The old code re-opened the same file a
+                        // second time — a duplicate MAP_SHARED of the
+                        // same 128 KB..1 MB area that (with no Drop)
+                        // stayed mapped forever; with Drop it was
+                        // merely one wasteful mmap/munmap cycle per
+                        // lookup. The single mapping is fully usable
+                        // for the read path that follows.
+                        return Some(a);
                     }
                 }
+                // Not here: `a` drops -> unmaps (Round 34 Drop).
             }
         }
         None

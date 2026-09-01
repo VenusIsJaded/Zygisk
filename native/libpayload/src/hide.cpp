@@ -636,6 +636,21 @@ static void maybe_refresh_denylist() {
     if (changed) load_denylist();
 }
 
+// ROUND 34 — the zygote-side refresh tick. Called from zs_impl_fork
+// PRE-fork (see entry.cpp): running maybe_refresh_denylist in the
+// long-lived zygote is what makes the throttle and the mtime
+// bookkeeping actually advance — the pre-R34 call sites all ran in
+// forked children, where copy-on-write gave every child a fresh
+// g_next_refresh_check == 0 (the 2 s throttle elided nothing: every
+// fork paid 2 stat() calls) and the zygote's stored mtimes never
+// moved (after ANY packages.list change, every subsequent fork
+// re-parsed both files in the child until the next zygote restart).
+// From the zygote: the first fork after the interval stats both
+// files ONCE and every later child inherits the fresh map and the
+// future-dated throttle for free. The child-side calls stay as a
+// belt-and-suspenders path (host tests, the R29 blocked-open retry).
+void hide_refresh_tick() { maybe_refresh_denylist(); }
+
 // ------------------------------------------------------------------------
 // Mount table unmounting
 // ------------------------------------------------------------------------
@@ -1320,6 +1335,16 @@ size_t hide_unmap_records(struct so_record* out, size_t cap) {
     size_t n = g_self_so_count < cap ? g_self_so_count : cap;
     for (size_t i = 0; i < n; ++i) out[i] = g_self_so_records[i];
     return n;
+}
+
+// ROUND 34: see hide.h. Address-based, name-agnostic — works under
+// the Round 30 randomized install names.
+int hide_is_self_load_addr(uintptr_t addr) {
+    for (size_t i = 0; i < g_self_so_count; ++i) {
+        const so_record& r = g_self_so_records[i];
+        if (addr >= r.base && addr < r.base + r.size) return 1;
+    }
+    return 0;
 }
 
 int hide_trampoline_unmap_pending() {

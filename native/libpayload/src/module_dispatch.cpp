@@ -21,6 +21,9 @@
 #include "obfstr.h"
 #include "resolve_libc.h"
 
+// ROUND 34: bounded daemon sockets (see the header for the design).
+#include "daemon_sock.h"
+
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -329,19 +332,16 @@ static std::vector<LoadedModule> fetch_module_list_from_daemon(
         int* was_connected = nullptr) {
     std::vector<LoadedModule> out;
     if (was_connected) *was_connected = 0;
-    int sock = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    // ROUND 34: this runs on the ZYGOTE'S MAIN THREAD inside the
+    // fork hook — a stalled daemon must not freeze every app launch.
+    // 100 ms is ~100x a local request/reply and bounds the damage;
+    // a timeout behaves exactly like "daemon not up" (retry next
+    // fork through the existing latch machinery).
+    int sock = zs_daemon_connect_bounded(daemon_socket(), 100, 100);
     if (sock < 0) return out;
-    struct sockaddr_un addr{};
-    addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, daemon_socket(), sizeof(addr.sun_path) - 1);
-
-    if (connect(sock, (struct sockaddr*)&addr, sizeof addr) != 0) {
-        close(sock);
-        return out;
-    }
     if (was_connected) *was_connected = 1;
     char req = 'L';
-    if (send(sock, &req, 1, 0) != 1) {
+    if (send(sock, &req, 1, MSG_NOSIGNAL) != 1) {
         close(sock);
         return out;
     }
@@ -384,14 +384,13 @@ public:
     }
 
     int  connectCompanion() override {
-        int sock = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        // ROUND 34: bound the HANDSHAKE only (io_ms = 0): the module
+        // owns this long-lived socket afterwards and its blocking
+        // semantics must not carry our timeout. The daemon's accept
+        // backlog stall previously blocked the caller indefinitely.
+        int sock = zs_daemon_connect_bounded(daemon_socket(), 100, 0);
         if (sock < 0) return -1;
-        struct sockaddr_un addr{};
-        addr.sun_family = AF_UNIX;
-        strncpy(addr.sun_path, daemon_socket(),
-                sizeof(addr.sun_path) - 1);
-        if (connect(sock, (struct sockaddr*)&addr, sizeof addr) != 0 ||
-            send(sock, "C", 1, 0) != 1) {
+        if (send(sock, "C", 1, MSG_NOSIGNAL) != 1) {
             close(sock);
             return -1;
         }
@@ -403,6 +402,13 @@ public:
     }
 
     void getProcessName(char* out, size_t cap) override {
+        // ROUND 34: guard the degenerate call — `cap - 1` underflows
+        // to SIZE_MAX when cap == 0 and `out[0] = '\0'` writes into a
+        // zero-capacity caller buffer (the module API is the trust
+        // boundary; a misbehaving module must not smash its own
+        // memory through us). Same guard hide_lookup_package_for_uid
+        // already had.
+        if (!out || cap == 0) return;
         int fd = open(ZS_OBFS("/proc/self/cmdline"), O_RDONLY | O_CLOEXEC);
         if (fd < 0) { out[0] = '\0'; return; }
         ssize_t n = read(fd, out, cap - 1);
@@ -799,22 +805,19 @@ int zs_module_force_unmount() {
     return g_force_unmount.load(std::memory_order_acquire);
 }
 
-// Round 14 — single-entry derived-args cache. The common app fork
-// pattern is the SAME package launching repeatedly; the cache
-// skips the hash lookup + snprintf for every fork after the first
-// of that uid. Keyed on the FULL uid (not the appId family: users
-// 0 and 10 of the same package share the map entry but need
-// different /data/user/<id>/ dirs) AND the packages.map
-// generation, so a reload (R13 staleness fix) invalidates it in the
-// same breath as the map itself. Per-child copy-on-write storage —
-// no locking (the specialize path is single-threaded).
-static struct {
-    uid_t     key;
-    uint32_t  gen;
-    char package_name[256];
-    char app_data_dir[512];
-    int  valid;
-} g_args_cache{};
+// ROUND 34: the Round-14 "single-entry derived-args cache" is GONE.
+// Its stored state was per-child copy-on-write (fill_app_args runs in
+// the forked child, post-fork), so `valid` reset to 0 in EVERY child
+// — the cache never hit once on a real device, while every fork paid
+// a ~780-byte cache write that dirtied COW pages nobody would ever
+// read (the "skips the hash lookup for every fork after the first of
+// that uid" claim was only true within one process, which on device
+// means never: each child calls this once). The honest per-fork cost
+// here is one hash lookup in the already-loaded packages map plus
+// one snprintf (~0.5 us); the map itself is kept fresh by the
+// ZYGOTE-side refresh added in Round 34 (hide_refresh_tick from
+// zs_impl_fork, pre-fork: the mtime/throttle state advances in the
+// long-lived zygote and every child inherits fresh data for free).
 
 // Fill the app args from in-child observables. Only reads /proc when
 // a module actually asked for names (PROCESS_UNPRIORITY); the package
@@ -826,33 +829,17 @@ static void fill_app_args(uid_t uid) {
     gid_t gid = g_child_gid_recorded ? g_child_gid_recorded : getgid();
     g_child.gid = (jint)gid;
 
-    uint32_t gen = hide_pkg_map_generation();
-    if (g_args_cache.valid && g_args_cache.key == uid &&
-        g_args_cache.gen == gen) {
-        memcpy(g_child.package_name, g_args_cache.package_name,
-               sizeof g_child.package_name);
-        memcpy(g_child.app_data_dir, g_args_cache.app_data_dir,
-               sizeof g_child.app_data_dir);
-    } else {
-        g_child.package_name[0] = '\0';
-        hide_lookup_package_for_uid(uid, g_child.package_name,
-                                    sizeof g_child.package_name);
-        // /data/user/<userId>/<pkg> is the canonical per-user data
-        // dir (equals /data/data/<pkg> for user 0 through the
-        // well-known symlink; we report the canonical form).
-        g_child.app_data_dir[0] = '\0';
-        if (g_child.package_name[0] != '\0') {
-            long user_id = (long)uid / 100000L;
-            snprintf(g_child.app_data_dir, sizeof g_child.app_data_dir,
-                     ZS_OBFS("/data/user/%ld/%s"), user_id, g_child.package_name);
-        }
-        g_args_cache.key = uid;
-        g_args_cache.gen = gen;
-        memcpy(g_args_cache.package_name, g_child.package_name,
-               sizeof g_args_cache.package_name);
-        memcpy(g_args_cache.app_data_dir, g_child.app_data_dir,
-               sizeof g_args_cache.app_data_dir);
-        g_args_cache.valid = 1;
+    g_child.package_name[0] = '\0';
+    hide_lookup_package_for_uid(uid, g_child.package_name,
+                                sizeof g_child.package_name);
+    // /data/user/<userId>/<pkg> is the canonical per-user data
+    // dir (equals /data/data/<pkg> for user 0 through the
+    // well-known symlink; we report the canonical form).
+    g_child.app_data_dir[0] = '\0';
+    if (g_child.package_name[0] != '\0') {
+        long user_id = (long)uid / 100000L;
+        snprintf(g_child.app_data_dir, sizeof g_child.app_data_dir,
+                 ZS_OBFS("/data/user/%ld/%s"), user_id, g_child.package_name);
     }
 
     g_child.nice_name[0] = '\0';

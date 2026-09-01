@@ -1621,6 +1621,152 @@ ZS_TEST(find_prop_mappings_from_fd_handles_oversized_maps) {
     close(fd);
 }
 
+// ROUND 34 (A6 gate): the chunked scan must ALSO capture the stock
+// text of the property lines — the pre-R34 code only captured on the
+// single-read path, so every truncated (the NORMAL case on a real
+// zygote, ~110 KB maps) Tier B child emitted BLANK lines where stock
+// shows /dev/__properties__. The capture flag drives the chunked
+// pass; all three property lines must land in the restore table.
+ZS_TEST(chunked_scan_captures_prop_line_restores) {
+    std::string content;
+    content.reserve(120 * 1024);
+    char line[200];
+    unsigned long addr = 0x700000000000UL;
+    int lineno = 0;
+    auto add_prop = [&]() {
+        snprintf(line, sizeof line,
+                 "%012lx-%012lx r--s 00000000 00:05 %d  "
+                 "/dev/__properties__/u:object_r:default_prop:s0\n",
+                 addr, addr + 0x1000, lineno);
+        content += line;
+        addr += 0x1000;
+        ++lineno;
+    };
+    auto add_plain = [&]() {
+        snprintf(line, sizeof line,
+                 "%012lx-%012lx r--p 00000000 fd:00 %d  "
+                 "/system/lib64/libc.so\n",
+                 addr, addr + 0x1000, lineno);
+        content += line;
+        addr += 0x1000;
+        ++lineno;
+    };
+    add_prop();
+    while (content.size() < 20 * 1024) add_plain();
+    add_prop();                        // crosses chunk boundaries
+    while (content.size() < 40 * 1024) add_plain();
+    add_prop();                        // the final line
+    // Note: a trailing partial line keeps the carry path honest —
+    // remove the last newline so the final prop line is unterminated.
+    if (!content.empty() && content.back() == '\n') content.pop_back();
+
+    int fd = write_text_to_memfd(content);
+    ZS_CHECK(fd >= 0);
+    PropMapping out[8];
+    size_t n = find_prop_mappings_from_fd(fd, out, 8, /*capture=*/1);
+    close(fd);
+    ZS_CHECK_EQ(n, (size_t)3);
+    // All three stock lines captured (first region resets, later
+    // regions APPEND — the Round-34 reset parameter).
+    ZS_CHECK_EQ(g_prop_line_restore_count, (size_t)3);
+    for (size_t i = 0; i < g_prop_line_restore_count; ++i) {
+        ZS_CHECK(strstr(g_prop_line_restore[i].line,
+                        "/dev/__properties__") != nullptr);
+    }
+    g_prop_line_restore_count = 0;   // do not leak into other tests
+}
+
+// ROUND 34 (A8 gate): maps lines longer than the 1024-byte carry
+// margin. The old `pread(fd, buf + carry, kChunk, off)` wrote 8 KB at
+// buf+carry whenever carry exceeded 1024 — a stack smash on any maps
+// line with a long path (run under ASan in run-sanitize, this test
+// aborts loudly on the pre-fix code). The bounded read makes the
+// scan terminate instead, still finding later property mappings.
+ZS_TEST(chunked_scan_survives_oversized_lines) {
+    std::string content;
+    char line[4096];
+    unsigned long addr = 0x700000000000UL;
+    // One gigantic unterminated-in-chunk line (~3000 bytes, no
+    // newline), then a property mapping AFTER it.
+    {
+        std::string path(3000, 'x');
+        snprintf(line, sizeof line,
+                 "%012lx-%012lx r--p 00000000 fd:00 7  ",
+                 addr, addr + 0x1000);
+        content += line;
+        content += path;
+        content += "\n";
+        addr += 0x1000;
+    }
+    {
+        snprintf(line, sizeof line,
+                 "%012lx-%012lx r--s 00000000 00:05 8  "
+                 "/dev/__properties__/u:object_r:default_prop:s0\n",
+                 addr, addr + 0x1000);
+        content += line;
+        addr += 0x1000;
+    }
+    int fd = write_text_to_memfd(content);
+    ZS_CHECK(fd >= 0);
+    PropMapping out[8];
+    size_t n = find_prop_mappings_from_fd(fd, out, 8);
+    close(fd);
+    ZS_CHECK_EQ(n, (size_t)1);   // the property line behind the giant
+}
+
+// ROUND 34 (A2 gate): the GOT walker must skip OUR OWN DSOs by
+// ADDRESS, not by name. The Round-30 randomized install names
+// (lib<8-hex>-p.so) defeated the old name-needle skip; the walker
+// then patched libpayload's own GOT and every Tier B child crashed
+// on the first hooked libc call from the payload itself (infinite
+// re-entry). Observable here through the walked-DSO mark set: a
+// skipped DSO is never marked.
+ZS_TEST(got_walker_skips_self_dso_by_address) {
+    // Save the real record set through the public API (the records
+    // themselves live in hide.cpp; other tests depend on them).
+    so_record saved[64];
+    size_t saved_n = hide_unmap_records(saved, 64);
+
+    // Register a synthetic self record: covers
+    // [0x7f0000000000, 0x7f0000020000).
+    so_record rec = {};
+    rec.base = 0x7f0000000000UL;
+    rec.size = 0x20000;
+    rec.flags = ZS_SO_SELF;
+    rec.prot = 0x5;
+    hide_test_set_records(&rec, 1);
+
+    // Containment semantics.
+    ZS_CHECK_EQ(hide_is_self_load_addr(0x7f0000000000UL), 1);   // base
+    ZS_CHECK_EQ(hide_is_self_load_addr(0x7f0000010000UL), 1);   // interior
+    ZS_CHECK_EQ(hide_is_self_load_addr(0x7f000001ffffUL), 1);   // last byte
+    ZS_CHECK_EQ(hide_is_self_load_addr(0x7f0000020000UL), 0);   // end
+    ZS_CHECK_EQ(hide_is_self_load_addr(0), 0);                  // exe
+
+    // The randomized-name payload DSO, load address inside the
+    // record: the walker must SKIP it (never marked as walked).
+    clear_walked_dsos();
+    dl_phdr_info info = {};
+    const char name1[] = "/system/lib64/lib3f9a2b7c-p.so";
+    info.dlpi_addr = (ElfW(Addr))0x7f0000010000UL;
+    info.dlpi_name = name1;
+    patch_got_all_for_phdr(&info, 0, nullptr);
+    ZS_CHECK_EQ(dso_already_walked(info.dlpi_addr), 0);
+
+    // A foreign DSO outside the records with a non-matching name:
+    // walked (marked) — the walker still does its job.
+    dl_phdr_info info2 = {};
+    const char name2[] = "/system/lib64/libwhatever.so";
+    info2.dlpi_addr = (ElfW(Addr))0x7f0001000000UL;
+    info2.dlpi_name = name2;
+    patch_got_all_for_phdr(&info2, 0, nullptr);
+    ZS_CHECK_EQ(dso_already_walked(info2.dlpi_addr), 1);
+    clear_walked_dsos();
+
+    // Restore the real record set.
+    hide_test_set_records(saved, saved_n);
+}
+
 // ======================================================================
 // Round 9 tests
 // ======================================================================

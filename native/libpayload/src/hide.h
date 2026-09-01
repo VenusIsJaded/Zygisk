@@ -185,6 +185,25 @@ size_t hide_unmap_record_count();
 // Copy up to cap records into out. Returns the number copied.
 size_t hide_unmap_records(struct so_record* out, size_t cap);
 
+// ROUND 34 — identity test used by the GOT walker (hide_advanced.cpp)
+// to skip our own DSOs BY ADDRESS: true when `addr` falls inside any
+// registered self record range. The Round 30 randomized install
+// names (lib<8hex>-p.so) defeated the old name-needle skip, and the
+// walker then patched libpayload's own GOT — the internal fstat()
+// calls of the fd-shadow layer re-entered the fstat hook and
+// recursed to a stack overflow in every Tier B child. The load bias
+// dl_iterate_phdr reports (dlpi_addr) is the base of a DSO's first
+// PT_LOAD; if that address lies inside one of OUR live mappings,
+// the DSO IS us — no other library can have its load base mapped
+// over our ranges.
+int    hide_is_self_load_addr(uintptr_t addr);
+
+// ROUND 34 — zygote-side (pre-fork) denylist/packages.list refresh
+// tick. Call from the fork hook while still in the long-lived zygote
+// so the throttle/mtime state advances there and children inherit
+// fresh data through fork's copy-on-write. See hide.cpp.
+void   hide_refresh_tick();
+
 // True if any ZS_SO_SELF records are registered (i.e. the trampoline
 // path should be used). On host test builds without a real
 // libpayload.so mapping this is 0 and the whole thing is a no-op.

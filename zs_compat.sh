@@ -47,6 +47,27 @@
 # overlayfs bind over /system/lib[64] -> fail closed with a clean
 # rollback so the boot never depends on a missing file).
 
+# --- gated logging (Round 34) ---------------------------------------------
+#
+# THE LEAK being closed: every boot script wrote `log -t ZygiskStudy`
+# lines into logcat — a greppable identity tag PLUS, in several
+# messages, the RANDOMIZED bridge soname and the workdir path: the
+# exact strings the stealth layers exist to hide, readable by
+# anything with READ_LOGS (and by adb logcat). The random loader
+# name's whole value was undone by one log line.
+#
+# zs_log: silent by default. Opt in per-install by touching
+# <module>/.debug or <workdir>/.debug. The tag stays "ZygiskStudy"
+# ONLY in the opt-in diagnostics (the user asked for them); messages
+# never contain the randomized soname — log the EVENT, not the
+# secret.
+zs_log() {
+  if [ "$ZS_DEBUG" = "1" ] && command -v log >/dev/null 2>&1; then
+    log -t ZygiskStudy "$@"
+  fi
+  return 0
+}
+
 # --- property write chain -------------------------------------------------
 
 # zs_prop_get NAME -> prints value (empty if absent)
@@ -122,14 +143,71 @@ zs_have_overlayfs() {
   grep -qw overlay /proc/filesystems 2>/dev/null
 }
 
+# zs_ovl_root -> prints the overlay scratch directory for this boot.
+#
+# ROUND 34 (B2 — the /proc/mounts leak): the upper/work pair used to
+# live under $MODDIR (.ovl_system_lib64/upper...) — the module's full
+# path appeared VERBATIM in /proc/mounts (world-readable), shouting
+# the module's identity from the one file this project's own docs
+# cite as the reason the workdir is not under /data/adb. The scratch
+# now lives in a RANDOMIZED directory — /data/system/.<8-hex>.o — the
+# same naming class as the daemon's Round-13 socket dir: the mounts
+# line carries no identifier. The path is recorded (root-only) in
+# $WORKDIR/.ovl_root for idempotence and for uninstall cleanup.
+zs_ovl_root() {
+  if [ -n "$ZS_OVL_ROOT" ]; then
+    printf '%s\n' "$ZS_OVL_ROOT"
+    return 0
+  fi
+  _root=""
+  if [ -f "$WORKDIR/.ovl_root" ]; then
+    _root="$(cat "$WORKDIR/.ovl_root" 2>/dev/null | tr -d ' \r\n')"
+  fi
+  case "$_root" in
+    */.*) ;;               # looks like ours: /data/system/.<hex>.o
+    *) _root="" ;;
+  esac
+  if [ -z "$_root" ] || [ ! -d "$_root" ]; then
+    # New randomized scratch (mirrors the daemon's pattern). POSIX-safe
+    # fallback (printf %x) when /dev/urandom or od is unavailable.
+    _hex=""
+    if [ -r /dev/urandom ]; then
+      _hex="$(head -c4 /dev/urandom 2>/dev/null | od -An -tx4 2>/dev/null | tr -d ' \n')"
+    fi
+    if [ -z "$_hex" ]; then
+      _sec="$(date +%s 2>/dev/null || echo 0)"
+      _hex="$(printf '%x%x' "$$" "$_sec")"
+    fi
+    _sys="${ZS_TEST_ROOT:-/data/system}"
+    _root="$_sys/.$_hex.o"
+    mkdir -p "$_root/upper" "$_root/work" 2>/dev/null || return 1
+    chmod 0700 "$_root" 2>/dev/null
+    printf '%s' "$_root" > "$WORKDIR/.ovl_root" 2>/dev/null
+  fi
+  ZS_OVL_ROOT="$_root"
+  printf '%s\n' "$_root"
+  return 0
+}
+
+# zs_uninstall_record TYPE TARGET — append a line to the uninstall
+# manifest (Round 34, B8): uninstall.sh undoes direct copies and
+# self-mounted overlays using it. Format: "copy <file>" /
+# "overlay <dir> <scratch>".
+zs_uninstall_record() {
+  printf '%s %s\n' "$1" "$2" >> "$WORKDIR/.uninstall_manifest" 2>/dev/null
+  return 0
+}
+
 # zs_self_mount_dir DIR -> 0 if OUR overlay over DIR is (now) active.
-# Mounts an overlayfs with lowerdir=DIR and an upper/work pair under
-# the module dir (the same approach KernelSU's official meta-overlayfs
-# metamodule uses, scoped to only the lib dir we need). Idempotent:
-# skips when /proc/mounts already shows our upperdir on DIR.
+# Mounts an overlayfs with lowerdir=DIR and an upper/work pair in the
+# RANDOMIZED scratch dir (see zs_ovl_root; the same approach KernelSU's
+# official meta-overlayfs metamodule uses, scoped to only the lib dir
+# we need). Idempotent: skips when /proc/mounts already shows OUR
+# upperdir on DIR.
 zs_self_mount_dir() {
   _dir="$1"
-  _tag="$MODDIR/.ovl$(echo "$_dir" | tr '/' '_')"
+  _root="$(zs_ovl_root)" || return 1
+  _tag="$_root$(echo "$_dir" | tr '/' '_')"
   # already mounted?
   if grep -q " $_dir overlay " /proc/mounts 2>/dev/null; then
     if grep -q "upperdir=$_tag/upper" /proc/mounts 2>/dev/null; then
@@ -150,10 +228,13 @@ zs_self_mount_dir() {
   mount -t overlay overlay \
     -o "lowerdir=$_dir,upperdir=$_tag/upper,workdir=$_tag/work" \
     "$_dir" 2>/dev/null || return 1
+  zs_uninstall_record overlay "$_dir $_tag"
   cp "$_src/$ZS_BRIDGE_NAME" "$_dir/$ZS_BRIDGE_NAME" 2>/dev/null || return 1
+  zs_uninstall_record copy "$_dir/$ZS_BRIDGE_NAME"
   # The payload lives beside the bridge under the same soname family.
   if [ -f "$_src/$ZS_PAYLOAD_NAME" ]; then
-    cp "$_src/$ZS_PAYLOAD_NAME" "$_dir/$ZS_PAYLOAD_NAME" 2>/dev/null
+    cp "$_src/$ZS_PAYLOAD_NAME" "$_dir/$ZS_PAYLOAD_NAME" 2>/dev/null \
+      && zs_uninstall_record copy "$_dir/$ZS_PAYLOAD_NAME"
   fi
   [ -f "$_dir/$ZS_BRIDGE_NAME" ]
 }
@@ -166,7 +247,7 @@ zs_self_mount_dir() {
 zs_ensure_loader_mounted() {
   zs_loader_visible && { rm -f "$WORKDIR/.mount_pending" 2>/dev/null; return 0; }
   if [ -f "$MODDIR/skip_mount" ]; then
-    log -t ZygiskStudy "skip_mount set; not self-mounting the loader"
+    zs_log "skip_mount set; not self-mounting the loader"
     return 1
   fi
   # Direct copy: works only when the /system mount is RW (some custom
@@ -174,9 +255,11 @@ zs_ensure_loader_mounted() {
   for d in $(zs_lib_dirs); do
     _src="$MODDIR/system${d#/system}"
     if [ -f "$_src/$ZS_BRIDGE_NAME" ] && [ ! -f "$d/$ZS_BRIDGE_NAME" ]; then
-      cp "$_src/$ZS_BRIDGE_NAME" "$d/$ZS_BRIDGE_NAME" 2>/dev/null
+      cp "$_src/$ZS_BRIDGE_NAME" "$d/$ZS_BRIDGE_NAME" 2>/dev/null \
+        && zs_uninstall_record copy "$d/$ZS_BRIDGE_NAME"
       [ -f "$_src/$ZS_PAYLOAD_NAME" ] && \
-        cp "$_src/$ZS_PAYLOAD_NAME" "$d/$ZS_PAYLOAD_NAME" 2>/dev/null
+        cp "$_src/$ZS_PAYLOAD_NAME" "$d/$ZS_PAYLOAD_NAME" 2>/dev/null \
+        && zs_uninstall_record copy "$d/$ZS_PAYLOAD_NAME"
     fi
   done
   zs_loader_visible && { rm -f "$WORKDIR/.mount_pending" 2>/dev/null; return 0; }
@@ -186,7 +269,7 @@ zs_ensure_loader_mounted() {
   done
   if zs_loader_visible; then
     rm -f "$WORKDIR/.mount_pending" 2>/dev/null
-    log -t ZygiskStudy "loader self-mounted via overlayfs ($ZS_BRIDGE_NAME)"
+    zs_log "loader self-mounted via overlayfs (name withheld)"
     return 0
   fi
   return 1
@@ -215,6 +298,12 @@ zs_rollback_bridge() {
 zs_compat_init() {
   ZS_BRIDGE_NAME="libzygisk.so"
   ZS_PAYLOAD_NAME="libpayload.so"
+  ZS_OVL_ROOT=""
+  # Round 34: opt-in diagnostics only (see zs_log above).
+  ZS_DEBUG="0"
+  if [ -f "$MODDIR/.debug" ] || [ -f "$WORKDIR/.debug" ]; then
+    ZS_DEBUG="1"
+  fi
   if [ -f "$MODDIR/.loader_names" ]; then
     _b="$(sed -n 's/^bridge=//p' "$MODDIR/.loader_names" 2>/dev/null | head -n1)"
     _p="$(sed -n 's/^payload=//p' "$MODDIR/.loader_names" 2>/dev/null | head -n1)"

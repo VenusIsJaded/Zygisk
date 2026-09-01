@@ -953,6 +953,126 @@ built locally with the runner's exact NDK (r27d, 27.3.13750724).
 The research trail: `docs/ANDROID-REALISM.md` (Round 33) and
 `docs/hiding.md` (Round 33).
 
+### Round 34 — the silent no-op on every arm64 device, and the gates that missed it
+
+A full per-file audit (every tracked source file, three parallel
+review passes, every fact re-verified online) flushed out the
+round's headline bug: **the aarch64 self-unmap trampoline loaded
+the munmap arguments into x23/x24 — registers the kernel never
+reads** (the syscall ABI is x8 = number, x0/x1 = args; verified
+from man2 syscall.2's arch table). Every `svc` executed
+`munmap(<stale x0>, <garbage x1>)` = EINVAL, all 32 attempts, no
+error path: **Tier A silently unmapped NOTHING on every arm64
+device** — the dominant Android architecture — while every host
+test stayed green (the host executes only the x86_64 blob, whose
+twin loads rdi/rsi correctly). The fix is two instructions; the
+reason it shipped is that `verify-trampolines.py` — the only
+automated check of the arm64 blob's ABI — **was invoked by nothing
+in CI**. It is now a hard dependency of `make run`, and it gained
+the gates that would have caught the bug: the argument registers
+are pattern-checked per architecture (x0/x1 on arm64, rdi/rsi on
+x86_64), the old x23/x24 shape fails the build, and the scrub
+sequence is verified from its mprotect syscall number (226/10,
+decoded from the assembled encoding) down to its PROT constants.
+
+The same audit closed, with sources, not guesses:
+
+- **The GOT walker patched our own DSO under randomized names**
+  (Round 30 renamed the payload `lib<8hex>-p.so`; the walker's
+  self-skip only knew the legacy `libpayload.so` needles) — the
+  hooks' internal `fstat`/`open` calls then re-entered themselves:
+  infinite recursion, every Tier B child. Identity is by ADDRESS
+  now (dlpi_addr vs the registered self-record ranges); the name
+  needles stay as a fallback. Regression-tested through the
+  walked-DSO mark set.
+- **The trampoline page kept a readable forensic payload** — the
+  record table of every just-unmapped range plus the wrapper's
+  frame pointer, readable by the app itself through the residual
+  `[anon:jit-cache]` page. The blob now mprotects its page R|W|X
+  (it is EXECUTING from it — plain RW faults the next fetch;
+  verified the hard way by the host test), zeroes the whole data
+  area, and re-seals R|X. Gate: the host test reads the residual
+  page through `/proc/self/mem` and asserts it is all zeros.
+- **The real-bridge probe shadowed houdini**: `libnativebridge.so`
+  is the CLIENT-side loader (present on every device, never
+  exports `NativeBridgeItf` — read from AOSP native_bridge.cc at
+  5.0/6.0/16.0), and probing it first pinned a useless dlopen in
+  the zygote on every device while blocking `libhoudini.so` on
+  exactly the translation devices that need it. Candidates are now
+  confirmed by dlsym before acceptance.
+- **libzn_loader dlopened the fixed soname** `libpayload.so` —
+  dead under the randomized install (no DT_SONAME, no such file).
+  It derives the payload path from its own mapped file now, the
+  same coupling libzygisk uses.
+- **Every zygote-side daemon socket was unbounded** — a stalled
+  daemon froze the zygote's fork hook, i.e. every app launch. All
+  sockets now connect with a poll-bounded non-blocking handshake
+  and carry SO_RCVTIMEO/SO_SNDTIMEO (AF_UNIX honors both — kernel
+  af_unix.c routes reads/writes through sock_rcvtimeo).
+- **The COW performance illusion**: the denylist refresh throttle
+  and the args cache lived in per-fork copy-on-write memory — the
+  2 s throttle elided nothing (every child paid 2 stat()s) and the
+  cache never hit once on device. The refresh now runs in the
+  ZYGOTE pre-fork (state advances in the long-lived process,
+  children inherit fresh maps); the cache is deleted.
+- **The daemon leaks and gaps**: `AreaMap` had no `Drop` (every
+  property-engine operation leaked its MAP_SHARED mapping —
+  several MB per boot under mlockall), the property guard
+  re-scanned all of `/proc` 4x/second forever (now backs off to a
+  2 s death-watch + periodic census after restore — a ~4000x
+  steady-state syscall reduction), the inotify "re-arm" was dead
+  code (an IN_IGNORED from a module-manager swap killed event
+  delivery forever; events are parsed now), a fork() failure
+  served the client AS ROOT in the daemon's own threads (now fail
+  closed), PDEATHSIG was installed after the blocking verb read
+  (a silent client could park a ROOT child past the daemon's
+  death; now first instruction after fork), and `find_zygote_pid`
+  aborted the whole census on one odd entry (spurious "zygote
+  died" -> up to 4 blips = permanent bootloop rollback).
+- **Script-layer stealth and safety**: every boot script logged
+  `log -t ZygiskStudy` with the RANDOMIZED bridge name into logcat
+  (silent unless `<module>/.debug` exists now); the overlayfs
+  self-mount put the module path in world-readable `/proc/mounts`
+  (the scratch dir is randomized per install now, and uninstall
+  undoes the overlays and direct `/system` copies it recorded);
+  `customize.sh` ran `set -e` inside Magisk's SOURCED installer
+  shell (removed — the epilogue's `rmdir -p $MODPATH` fails
+  legitimately on a non-empty dir and took the install down with
+  it); the post-fs-data swap proceeded even when the backup write
+  failed (fail-closed now), treated our own previous install's
+  applied name as a foreign "real bridge" after an update flash,
+  and the daemon fallback probed arm64 first on every ABI.
+- **CI**: PRs now run the FULL gate suite (build.yml gained the
+  `pull_request` trigger — before, a PR touching the daemon or a
+  boot script merged on a green C++-only check), in-flight runs of
+  the same branch cancel, the apt-get step and a duplicate
+  verify-scripts pass are gone, and `make race` no longer reports
+  "no data races" when the TSan build FAILS — which immediately
+  surfaced a real one: the fd-prefix lazy decode published its
+  table with a plain (non-atomic) read/write pair. Now a
+  mutex-guarded one-time init with release/acquire publication.
+
+Also verified and CLOSED as non-issues (with the source to prove
+it): Android 6.0's `VersionCheck` accepts our version=8 table
+(6.0.0_r1 native_bridge.cc:144-160 — version >= 2 asks
+`isCompatibleWith(2)`, ours answers true), and Android 5.x
+tool-availability is covered by Magisk's busybox standalone ash
+(docs/guides.md — "the full suite of commands no matter which
+Android version"; the `setsid`/`od` guards stay for KSU/APatch).
+
+Final state: **254/254 host tests** (8 obfstr / 41 hide / 115
+advanced / 20 stealth / 5 e2e / 6 perf / 4 trampoline / 23
+dispatch / 11 version-compat / 16 zn_loader / 5 race) + `make
+race` TSan clean + `make run-sanitize` green + 48/48 cargo tests +
+clippy clean + `make verify-daemon` live checks (now exercising
+the getprop-ABI path, the 1 Hz sweeper survival past rollback,
+and the slow-cadence death detection) + `make verify-scripts`
+live checks (fail-closed backup, own-old-name swap, ABI-derived
+fallback, abort hardening) + trampoline binary verification green
+with the new ABI gates. The research trail:
+`docs/ANDROID-REALISM.md` (Round 34) and `docs/hiding.md`
+(Round 34).
+
 ## License
 
 Apache-2.0. See `LICENSE`.

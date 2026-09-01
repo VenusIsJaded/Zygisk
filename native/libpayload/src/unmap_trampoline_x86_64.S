@@ -16,6 +16,7 @@
     .equ TRAMP_COUNT_OFF, 512
     .equ TRAMP_FP_OFF,    520
     .equ TRAMP_RETVAL_OFF, 528
+    .equ TRAMP_PAGE_OFF,   536
 
 // ---------------------------------------------------------------------------
 // The wrappers. Frame layout (rbp = fp):
@@ -156,10 +157,10 @@ zs_setuid_wrapper:
 //
 // Register notes: the x86-64 kernel clobbers rcx, r11 and rax across
 // syscall — the loop keeps its cursor in r8 and end in r9, the record
-// base/size are reloaded into rdi/rsi every iteration, the wrapper fp
-// sits in r12 and the staged retval in r10 (both preserved by the
-// kernel across syscall, and both restored from the frame at the end
-// anyway).
+// base/size are reloaded into rdi/rsi every iteration (the two
+// syscall argument registers), the wrapper fp sits in r12 and the
+// staged retval in r10 (both preserved by the kernel across syscall,
+// and both restored from the frame at the end anyway).
 // ---------------------------------------------------------------------------
 
     .align 16
@@ -174,13 +175,57 @@ zs_trampoline_code_start:
     lea  (%rdi,%r13), %r9              # end = records + count*16
 .Lzs_loop:
     cmp  %r9, %r8
-    jae  .Lzs_restore
-    mov  (%r8), %rdi                   # base
-    mov  8(%r8), %rsi                  # size
+    jae  .Lzs_scrub
+    mov  (%r8), %rdi                   # base  -> syscall arg 0
+    mov  8(%r8), %rsi                  # size  -> syscall arg 1
     mov  $11, %eax                     # __NR_munmap (x86-64)
     syscall
     add  $16, %r8
     jmp  .Lzs_loop
+.Lzs_scrub:
+    # ROUND 34 (stealth): zero the whole 544-byte data area — the
+    # record table (the exact ranges just unmapped), count, the
+    # wrapper frame pointer, the retval and the page base — before
+    # returning. The residual [anon:jit-cache] page stays readable
+    # by the app itself (process_vm_readv / /proc/self/mem); a
+    # populated forensic map of "where the module used to be" plus
+    # a stack pointer is a signature no stock jit page carries.
+    #
+    # zs_trampoline_jump() sealed this page R|X before entering, so
+    # the scrub first mprotects it R|W (__NR_mprotect = 10 on
+    # x86-64, verified from arch/x86/entry/syscalls/syscall_64.tbl),
+    # scrubs, then re-seals R|X. An mprotect failure skips the
+    # scrub (correctness over stealth). rbx/r14/r15 are safe as
+    # scratch: the restore phase reloads them from the wrapper frame.
+    sub  %r13, %r9                     # r9 = data area start (end - count*16)
+    lea  544(%r9), %r15                # r15 = data area end (sizeof ZsTrampData)
+    mov  TRAMP_PAGE_OFF(%r9), %rbx     # rbx = page base
+    mov  %r15, %r14
+    sub  %rbx, %r14                    # r14 = page size (data occupies the tail)
+    mov  %rbx, %rdi                    # mprotect(page, size, RWX)
+    mov  %r14, %rsi
+    # PROT_READ|PROT_WRITE|PROT_EXEC (7) — the EXEC bit must stay:
+    # we are EXECUTING from this page; dropping it (RW alone) faults
+    # the next instruction fetch (verified the hard way by the host
+    # trampoline test: child SIGSEGV inside the scrub).
+    mov  $7, %edx
+    mov  $10, %eax                     # __NR_mprotect (x86-64)
+    syscall
+    test %rax, %rax
+    jnz  .Lzs_restore                  # unprotect failed: skip scrub
+    xor  %eax, %eax
+.Lzs_scrub_loop:
+    cmp  %r15, %r9
+    jae  .Lzs_scrub_seal
+    mov  %rax, (%r9)
+    add  $8, %r9
+    jmp  .Lzs_scrub_loop
+.Lzs_scrub_seal:
+    mov  %rbx, %rdi                    # mprotect(page, size, RX)
+    mov  %r14, %rsi
+    mov  $5, %edx                      # PROT_READ|PROT_EXEC
+    mov  $10, %eax
+    syscall                            # best effort (like jump()'s seal)
 .Lzs_restore:
     # Slot map (from the wrapper prologue): [fp-8]=rbx, [fp-16]=r12,
     # [fp-24]=r13, [fp-32]=r14, [fp-40]=r15, [fp]=caller rbp,

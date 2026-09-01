@@ -2887,3 +2887,117 @@ Honest residuals:
   reverse engineer — the decode loops are visible in any
   disassembler. Documented as the threat model in hiding.md.
 - The 32-bit execution gap from R32 stands (host is 64-bit only).
+
+## Round 34 — the silent arm64 no-op, the dead gates, and the audit that found them
+
+Research base for this round (every fact fetched and READ; nothing
+guessed — the round's brief was "check every single file" and
+"verify everything on the Internet"):
+
+* man-pages syscall(2) arch table: arm64 = `svc #0`, number in w8,
+  args in x0/x1 — the ABI fact the aarch64 trampoline blob violated.
+* torvalds/linux syscall_64.tbl (`mprotect` = 10) and
+  include/uapi/asm-generic/unistd.h (`mprotect` = 226, `munmap` =
+  215) — the scrub's syscall numbers.
+* Kernel net/unix/af_unix.c: both the stream read and write paths
+  route through `sock_rcvtimeo` — SO_RCVTIMEO/SO_SNDTIMEO are
+  honored on AF_UNIX sockets (the zygote-side timeout fix).
+* AOSP system/core/libnativebridge/native_bridge.cc read at
+  6.0.0_r1 (the previously extrapolated release): VersionCheck
+  accepts version==1 unconditionally, and version>=2 calls
+  `callbacks->isCompatibleWith(2)` — our version=8 table with
+  `native_bridge_is_compatible(1..8) == true` passes. Also the
+  source proof that libnativebridge.so is the CLIENT side: it
+  dlsym's "NativeBridgeItf" OUT of the bridge library and never
+  exports it (the probe-order bug).
+* Magisk master: scripts/util_functions.sh:711 —
+  `[ -f $MODPATH/customize.sh ] && . $MODPATH/customize.sh` —
+  install_module SOURCES the customization script (the set -e leak:
+  the epilogue's `rmdir -p $MODPATH 2>/dev/null` fails on a
+  non-empty module dir and an inherited -e aborts the install).
+  docs/guides.md: every module script runs under BusyBox ash in
+  standalone mode — "the full suite of commands no matter which
+  Android version" (setsid/od exist on 5.x through busybox, not
+  toolbox — the 5.0.0_r1 toolbox applet list has neither).
+* Magisk native/src/core/resetprop (mod.rs + persist.rs): the
+  in-memory property write and the /data/property/
+  persistent_properties file persistence are SEPARATE paths — our
+  scripts never opt into file persistence, so a stale swapped
+  value cannot survive a reboot (the update-flash edge is
+  therefore a live-window-only problem, closed by recognizing our
+  own recorded applied name).
+* man7 signal-safety(7): prctl is async-signal-safe (the PDEATHSIG
+  immediately-after-fork ordering).
+
+THE FINDINGS (three independent per-file audit passes, then every
+claim re-verified against the code before fixing — 21 fixed):
+
+1. The aarch64 trampoline argument-register bug (device-fatal,
+   headline above) + the discovery that verify-trampolines.py was
+   wired into NOTHING (now a hard `make run` dependency with
+   arg-register, scrub-sequence and PROT-constant gates).
+2. The GOT self-skip by address (Tier B recursion crash under
+   randomized names), the trampoline forensic residue (scrub),
+   the code/data overlap guard (page-size-aware now).
+3. The real-bridge probe order, libzn_loader's dead fixed-soname
+   dlopen, and the unbounded zygote-side daemon sockets.
+4. The COW performance illusion (throttle + cache in per-fork
+   memory; refresh moved to the zygote pre-fork, cache deleted —
+   the honest per-fork cost is one map lookup + snprintf).
+5. The daemon batch: AreaMap Drop (the MAP_SHARED leak),
+   find_area_ro double-map, the guard's /proc flood (back-off),
+   the dead inotify re-arm, fork-failure fail-open, PDEATHSIG
+   ordering, the census `?` abort, mlockall MCL_FUTURE, the
+   stderr identity leak, RollbackAndStop killing the sweeper
+   thread, the SIGCHLD/ChildGrim work carried in from the
+   interrupted session (with its own regression tests), and the
+   E2E naming collision fixed.
+6. The script batch: gated diagnostics (log -t was leaking the
+   randomized soname into logcat), the /proc/mounts overlay path,
+   uninstall fallback functions + the recorded-manifest cleanup,
+   set -e in the sourced customize.sh, backup-before-swap,
+   own-old-name recognition, the ABI-derived daemon fallback, the
+   setsid guard.
+7. The CI/harness batch: pull_request trigger for the full gate
+   suite, concurrency cancel, dead-weight steps removed, the make
+   race false-green fixed — which immediately exposed a REAL race
+   (the fd-prefix lazy decode published with a plain read/write
+   pair; now a mutex-guarded one-time init with release/acquire
+   publication), the Python BST fixtures' lexicographic order
+   (bionic's cmp_prop_name is length-first), and the .loader_names
+   and/or precedence hole.
+8. The pread bounds fix in the chunked maps scanner (a stack smash
+   on any >1024-byte maps line — now regression-tested), the
+   prop-line capture extended to the truncated path (the NORMAL
+   case on real devices), and the getProcessName cap-0 guard.
+
+Verification: 254/254 C++ host tests (new: chunked-capture,
+oversized-line, GOT self-skip-by-address, scrub-zero, plus the
+Round 34 SIGCHLD/Snapshot/ChildGrim suite), make race TSan clean,
+ASan+UBSan+leaks green, 48/48 cargo tests + clippy clean, daemon
+E2E green (new checks: getprop ABI path, sweeper survival past
+rollback, slow-cadence death detection, 50-connection zombie
+bound), script E2E green (new checks: fail-closed backup,
+own-old-name swap, ABI-derived fallback, abort hardening,
+overlay-scratch naming), trampoline binary verification green with
+the new ABI gates, 4-ABI cross-build green against the runner's
+NDK.
+
+Honest residuals:
+
+- The arm64 fix is verified by the binary gates (assembled
+  encodings, arg-register patterns, syscall numbers decoded from
+  the encodings) and by the x86_64 twin's live host test — but no
+  arm64 CODE EXECUTION happens on this host (no qemu-user in the
+  sandbox). The residual is the same class as every prior arm64
+  round; the gates are now mechanical where before they were none.
+- The slow-cadence guard back-off assumes /proc/<pid> existence
+  is a sufficient death signal between periodic censuses; pid
+  reuse within the 30 s census window could delay a re-apply by
+  one census. Detected and corrected at the next census; the
+  property is either already restored (nothing exposed) or the
+  new zygote re-arms on its own restart.
+- The /proc/mounts randomized overlay scratch closes the module
+  PATH leak; the overlay itself remains visible as an overlayfs
+  mount on /system/lib64 (inherent to the self-mount strategy —
+  the same surface KernelSU's own metamodule presents).

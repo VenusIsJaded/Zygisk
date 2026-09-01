@@ -17,11 +17,23 @@
 #   API           — Android API level
 #   ZYGISK_*      — Magisk Zygisk state vars (we don't depend on these)
 
-set -e
-
+# ROUND 34 (B5 — the set -e leak, verified not guessed): Magisk's
+# install_module() SOURCES customize.sh into the installer shell
+# (topjohnwu/Magisk scripts/util_functions.sh:711 —
+# `[ -f $MODPATH/customize.sh ] && . $MODPATH/customize.sh`), then
+# keeps running ITS OWN epilogue under whatever shell STATE we leave
+# behind: the REPLACE/REMOVE loops, `rmdir -p $MODPATH 2>/dev/null`
+# (which legitimately FAILS on a non-empty module dir), the TMPDIR
+# cleanup. With `set -e` inherited, a failing epilogue command aborted
+# the install AFTER all the copying — a half-installed module and a
+# failed exit status. KernelSU/APatch source it the same way (their
+# installer shells run the identical epilogue pattern). The module's
+# own paths already carry explicit error handling (the Round-32 work
+# `|| true`-guarded every substitution); the blanket -e was pure
+# downside. Removed; every gate below is explicit.
 # zs_getprop <prop>: an installer-safe property lookup.
 #
-# ROUND 32 (recovery-install bug): this script runs under `set -e`, and
+# ROUND 32 (recovery-install bug): under the old `set -e`, and
 # a bare `X="$(getprop ...)"` line makes the whole installer EXIT when
 # the getprop binary is missing (the command substitution's failure
 # status propagates through the assignment — verified on dash/bash
@@ -63,7 +75,7 @@ zs_getprop() {
 # that would misbehave at boot.
 if [ -n "$API" ] && [ "$API" -lt 21 ] 2>/dev/null; then
   ui_print "- This Android version (API $API) is below the minimum (21 / Android 5.0)."
-  abort "! Zygisk Study requires Android 5.0 or newer."
+  abort "! Zygisk Study requires Android 5.0 or newer." || exit 1
 fi
 
 # Pick the right subdirectory for our prebuilt .so files.
@@ -98,7 +110,7 @@ case "$ARCH" in
     ;;
   *)
     ui_print "- Unsupported ARCH: $ARCH"
-    abort "! Zygisk Study does not support $ARCH"
+    abort "! Zygisk Study does not support $ARCH" || exit 1
     ;;
 esac
 
@@ -115,7 +127,7 @@ ui_print "- Target ABI: $ZS_ABI (ARCH=$ARCH)"
 for f in "$LIBZYGISK" "$LIBPAYLOAD" "$LIBLOADER" "$DAEMON_BIN"; do
   if [ ! -f "$f" ]; then
     ui_print "! Missing artifact: $f"
-    abort "! Build the binaries from source first (see README)."
+    abort "! Build the binaries from source first (see README)." || exit 1
   fi
 done
 
@@ -235,17 +247,33 @@ for wd in "$ZS_ADB_ROOT/neozygisk" "$ZS_ADB_ROOT/rezygisk"; do
   [ -d "$wd" ] && [ -z "$CONFLICT" ] && CONFLICT="$wd (another zygisk implementation)"
 done
 if [ -z "$CONFLICT" ]; then
-  # ROUND 32: zs_getprop — safe under `set -e` when getprop is missing
+  # ROUND 32: zs_getprop — safe when getprop is missing
   # (plain-recovery installs) and falls back to build.prop grep.
   LIVE_BRIDGE="$(zs_getprop ro.dalvik.vm.native.bridge)"
   if [ "$LIVE_BRIDGE" = "libzygisk.so" ]; then
     CONFLICT="the live native-bridge value libzygisk.so (Magisk Zygisk or a fixed-name loader)"
+  else
+    # ROUND 34 (B9): a live value that matches OUR previous install's
+    # recorded applied name is OURS (update flash in the live window
+    # before the guard restored stock) — NOT a conflict. post-fs-data
+    # re-checks and treats it as swappable.
+    _prev_applied=""
+    _prev_workdir="${ZS_TEST_ROOT:-/data/system}/zygisk_study"
+    if [ -f "$_prev_workdir/.native_bridge_applied" ]; then
+      _prev_applied="$(cat "$_prev_workdir/.native_bridge_applied" 2>/dev/null | tr -d ' \r\n')"
+    fi
+    if [ -n "$_prev_applied" ] && [ "$LIVE_BRIDGE" = "$_prev_applied" ] \
+       && [ "$LIVE_BRIDGE" != "$BRIDGE_NAME" ]; then
+      ui_print "- Live bridge value is our previous install's; it will be swapped"
+    elif [ -n "$_prev_applied" ] && [ "$LIVE_BRIDGE" = "$_prev_applied" ]; then
+      ui_print "- Live bridge value matches this build's name; re-using it"
+    fi
   fi
 fi
 if [ -n "$CONFLICT" ]; then
   ui_print "! CONFLICT: $CONFLICT"
   ui_print "! Two zygote-injection frameworks cannot run at once."
-  abort "! Resolve the conflict, then reinstall."
+  abort "! Resolve the conflict, then reinstall." || exit 1
 fi
 ui_print "- No conflicting zygisk implementation detected"
 

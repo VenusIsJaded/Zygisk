@@ -220,6 +220,74 @@ def check_a64():
     else:
         ok("aarch64: final sp = fp+16")
 
+    # 6. ROUND 34 — the syscall-ARGUMENT register contract. The arm64
+    #    Linux syscall ABI is x8 = number, x0/x1 = args (man2
+    #    syscall.2). The pre-R34 blob loaded the record base/size
+    #    into x23/x24 — registers the kernel never reads — so Tier A
+    #    silently unmapped NOTHING on every arm64 device while every
+    #    test stayed green (this script checked the syscall NUMBER
+    #    and the frame map, never the argument registers). These
+    #    pattern gates pin the exact shapes.
+    loop_loads_args = any(
+        re.match(r"ldr\s+x0\s*,\s*\[x21\]\s*,\s*#16", line)
+        for _, line in blob)
+    if not loop_loads_args:
+        fail("aarch64: unmap loop does not load the record base "
+             "into x0 (syscall arg 0) — the Round-34 bug class")
+    else:
+        ok("aarch64: record base loads into x0 (syscall arg 0)")
+    if not any(re.match(r"ldr\s+x1\s*,\s*\[x21,\s*#-8\]", line)
+               for _, line in blob):
+        fail("aarch64: unmap loop does not load the record size "
+             "into x1 (syscall arg 1) — the Round-34 bug class")
+    else:
+        ok("aarch64: record size loads into x1 (syscall arg 1)")
+    # The OLD bug shape must be gone: no x23/x24 record loads at all.
+    for raw, line in blob:
+        if re.match(r"ldr\s+x2[34]\s*,\s*\[x21", line):
+            fail("aarch64: record loads still target x23/x24 (not "
+                 "syscall argument registers)")
+    # 7. ROUND 34 — the data-area scrub (stealth): the residual jit
+    #    page must not carry the unmap record table / wrapper fp. The
+    #    blob unprotects its own page (mprotect, __NR 226 — decoded
+    #    below; R|W|X = 7 — EXEC must stay: we execute from the page),
+    #    zeroes 544 bytes (sizeof ZsTrampData incl. page_base), and
+    #    re-seals R|X = 5.
+    if not any(re.match(r"str\s+xzr,\s*\[x23\]\s*,\s*#8", line)
+               for _, line in blob):
+        fail("aarch64: data-area scrub store missing (forensic residue)")
+    elif not any(re.match(r"add\s+x27,\s*x23,\s*#544", line)
+                 for _, line in blob):
+        fail("aarch64: scrub bound is not sizeof(ZsTrampData)=544")
+    elif not any(re.match(r"ldr\s+x25,\s*\[x23,\s*#(TRAMP_PAGE_OFF|536)\]",
+                          line)
+                 for _, line in blob):
+        fail("aarch64: scrub does not load page_base from offset 536")
+    elif not any(" ".join(line.split()) == "mov x8, #226"
+                 for _, line in blob):
+        fail("aarch64: scrub mprotect syscall number missing")
+    else:
+        # Decode the mprotect immediate from the encoding (MOVZ).
+        for raw, line in blob:
+            if " ".join(line.split()) == "mov x8, #226":
+                enc = int.from_bytes(a64_assemble_one(line), "little")
+                imm = (enc >> 5) & 0xFFFF
+                if imm != 226:
+                    fail("aarch64: __NR_mprotect decodes to "
+                         f"{imm}, not 226")
+        ok("aarch64: scrub = mprotect(RWX) + zero 544B + re-seal, "
+           "page_base loaded, __NR_mprotect verified")
+    # PROT constants: exactly R|W (3) for the unprotect and R|X (5)
+    # for the re-seal.
+    prots = []
+    for raw, line in blob:
+        m = re.match(r"mov\s+x2,\s*#(\d+)", line)
+        if m:
+            prots.append(int(m.group(1)))
+    if 7 not in prots or 5 not in prots:
+        fail(f"aarch64: scrub mprotect prot constants wrong: {prots} "
+             "(unprotect must keep EXEC = RWX|7)")
+
 
 # ---------------------------------------------------------------------------
 # x86-64
@@ -269,6 +337,29 @@ def att_to_intel(att):
     m = re.match(r"add\s+\$(\d+),\s*%(\w+)$", att)
     if m:
         return f"add {m.group(2)}, {m.group(1)}"
+    # ROUND 34 — the scrub instructions' forms.
+    m = re.match(r"sub\s+%(\w+)\s*,\s*%(\w+)$", att)          # reg,reg
+    if m:
+        return f"sub {m.group(2)}, {m.group(1)}"
+    m = re.match(r"xor\s+%(\w+)\s*,\s*%(\w+)$", att)          # reg,reg
+    if m:
+        return f"xor {m.group(2)}, {m.group(1)}"
+    m = re.match(r"test\s+%(\w+)\s*,\s*%(\w+)$", att)      # ROUND 34
+    if m:
+        return f"test {m.group(2)}, {m.group(1)}"
+    m = re.match(r"jnz\s+(\S+)$", att)                     # ROUND 34
+    if m:
+        return f"jne {m.group(1)}"
+    m = re.match(r"mov\s+%(\w+)\s*,\s*(-?\d+)?\(%(\w+)\)$", att)  # store
+    if m:
+        off = m.group(2)
+        if off in (None, "0"):
+            mem = m.group(3)
+        elif off.startswith("-"):
+            mem = f"{m.group(3)}{off}"
+        else:
+            mem = f"{m.group(3)}+{off}"
+        return f"mov qword ptr [{mem}], {m.group(1)}"
     return None
 
 
@@ -372,6 +463,40 @@ def check_x64():
         fail("x86_64: final rsp does not point at the return address")
     else:
         ok("x86_64: final rsp points at the return address slot")
+
+    # 6. ROUND 34 — syscall-argument register contract (the x86_64
+    #    twin of the aarch64 arg-register gate; this blob was already
+    #    correct, the gate keeps it that way).
+    if not any(re.match(r"mov\s+\(%r8\),\s*%rdi$", line)
+               for _, line in blob):
+        fail("x86_64: record base does not load into %rdi (arg 0)")
+    else:
+        ok("x86_64: record base loads into %rdi (syscall arg 0)")
+    if not any(re.match(r"mov\s+8\(%r8\),\s*%rsi$", line)
+               for _, line in blob):
+        fail("x86_64: record size does not load into %rsi (arg 1)")
+    else:
+        ok("x86_64: record size loads into %rsi (syscall arg 1)")
+
+    # 7. ROUND 34 — data-area scrub (stealth): mprotect(10) RW,
+    #    zero 544 bytes, re-seal R|X; page_base from offset 536.
+    if not any(re.match(r"mov\s+%rax,\s*\(%r9\)$", line)
+               for _, line in blob):
+        fail("x86_64: data-area scrub store missing (forensic residue)")
+    elif not any(re.match(r"lea\s+544\(%r9\),\s*%r15$", line)
+                 for _, line in blob):
+        fail("x86_64: scrub bound is not sizeof(ZsTrampData)=544")
+    elif not any(re.match(r"mov\s+(TRAMP_PAGE_OFF|536)\(%r9\),\s*%rbx$",
+                          line)
+                 for _, line in blob):
+        fail("x86_64: scrub does not load page_base from offset 536")
+    elif "mov $10, %eax" not in blob_norm:
+        fail("x86_64: scrub mprotect syscall number (10) missing")
+    elif "mov $7, %edx" not in blob_norm or "mov $5, %edx" not in blob_norm:
+        fail("x86_64: scrub mprotect prot constants (7 RWX / 5 RX) missing")
+    else:
+        ok("x86_64: scrub = mprotect(RWX) + zero 544B + re-seal, "
+           "page_base loaded, __NR_mprotect/prot verified")
 
 
 def main():

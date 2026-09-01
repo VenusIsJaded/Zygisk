@@ -106,10 +106,39 @@ zs_compat_init
 
 if [ -n "$RESETPROP" ] || [ -x "$ZS_DAEMON" ]; then
   CURRENT="$(zs_prop_get ro.dalvik.vm.native.bridge)"
+  # ROUND 34 (B9 — the update-flash edge): a live value that equals
+  # OUR previous install's applied name is OURS (the daemon's guard
+  # had not restored stock yet, or the module was live-flashed
+  # without a reboot), not a "real bridge": treat it as swappable.
+  # resetprop changes are memory-only (verified from Magisk
+  # native/src/core/resetprop — file persistence is a separate,
+  # --persist-only path our scripts never use), so a REBOOT always
+  # reloads the stock value; this check covers the live window.
+  _ours_prev=""
+  if [ -f "$WORKDIR/.native_bridge_applied" ]; then
+    _ours_prev="$(cat "$WORKDIR/.native_bridge_applied" 2>/dev/null | tr -d ' \r\n')"
+  fi
+  _swap_ok=0
   # Round 29: "" and "0" are the two documented no-bridge values.
   if [ -z "$CURRENT" ] || [ "$CURRENT" = "0" ]; then
+    _swap_ok=1
+  elif [ -n "$_ours_prev" ] && [ "$CURRENT" = "$_ours_prev" ]; then
+    _swap_ok=1
+  fi
+  if [ "$_swap_ok" = "1" ]; then
+    # ROUND 34 (B6 — fail CLOSED): the swap previously proceeded even
+    # when the backup write failed silently (full disk, SELinux
+    # denial of the script context writing system_data_file on
+    # KernelSU/APatch) — leaving no rollback record, no uninstall
+    # restore, and (with .mount_pending also unwritable) no rollback
+    # trigger. Verify the backup BEFORE touching the property; if it
+    # cannot be written, this boot stays stock.
     if [ ! -f "$WORKDIR/.native_bridge_backup" ]; then
       printf '%s' "$CURRENT" > "$WORKDIR/.native_bridge_backup" 2>/dev/null
+      if [ ! -f "$WORKDIR/.native_bridge_backup" ]; then
+        zs_log "backup unwritable; skipping the swap this boot (fail-closed)"
+        return 0 2>/dev/null || exit 0
+      fi
     fi
     zs_prop_set ro.dalvik.vm.native.bridge "$BRIDGE_LIB"
     # Round 30: record the value we just installed so the daemon's
@@ -121,7 +150,7 @@ if [ -n "$RESETPROP" ] || [ -x "$ZS_DAEMON" ]; then
     if [ "$(zs_prop_get ro.dalvik.vm.native.bridge)" = "$BRIDGE_LIB" ]; then
       printf '%s' "$BRIDGE_LIB" > "$WORKDIR/.native_bridge_applied" 2>/dev/null
     fi
-    log -t ZygiskStudy "native.bridge set to $BRIDGE_LIB (was: ${CURRENT:-<absent>})"
+    zs_log "native.bridge swapped (was: ${CURRENT:-<absent>}; name withheld)"
     # ROUND 31 (KernelSU / APatch / metamodule-less environments):
     # on Magisk the root manager has ALREADY magic-mounted
     # $MODPATH/system over /system, so the loader is visible right
@@ -135,17 +164,17 @@ if [ -n "$RESETPROP" ] || [ -x "$ZS_DAEMON" ]; then
       rm -f "$WORKDIR/.mount_pending" 2>/dev/null
     else
       : > "$WORKDIR/.mount_pending" 2>/dev/null
-      log -t ZygiskStudy "loader not visible at /system yet; mount check deferred"
+      zs_log "loader not visible at /system yet; mount check deferred"
     fi
   else
     # A real bridge is in use — do not touch it. Magisk's own Zygisk
     # (if enabled) sets exactly "libzygisk.so" here.
     if [ "$CURRENT" = "libzygisk.so" ]; then
-      log -t ZygiskStudy "Magisk's own Zygisk is active (libzygisk.so); refusing to double-inject"
+      zs_log "Magisk's own Zygisk is active; refusing to double-inject"
     else
-      log -t ZygiskStudy "native.bridge already set ($CURRENT); leaving it alone"
+      zs_log "native.bridge already set to a foreign bridge; leaving it alone"
     fi
   fi
 else
-  log -t ZygiskStudy "no property writer available (resetprop / zygiskd); cannot set native.bridge"
+  zs_log "no property writer available (resetprop / zygiskd); cannot set native.bridge"
 fi

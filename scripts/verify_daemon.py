@@ -176,6 +176,10 @@ def count_zombies(pid):
 def main():
     print("== building the daemon (first live build) ==")
     binary, env = cargo_build()
+    # Round 34b: speed up the stand-down zombie sweep for the E2E
+    # (device default is 1 Hz — the zombie check's 0.6 s settle
+    # window needs the sub-second cadence the env var provides).
+    env["ZS_TEST_SWEEP_MS"] = "150"
 
     tmp = tempfile.mkdtemp(prefix="zygiskd_e2e_")
     tree = Tree(tmp)
@@ -249,6 +253,53 @@ def run_checks(binary, tree, env, proc):
           b"testmod" in reply and b"libzygisk-module.so" in reply,
           repr(reply))
 
+    # 3b. Round 34 — getprop ABI regression. Before the ChildGrim
+    # fix, SIGCHLD=SIG_IGN made Command::output() fail with ECHILD,
+    # read_prop() lost getprop's stdout, and pick_abi() was pinned
+    # to the arm64-v8a default: on a device whose ro.product.cpu.abi
+    # differs, modules under zygisk/<abi>/ were never listed. A fake
+    # getprop returning a custom ABI + a module under that ABI
+    # exercises the FULL exec path (fork + exec + pipe read + parse)
+    # — this check fails under the old SIG_IGN design.
+    # (Module name "abifake" deliberately shares no substring with
+    # the first tree's "testmod": the not-listed assertion compares
+    # raw bytes, and a name like "abitestmod" CONTAINS "testmod" —
+    # the exact substring-collision bug this check itself had.)
+    # Isolated tree + daemon: a second daemon on the FIRST tree
+    # would delete the first daemon's socket dir (random-socket
+    # cleanup reads the same session file) and break every later
+    # check.
+    tmp_abi = tempfile.mkdtemp(prefix="zygiskd_e2e_abi_")
+    tree_abi = Tree(tmp_abi)
+    fake_abi_mod = os.path.join(tree_abi.modules_root, "abifake",
+                                "zygisk", "x86_64")
+    os.makedirs(fake_abi_mod, exist_ok=True)
+    open(os.path.join(fake_abi_mod, "libzygisk-module.so"), "wb").close()
+    bindir = os.path.join(tree_abi.root, "bin")
+    os.makedirs(bindir, exist_ok=True)
+    getprop = os.path.join(bindir, "getprop")
+    with open(getprop, "w") as f:
+        f.write("#!/bin/sh\n[ \"$1\" = ro.product.cpu.abi ] && printf 'x86_64\\n' && exit 0\nexit 1\n")
+    os.chmod(getprop, 0o755)
+    env_abi = dict(env)
+    env_abi["ZS_TEST_ROOT"] = tree_abi.root
+    env_abi["PATH"] = bindir + ":" + env_abi.get("PATH", "")
+    proc_abi = start_daemon(binary, tree_abi, env_abi)
+    try:
+        sock_abi = read_session_path(tree_abi)
+        reply = ask(sock_abi, b"L")
+        check("'L' honors getprop's ABI (x86_64 module listed)",
+              b"abifake/zygisk/x86_64" in reply, repr(reply))
+        check("'L' default-ABI module NOT listed under fake ABI",
+              b"testmod" not in reply, repr(reply))
+    finally:
+        proc_abi.send_signal(signal.SIGTERM)
+        try:
+            proc_abi.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc_abi.kill()
+        shutil.rmtree(tmp_abi, ignore_errors=True)
+
     # 4. 'I' before / after the denylist flip.
     reply = ask(sock_path, b"Icom.example.app\n")
     check("'I' answers '1' for a non-denied process", reply == b"1",
@@ -309,12 +360,18 @@ def run_checks(binary, tree, env, proc):
     reply = ask(sock_path, b"P" + struct.pack("<I", len(bad)) + bytes(bad))
     check("'P' rejects a bad-magic image", reply == b"0\n", repr(reply))
 
-    # 7. zombies (SIGCHLD fix).
-    for _ in range(10):
+    # 7. zombies (Round 28 first guarded this; Round 34's ChildGrim
+    # keeps the property while SIGCHLD stays at its default so
+    # std::process children keep working — see the getprop check
+    # above). 50 connections, not 10: a leak that strands even 1 in
+    # 10 shows up as 5 zombies here, and the reverse (a reaper that
+    # waits/block) would blow the 2s settle window.
+    for _ in range(50):
         ask(sock_path, b"L")
-    time.sleep(0.4)
+    time.sleep(0.6)
     n = count_zombies(pid)
-    check("no zombie children after 10 connections", n == 0, f"{n} zombies")
+    check("no zombie children after 50 connections", n == 0,
+          f"{n} zombies")
 
     # 7b. Round 33: the daemon writes its OWN pid file after the bind
     # (the old service.sh `echo $!` recorded the setsid wrapper's pid,
@@ -422,6 +479,10 @@ def run_prop_guard_checks(binary, tree, env):
     e = dict(env)
     e["ZS_TEST_ROOT"] = tree.root
     e["ZS_TEST_POLL_MS"] = "100"
+    # ROUND 34: exercise the post-restore SLOW cadence (death
+    # detection + periodic census) at test speed — the device default
+    # is 2 s and would make the replacement cycle crawl.
+    e["ZS_TEST_SLOW_MS"] = "100"
     e["ZS_TEST_ZYGOTE_GRACE_MS"] = "600"
     e["PATH"] = bindir + ":" + e.get("PATH", "")
     e["ZS_PROP_LOG"] = proplog
@@ -524,6 +585,19 @@ def run_prop_guard_checks(binary, tree, env):
         reply = ask(read_session_path(tree), b"L")
         check("daemon still serves 'L' after the guard exercised",
               b"testmod" in reply, repr(reply))
+
+        # (f) ROUND 34 (C8): the guard thread must still be ALIVE as
+        # the zombie sweeper after RollbackAndStop — the old code
+        # `return`ed from the thread, regressing child reaping to the
+        # 30 s rescan tick exactly in the rolled-back state. 30
+        # connections + the sweep interval (150 ms here) must leave
+        # zero zombies.
+        for _ in range(30):
+            ask(read_session_path(tree), b"L")
+        time.sleep(0.8)
+        n_z = count_zombies(proc.pid)
+        check("sweeper thread survives rollback (no zombies)",
+              n_z == 0, f"{n_z} zombies after rollback")
     finally:
         for z in list(zygotes):
             try:
@@ -604,7 +678,7 @@ def run_prop_guard_engine_checks(binary, tree, env):
                 nm = bytes(buf[128 + cur + 20:128 + cur + 20 + nl]).decode()
                 if nm == frag:
                     return cur
-                f = 8 if frag < nm else 12
+                f = 8 if (len(frag), frag) < (len(nm), nm) else 12  # ROUND 34: bionic cmp_prop_name is (len, bytes)
                 ch = struct.unpack_from("<I", buf, 128 + cur + f)[0]
                 if ch:
                     cur = ch
@@ -660,7 +734,7 @@ def run_prop_guard_engine_checks(binary, tree, env):
                 if nm2 == frag:
                     found = (scan, p2)
                     break
-                scan = l2 if frag < nm2 else r2
+                scan = l2 if (len(frag), frag) < (len(nm2), nm2) else r2  # ROUND 34: bionic cmp_prop_name is (len, bytes)
             if not found:
                 return None
             cur, prop = found
@@ -693,6 +767,10 @@ def run_prop_guard_engine_checks(binary, tree, env):
     e = dict(env)
     e["ZS_TEST_ROOT"] = tree.root
     e["ZS_TEST_POLL_MS"] = "100"
+    # ROUND 34: exercise the post-restore SLOW cadence (death
+    # detection + periodic census) at test speed — the device default
+    # is 2 s and would make the replacement cycle crawl.
+    e["ZS_TEST_SLOW_MS"] = "100"
     e["ZS_TEST_ZYGOTE_GRACE_MS"] = "600"
     e["ZS_PROP_ROOT"] = proot
     # NO resetprop anywhere: pure engine path.

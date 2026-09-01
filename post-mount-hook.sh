@@ -37,10 +37,10 @@ MODDIR="$MODDIR_REAL"
 zs_compat_init
 
 if zs_ensure_loader_mounted; then
-  log -t ZygiskStudy "post-mount: loader resolved at /system ($ZS_BRIDGE_NAME)"
+  zs_log "post-mount: loader resolved at /system (name withheld)"
 else
   zs_rollback_bridge
   rm -f "$WORKDIR/.mount_pending" 2>/dev/null
-  log -t ZygiskStudy "post-mount: loader could not be made visible; bridge rolled back"
+  zs_log "post-mount: loader could not be made visible; bridge rolled back"
 fi
 exit 0

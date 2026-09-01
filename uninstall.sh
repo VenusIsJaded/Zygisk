@@ -29,6 +29,43 @@ zs_compat_init 2>/dev/null || {
   # Module dir already half-removed (defensive): fall back to the
   # binary chain alone.
   ZS_DAEMON="$MODDIR/zygiskd"
+  # ROUND 34 (B4 — the broken fallback): with zs_compat.sh missing,
+  # zs_compat_init / zs_prop_set / zs_prop_delete are UNDEFINED
+  # commands (exit 127), so the property restore below — this
+  # script's PRIMARY purpose — silently failed exactly in the
+  # degraded scenario the fallback was written for. Define inline
+  # fallbacks for the two writers used here.
+  zs_prop_set() {
+    if command -v resetprop >/dev/null 2>&1; then
+      resetprop "$1" "$2" 2>/dev/null && return 0
+    fi
+    for _c in /data/adb/magisk/resetprop /system/bin/resetprop; do
+      if [ -x "$_c" ]; then
+        "$_c" "$1" "$2" 2>/dev/null && return 0
+      fi
+    done
+    if [ -x "$ZS_DAEMON" ]; then
+      "$ZS_DAEMON" prop set "$1" "$2" 2>/dev/null && return 0
+    fi
+    return 1
+  }
+  zs_prop_delete() {
+    if command -v resetprop >/dev/null 2>&1; then
+      resetprop --delete "$1" 2>/dev/null && return 0
+    fi
+    for _c in /data/adb/magisk/resetprop /system/bin/resetprop; do
+      if [ -x "$_c" ]; then
+        "$_c" --delete "$1" 2>/dev/null && return 0
+      fi
+    done
+    if [ -x "$ZS_DAEMON" ]; then
+      "$ZS_DAEMON" prop delete "$1" 2>/dev/null && return 0
+    fi
+    return 1
+  }
+  # zs_log is referenced by nothing here yet, but define a silent
+  # stub so a future edit cannot break on a missing function.
+  zs_log() { return 0; }
 }
 
 # ROUND 31: remove the post-mount.d hook customize.sh installed (only
@@ -55,6 +92,47 @@ if [ -f "$WORKDIR/.native_bridge_backup" ]; then
     # empty identically (same ALOGW path in AndroidRuntime.cpp at
     # 5.0 and 16.0 — verified), so deleting is the correct restore.
     zs_prop_delete ro.dalvik.vm.native.bridge
+  fi
+fi
+
+# ROUND 34 (B8 — uninstall hygiene): undo what zs_ensure_loader_mounted
+# recorded in the manifest — our self-mounted overlays (unmount, then
+# drop the randomized scratch) and the DIRECT COPIES into a RW
+# /system (emulators, some custom ROMs): those files do NOT vanish
+# with the module dir, and a leftover lib<rand>.so in the real
+# /system is both an orphan and an identifying artifact. Order
+# matters: unmount the overlay FIRST (the copies under it are
+# shadowed by the lowerdir once it is gone anyway), then remove
+# direct copies recorded outside any overlay.
+if [ -f "$WORKDIR/.uninstall_manifest" ]; then
+  _ovl_root=""
+  if [ -f "$WORKDIR/.ovl_root" ]; then
+    _ovl_root="$(cat "$WORKDIR/.ovl_root" 2>/dev/null | tr -d ' \r\n')"
+  fi
+  while IFS= read -r _line; do
+    [ -n "$_line" ] || continue
+    case "$_line" in
+      "overlay "*)
+        _dir="${_line#overlay }"
+        _dir="${_dir%% *}"
+        umount "$_dir" 2>/dev/null
+        ;;
+      "copy "*)
+        _f="${_line#copy }"
+        # Only remove a recorded file that still matches OUR naming
+        # (defense in depth: never rm -f a path we do not recognize).
+        case "$_f" in
+          /system/lib*/lib*.so) rm -f "$_f" 2>/dev/null ;;
+        esac
+        ;;
+    esac
+  done < "$WORKDIR/.uninstall_manifest"
+  # Drop the randomized overlay scratch (verified to be OURS by the
+  # recorded root, then by the name class).
+  if [ -n "$_ovl_root" ]; then
+    case "$_ovl_root" in
+      "$ZS_SYS_ROOT"/.*.o) rm -rf "$_ovl_root" 2>/dev/null ;;
+    esac
   fi
 fi
 

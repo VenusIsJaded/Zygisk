@@ -522,12 +522,50 @@ struct DaemonState {
     denylist:  Mutex<HashSet<String>>,
 }
 
+/// Round 34 — the fork-safe snapshot handed to connection children.
+///
+/// The connection child is forked from a MULTITHREADED parent (the
+/// rescan and property-guard threads exist by then). Allocations in
+/// the child are safe — Scudo (Android 11+) and jemalloc (≤ 10) both
+/// register pthread_atfork handlers that lock the allocator across
+/// fork (verified: external/scudo standalone/wrappers_c.inc calls
+/// pthread_atfork(scudo_malloc_disable, scudo_malloc_enable,
+/// scudo_malloc_enable); external/jemalloc registers
+/// jemalloc_prefork/postfork under JEMALLOC_HAVE_PTHREAD_ATFORK).
+/// But std::sync::Mutex has NO such protection: if the rescan
+/// thread held `modules` at the fork instant, the child's
+/// `state.modules.lock()` would block FOREVER — the holder thread
+/// does not exist in the child (a stuck root child holding a socket,
+/// one more 'subsysd' row in the process table, and the payload's
+/// request timing out).
+///
+/// The fix is structural rather than pthread_atfork: the accept
+/// loop takes BOTH locks in the (single) forking thread BEFORE
+/// fork(), copies the data, releases the locks, and hands the child
+/// a plain, lock-free `Snapshot` through fork's CoW. The child never
+/// touches a shared mutex again. Snapshot cost: a Vec of ~10 module
+/// entries + a HashSet of ~100 names ≈ a few KB memcpy — noise next
+/// to fork()'s own page-table copy.
+#[derive(Clone, Debug)]
+struct Snapshot {
+    modules:  Vec<ModuleEntry>,
+    denylist: HashSet<String>,
+}
+
 impl DaemonState {
     fn new() -> Self {
         DaemonState {
             modules:  Mutex::new(Vec::new()),
             denylist: Mutex::new(HashSet::new()),
         }
+    }
+
+    /// Lock both lists (in the forking thread!), copy, release.
+    /// Lock order is modules -> denylist — the same order everywhere.
+    fn snapshot(&self) -> Snapshot {
+        let modules = self.modules.lock().unwrap().clone();
+        let denylist = self.denylist.lock().unwrap().clone();
+        Snapshot { modules, denylist }
     }
 
     fn reload_modules(&self) {
@@ -561,6 +599,11 @@ impl DaemonState {
         *self.denylist.lock().unwrap() = out;
     }
 
+    /// Round 34: production denylist lookups now go through the
+    /// fork-safe Snapshot (the child reads `snap.denylist.contains`).
+    /// This method stays as the shared-locked form for unit tests,
+    /// which run in a single process where the lock is safe.
+    #[cfg(test)]
     fn is_on_denylist(&self, name: &str) -> bool {
         // Mutex (not RwLock): see the comment on the struct definition.
         let dl = self.denylist.lock().unwrap();
@@ -687,23 +730,24 @@ fn read_prop(key: &str) -> std::io::Result<String> {
 // itself) for any future caller that has not peeked the verb yet.
 // ----------------------------------------------------------------------
 #[allow(dead_code)]
-fn handle_client(mut stream: UnixStream, state: Arc<DaemonState>) {
+fn handle_client(mut stream: UnixStream, snap: Snapshot) {
     let mut first = [0u8; 1];
     if stream.read_exact(&mut first).is_err() { return; }
-    handle_client_with_first(stream, first[0], state);
+    handle_client_with_first(stream, first[0], snap);
 }
 
 fn handle_client_with_first(mut stream: UnixStream, first: u8,
-                            state: Arc<DaemonState>) {
+                            snap: Snapshot) {
     let verb = match ClientVerb::parse_after(first, &mut stream) {
         Ok(v) => v,
         Err(_) => return,
     };
     match verb {
         ClientVerb::ListModules => {
-            // Mutex (not RwLock): see the struct definition comment.
-            let mods = state.modules.lock().unwrap().clone();
-            let buf = format_module_list(&mods);
+            // Round 34: the child serves from its fork-inherited
+            // Snapshot — no shared locks are touched after fork
+            // (see the Snapshot doc comment for why that matters).
+            let buf = format_module_list(&snap.modules);
             let _ = stream.write_all(buf.as_bytes());
         }
         ClientVerb::ShouldInject(name) => {
@@ -712,7 +756,7 @@ fn handle_client_with_first(mut stream: UnixStream, first: u8,
             // whether it wants this target (via the
             // zygisk_study_api.should_inject callback). This stub is
             // documented in docs/architecture.md.
-            let yes = !state.is_on_denylist(&name);
+            let yes = !snap.denylist.contains(&name);
             let _ = stream.write_all(if yes { b"1" } else { b"0" });
         }
         ClientVerb::Companion => {
@@ -858,6 +902,81 @@ fn set_dumpable_zero() {
 }
 
 // ----------------------------------------------------------------------
+// Round 34 — precise child reaping (ChildGrim).
+//
+// BUG (empirically verified this round with a standalone Rust
+// probe): Round 28 set SIGCHLD to SIG_IGN so the kernel would
+// auto-reap connection children. On Linux that ALSO makes waitpid()
+// return ECHILD for EVERY child — including the ones Rust std
+// spawns internally for Command::output()/status(). Verified
+// consequences, both silent since R28:
+//
+//   * read_prop() ("getprop ro.product.cpu.abi") lost its stdout
+//     entirely (output() returns Err and drops the capture), so
+//     pick_abi() was pinned to the "arm64-v8a" default on every
+//     device — on 32-bit-only hardware, modules under
+//     zygisk/armeabi-v7a were never listed (the module looks dead;
+//     invisible to the E2E because it never exercised getprop).
+//
+//   * run_resetprop()'s external-binary fallback returned FAILURE
+//     even when the helper ran and did its job — the E2E still
+//     passed because it asserts the helper's SIDE EFFECT (the
+//     fake resetprop's log line), not the parent's return value.
+//
+// The reaper below tracks EXACTLY the pids WE fork (connection
+// children) and reaps each with waitpid(pid, WNOHANG). std::process
+// children are never stolen — their pids are never in the list, so
+// Command's internal waitpid always succeeds and getprop's stdout
+// comes back. Reap runs (a) after every accept, (b) on every rescan
+// tick, and (c) on every guard poll — bounding a dead child's
+// zombie lifetime by the shortest active interval (250 ms).
+// ----------------------------------------------------------------------
+struct ChildGrim {
+    /// Pids of forked connection children not yet reaped.
+    pending: Mutex<Vec<i32>>,
+}
+
+impl ChildGrim {
+    fn new() -> Self { ChildGrim { pending: Mutex::new(Vec::new()) } }
+
+    /// Record a freshly-forked child pid (parent side only).
+    fn track(&self, pid: i32) {
+        let mut v = self.pending.lock().unwrap();
+        // Bound the bookkeeping: companion children can live for
+        // hours, but a healthy device forking apps all day still
+        // keeps this list tiny (entries leave at reap time). The cap
+        // keeps memory flat even if a future caller ever leaked
+        // tracks without reaping.
+        if v.len() < 4096 { v.push(pid); }
+    }
+
+    /// Non-blocking reap of every tracked pid. Returns how many
+    /// were reaped (or vanished). Never waits on a live child.
+    fn reap(&self) -> usize {
+        let mut v = self.pending.lock().unwrap();
+        if v.is_empty() { return 0; }
+        let mut reaped = 0;
+        v.retain(|&pid| unsafe {
+            let r = libc::waitpid(pid, std::ptr::null_mut(),
+                                  libc::WNOHANG);
+            if r == pid {
+                reaped += 1;
+                false            // reaped — drop from the list
+            } else if r == 0 {
+                true             // still running — keep
+            } else {
+                // -1/ECHILD: nobody else should reap OUR tracked
+                // pids... but stay defensive rather than wedge the
+                // bookkeeping forever if something ever does.
+                reaped += 1;
+                false
+            }
+        });
+        reaped
+    }
+}
+
+// ----------------------------------------------------------------------
 // STEALTH: per-connection privilege drop.
 //
 // For each incoming client connection, we:
@@ -868,33 +987,49 @@ fn set_dumpable_zero() {
 //        child exits. Every other verb:
 //   3.   setresgid(CHILD_GID), setresuid(CHILD_UID)
 //   4.   The child handles the connection and exits
-//   5. The parent waits for the next connection
+//   5. The parent tracks the child in the grim reaper and waits
+//      for the next connection
 //
 // If the child is exploited, the attacker is uid nobody, not root.
 // ----------------------------------------------------------------------
-fn spawn_privileged_child<F>(stream: UnixStream, state: Arc<DaemonState>,
-                              session_dir: &str, handler: F)
-    where F: FnOnce(UnixStream, u8, Arc<DaemonState>) + Send + 'static
+fn spawn_privileged_child<F>(stream: UnixStream, snap: Snapshot,
+                              grim: Arc<ChildGrim>, session_dir: &str,
+                              handler: F)
+    where F: FnOnce(UnixStream, u8, Snapshot) + Send + 'static
 {
     match unsafe { libc::fork() } {
         -1 => {
-            // fork failed — handle in the (root) parent thread as a
-            // fallback. Read the verb byte so the handler's parse
-            // stays consistent; 'P' takes the same root path it
-            // would have taken in the child.
-            let session_dir = session_dir.to_string();
-            let _ = thread::spawn(move || {
-                let mut s = stream;
-                let mut first = [0u8; 1];
-                if s.read_exact(&mut first).is_err() { return; }
-                if !try_handle_props_file_root(&mut s, first[0],
-                                               &session_dir) {
-                    handle_client_with_first(s, first[0], state);
-                }
-            });
+            // ROUND 34: fail CLOSED. The pre-R34 fallback handled the
+            // connection in a thread of the ROOT daemon process — no
+            // uid drop, no NO_NEW_PRIVS, no PDEATHSIG — so the whole
+            // "an exploited handler is uid nobody, not root"
+            // containment model silently vanished exactly under the
+            // memory pressure (RLIMIT_NPROC exhaustion, fork bombs)
+            // an attacker induces, while parsing client-controlled
+            // input. A dropped connection is recoverable (the
+            // payload retries on the next fork through its latch
+            // machinery); a root-context handler is not.
+            drop(stream);
+            drop(snap);
+            let _ = session_dir;
         }
         0 => {
-            // Child. Peek the verb byte BEFORE dropping privileges:
+            // Child. ROUND 34: PDEATHSIG FIRST — immediately after
+            // fork, before ANY blocking I/O. prctl is
+            // async-signal-safe (man7 signal-safety(7)), and the
+            // ordering matters: a client that connects and never
+            // sends its verb byte parks the child in read_exact; if
+            // the daemon dies in that window (or the client stalls
+            // forever), the child must already be scheduled to die
+            // with it — otherwise a ROOT child (privileges not yet
+            // dropped!) outlives the daemon holding an open socket,
+            // the exact "orphaned uid-0 subsysd row" the Round-34
+            // comment below was written to prevent, except worse.
+            unsafe {
+                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL,
+                            0, 0, 0);
+            }
+            // Peek the verb byte BEFORE dropping privileges:
             // 'P' must run as root (it writes into the root-only
             // session dir and relabels); everything else drops to
             // nobody exactly as before.
@@ -906,6 +1041,15 @@ fn spawn_privileged_child<F>(stream: UnixStream, state: Arc<DaemonState>,
             if try_handle_props_file_root(&mut s, first[0], session_dir) {
                 process::exit(0);   // consumed and answered as root
             }
+            // (The Round 34 PDEATHSIG moved to the TOP of the child
+            // prologue — before the blocking verb read. See the
+            // comment there. It dies with the daemon: a long-lived
+            // companion child would otherwise survive the daemon's
+            // death as a uid-9999 'subsysd' row until its client
+            // hangs up; PDEATHSIG fires when the forking THREAD (the
+            // accept loop, which runs for the daemon's lifetime)
+            // exits — exactly the daemon's death. Same prctl the
+            // payload uses for ITS children — hide_stealth.cpp.)
             // Drop privileges.
             unsafe {
                 libc::setresgid(CHILD_GID, CHILD_GID, CHILD_GID);
@@ -934,15 +1078,17 @@ fn spawn_privileged_child<F>(stream: UnixStream, state: Arc<DaemonState>,
             unsafe {
                 libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
             }
-            handler(s, first[0], state);
+            handler(s, first[0], snap);
             // Exit the child explicitly so we never fall through to
             // the parent's accept loop.
             process::exit(0);
         }
-        _ => {
+        pid => {
             // Parent. The child has its own copy of the stream fd,
-            // so we close ours to avoid leaking.
+            // so we close ours to avoid leaking; the pid goes into
+            // the tracked-reaper list (Round 34 — see ChildGrim).
             drop(stream);
+            grim.track(pid);
         }
     }
 }
@@ -1119,7 +1265,13 @@ fn find_zygote_pid() -> Option<u32> {
     let mut fallback: Option<u32> = None;
     for entry in dir.flatten() {
         let name = entry.file_name();
-        let name = name.to_str()?;
+        // ROUND 34 (C11): `?` here propagated None out of the WHOLE
+        // census — one non-UTF-8 entry name (or a transient read_dir
+        // failure) read as "the zygote DIED": the guard counted a
+        // spurious restart, and 4 blips tripped the permanent
+        // bootloop RollbackAndStop with no zygote problem at all.
+        // Per-entry conversions must skip the entry, not the scan.
+        let name = match name.to_str() { Some(s) => s, None => continue };
         let pid: u32 = match name.parse() { Ok(v) => v, Err(_) => continue };
         if pid == 0 { continue; }
         // Read cmdline; skip the current process (the daemon itself
@@ -1314,78 +1466,121 @@ fn guard_reapply(applied: &str) -> bool {
 /// The guard thread body. Config (poll interval, zygote grace
 /// period) is overridable through the environment for the host
 /// E2E; unset = device defaults.
-fn prop_guard_thread() {
+fn prop_guard_thread(grim: Arc<ChildGrim>) {
     let workdir = remap_path(WORKDIR);
-    let applied = match std::fs::read_to_string(
-            format!("{}/.native_bridge_applied", workdir)) {
-        Ok(s) => s.trim().to_string(),
-        Err(_) => {
-            // post-fs-data did not (or could not) swap this boot:
-            // there is nothing to guard. This is the normal state
-            // on devices with a real native bridge (they were
-            // refused) and on hosts without the test fixture.
-            return;
+
+    let poll_ms: u64 = std::env::var("ZS_TEST_POLL_MS").ok()
+        .and_then(|v| v.parse().ok()).unwrap_or(250);
+    // Round 34b — stand-down sweep cadence. When there is nothing
+    // to guard (no applied value yet — a real bridge was refused,
+    // a host fixture, or the guard's permanent rollback disarm),
+    // this thread STILL sweeps the grim reaper at 1 Hz. Without it,
+    // a connection child that exits while no new accept arrives
+    // would stay a zombie for up to the rescan thread's 30 s poll:
+    // this thread is the only always-on sub-second timer the daemon
+    // has, so it doubles as the sweeper in BOTH states. Steady-state
+    // cost: one stat + one reap() (whose pending list is normally
+    // empty — a single is_empty() check) per second. Overridable
+    // for the host E2E (set to ~150 ms there).
+    let sweep_ms: u64 = std::env::var("ZS_TEST_SWEEP_MS").ok()
+        .and_then(|v| v.parse().ok()).unwrap_or(1000);
+
+    // Arm: wait until post-fs-data's record exists. The wait loop
+    // (not an early return) matters twice over: it keeps the
+    // sweeper alive for devices that will never arm (real-bridge
+    // refusals — the normal stand-down), and it catches LATE
+    // records (a daemon racing post-fs-data's write, or a manual
+    // test run that arms the guard after startup).
+    let applied = loop {
+        if let Ok(s) = std::fs::read_to_string(
+                format!("{}/.native_bridge_applied", workdir)) {
+            let t = s.trim();
+            if !t.is_empty() { break t.to_string(); }
+            // An EMPTY record is the rolled-back/disarmed state:
+            // stay in the sweeper, keep watching.
         }
+        thread::sleep(Duration::from_millis(sweep_ms.max(poll_ms)));
+        grim.reap();
     };
-    if applied.is_empty() { return; }
     let backup = std::fs::read_to_string(
             format!("{}/.native_bridge_backup", workdir))
         .unwrap_or_default()
         .trim()
         .to_string();
 
-    let poll_ms: u64 = std::env::var("ZS_TEST_POLL_MS").ok()
-        .and_then(|v| v.parse().ok()).unwrap_or(250);
     // How long a NEWLY SEEN zygote pid must exist before its
     // maps are trusted (Runtime::Init + bridge dlopen complete).
     let grace_ms: u64 = std::env::var("ZS_TEST_ZYGOTE_GRACE_MS").ok()
         .and_then(|v| v.parse().ok()).unwrap_or(3000);
 
+    // ROUND 34 (C4 — the cost bug): the old loop ran the FULL
+    // observation every cycle, forever: find_zygote_pid() readdirs
+    // /proc and opens+reads+close()s cmdline for EVERY process
+    // (300-600 on a real phone), then bridge_mapped_in() re-reads
+    // the zygote's whole maps file — 4x/second, sustained, on a
+    // battery device, with a 250 ms timer that blocks deep idle.
+    // The header comment ("one 250 ms poll of a single /proc read")
+    // was simply false. The work is only needed while WAITING for
+    // the consume (bridge appears in maps) or after a zygote death
+    // (re-apply window). Once the stock value is restored for the
+    // tracked zygote, the guard backs off to a slow cadence whose
+    // only job is DEATH DETECTION of the known pid — one stat() —
+    // with a periodic full census to re-sync (catches pid reuse:
+    // /proc/<pid> existing is a weak signal; every ~30 s the real
+    // census re-derives the truth). Env-overridable for the E2E.
+    let slow_ms: u64 = std::env::var("ZS_TEST_SLOW_MS").ok()
+        .and_then(|v| v.parse().ok()).unwrap_or(2000);
+    const CENSUS_EVERY_SLOW_TICKS: u32 = 15;   // ~30 s at 2 s
+
     let mut st = GuardState::new();
     let mut first_seen: std::collections::HashMap<u32, std::time::Instant> =
         std::collections::HashMap::new();
+    // C8: the guard thread is ALSO the 1 Hz zombie sweeper — the
+    // Round-34b design. RollbackAndStop must therefore STOP
+    // GUARDING without STOPPING THE THREAD: sweeper_only drops all
+    // /proc work (the old `return` here killed the sweeper exactly
+    // in the state the module considers its most important failure
+    // mode, regressing dead-child reaping to the 30 s rescan tick).
+    let mut sweeper_only = false;
+    let mut slow_ticks: u32 = 0;
     loop {
-        thread::sleep(Duration::from_millis(poll_ms));
-        let obs = match find_zygote_pid() {
-            None => ZygoteObservation::Absent,
-            Some(pid) => {
-                let stable = match first_seen.get(&pid) {
-                    Some(t) => t.elapsed().as_millis() as u64 >= grace_ms,
-                    None => {
-                        first_seen.insert(pid, std::time::Instant::now());
-                        false
-                    }
-                };
-                // A zygote that has been up longer than the grace
-                // period is stable no matter when WE first noticed
-                // it (covers the daemon starting long after boot:
-                // the boot zygote's bridge loaded minutes ago).
-                let up_stable = stable || {
-                    std::fs::read(format!("/proc/{}/stat", pid))
-                        .ok()
-                        .and_then(|s| {
-                            // field 22 (starttime) — just require the
-                            // read to succeed and treat anything
-                            // readable as old enough IF it is the pid
-                            // we have tracked before.
-                            let txt = String::from_utf8_lossy(&s);
-                            let after = txt.split_once(") ").map(|x| x.1)?;
-                            let f: Vec<&str> = after.split(' ').collect();
-                            let starttime: u64 = f.get(19)?.parse().ok()?;
-                            // 100 Hz clock: 2s uptime == 200 ticks.
-                            let uptime: u64 = std::fs::read_to_string(
-                                "/proc/uptime").ok()?
-                                .split('.').next()?.parse().ok()?;
-                            Some(uptime.saturating_sub(starttime / 100) >= 2)
-                        })
-                        .unwrap_or(false)
-                };
-                let bridge_loaded =
-                    bridge_mapped_in(pid, &applied);
+        // Slow mode: stock restored for the tracked zygote. Fast
+        // mode: waiting for the consume, or hunting a new zygote.
+        let slow = st.restored && st.known_pid.is_some();
+        thread::sleep(Duration::from_millis(
+            if slow { slow_ms } else { poll_ms }));
+        // Round 34: the guard runs on the shortest timer in the
+        // daemon — it doubles as the zombie sweeper (dead children
+        // leave within one poll interval even with no new accepts).
+        grim.reap();
+        if sweeper_only {
+            // C8: rolled back — nothing left to guard, but the
+            // reaping never stops.
+            continue;
+        }
+        let obs = if slow {
+            // Cheap path: is the KNOWN pid still alive? A periodic
+            // full census re-syncs (pid reuse, drift).
+            slow_ticks = slow_ticks.saturating_add(1);
+            let alive = st.known_pid
+                .map(|p| std::path::Path::new(
+                    &format!("/proc/{}", p)).exists())
+                .unwrap_or(false);
+            if alive && slow_ticks < CENSUS_EVERY_SLOW_TICKS {
+                // Synthesized "nothing changed" observation: same
+                // pid, no new consume to detect (already restored).
+                // The step function sees the tracked pid and idles.
                 ZygoteObservation::Present {
-                    pid, bridge_loaded, stable: up_stable,
+                    pid: st.known_pid.unwrap_or(0),
+                    bridge_loaded: true,
+                    stable: true,
                 }
+            } else {
+                slow_ticks = 0;   // death — or the periodic re-census
+                full_observation(&applied, &mut first_seen, grace_ms)
             }
+        } else {
+            full_observation(&applied, &mut first_seen, grace_ms)
         };
         match prop_guard_step(&mut st, obs) {
             GuardAction::None => {}
@@ -1397,7 +1592,59 @@ fn prop_guard_thread() {
             }
             GuardAction::RollbackAndStop => {
                 let _ = guard_restore_stock(&backup);
-                return;
+                // C8: stand down from GUARDING; keep REAPING.
+                sweeper_only = true;
+            }
+        }
+    }
+}
+
+/// ROUND 34 (C4): the full observation the FAST guard cadence uses —
+/// the /proc census + stability + bridge-mapped check, factored out
+/// of the loop body so the slow path can fall back to it.
+fn full_observation(
+    applied: &str,
+    first_seen: &mut std::collections::HashMap<u32, std::time::Instant>,
+    grace_ms: u64,
+) -> ZygoteObservation {
+    match find_zygote_pid() {
+        None => ZygoteObservation::Absent,
+        Some(pid) => {
+            let stable = match first_seen.get(&pid) {
+                Some(t) => t.elapsed().as_millis() as u64 >= grace_ms,
+                None => {
+                    first_seen.insert(pid, std::time::Instant::now());
+                    false
+                }
+            };
+            // A zygote that has been up longer than the grace
+            // period is stable no matter when WE first noticed
+            // it (covers the daemon starting long after boot:
+            // the boot zygote's bridge loaded minutes ago).
+            let up_stable = stable || {
+                std::fs::read(format!("/proc/{}/stat", pid))
+                    .ok()
+                    .and_then(|s| {
+                        // field 22 (starttime) — just require the
+                        // read to succeed and treat anything
+                        // readable as old enough IF it is the pid
+                        // we have tracked before.
+                        let txt = String::from_utf8_lossy(&s);
+                        let after = txt.split_once(") ").map(|x| x.1)?;
+                        let f: Vec<&str> = after.split(' ').collect();
+                        let starttime: u64 = f.get(19)?.parse().ok()?;
+                        // 100 Hz clock: 2s uptime == 200 ticks.
+                        let uptime: u64 = std::fs::read_to_string(
+                            "/proc/uptime").ok()?
+                            .split('.').next()?.parse().ok()?;
+                        Some(uptime.saturating_sub(starttime / 100) >= 2)
+                    })
+                    .unwrap_or(false)
+            };
+            let bridge_loaded =
+                bridge_mapped_in(pid, applied);
+            ZygoteObservation::Present {
+                pid, bridge_loaded, stable: up_stable,
             }
         }
     }
@@ -1514,24 +1761,16 @@ fn main() {
         std::process::exit(prop_cli_main(&rest));
     }
 
-    // Round 28 — reap connection children. The accept loop forks one
-    // child per client connection (see spawn_privileged_child) and
-    // never wait()s for them: with SIGCHLD left at its default
-    // (ignored-but-not-SIG_IGN) disposition, every exited child stays
-    // as a zombie until the PARENT dies. With hundreds of
-    // should-inject queries per cold start, that is hundreds of
-    // defunct rows in /proc (each still carrying the cloaked name —
-    // a fleet of zombies is itself a signature) and a slow leak of
-    // the pid space on a long-running device.
-    //
-    // SIGCHLD -> SIG_IGN makes the kernel auto-reap children on
-    // Linux (the POSIX.1-2008 / Linux behavior for explicitly
-    // ignored SIGCHLD). We fork no children we ever need a status
-    // from, so discarding exit statuses is correct here. Must be
-    // installed BEFORE the first fork, i.e. here at the top of main.
-    unsafe {
-        libc::signal(libc::SIGCHLD, libc::SIG_IGN);
-    }
+    // Round 28 tried to reap connection children by leaving SIGCHLD
+    // at SIG_IGN (kernel auto-reap). Round 34 proved empirically
+    // that this ALSO breaks waitpid for std::process children:
+    // Command::output() returned ECHILD, getprop's stdout was lost
+    // (ABI detection pinned to arm64-v8a), and the external
+    // resetprop fallback always reported failure. See ChildGrim's
+    // comment for the full story. SIGCHLD now stays at its DEFAULT
+    // disposition and the reaper below reaps EXACTLY the pids we
+    // forked — nobody else's.
+    let grim = Arc::new(ChildGrim::new());
 
     // STEALTH: cloak the process before we bind the socket, so
     // any process listing during socket setup shows the cloaked
@@ -1559,8 +1798,15 @@ fn main() {
     // the daemon's RLIMIT_MEMLOCK is too low (default is 0 on some
     // devices), we silently skip — the cloak + dumpable + path
     // cloaking layers are still in place.
+    // ROUND 34 (C10): MCL_CURRENT alone pinned only the ~few-hundred-KB
+    // resident set at this point — everything faulted in later (the
+    // denylist, module list, guard-thread stack, snapshots) stayed
+    // swappable, so the documented anti-swap/anti-forensics claim was
+    // ~90% not delivered. MCL_FUTURE pins pages as they fault in.
+    // RLIMIT_MEMLOCK is unbounded for the root daemon, and the total
+    // footprint is a few MB, so the cost is bounded and intentional.
     unsafe {
-        let _ = libc::mlockall(libc::MCL_CURRENT);
+        let _ = libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE);
     }
 
     // Make sure workdir and sockdir exist with the right perms.
@@ -1593,15 +1839,23 @@ fn main() {
     // Linux since 2.6.13, ~2005).
     {
         let s = state.clone();
+        let g = grim.clone();
         thread::spawn(move || {
-            rescan_thread_main(s);
+            rescan_thread_main(s, g);
         });
     }
 
     // Round 30 — the property guard (see the Round 30 section above
     // for the full design). One more thread, one 250 ms poll of a
-    // single /proc read: negligible next to the rescan thread.
-    thread::spawn(prop_guard_thread);
+    // single /proc read: negligible next to the rescan thread. It
+    // also sweeps the grim reaper each cycle (shortest interval in
+    // the process — bounds a dead child's zombie lifetime).
+    {
+        let g = grim.clone();
+        thread::spawn(move || {
+            prop_guard_thread(g);
+        });
+    }
 
     // Remove any stale socket, then bind a new one. Round 13: the
     // socket lives in a randomized per-boot directory when
@@ -1638,7 +1892,14 @@ fn main() {
     let _ = std::fs::set_permissions(&pid_path,
         std::fs::Permissions::from_mode(0o600));
 
-    eprintln!("zygiskd: listening on {}", sock_path);
+    // ROUND 34 (C12): the daemon's identity and the live randomized
+    // socket path printed to STDERR on every start — the exact
+    // secret the session-file handoff exists to protect. service.sh
+    // redirects to /dev/null, but any manual run (adb shell) leaked
+    // both. Gated behind an explicit env opt-in now.
+    if std::env::var("ZS_DAEMON_VERBOSE").is_ok() {
+        eprintln!("zygiskd: listening on {}", sock_path);
+    }
 
     // Accept loop. The parent stays as root and accepts; each
     // connection is handed off to a privileged child. The session
@@ -1650,9 +1911,16 @@ fn main() {
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                spawn_privileged_child(stream, state.clone(),
+                // Round 34: snapshot BEFORE fork (locks taken here,
+                // in the single forking thread — the child inherits a
+                // lock-free copy through fork's CoW; see Snapshot).
+                let snap = state.snapshot();
+                spawn_privileged_child(stream, snap, grim.clone(),
                                        &session_dir,
                                        handle_client_with_first);
+                // Reap after every accept: connection children are
+                // short-lived, so this is normally where they leave.
+                grim.reap();
             }
             Err(_) => continue,
         }
@@ -1712,7 +1980,7 @@ fn inotify_watch_root(fd: i32, mask: u32) -> i32 {
 // alongside the inotify wait — no need to also watch it via
 // inotify (which would add another watch + another fd to track).
 // ----------------------------------------------------------------------
-fn rescan_thread_main(state: Arc<DaemonState>) {
+fn rescan_thread_main(state: Arc<DaemonState>, grim: Arc<ChildGrim>) {
     let mut last_modules_mtime: Option<std::time::SystemTime> = None;
     let mut last_denylist_mtime: Option<std::time::SystemTime> = None;
 
@@ -1741,6 +2009,10 @@ fn rescan_thread_main(state: Arc<DaemonState>) {
     }
 
     loop {
+        // Round 34: sweep tracked connection children every tick —
+        // companion children whose client vanished between accepts
+        // leave the zombie state here at the latest.
+        grim.reap();
         if inotify_fd >= 0 && inotify_wd >= 0 {
             // Block on poll() with a 30s timeout. If events arrive,
             // drain them; if timeout, fall through to mtime check.
@@ -1755,10 +2027,21 @@ fn rescan_thread_main(state: Arc<DaemonState>) {
             if ret > 0 && (pfd[0].revents & libc::POLLIN) != 0 {
                 // Drain inotify events. The kernel writes one
                 // inotify_event struct per event, with the struct's
-                // name field following (variable length). We don't
-                // care about the event contents — any event in
-                // MODULES_ROOT triggers a rescan.
+                // name field following (variable length).
+                //
+                // ROUND 34 (C5): the drain used to discard the
+                // contents and the "re-arm if lost" guard below could
+                // never fire — nothing ever set inotify_wd back to
+                // -1, so an IN_IGNORED (the watched directory itself
+                // was deleted/replaced — exactly what a module
+                // manager's atomic swap does) silently killed event
+                // delivery FOREVER, with only the 30 s mtime
+                // fallback left. The events are now parsed for the
+                // watch-INVALIDATING masks (IN_IGNORED |
+                // IN_DELETE_SELF | IN_UNMOUNT) so the re-arm below
+                // actually runs.
                 let mut buf = [0u8; 4096];
+                let mut watch_lost = false;
                 loop {
                     let n = unsafe {
                         libc::read(inotify_fd,
@@ -1766,11 +2049,34 @@ fn rescan_thread_main(state: Arc<DaemonState>) {
                                    buf.len())
                     };
                     if n <= 0 { break; }
+                    // struct inotify_event (man 7 inotify):
+                    //   int wd; uint32_t mask; uint32_t cookie;
+                    //   uint32_t len; char name[len];
+                    let mut off = 0usize;
+                    while off + 16 <= n as usize {
+                        let wd = i32::from_ne_bytes(
+                            buf[off..off + 4].try_into().unwrap());
+                        let mask = u32::from_ne_bytes(
+                            buf[off + 4..off + 8].try_into().unwrap());
+                        let len = u32::from_ne_bytes(
+                            buf[off + 12..off + 16].try_into().unwrap())
+                            as usize;
+                        if (mask & (libc::IN_IGNORED
+                                    | libc::IN_DELETE_SELF
+                                    | libc::IN_UNMOUNT)) != 0 {
+                            watch_lost = true;
+                            if wd == inotify_wd { inotify_wd = -1; }
+                        }
+                        off += 16 + len;
+                    }
                 }
                 state.reload_modules();
-                // Re-arm the watch if it was lost (IN_IGNORED /
-                // IN_MOVE_SELF etc. would have removed it).
-                if inotify_wd < 0 {
+                // Re-arm the watch if it was lost (IN_IGNORED etc.
+                // removed it — see the ROUND 34 note above). The
+                // retry is immediate after a manager swap; a MISSING
+                // dir returns -1 again and the 30 s mtime fallback
+                // covers the gap until it reappears.
+                if watch_lost || inotify_wd < 0 {
                     let mask = libc::IN_CREATE
                              | libc::IN_DELETE
                              | libc::IN_MOVED_FROM
@@ -2255,5 +2561,163 @@ mod tests {
         let a = prop_guard_step(&mut st, ZygoteObservation::Absent);
         assert_eq!(a, GuardAction::None);
         assert_eq!(st.restarts, 0);
+    }
+
+    // ---------------- Round 34: SIGCHLD / ChildGrim / Snapshot ----
+
+    /// Signal disposition is process-wide and cargo tests run on
+    /// parallel threads: every test that mutates SIGCHLD or relies
+    /// on helper-exit semantics takes this lock so the two cannot
+    /// interleave.
+    static SIGNAL_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// THE Round 34 regression: documents, as an executable fact on
+    /// THIS kernel/libc, why the daemon must NOT leave SIGCHLD at
+    /// SIG_IGN. Under SIG_IGN the kernel auto-reaps every child, so
+    /// waitpid() — including the one Rust std runs inside
+    /// Command::output() — returns ECHILD and output() FAILS, losing
+    /// the child's stdout. That is exactly how getprop's ABI answer
+    /// was silently lost between Rounds 28 and 34.
+    #[test]
+    fn sigchld_sig_ign_breaks_std_command_output() {
+        let _g = SIGNAL_TEST_LOCK.lock().unwrap();
+        unsafe { libc::signal(libc::SIGCHLD, libc::SIG_IGN); }
+        let r = std::process::Command::new("/bin/true").output();
+        // Restore FIRST so a later assert! failure cannot poison the
+        // disposition for other tests.
+        unsafe { libc::signal(libc::SIGCHLD, libc::SIG_DFL); }
+        match r {
+            Ok(out) => panic!(
+                "SIG_IGN no longer breaks Command::output() on this \
+                 platform — the ChildGrim design note needs revisiting.\
+                 (output unexpectedly succeeded: {:?})", out.status),
+            Err(e) => assert_eq!(e.raw_os_error(), Some(10) /* ECHILD */,
+                                 "unexpected error: {}", e),
+        }
+        // And with the default disposition (the daemon's new state),
+        // helper execs work again.
+        let ok = std::process::Command::new("/bin/true").output();
+        assert!(ok.is_ok(), "default SIGCHLD must make output() work: {:?}",
+                ok.err());
+    }
+
+    /// The reaper reaps EXACTLY the tracked pids and never steals a
+    /// std::process child: forked children exit, a Command child runs
+    /// concurrently, one reap() clears the zombies, and the Command's
+    /// own waitpid still succeeded (its exit status is observable).
+    #[test]
+    fn grim_reaps_tracked_children_and_never_steals_std_children() {
+        let _g = SIGNAL_TEST_LOCK.lock().unwrap();
+        let grim = ChildGrim::new();
+        let mut tracked: Vec<i32> = Vec::new();
+        for _ in 0..4 {
+            let pid = unsafe { libc::fork() };
+            if pid == 0 {
+                // Child: nothing but the exit. (Async-signal-safe.)
+                unsafe { libc::_exit(0); }
+            }
+            tracked.push(pid);
+            grim.track(pid);
+        }
+        // A std::process child — NOT tracked — runs while the
+        // tracked ones are zombies. std's internal waitpid must get
+        // ITS pid, not be confused by anything the reaper does.
+        let out = std::process::Command::new("/bin/echo")
+            .arg("pong").output().expect("untracked Command child");
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "pong");
+
+        // Reap the tracked children. They exit asynchronously —
+        // the reaper is designed to sweep them on LATER ticks, so
+        // poll until all four are gone (bounded).
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_secs(3);
+        let mut n = 0;
+        while n < 4 {
+            n += grim.reap();
+            if n >= 4 { break; }
+            assert!(std::time::Instant::now() < deadline,
+                    "tracked children never left: reaped {} of 4", n);
+            thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(n, 4, "all four tracked children reaped");
+        assert!(grim.pending.lock().unwrap().is_empty());
+
+        // None of them is a zombie anymore (a zombie would still
+        // have a /proc/<pid>/stat with state 'Z'; a fully reaped
+        // child has NO /proc entry at all).
+        for pid in tracked {
+            assert!(!std::path::Path::new(&format!("/proc/{}", pid))
+                        .exists(),
+                    "pid {} still has a /proc entry after reap", pid);
+        }
+        // Idempotent: nothing left to reap.
+        assert_eq!(grim.reap(), 0);
+    }
+
+    /// The fork-safety property: another thread HOLDS the shared
+    /// denylist mutex at the fork instant. The child serves its
+    /// request from the Snapshot (taken before fork, locks released)
+    /// and exits promptly. Under the pre-Round-34 design — child
+    /// locking the shared state — this exact scenario deadlocks the
+    /// child forever (the holder thread does not exist in the child).
+    #[test]
+    fn snapshot_child_never_blocks_on_a_lock_the_parent_thread_holds() {
+        use std::time::{Duration, Instant};
+
+        // Serialized with the signal tests: if SIGCHLD were SIG_IGN
+        // while this child exits, the kernel would auto-reap it and
+        // our waitpid would get ECHILD — a false "deadlock".
+        let _g = SIGNAL_TEST_LOCK.lock().unwrap();
+
+        let state = Arc::new(DaemonState::new());
+        *state.modules.lock().unwrap() = vec![
+            ModuleEntry { id: "mod_a".into(),
+                          path: PathBuf::from("/x/zygisk/arm64-v8a/m.so") },
+        ];
+        *state.denylist.lock().unwrap() =
+            parse_denylist_text("com.example.app1\n");
+
+        // Another thread holds the denylist lock for 400 ms — the
+        // fork will land inside that window.
+        let st2 = state.clone();
+        let holder = thread::spawn(move || {
+            let _g = st2.denylist.lock().unwrap();
+            thread::sleep(Duration::from_millis(400));
+        });
+
+        // Snapshot in the forking thread (locks free by then: the
+        // snapshot's own lock() would otherwise serialize with the
+        // holder — which is FINE, it just delays this test slightly).
+        let snap = state.snapshot();
+
+        let pid = unsafe { libc::fork() };
+        if pid == 0 {
+            // Child: build a reply from the SNAPSHOT ONLY. No shared
+            // lock is touched; glibc's malloc-atfork protection makes
+            // the String allocation safe on the host (Scudo/jemalloc
+            // give the same guarantee on device — see Snapshot docs).
+            let buf = format_module_list(&snap.modules);
+            let ok = buf.contains("mod_a")
+                     && snap.denylist.contains("com.example.app1")
+                     && !snap.denylist.contains("com.innocent.game");
+            unsafe { libc::_exit(if ok { 0 } else { 1 }); }
+        }
+        // Parent: the child must exit on its own quickly (it would
+        // hang forever if it ever locked the held mutex).
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut status: libc::c_int = 0;
+        loop {
+            let r = unsafe { libc::waitpid(pid, &mut status,
+                                            libc::WNOHANG) };
+            if r == pid { break; }
+            assert!(Instant::now() < deadline,
+                    "child deadlocked: it blocked on a mutex held by a \
+                     thread that does not exist in the child");
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+                "child failed the snapshot checks: status={}", status);
+        holder.join().unwrap();
     }
 }

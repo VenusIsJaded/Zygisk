@@ -499,6 +499,16 @@ extern "C" long zs_impl_fork(void* /*wrapper_fp*/) {
     // VM exists AND we still run pre-fork — acquire the JNIEnv and
     // dispatch module onLoad there (once per process lifetime).
     if (getpid() == g_origin_pid) {
+        // ROUND 34: refresh the denylist/packages.list HERE, in the
+        // long-lived zygote, pre-fork. Child-side refreshes were
+        // COW-private: the 2 s throttle never elided a stat (every
+        // child started with next_check == 0) and mtime changes
+        // re-parsed both files in every child. From here the state
+        // advances once per interval for the whole system and every
+        // child inherits the fresh map. Steady state: 2 stat() calls
+        // per 2 s in the zygote, zero per child (a vDSO clock read
+        // when throttled).
+        hide_refresh_tick();
         // Round 19: daemon-dependent init (module list fetch, the
         // spoofed properties_serial handoff) retries here until it
         // latches — the daemon is never up at native-bridge init on
@@ -533,12 +543,20 @@ struct ZsTrampData {
     size_t    count;        // offset 512
     uintptr_t wrapper_fp;   // offset 520
     long      retval;       // offset 528
+    // ROUND 34 (stealth scrub): the blob mprotects its own page
+    // R|W (the page is sealed R|X by zs_trampoline_jump before the
+    // entry), zeroes the whole data area, and re-seals R|X. The
+    // page base is needed for that mprotect; the page size is
+    // derived (data occupies the page tail).
+    uintptr_t page_base;    // offset 536
 };
 #if defined(__aarch64__) || defined(__x86_64__)
-static_assert(sizeof(ZsTrampData) == 512 + 8 + 8 + 8, "trampoline data layout");
+static_assert(sizeof(ZsTrampData) == 512 + 8 + 8 + 8 + 8,
+              "trampoline data layout");
 static_assert(offsetof(ZsTrampData, count) == 512, "count offset");
 static_assert(offsetof(ZsTrampData, wrapper_fp) == 520, "fp offset");
 static_assert(offsetof(ZsTrampData, retval) == 528, "retval offset");
+static_assert(offsetof(ZsTrampData, page_base) == 536, "page offset");
 #endif
 
 #if defined(__aarch64__) || defined(__x86_64__)
@@ -556,10 +574,19 @@ void* zs_trampoline_prepare(const ZsTrampRecord* records, size_t count,
     }
     const size_t code_size = (size_t)(zs_trampoline_code_end
                                       - zs_trampoline_code_start);
-    if (code_size == 0 || code_size > 4096 - 64) return nullptr;
-
     long page_size = sysconf(_SC_PAGESIZE);
     if (page_size <= 0) page_size = 4096;
+
+    // ROUND 34: the guard must be page-size-aware and reserve the
+    // FULL data area (536 bytes), not a magic 64: on a 4 KB page the
+    // data occupies [page+3560, page+4096), so a blob of 3561..4032
+    // bytes would have its tail overwritten by the memset below (the
+    // old `4096 - 64` bound allowed exactly that — latent only
+    // because today's blobs are ~200 bytes).
+    if (code_size == 0 ||
+        (size_t)code_size > (size_t)page_size - sizeof(ZsTrampData)) {
+        return nullptr;
+    }
 
     // One private executable page. RW for the copy; jump() seals it.
     void* page = mmap(nullptr, (size_t)page_size,
@@ -586,6 +613,7 @@ void* zs_trampoline_prepare(const ZsTrampRecord* records, size_t count,
     for (size_t i = 0; i < count; ++i) data->records[i] = records[i];
     data->count      = count;
     data->wrapper_fp = (uintptr_t)wrapper_fp;
+    data->page_base  = (uintptr_t)page;   // ROUND 34: for the scrub's mprotect
     // data->retval is written by zs_trampoline_jump() — the real
     // privilege-drop call happens between prepare and jump.
     return page;

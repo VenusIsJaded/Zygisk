@@ -857,13 +857,17 @@ ZS_TEST(session_fallback_record_rejects_overlong_content) {
 }
 
 // ----------------------------------------------------------------------
-// Round 14 — args cache + deny-decision skip
+// Round 14 — derived-args correctness + deny-decision skip
+// (ROUND 34: the args CACHE itself is gone — per-child COW made it
+// dead weight on device; see fill_app_args. The test stays: it pins
+// the VALUES the modules see and the reload invalidation through the
+// packages.map generation, which is the surviving invariant.)
 // ----------------------------------------------------------------------
-ZS_TEST(args_cache_serves_repeated_forks_and_invalidates_on_reload) {
+ZS_TEST(derived_args_are_correct_and_reload_invalidates_the_map) {
     // uid 10234 is force-denied by the earlier deny test; use 10195
-    // (com.other.app). The forced_unmount test dispatched it, so the
-    // single-entry cache holds 10195 — a repeat fork of the SAME uid
-    // must serve the identical values (cache hit).
+    // (com.other.app). A repeat fork of the SAME uid must observe the
+    // identical values, and a packages.list edit + reload must swap
+    // them in the same breath as the map itself.
     int st = drive_child(10195, 10195);
     ZS_CHECK(st == 0);
     ZS_CHECK(rec_count() == 2);

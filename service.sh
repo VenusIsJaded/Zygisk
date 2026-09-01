@@ -8,6 +8,24 @@ MODDIR=${0%/*}
 ZS_SYS_ROOT="${ZS_TEST_ROOT:-/data/system}"
 WORKDIR="$ZS_SYS_ROOT/zygisk_study"
 
+# ROUND 34: source the compat layer up front so zs_log (the gated
+# diagnostics) is defined on EVERY path — the socket-check tail used
+# it while zs_compat.sh was only sourced inside the .mount_pending
+# branch. `|| true`: a missing file must not take the daemon launch
+# down (the property chain degrades to resetprop-only there).
+. "$MODDIR/zs_compat.sh" 2>/dev/null || true
+zs_compat_init 2>/dev/null || true
+
+# ROUND 34 (B1): gated diagnostics usable BEFORE zs_compat.sh is
+# sourced (the daemon-not-found path exits first). Same opt-in rule
+# as zs_log: silent unless <module>/.debug exists.
+zs_log_note() {
+  if [ -f "$MODDIR/.debug" ] && command -v log >/dev/null 2>&1; then
+    log -t ZygiskStudy "$@"
+  fi
+  return 0
+}
+
 # Spawn the daemon. We use `setsid` + `&` so it survives this script's
 # exit. We use `exec` style trickery: setsid forks the child, then we
 # background it.
@@ -18,21 +36,40 @@ if [ ! -x "$DAEMON" ]; then
   # customize.sh creates. For manual/legacy layouts (a module dir
   # built by hand following the README without re-running
   # customize.sh), fall back to the ABI directory the artifacts
-  # actually live in. The first match wins; arm64 is listed first
-  # because that is the layout customize.sh builds for 64-bit
-  # devices (IS64BIT=true).
-  for cand in "$MODDIR"/libs/arm64-v8a/zygiskd \
-              "$MODDIR"/libs/x86_64/zygiskd \
-              "$MODDIR"/libs/armeabi-v7a/zygiskd \
-              "$MODDIR"/libs/x86/zygiskd; do
-    if [ -x "$cand" ]; then
-      DAEMON="$cand"
-      break
-    fi
-  done
+  # actually live in.
+  #
+  # ROUND 34 (B7 - the wrong-ABI fallback): the zip ships ALL FOUR
+  # ABIs, so the old fixed probe order (arm64 first) picked the
+  # arm64 binary on every x86/x86_64 device with a missing symlink
+  # - exactly the layout this fallback exists for - and setsid
+  # failed to exec it: daemon dead on the ABI it was supposed to
+  # rescue. Derive the device's ABI FIRST (getprop, the
+  # customize.sh-written arch= record) and probe that directory;
+  # any-executable is the last resort (single-ABI installs).
+  _abi="$(getprop ro.product.cpu.abi 2>/dev/null | tr -d ' \r\n')"
+  if [ -z "$_abi" ] && [ -f "$MODDIR/.zygisk_study_info" ]; then
+    _abi="$(sed -n 's/^arch=//p' "$MODDIR/.zygisk_study_info" 2>/dev/null | head -n1 | tr -d ' \r\n')"
+  fi
+  case "$_abi" in
+    arm64-v8a|x86_64|armeabi-v7a|x86) ;;
+    aarch64) _abi=arm64-v8a ;;
+    armeabi*) _abi=armeabi-v7a ;;
+    i686) _abi=x86 ;;
+    *) _abi="" ;;
+  esac
+  if [ -n "$_abi" ] && [ -x "$MODDIR/libs/$_abi/zygiskd" ]; then
+    DAEMON="$MODDIR/libs/$_abi/zygiskd"
+  else
+    for cand in "$MODDIR"/libs/*/zygiskd; do
+      if [ -x "$cand" ]; then
+        DAEMON="$cand"
+        break
+      fi
+    done
+  fi
 fi
 if [ ! -x "$DAEMON" ]; then
-  log -t ZygiskStudy "daemon not found at $MODDIR/zygiskd (or libs/<abi>/)"
+  zs_log_note "daemon not found at $MODDIR/zygiskd (or libs/<abi>/)"
   exit 0
 fi
 
@@ -51,11 +88,11 @@ if [ -f "$WORKDIR/.mount_pending" ]; then
   . "$MODDIR/zs_compat.sh"
   zs_compat_init
   if zs_ensure_loader_mounted; then
-    log -t ZygiskStudy "service: loader resolved late ($ZS_BRIDGE_NAME); armed for next zygote start"
+    zs_log "service: loader resolved late; armed for next zygote start"
   else
     zs_rollback_bridge
     rm -f "$WORKDIR/.mount_pending" 2>/dev/null
-    log -t ZygiskStudy "service: loader unresolvable; bridge rolled back (module inert this boot)"
+    zs_log "service: loader unresolvable; bridge rolled back (module inert this boot)"
   fi
 fi
 
@@ -66,7 +103,18 @@ fi
 # millisecond. The daemon now writes its own pid AFTER the socket bind
 # (native/zygiskd/src/main.rs), so the file only ever exists for a
 # fully-started daemon.
-setsid "$DAEMON" --workdir "$WORKDIR" >/dev/null 2>&1 &
+# ROUND 34 (B10): guard the setsid call. Magisk runs module scripts
+# under busybox ash standalone mode (docs/guides.md - "the full suite
+# of commands no matter which Android version"), so setsid exists
+# there; KernelSU/APatch environments vary. A missing setsid must not
+# take the daemon down with it - the daemon does not need a ctty, a
+# plain background launch is enough (the shell exits, the daemon is
+# reparented to init).
+if command -v setsid >/dev/null 2>&1; then
+  setsid "$DAEMON" --workdir "$WORKDIR" >/dev/null 2>&1 &
+else
+  "$DAEMON" --workdir "$WORKDIR" >/dev/null 2>&1 &
+fi
 
 # Give it a moment to come up, then sanity-check the socket. Round 13:
 # the socket path is randomized per boot — the daemon hands it to the
@@ -87,7 +135,7 @@ if [ -z "$SOCK" ]; then
 fi
 sleep 1
 if [ -S "$SOCK" ]; then
-  log -t ZygiskStudy "daemon ready"
+  zs_log "daemon ready"
 else
-  log -t ZygiskStudy "daemon did not open socket; check logcat for errors"
+  zs_log "daemon did not open socket; check logcat for errors"
 fi
