@@ -288,6 +288,49 @@ def check_a64():
         fail(f"aarch64: scrub mprotect prot constants wrong: {prots} "
              "(unprotect must keep EXEC = RWX|7)")
 
+    # 8. ROUND 35 — the setcontext wrapper's argument shuffle. The
+    #    function is selinux_android_setcontext(uid, isSysServer,
+    #    seInfo, niceName): FOUR arguments, so the wrapper must move
+    #    a3->x4, a2->x3, a1->x2, a0->x1 and load the frame pointer
+    #    into x0 before the call. A missed shuffle register silently
+    #    hands zs_impl_setcontext garbage (the wrapper test catches
+    #    it on the SAME arch only — this gate covers both blobs).
+    setctx = section(lines, "zs_setcontext_wrapper",
+                     "zs_trampoline_code_start")
+    if not setctx:
+        fail("aarch64: zs_setcontext_wrapper section not found")
+    else:
+        shuffle_ok = all(
+            any(re.match(p, line) for _, line in setctx) for p in (
+                r"mov\s+x4,\s*x3$",
+                r"mov\s+x3,\s*x2$",
+                r"mov\s+x2,\s*x1$",
+                r"mov\s+x1,\s*x0$",
+                r"mov\s+x0,\s*x29$",
+            ))
+        if not shuffle_ok:
+            fail("aarch64: setcontext wrapper argument shuffle wrong "
+                 "(expect x0=fp, x1=a0, x2=a1, x3=a2, x4=a3)")
+        else:
+            ok("aarch64: setcontext wrapper shuffles 4 args + fp")
+        if not any(re.match(r"bl\s+zs_impl_setcontext", line)
+                   for _, line in setctx):
+            fail("aarch64: setcontext wrapper does not call "
+                 "zs_impl_setcontext")
+        # The wrapper epilogue must be the shared full restore
+        # (10 stp/ldp pairs: fp + 5 x-pairs + 4 d-pairs) — the
+        # trampoline's restore phase contract depends on every
+        # wrapper saving ALL callee-saved registers at the SAME
+        # offsets.
+        n_ldp = sum(1 for _, line in setctx
+                    if re.match(r"ldp\s+(x\d+|d\d+)", line))
+        if n_ldp != 10:
+            fail(f"aarch64: setcontext wrapper restores {n_ldp} "
+                 "register pairs (expect 10)")
+        else:
+            ok("aarch64: setcontext wrapper epilogue restores all 10 "
+               "pairs")
+
 
 # ---------------------------------------------------------------------------
 # x86-64
@@ -497,6 +540,34 @@ def check_x64():
     else:
         ok("x86_64: scrub = mprotect(RWX) + zero 544B + re-seal, "
            "page_base loaded, __NR_mprotect/prot verified")
+
+    # 8. ROUND 35 — the setcontext wrapper's argument shuffle (the
+    #    x86_64 twin). SysV: 4 args arrive in rdi/rsi/rdx/rcx, the
+    #    inserted wrapper_fp goes to r8 (5th integer arg register).
+    setctx = section(lines, "zs_setcontext_wrapper",
+                     "zs_trampoline_code_start")
+    if not setctx:
+        fail("x86_64: zs_setcontext_wrapper section not found")
+    else:
+        want = ("mov %rcx, %r8", "mov %rdx, %rcx",
+                "mov %rsi, %rdx", "mov %rdi, %rsi",
+                "mov %rbp, %rdi", "call zs_impl_setcontext")
+        missing = [w for w in want
+                   if not any(line == w or " ".join(line.split()) == w
+                              for _, line in setctx)]
+        if missing:
+            fail("x86_64: setcontext wrapper shuffle wrong/missing: "
+                 f"{missing}")
+        else:
+            ok("x86_64: setcontext wrapper shuffles 4 args + fp (r8)")
+        n_pop = sum(1 for _, line in setctx
+                    if re.match(r"pop\s+%\w+$", line))
+        if n_pop != 6:
+            fail(f"x86_64: setcontext wrapper pops {n_pop} registers "
+                 "(expect 6: rbp rbx r12-r15)")
+        else:
+            ok("x86_64: setcontext wrapper epilogue restores "
+               "rbp/rbx/r12-r15")
 
 
 def main():

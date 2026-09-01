@@ -3001,3 +3001,75 @@ Honest residuals:
   PATH leak; the overlay itself remains visible as an overlayfs
   mount on /system/lib64 (inherent to the self-mount strategy —
   the same surface KernelSU's own metamodule presents).
+
+## Round 36 — the isolated-process deferral: what ships, what is honestly left
+
+Research base (every fact fetched and read this round, none from
+memory):
+
+- `com_android_internal_os_Zygote.cpp` at android-5.0.0_r1,
+  10.0.0_r1, 12.0.0_r1, 16.0.0_r1 and refs/heads/main:
+  `SpecializeCommon` runs `setresgid` (501/.../2001) → `setresuid`
+  (507/.../2015) → `selinux_android_setcontext(uid,
+  isSystemServer, seInfo, niceName)` (546/1095/1761/2143/2133) —
+  the ordering that makes the uid-drop hooks the earliest decision
+  point and setcontext the only name-carrying one. `nice_name_ptr`
+  is `has_value ? c_str : nullptr` (null is a real input), and
+  `__android_log_close()` runs BEFORE the setcontext call (module
+  log writes from the deferred dispatch are dropped — documented).
+- `Process.java` (main): FIRST_ISOLATED_UID 99000 / LAST 99999,
+  FIRST_APP_ZYGOTE_ISOLATED_UID 90000 / LAST 98999,
+  FIRST_SDK_SANDBOX_UID 20000 / LAST 29999; at 12.0.0_r1 the
+  sandbox constants are ABSENT, at 13.0.0_r1 they are present with
+  `getAppUidForSdkSandboxUid(uid) = uid - (20000 - 10000)` — the
+  1-1 remap the uid matcher now applies (appId frame 20000-29999 →
+  minus 10000; no modulo wraparound because owning appIds are
+  10000-19999).
+- `ActiveServices.getProcessNameForService` (main): regular
+  isolated = `sInfo.processName + ":" + className`, shared
+  isolated = `callingPackage + ":ishared:" + instanceName`, SDK
+  sandbox = the instanceName; the matcher's `"<entry>:"` prefix
+  rule covers all of them (the colon blocks stem collisions —
+  "com.bank.app" vs "com.bank.app.evil").
+- `libselinux` (5.0.0_r1 external/libselinux/src/android.c:736;
+  main libselinux/src/android/android_device.c:88):
+  `selinux_android_setcontext(uid_t, int/bool, const char*, const
+  char*)` — the exported C symbol the GOT walker matches; called
+  from libandroid_runtime's own GOT (same DSO, same file the
+  setresuid hooks already patch — production-proven walker path).
+
+Fixes this round (each with the mechanism verified first): the
+deferred isolated dispatch (Bug A — the WIP's coverage hook was
+unreachable behind its own `g_dispatch_done` latch whenever
+modules were installed), the FORCE mount phase's dead gate (Bug B
+— the option's mount half has been a no-op since Round 12), the
+missing 32-bit wrapper stub (Bug C — armeabi-v7a/x86 did not
+link), the daemon `update()` lost-update race (Bug D — live proof:
+179/200 lost), the module loader's append-vs-replace (Bug E), and
+the deny-name test seam's refresh wipe (Bug F).
+
+Honest residuals for the isolated path (the reason is structural:
+the name arrives AFTER the last root window):
+
+- Hidden isolated children keep the platform's mount view — the
+  unshare+unmount phase requires CAP_SYS_ADMIN, which the real
+  setresuid already dropped. An eager unshare for ALL isolated
+  children was considered and rejected: it would remove module
+  overlays from non-denylisted isolated children (a functional
+  regression) and cost a namespace copy per isolated fork, to
+  close a residual that is already strictly better than both
+  Magisk (whose DenyList does not cover isolated processes at
+  all — modules inject, mounts visible) and the pre-R36 code
+  (which also left module .so's mapped in those children).
+- Exec'd helpers of hidden isolated children map the real property
+  area: the exec-proof spoofed-properties bind mount is part of
+  the mount phase that cannot run (no privileges left). In-process
+  reads ARE spoofed (the per-process clone+remap runs in
+  hide_process_phase like every hide path).
+- Module callbacks in isolated children run unprivileged
+  (post-drop): uid/gid overrides are accepted-but-inert (an
+  isolated uid is assigned by system_server, not module business),
+  and log writes are dropped (the runtime closed the log socket
+  before the dispatch point). Ordinary (package-uid) children keep
+  the pre-R36 root-window dispatch — the deferral only engages for
+  the two isolated uid ranges.

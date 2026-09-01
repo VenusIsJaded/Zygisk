@@ -173,6 +173,42 @@ zs_setuid_wrapper:
     ldp  x29, x30, [sp], #16
     ret
 
+// Round 35 — the isolated-process coverage wrapper.
+// selinux_android_setcontext(uid_t uid, bool isSystemServer,
+//                            const char* seInfo, const char* niceName)
+// — a 4-argument call, so the shuffle reaches x4.
+    .global zs_setcontext_wrapper
+    .type   zs_setcontext_wrapper, %function
+zs_setcontext_wrapper:
+    stp  x29, x30, [sp, #-16]!
+    mov  x29, sp
+    stp  x19, x20, [sp, #-16]!
+    stp  x21, x22, [sp, #-16]!
+    stp  x23, x24, [sp, #-16]!
+    stp  x25, x26, [sp, #-16]!
+    stp  x27, x28, [sp, #-16]!
+    stp  d8,  d9,  [sp, #-16]!
+    stp  d10, d11, [sp, #-16]!
+    stp  d12, d13, [sp, #-16]!
+    stp  d14, d15, [sp, #-16]!
+    mov  x4, x3
+    mov  x3, x2
+    mov  x2, x1
+    mov  x1, x0
+    mov  x0, x29
+    bl   zs_impl_setcontext
+    ldp  d14, d15, [sp], #16
+    ldp  d12, d13, [sp], #16
+    ldp  d10, d11, [sp], #16
+    ldp  d8,  d9,  [sp], #16
+    ldp  x27, x28, [sp], #16
+    ldp  x25, x26, [sp], #16
+    ldp  x23, x24, [sp], #16
+    ldp  x21, x22, [sp], #16
+    ldp  x19, x20, [sp], #16
+    ldp  x29, x30, [sp], #16
+    ret
+
 // ---------------------------------------------------------------------------
 // The position-independent trampoline blob.
 //

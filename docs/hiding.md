@@ -1143,3 +1143,52 @@ string obfuscation still defeats scanning, not reverse
 engineering; and the overlay mount line still shows an overlayfs
 on /system/lib64 (inherent to the strategy, shared with KernelSU's
 own metamodule).
+
+## Round 36 — isolated-process coverage (and the deferral that makes it real)
+
+The denylist now covers Android's isolated processes — the uid
+ranges no package ever owns (appId 99000-99999 from the system
+zygote, 90000-98999 from app zygotes), where the uid matcher is
+blind and the only owner signal is the nice_name. The name arrives
+at `selinux_android_setcontext` — the tail of SpecializeCommon,
+after the uid drop (verified 5.0.0_r1..main) — so the hook there
+matches the name against the denylist (`"<package>:"` prefix or
+exact equality; the colon blocks stem collisions) and hides the
+child through the full pipeline: Tier A unmap (the trampoline
+blob's fourth wrapper — both ABI shuffles verified by the binary
+gates) or Tier B hooks, GOT slots restored, residual page
+scrubbed, module .so's unmapped. Denylisted apps' isolated children
+now hide with NO module callback ever having run in them — the
+same "modules vanish with everything else" contract every other
+hidden child keeps. This is coverage Magisk's own DenyList
+mechanism does not have (its uid map carries package uids only).
+
+The load-bearing design point (the round's headline bug): the
+uid-drop hook DEFERS isolated-range children to setcontext — the
+dispatch, the latches, everything. Without the deferral the uid
+hook dispatches modules for the undecidable uid and latches
+`g_dispatch_done`, and the coverage hook's own guard screens
+itself out: dead code in exactly the configuration (modules
+installed) it was written for. The regression tests drive the real
+production sequence (`setresgid → setresuid → setcontext`) through
+the real impls — the missing coverage that let the WIP ship green.
+
+Also closed this round: the FORCE_DENYLIST_UNMOUNT mount phase —
+dead since Round 12 behind the decision gate (the env-scrub half
+worked, the unshare/unmount half never ran; the test now asserts
+the mount log). And the SDK-sandbox remap: sandbox uids (appId
+20000-29999, Android 13+) are decided at uid-drop time by mapping
+them to their owning app (`uid - 10000`, the AOSP formula) —
+multi-user included, no modulo wraparound (owning appIds are
+10000-19999).
+
+Residuals (structural, documented honestly): hidden isolated
+children keep the platform mount view (the name arrives after the
+last root window — an eager unshare was rejected as a functional
+regression for non-denylisted isolated children); their exec'd
+helpers see the real property area (the spoofed-file bind mount
+needs the privileges the drop already took; in-process reads are
+spoofed normally); and module callbacks for isolated children run
+post-drop (unprivileged, uid/gid writes inert, logd already
+closed). All three are strictly better than Magisk's behavior for
+the same processes (which injects modules and hides nothing).

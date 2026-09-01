@@ -1567,3 +1567,113 @@ version-compat) + the public-header check, 24/24 cargo tests,
 45/45 live checks, 0 warnings, ASan+UBSan+leaks green, trampoline
 verification green, perf medians unchanged (0 us / 0 us / 41 ns —
 already at the measurement floor; no forced optimizations).
+
+### Round 36 — the isolated-process coverage that its own guard screened out, and the FORCE option that never worked
+
+The Round 35 work-in-progress (landed this round, re-verified from
+scratch) added denylist coverage for Android's **isolated
+processes** — the uid ranges Android never maps to a package
+(appId 99000-99999 system-zygote, 90000-98999 app-zygote; verified
+from Process.java at 5.0.0_r1..main), where the uid matcher is
+structurally blind: the only signal that identifies the owner is
+the nice_name, which AOSP hands to
+`selinux_android_setcontext(uid, isSystemServer, seInfo, niceName)`
+as the tail of `SpecializeCommon` — AFTER `setresuid` (verified at
+5.0.0_r1, 10.0.0_r1, 12.0.0_r1, 16.0.0_r1 and main; the call shape
+is identical across the whole range, and `nice_name_ptr` may be
+null). The hook + name matcher + SDK-sandbox uid remap (appId
+20000-29999 → owning app, Android 13+; absent in 12.0.0_r1) close
+a documented gap Magisk's own DenyList mechanism leaves open (its
+uid map carries package uids only).
+
+**But the WIP's coverage hook was dead code for its exact target
+case**, and proving that produced this round's bug list — each one
+verified against the source before the fix:
+
+- **Bug A (Fatal, all versions 5.0-16):** with modules installed
+  (the default configuration), the uid-drop hook ran the module
+  dispatch for every undecidable isolated uid and latched
+  `g_dispatch_done` — the setcontext hook's own guard then
+  early-returned, so denylisted apps' isolated children kept
+  getting modules injected (and mapped) while the "coverage" never
+  fired. The host test drove the wrapper in isolation, never the
+  production `setresgid -> setresuid -> setcontext` sequence, so
+  everything stayed green. Fix: the uid hook now DEFERS isolated-
+  range children to setcontext (the only point where the name
+  exists): FORCE mount work runs while still root, the real drop
+  runs, and the decision + dispatch happen at setcontext —
+  denylisted owners' isolated children hide with modules never
+  having run (the same contract the uid path keeps); everyone
+  else's dispatch with the FULL name in the module args (closer to
+  real Zygisk semantics than the old uid-map path, which had
+  nothing — /proc/self/cmdline still holds the zygote's name at
+  that point in SpecializeCommon). A vendor build without the
+  libselinux symbol degrades to the pre-R36 behavior (modules keep
+  dispatching; the hook is simply not registered).
+- **Bug B (Fatal, feature-dead since Round 12, all versions):**
+  `FORCE_DENYLIST_UNMOUNT`'s mount phase called the
+  decision-gated `hide_mount_phase()` — which returns immediately
+  for every non-denylisted child, i.e. for exactly the children
+  the option exists for. The mount half of the option has been a
+  silent no-op since it was born (Round 7's gate predates Round
+  12's feature; the tests asserted the env-scrub half, never the
+  mount log — the same "dead gate" class Round 34 found in the
+  trampoline verifier). Fix: the fail-closed namespace dance is
+  split out (`hide_mount_phase_forced()`) and both FORCE sites
+  call it; the regression test asserts unshare + slave + unmounts
+  actually appear in the mount log for a FORCE child.
+- **Bug C (build-fatal, 32-bit devices):** the WIP registered the
+  setcontext hook unconditionally but only wrote the
+  aarch64/x86_64 wrappers — armeabi-v7a and x86 failed to link
+  (`undefined zs_setcontext_wrapper`; the zip could not be built
+  at all). Found by the 4-ABI cross-build gate, the exact Round 32
+  class. Fix: the 32-bit plain-C stub (null frame = the documented
+  Tier B input — the isolated coverage works, only the self-unmap
+  is absent, like the other five wrappers on no-blob arches).
+- **Bug D (concurrency, all versions):** the Round 35 daemon
+  refactor's `update()` helper released the state lock between the
+  clone and the swap — a lost-update window between the rescan
+  thread and the denylist reload thread (both write the ONE merged
+  Snapshot since R35). Live regression proof: the old code lost
+  179 of 200 concurrent updates; the fixed single-lock
+  read-modify-write loses none. The pre-R35 two-Mutex design could
+  not lose updates; the guarantee is restored for the merged state.
+- **Bug E (test-harness, defense-in-depth):** `load_modules_from`
+  appended instead of replacing — any re-fetch path (the test
+  seam's lazy-reset; a future production retry) would
+  double-load modules, running every callback twice with zero
+  downstream signal. The "must not double-load" invariant is now
+  enforced in the loader, not assumed by the latch.
+- **Bug F (test-seam):** `zs_test_force_deny_name` only set the
+  uid-map latch — the child-side refresh (`maybe_refresh_denylist`)
+  then reloaded the (empty) denylist file and wiped the seam's
+  entry before the matcher could read it. The seam now pins the
+  full refresh state (latches, mtimes, throttle), matching what
+  production children actually inherit.
+
+Round 35's daemon performance work landed with the race fixed: the
+accept loop's per-connection snapshot is now ONE Arc refcount bump
+(~5-20 ns) instead of a deep clone of both lists under two locks
+(~30-80 µs, ~110 allocations for a 100-entry denylist) — the
+copy-on-write cost moved to the rare reload paths. Measured on
+this host (the regression test pins >= 50x): deep-clone 5-figure
+ns vs Arc double-digit ns per snapshot. Matcher median 63 ns, fast
+paths 0 µs, COW delta 0.00 pages — unchanged.
+
+Honest residuals (documented in docs/hiding.md): hidden isolated
+children keep the platform's mount view (the mount phase needs
+root, the name arrives after the drop — no eager fix exists
+without paying module-overlay loss on every isolated fork); their
+exec'd helpers map the real property area (same root-window
+reason); module callbacks for isolated children run
+unprivileged post-drop with uid/gid overrides inert and log writes
+dropped (`__android_log_close` runs before setcontext).
+
+**268/268 host tests** (46 hide / 116 advanced / 20 stealth / 5
+e2e / 6 perf / 8 trampoline / 27 dispatch / 11 version-compat / 16
+zn_loader / 8 obfstr / 5 race) + 50/50 cargo (incl. the two new
+concurrency proofs) + clippy clean, ASan+UBSan+leaks green, TSan
+race suite green, trampoline binary verification green (with the
+setcontext shuffle gates for both blobs), script E2E + daemon E2E
+ALL GREEN, and the 4-ABI flashable zip built with every stealth
+gate (stripped, no SONAME, banned strings, 16 KB alignment) green.

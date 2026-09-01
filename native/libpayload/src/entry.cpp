@@ -53,6 +53,12 @@
 #include "resolve_libc.h"
 #include "unmap_trampoline.h"
 
+// Branch-prediction hints (the payload's hot per-fork paths).
+#ifndef ZS_LIKELY
+#  define ZS_LIKELY(x)   __builtin_expect(!!(x), 1)
+#  define ZS_UNLIKELY(x) __builtin_expect(!!(x), 0)
+#endif
+
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -100,6 +106,17 @@ static std::atomic<int> g_hide_done{0};
 // has run (guards the setresuid hook against double-entry the same
 // way g_hide_done guards the hide pipeline).
 static std::atomic<int> g_dispatch_done{0};
+
+// Round 36: set when the selinux_android_setcontext GOT hook is
+// actually REGISTERED (the real symbol resolved — it does on every
+// studied release from 5.0.0_r1 to main; a hypothetical vendor build
+// that hides it leaves this 0). While 0, the uid-drop hook keeps the
+// pre-R36 behavior for isolated-range uids: dispatch at uid-drop
+// time, no name-based isolated coverage (modules keep working —
+// graceful degradation). While 1, the uid-drop hook DEFERS the
+// decision for isolated-range uids (appId 90000-99999) to the
+// setcontext hook, where the full nice_name arrives.
+static std::atomic<int> g_setcontext_hook_live{0};
 
 #ifdef ZS_HOST_TEST
 // Round 30: test-only — when 1, the Tier A path skips the
@@ -282,6 +299,20 @@ static int (*g_real_setresuid)(uid_t, uid_t, uid_t) = nullptr;
 static int (*g_real_setgid)(gid_t)                  = nullptr;
 static int (*g_real_setuid)(uid_t)                  = nullptr;
 static long (*g_real_fork)(void)                    = nullptr;
+// Round 35 — the isolated-process coverage hook's real target:
+// int selinux_android_setcontext(uid_t, int, const char*, const char*)
+// from libselinux.so, called by AOSP's SpecializeCommon on every
+// studied release (5.0.0_r1 .. refs/heads/main) AFTER the uid drop
+// with the FULL, untruncated nice_name. Resolved at init; the GOT
+// hook is only registered when this resolves (a vendor build with the
+// symbol hidden leaves the coverage off rather than hooking blindly).
+static int (*g_real_setcontext)(uid_t, int, const char*, const char*) = nullptr;
+#ifdef ZS_HOST_TEST
+// Round 35 — test-only override for the real setcontext (recorder +
+// deterministic return value); see zs_impl_setcontext.
+static long (*g_test_setcontext_fn)(long, long, const char*,
+                                    const char*) = nullptr;
+#endif
 
 struct RealCtx3 { long a, b, c; };
 struct RealCtx1 { long a; };
@@ -416,10 +447,59 @@ static long uid_drop_hook(void* wrapper_fp, uid_t id,
             return call_real(real_ctx);
         }
 
+        // ---- Round 36: the isolated-process deferral ----
+        // Isolated-range uids (appId 90000-99999 in the uid%100000
+        // frame: 99000-99999 system-zygote, 90000-98999 app-zygote —
+        // Process.java FIRST_/LAST_ISOLATED_UID and
+        // FIRST_/LAST_APP_ZYGOTE_ISOLATED_UID, verified from AOSP)
+        // belong to NO package: the uid map cannot decide them, so
+        // the pre-R36 code fell straight into the module dispatch
+        // below — injecting modules (and leaving them mapped) into
+        // the isolated children of DENYLISTED apps, and latching
+        // g_dispatch_done so the setcontext name matcher (this
+        // round's coverage) never fired. The owner's identity is
+        // only knowable from the nice_name, which AOSP hands to
+        // selinux_android_setcontext AFTER this hook (verified
+        // 5.0.0_r1 / 10.0.0_r1 / 12.0.0_r1 / 16.0.0_r1 / main: the
+        // call is the tail of SpecializeCommon, setresuid is the
+        // middle). So: run the root-only work we CAN run here (the
+        // FORCE mount phase), make the real call, and leave the
+        // decision + dispatch to zs_impl_setcontext. A vendor build
+        // without the setcontext symbol (g_setcontext_hook_live == 0)
+        // takes the old path instead — modules keep dispatching at
+        // uid-drop time, with no isolated coverage (graceful).
+        if (g_setcontext_hook_live.load(std::memory_order_acquire)) {
+            uid_t iso_app_id = (uid_t)(id % 100000);
+            if (iso_app_id >= 90000 && iso_app_id <= 99999) {
+                if (zs_module_dispatch_wanted() &&
+                    zs_module_force_unmount()) {
+                    // Round 36 Bug B: the FORCED variant — the gated
+                    // hide_mount_phase was a silent no-op here since
+                    // Round 12 (g_will_hide == 0 for undecidable
+                    // uids). Still root: the last chance for the
+                    // namespace work.
+                    hide_mount_phase_forced();
+                }
+                // NOTE: no dispatch, no latches — zs_impl_setcontext
+                // owns this child from here. If specialization dies
+                // before setcontext (fail_fn on a failed drop), the
+                // child is dying anyway; the module callbacks of a
+                // failed specialization were never a contract.
+                return call_real(real_ctx);
+            }
+        }
+
         // ---- Round 12: module dispatch ----
         if (zs_module_dispatch_wanted()) {
             if (zs_module_force_unmount()) {
-                hide_mount_phase();               // still root
+                // Round 36 Bug B: the FORCE mount phase. Pre-R36 this
+                // called the DECISION-GATED hide_mount_phase(), which
+                // returns immediately for every non-denylisted child
+                // (g_will_hide == 0) — i.e. for exactly the children
+                // FORCE exists for. The mount half of the option has
+                // been a no-op since Round 12; this now runs the real
+                // fail-closed namespace dance (see hide.cpp).
+                hide_mount_phase_forced();          // still root
             }
 
             uid_t eff_uid = id, eff_gid = 0;
@@ -490,6 +570,124 @@ extern "C" long zs_impl_setuid(void* wrapper_fp, long a0) {
     RealCtx1 ctx{a0};
     return uid_drop_hook(wrapper_fp, (uid_t)a0,
                          call_real_setuid, &ctx, 1);
+}
+
+// Round 35 — the isolated-process coverage hook. Called (through the
+// patched GOT slot) as AOSP's SpecializeCommon winds down:
+//     selinux_android_setcontext(uid, isSystemServer, seInfo, niceName)
+// — AFTER setresuid/setresgid already ran and returned. The uid-only
+// matcher has therefore already decided for every package-backed uid;
+// the ONLY decisions still open are the ranges Android never maps to
+// a package: the isolated ranges (appId 99000-99999 forked from the
+// system zygote; 90000-98999 forked from an app zygote — covered for
+// free when the app zygote itself was hidden, but matched here too
+// because a NON-denylisted app's app-zygote keeps the payload
+// resident and its isolated children deserve the same check).
+//
+// The name is the authoritative signal: ActiveServices builds
+// isolated process names as "<package>:<class>" / "<pkg>:ishared:<n>"
+// (verified in main), so a denylist entry prefix decides. This is
+// beyond what Magisk's DenyList mechanism itself does (its uid map
+// carries package uids only) — closing a documented coverage gap.
+//
+// Ordering constraints honored here:
+//   * The REAL setcontext runs FIRST — the SELinux domain transition
+//     must happen exactly once, before any of our unmap work.
+//   * The mount phase (unshare + unmounts) is SKIPPED: at this point
+//     the child already dropped uid (no CAP_SYS_ADMIN) — an honest,
+//     documented residual: the isolated child keeps the platform's
+//     mount view; the maps scrub (the actual detection surface for a
+//     process that can read /proc/self/maps) runs in full.
+//   * hide_process_phase(..., real_already_ran=true, rv) is the exact
+//     shape the FORCE path uses: the trampoline relays the ALREADY
+//     OBTAINED return value instead of calling anything again.
+//
+// ROUND 36 — the deferred dispatch. The uid-drop hook defers the
+// module dispatch for isolated-range uids to HERE (the only point
+// where the nice_name exists); a NO-MATCH (or null name — a child
+// AOSP specialized without one) therefore still owes the child its
+// module callbacks. They run HERE, after the real setcontext:
+// preAppSpecialize fires with the FULL name in the args (closer to
+// real Zygisk's semantics than the old uid-map path, which had
+// nothing — /proc/self/cmdline still holds the zygote's name at
+// this point in SpecializeCommon), then postAppSpecialize, then the
+// latch. Documented residuals of the deferral (vs the old uid-drop
+// position, which could not know the name at all):
+//   * module writes to args->uid/args->gid are accepted but INERT —
+//     the runtime's setresuid already executed; an isolated child's
+//     uid is assigned by system_server and is not module business
+//     anyway;
+//   * module log writes are dropped — SpecializeCommon ran
+//     __android_log_close() before the setcontext call (verified
+//     main: the close is 5 lines above), so logd sockets are gone;
+//   * the callbacks run unprivileged (euid = the isolated uid) —
+//     the price of deciding by NAME instead of by uid. The FORCE
+//     mount phase is NOT affected: the uid-drop deferral arm runs
+//     it while still root, before returning.
+extern "C" long zs_impl_setcontext(void* wrapper_fp, long a0, long a1,
+                                   long a2, long a3) {
+    // a0 = uid, a1 = is_system_server, a2 = se_info, a3 = nice_name.
+    long rv;
+#ifdef ZS_HOST_TEST
+    if (g_test_setcontext_fn) {
+        rv = g_test_setcontext_fn(a0, a1, (const char*)a2,
+                                  (const char*)a3);
+    } else
+#endif
+    if (ZS_LIKELY(g_real_setcontext != nullptr)) {
+        rv = g_real_setcontext((uid_t)a0, (int)a1, (const char*)a2,
+                               (const char*)a3);
+    } else {
+        // Unresolved real (the hook is not registered when resolution
+        // failed; this arm exists only for direct-call tests).
+        rv = -1;
+    }
+
+    // Isolated coverage: forked children only, undecidable ranges
+    // only, once only.
+    if (ZS_LIKELY(getpid() == g_origin_pid) ||
+        g_hide_done.load(std::memory_order_acquire) ||
+        g_dispatch_done.load(std::memory_order_acquire)) {
+        return rv;
+    }
+    uid_t app_id = (uid_t)(((uid_t)a0) % 100000);
+    if (ZS_UNLIKELY(app_id < 90000 || app_id > 99999)) {
+        // Package-backed uid (or the system server): the uid-drop
+        // hook already decided — dispatch or hide, both latched.
+        return rv;
+    }
+    if (a3 != 0 && hide_setup_for_isolated_name((const char*)a3)) {
+        g_hide_done.store(1, std::memory_order_release);
+        // No mount phase possible post-drop; spoof + unmap phases run
+        // (hide_process_phase handles both tiers). Modules never ran
+        // in this child (the uid hook deferred, the name matched) —
+        // the same "modules vanish with everything else in hidden
+        // processes" contract the uid path keeps.
+        if (hide_process_phase(wrapper_fp, priv_drop_nop, nullptr,
+                               true, rv)) {
+            return 0;   // Tier A jumped out with rv relayed
+        }
+        // Tier B fell through — the payload stays resident with the
+        // Tier B hooks installed; return the real call's value.
+        return rv;
+    }
+    // Round 36 — the deferred isolated dispatch: the owner is NOT
+    // denylisted (or the name is null — undecidable, treated as
+    // non-denylisted exactly like the pre-R36 uid path treated every
+    // isolated uid). Modules run now, with the real name in the args.
+    if (zs_module_dispatch_wanted()) {
+        uid_t eff_uid = (uid_t)a0, eff_gid = 0;
+        ZsChildKind kind = zs_module_pre_specialize(
+            (uid_t)a0, &eff_uid, &eff_gid, (const char*)a3);
+        if (kind != ZS_CHILD_NONE) {
+            // (uid_t)eff_uid / eff_gid are the module's requested
+            // overrides — INERT here by the documented residual; the
+            // runtime's own drop already ran.
+            zs_module_post_specialize();
+            g_dispatch_done.store(1, std::memory_order_release);
+        }
+    }
+    return rv;
 }
 
 // Kept for the fork wrapper (registered but not required — the pid
@@ -690,6 +888,22 @@ extern "C" long zs_setgid_wrapper(long a0) {
 extern "C" long zs_setuid_wrapper(long a0) {
     return zs_impl_setuid(nullptr, a0);
 }
+// ROUND 36 (the Round 32 class, found by the 4-ABI cross-build gate
+// again): the Round 35 WIP added the setcontext registration to
+// zs_entry_init unconditionally but only wrote the aarch64/x86_64
+// wrappers — armeabi-v7a and x86 failed to LINK (undefined
+// zs_setcontext_wrapper; the module zip could not be built at all).
+// The 32-bit stub keeps the hook fully functional as a Tier B hook
+// (null frame = the documented Tier B input): the isolated-process
+// deferral, name matcher and hide phases all run — only the Tier A
+// self-unmap is absent, exactly like the other five wrappers on a
+// no-blob arch. Plain-C-ABI call compatibility for a 4-argument
+// function: arm32 passes a0-a3 in r0-r3, i386 on the stack slots —
+// both match four long parameters (long == int width on 32-bit).
+extern "C" long zs_setcontext_wrapper(long a0, long a1, long a2,
+                                      long a3) {
+    return zs_impl_setcontext(nullptr, a0, a1, a2, a3);
+}
 #endif
 
 // ------------------------------------------------------------------------
@@ -765,6 +979,20 @@ void zs_entry_init() {
         ZS_LOGW("payload: cannot resolve setresgid/setresuid; "
                 "hooks will fall back to raw syscalls");
     }
+    // Round 35 — resolve libselinux's setcontext. RTLD_NOLOAD first
+    // (libselinux is loaded into the zygote by libandroid_runtime's
+    // own dependencies — a NOLOAD lookup never touches disk), then
+    // the default scope. On host test builds both miss (glibc has no
+    // such symbol) and the hook simply does not register — the test
+    // seam installs a fake real instead.
+    {
+        void* sel_h = dlopen("libselinux.so", RTLD_NOLOAD | RTLD_LAZY);
+        void* fn = sel_h ? dlsym(sel_h, "selinux_android_setcontext")
+                         : nullptr;
+        if (!fn) fn = dlsym(RTLD_DEFAULT, "selinux_android_setcontext");
+        g_real_setcontext =
+            (int (*)(uid_t, int, const char*, const char*))fn;
+    }
 
     // Layer init: snapshots our own segments, loads the DenyList and
     // the uid map, resolves symbols, registers Tier B hooks as
@@ -792,6 +1020,20 @@ void zs_entry_init() {
         (void*)&zs_setuid_wrapper);
     hide_advanced_register_got_hook("fork",
         (void*)&zs_fork_wrapper);
+    // Round 35 — the isolated-process coverage hook. Registered ONLY
+    // when the real selinux_android_setcontext resolved: the GOT
+    // walker matches the slot by this exact symbol name across every
+    // DSO, and the wrapper's impl needs a real target to relay. The
+    // cost for non-isolated children is one patched-GOT indirect call
+    // plus four compares (pid, two latches, the appId range) before
+    // falling through to the real call's already-returned value.
+    if (g_real_setcontext) {
+        hide_advanced_register_got_hook("selinux_android_setcontext",
+            (void*)&zs_setcontext_wrapper);
+        // Round 36: the hook is live — the uid-drop hook may now
+        // DEFER isolated-range children to it (see uid_drop_hook).
+        g_setcontext_hook_live.store(1, std::memory_order_release);
+    }
     hide_advanced_install_got_hooks();
 }
 
@@ -838,6 +1080,56 @@ void zs_entry_post_fork(const char* package_name,
 extern "C" __attribute__((visibility("default")))
 void zs_test_force_deny_uid(int uid) {
     hide_test_force_deny_uid((uid_t)uid);
+}
+
+// Round 35 — force a denylisted PACKAGE name (drives the
+// isolated-process name matcher on the host).
+extern "C" __attribute__((visibility("default")))
+void zs_test_force_deny_name(const char* pkg) {
+    hide_test_force_deny_name(pkg);
+}
+
+// Round 35 — install a FAKE real setcontext (recorder + deterministic
+// rv) and register the GOT hook under the exact production symbol
+// name, so host tests can drive zs_setcontext_wrapper the way the
+// patched GOT does on a device.
+extern "C" __attribute__((visibility("default")))
+void zs_test_install_setcontext(long (*fn)(long, long, const char*,
+                                           const char*)) {
+    g_test_setcontext_fn = fn;
+    if (fn) {
+        hide_advanced_register_got_hook(
+            "selinux_android_setcontext",
+            (void*)&zs_setcontext_wrapper);
+        hide_advanced_install_got_hooks();
+        // Round 36: mirror the production init — installing the hook
+        // is what arms the uid-drop deferral.
+        g_setcontext_hook_live.store(1, std::memory_order_release);
+    }
+}
+
+// Round 36 — force the deferral flag OFF (drives the degradation
+// path: a vendor build without the setcontext symbol must keep the
+// pre-R36 uid-drop dispatch for isolated children).
+extern "C" __attribute__((visibility("default")))
+void zs_test_setcontext_live(int live) {
+    g_setcontext_hook_live.store(live ? 1 : 0,
+                                 std::memory_order_release);
+}
+
+// Round 36 — read the deferral flag back (test assertions).
+extern "C" __attribute__((visibility("default")))
+int zs_test_setcontext_is_live() {
+    return g_setcontext_hook_live.load(std::memory_order_acquire);
+}
+
+// Round 35 — call the REAL impl directly with a null wrapper frame
+// (Tier B path; mirrors zs_test_setresuid's shape).
+extern "C" __attribute__((visibility("default")))
+long zs_test_setcontext(long uid, long is_sys, const char* seinfo,
+                        const char* nice_name) {
+    return zs_impl_setcontext(nullptr, uid, is_sys, (long)seinfo,
+                              (long)nice_name);
 }
 
 // Round 12 — drive the REAL hook implementations from the dispatch

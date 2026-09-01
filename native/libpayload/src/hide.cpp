@@ -1203,9 +1203,70 @@ int hide_setup_for_target_uid(uid_t uid) {
     }
     // appId family match covers multi-user profiles.
     uid_t app_id = (uid_t)(uid % 100000);
+    // Round 35 — SDK-sandbox remap (Android 13+). AOSP Process.java:
+    //   FIRST_SDK_SANDBOX_UID  = 20000 (absent in 12.0, present 13.0)
+    //   getAppUidForSdkSandboxUid(uid) = uid - 10000
+    // The sandbox uid of user 10's app 10123 is 1020123; remapping
+    // inside the appId frame (20000+123 -> 10000+123) lands on the
+    // owning app for EVERY user simultaneously. Pre-13 platforms
+    // never allocate the range, so the branch is dead there — but
+    // harmless.
+    if (app_id >= 20000 && app_id < 30000) {
+        app_id = (uid_t)(app_id - 10000);
+    }
     int hide = g_deny_app_ids.count(app_id) > 0 ? 1 : 0;
     g_will_hide.store(hide, std::memory_order_release);
     return hide;
+}
+
+// Round 35 — the isolated-process matcher (see hide.h for the naming
+// research). This runs in a FORKED child from the setcontext hook:
+// the denylist cache was loaded/refreshed by the zygote pre-fork and
+// inherited through COW — exactly the same freshness discipline as
+// the uid matcher above (which the zygote-side fork hook refreshes;
+// children never stat()).
+//
+// The comparison itself is a scan over the denylist with a strlen of
+// the entry and a bounded memcmp of the name prefix — denylists are
+// small (tens of entries), this runs once per isolated process spawn,
+// and the fast pre-check (denylist empty / name null) keeps the cost
+// at zero for the overwhelmingly common no-denylist configuration.
+int hide_setup_for_isolated_name(const char* nice_name) {
+    if (ZS_UNLIKELY(!nice_name || nice_name[0] == '\0')) return 0;
+    if (ZS_UNLIKELY(!g_uid_map_loaded.load(std::memory_order_acquire))) {
+        // Defensive: the uid matcher normally loads first (the uid
+        // drop always precedes the setcontext call in SpecializeCommon
+        // on every studied release). If somehow it did not, load now.
+        load_denylist();
+    }
+    // g_denylist_cache holds denylist PACKAGE entries (the same set
+    // hide_setup_for_target compares names against).
+    if (g_denylist_cache.empty()) return 0;
+    size_t name_len = strnlen(nice_name, 4096);
+    for (const std::string& entry : g_denylist_cache) {
+        if (entry.empty()) continue;
+        // Exact equality: the denylisted entry is the whole process
+        // name (a denylisted app's MAIN process name is its package).
+        if (entry.size() == name_len &&
+            memcmp(entry.data(), nice_name, name_len) == 0) {
+            g_will_hide.store(1, std::memory_order_release);
+            return 1;
+        }
+        // Prefix "<entry>:": every isolated-process naming scheme
+        // (regular "<pkg>:<class>", shared "<pkg>:ishared:<inst>",
+        // app-declared ":suffix" process names) appends a colon after
+        // the owning package / process stem. A prefix WITHOUT the
+        // colon would also swallow unrelated packages sharing a stem
+        // ("com.bank.app" matching "com.bank.app.evil"), so the colon
+        // is required.
+        if (entry.size() + 1 < name_len &&
+            nice_name[entry.size()] == ':' &&
+            memcmp(entry.data(), nice_name, entry.size()) == 0) {
+            g_will_hide.store(1, std::memory_order_release);
+            return 1;
+        }
+    }
+    return 0;
 }
 
 void hide_lookup_package_for_uid(uid_t uid, char* out, size_t cap) {
@@ -1261,56 +1322,79 @@ int hide_deny_decided_for(uid_t uid) {
            (uint32_t)uid;
 }
 
-void hide_apply_for_target(const char* /*package_name*/) {
-    // Fast path: if setup decided NOT to hide, we're a no-op.
-    if (ZS_UNLIKELY(!g_will_hide.load(std::memory_order_acquire))) return;
-
-    // Slow path: target IS on the denylist.
-    //
-    // The caller (entry.cpp's setresgid/setresuid hook) guarantees we
-    // are still root here — unshare(CLONE_NEWNS) requires
-    // CAP_SYS_ADMIN, which is gone the moment the real setresuid
-    // runs. This is why the hide pipeline hooks the *privilege drop*
-    // rather than postAppSpecialize.
-    //
-    // Round 9 (B1): this function is now FAIL-CLOSED around the
-    // namespace dance. The old code had two system-breaking defects
-    // that host tests could not see (no root, no shared mounts):
-    //
-    //   a) On unshare() failure it fell through to the umount loop,
-    //      reasoning that "umount2 will fail without a private
-    //      namespace". That is exactly backwards: after a FAILED
-    //      unshare we are still in the INIT namespace and still root,
-    //      so umount2() SUCCEEDS there — detaching module mounts for
-    //      every process on the device. A denylisted app fork could
-    //      break the whole system's module mounts.
-    //   b) On unshare() SUCCESS, the copied namespace stays in the
-    //      same SHARED propagation peer group as init's. Every
-    //      umount2() on a shared mount propagates back to the init
-    //      namespace (same global breakage), and any mount event in
-    //      init after our unshare propagates INTO the child (a hide
-    //      leak). The MS_SLAVE|MS_REC remount below detaches us from
-    //      the peer group in both directions — the same guarantee
-    //      Magisk's DenyList and ReZygisk's clean-namespace setns()
-    //      rely on.
-    //
-    // Both failures now skip the unmount phase entirely: property
-    // spoofing, fd closing and the self-unmap still apply, we just
-    // leave the mount table alone rather than risk a global mutation.
+// ROUND 36 (Bug B): the namespace dance, split out of the gated path.
+//
+// The Round 7 decision gate (`g_will_hide`) inside
+// hide_apply_for_target PREDATES the Round 12 FORCE_DENYLIST_UNMOUNT
+// feature — and it silently screened the FORCE mount phase out: the
+// FORCE path runs for NON-denylisted children (g_will_hide == 0), so
+// the "fast path" early return made every FORCE child a no-op. The
+// mount component of the option has been dead since Round 12: the
+// module set the flag, the payload called hide_mount_phase(), and
+// hide_apply_for_target returned before unshare() on every single
+// fork (the env-scrub half of FORCE worked, the mount half never
+// did, and no test asserted the mount log for the FORCE shape — the
+// exact "dead gate" class Round 34 found in the trampoline verifier).
+//
+// The core below is the unchanged fail-closed Round 9 dance; the two
+// callers are the denylist path (gated, plus the property-file mount)
+// and the new FORCE path (ungated — the module explicitly asked for
+// the unmounts even though the target is not denylisted).
+//
+// The caller guarantees we are still root here — unshare(CLONE_NEWNS)
+// requires CAP_SYS_ADMIN, which is gone the moment the real setresuid
+// runs. This is why the hide pipeline hooks the *privilege drop*
+// rather than postAppSpecialize.
+//
+// Round 9 (B1): FAIL-CLOSED semantics, kept verbatim:
+//   a) On unshare() failure we are still in the INIT namespace and
+//      still root — umount2() would SUCCEED there and detach module
+//      mounts for every process on the device, so we must stop.
+//   b) On unshare() SUCCESS the copied namespace stays in the same
+//      SHARED propagation peer group as init's: every umount2() on a
+//      shared mount propagates back to the init namespace (global
+//      breakage), and any mount event in init propagates INTO the
+//      child (a hide leak). The MS_SLAVE|MS_REC remount detaches us
+//      from the peer group in both directions.
+// Both failures skip the unmount phase entirely.
+static int hide_namespace_unmounts() {
     if (ZS_UNLIKELY(g_fn_unshare(CLONE_NEWNS) != 0)) {
         ZS_LOGW("hide: unshare(CLONE_NEWNS) failed: %s — skipping the "
                 "unmount phase (never umount in the init namespace)",
                 strerror(errno));
-        return;
+        return -1;
     }
     if (ZS_UNLIKELY(g_fn_mount_slave() != 0)) {
         ZS_LOGW("hide: MS_SLAVE|MS_REC remount of / failed: %s — "
                 "skipping the unmount phase (shared propagation would "
                 "leak our umounts system-wide)",
                 strerror(errno));
-        return;
+        return -1;
     }
     unmount_magisk_paths();
+    return 0;
+}
+
+void hide_mount_phase_forced() {
+    // ROUND 36 (Bug B): FORCE path — no decision gate. A module that
+    // set FORCE_DENYLIST_UNMOUNT asked for exactly this: unshare +
+    // slave remount + detach the module mounts, even though the
+    // child's target is not denylisted. The spoofed-properties bind
+    // mount is deliberately NOT done here: that mount serves the
+    // per-process property spoofing of HIDDEN children; a FORCE
+    // child keeps the real property area (its props are not being
+    // spoofed, only its mount table is being cleaned).
+    (void)hide_namespace_unmounts();
+}
+
+void hide_apply_for_target(const char* /*package_name*/) {
+    // Fast path: if setup decided NOT to hide, we're a no-op. (The
+    // FORCE path no longer routes through here — see
+    // hide_mount_phase_forced above.)
+    if (ZS_UNLIKELY(!g_will_hide.load(std::memory_order_acquire))) return;
+
+    // Slow path: target IS on the denylist.
+    if (ZS_UNLIKELY(hide_namespace_unmounts() != 0)) return;
     // Round 19: serve the spoofed property area to exec'd helpers
     // (bind mount + self-check; no-op when the feature is off).
     // After the unmounts, not before: for THIS child the mount lands
@@ -1588,6 +1672,42 @@ void hide_test_force_deny_uid(uid_t uid) {
     g_uid_map_loaded.store(1);
 }
 
+// Round 35 — test-only: force a PACKAGE name into the denylist cache
+// so the isolated-name matcher can be driven on the host (the deny
+// file lives under a root-only /data/system tree that does not exist
+// here).
+void hide_test_force_deny_name(const char* pkg) {
+    if (pkg && *pkg) g_denylist_cache.insert(pkg);
+    g_uid_map_loaded.store(1);
+    // ROUND 36: pin the refresh state too. The first version of this
+    // seam only set g_uid_map_loaded — which made the uid hook's
+    // else-branch run maybe_refresh_denylist() in the CHILD, and a
+    // stale open-fail latch (or an mtime change some earlier test
+    // left behind) reloaded the (empty) denylist file, WIPING this
+    // seam's entry before the isolated matcher could read it. In
+    // production the equivalent can never happen: the zygote-side
+    // pre-fork refresh (R34) owns freshness, children inherit the
+    // loaded cache through copy-on-write, and the matcher's defensive
+    // load only fires when the uid hook never loaded the map (an
+    // impossible SpecializeCommon order — the uid drop always runs
+    // first on every studied release).
+    g_denylist_loaded.store(1);
+    g_last_load_open_fail.store(0, std::memory_order_relaxed);
+    struct stat st{};
+    if (stat(denylist_path(), &st) == 0) {
+        g_denylist_mtime.store(st.st_mtime, std::memory_order_relaxed);
+    }
+    struct stat pst{};
+    if (stat(packages_list_path(), &pst) == 0) {
+        g_pkg_list_mtime.store(pst.st_mtime, std::memory_order_relaxed);
+    }
+    // And do not let a throttled child re-check within the interval.
+    struct timespec now{};
+    clock_gettime(CLOCK_MONOTONIC_COARSE, &now);
+    g_next_refresh_check.store(now.tv_sec + 60,
+                               std::memory_order_relaxed);
+}
+
 void hide_test_set_records(const struct so_record* recs, size_t count) {
     g_self_so_count = count < kMaxSoRecords ? count : kMaxSoRecords;
     for (size_t i = 0; i < g_self_so_count; ++i) {
@@ -1666,6 +1786,23 @@ void zs_test_props_source_clear() {
 // extern "C" so the dlopen-based dispatch test can resolve it.
 extern "C" void zs_test_props_source_clear_c() {
     zs_test_props_source_clear();
+}
+// ROUND 36 (Bug B regression gate): extern "C" forms of the mount
+// seams so test_module_dispatch (which dlopens the full libpayload.so
+// and cannot reach the C++ names) can install the mount recorders and
+// assert the FORCE path ACTUALLY unshares/unmounts. On the pre-R36
+// code the log below stayed empty for a FORCE child — the assertion
+// shape that would have caught the dead gate in Round 12.
+extern "C" void zs_test_set_mount_fns_c(ZsUnshareFn u, ZsMountSlaveFn s,
+                                        ZsUmount2Fn um) {
+    zs_test_set_mount_fns(u, s, um);
+}
+extern "C" void zs_test_mount_log_reset_c() { zs_test_mount_log_reset(); }
+extern "C" const char* zs_test_mount_log_c() {
+    return zs_test_mount_log();
+}
+extern "C" void zs_test_mount_log_append_c(char op) {
+    zs_test_mount_log_append(op);
 }
 // Drive both fiction captures around a (recorded) bind mount so the
 // hide_advanced hook tests can exercise the stat parody end to end.

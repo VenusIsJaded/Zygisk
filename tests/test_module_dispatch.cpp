@@ -1082,6 +1082,248 @@ ZS_TEST(lazy_daemon_init_latches_only_after_daemon_answers) {
 // the platform's own path, and the stat-based detection must tell a
 // regular file from a directory.
 // ----------------------------------------------------------------------
+// ROUND 36 — the isolated-process deferral + the FORCE mount fix.
+//
+// Production order (AOSP SpecializeCommon, verified at 5.0.0_r1 /
+// 10.0.0_r1 / 12.0.0_r1 / 16.0.0_r1 / main):
+//     setresgid -> setresuid -> ... -> selinux_android_setcontext
+// The uid-drop hook fires FIRST; the nice_name only exists at the
+// setcontext call. These tests drive BOTH hooks in the production
+// order through the real impls — the missing coverage that let the
+// Round 35 WIP ship a coverage hook its own guard made unreachable.
+// ----------------------------------------------------------------------
+
+typedef void (*Fn_set_force_unmount)(int);
+typedef void (*Fn_setcontext_live)(int);
+typedef int  (*Fn_setcontext_is_live)(void);
+// Local twins of hide.h's Zs*Fn recorder types (the dispatch test
+// deliberately does not include the payload's private headers).
+typedef int  (*R36UnshareFn)(int);
+typedef int  (*R36MountSlaveFn)(void);
+typedef int  (*R36Umount2Fn)(const char*, int);
+typedef void (*Fn_set_mount_fns_c)(R36UnshareFn, R36MountSlaveFn,
+                                   R36Umount2Fn);
+typedef void (*Fn_mount_log_reset_c)(void);
+typedef const char* (*Fn_mount_log_c)(void);
+typedef void (*Fn_mount_log_append_c)(char);
+typedef void (*Fn_install_setcontext)(long (*)(long, long,
+                                               const char*,
+                                               const char*));
+typedef long (*Fn_setcontext)(long, long, const char*, const char*);
+typedef void (*Fn_force_deny_name)(const char*);
+
+static Fn_set_force_unmount   fn_set_force_unmount;
+static Fn_setcontext_live     fn_setcontext_live;
+static Fn_setcontext_is_live  fn_setcontext_is_live;
+static Fn_set_mount_fns_c     fn_set_mount_fns_c;
+static Fn_mount_log_reset_c   fn_mount_log_reset_c;
+static Fn_mount_log_c         fn_mount_log_c;
+static Fn_mount_log_append_c  fn_mount_log_append_c;
+static Fn_install_setcontext  fn_install_setcontext;
+static Fn_setcontext          fn_setcontext;
+static Fn_force_deny_name     fn_force_deny_name;
+
+static void r36_syms() {
+    static bool done = false;
+    if (done) return;
+    done = true;
+    fn_set_force_unmount  = (Fn_set_force_unmount)sym("zs_test_set_force_unmount");
+    fn_setcontext_live    = (Fn_setcontext_live)sym("zs_test_setcontext_live");
+    fn_setcontext_is_live = (Fn_setcontext_is_live)sym("zs_test_setcontext_is_live");
+    fn_set_mount_fns_c    = (Fn_set_mount_fns_c)sym("zs_test_set_mount_fns_c");
+    fn_mount_log_reset_c  = (Fn_mount_log_reset_c)sym("zs_test_mount_log_reset_c");
+    fn_mount_log_c        = (Fn_mount_log_c)sym("zs_test_mount_log_c");
+    fn_mount_log_append_c =
+        (Fn_mount_log_append_c)sym("zs_test_mount_log_append_c");
+    fn_install_setcontext = (Fn_install_setcontext)sym("zs_test_install_setcontext");
+    fn_setcontext         = (Fn_setcontext)sym("zs_test_setcontext");
+    fn_force_deny_name    = (Fn_force_deny_name)sym("zs_test_force_deny_name");
+}
+
+// A fake "real" setcontext: records its args in the shared rec page's
+// spare fields and returns a distinctive rv the test can verify was
+// relayed (the trampoline contract: the runtime sees the real call's
+// return value).
+static long r36_fake_setcontext(long uid, long is_sys, const char* se,
+                                const char* name) {
+    (void)is_sys; (void)se;
+    g_rec->entries[0].uid = (int)uid;   // RecEntry.uid doubles as the
+    g_rec->entries[0].gid = 0;          // recorder slot here (count
+                                        // stays 0: no module cb)
+    snprintf(g_rec->entries[0].nice_name,
+             sizeof g_rec->entries[0].nice_name, "%s",
+             name ? name : "");
+    return 4242;
+}
+
+// Bug A: with the setcontext hook live, an isolated uid must NOT
+// dispatch at uid-drop time; the dispatch happens at setcontext with
+// the real name in the args — the exact production order.
+ZS_TEST(isolated_uid_defers_dispatch_to_setcontext) {
+    r36_syms();
+    fn_install_setcontext(r36_fake_setcontext);
+    ZS_CHECK(fn_setcontext_is_live() == 1);
+
+    rec_reset();
+    fflush(nullptr);
+    pid_t pid = fork();
+    ZS_CHECK(pid >= 0);
+    if (pid == 0) {
+        fn_reset_child();
+        // Production order: gid hook, uid hook (isolated uid —
+        // NOTHING must dispatch here), then setcontext with the name.
+        fn_setresgid(99123);
+        fn_setresuid(99123);
+        int dispatched_early = (rec_count() > 0);   // pre/post fired?
+        // THE Round 36 regression: pre-R36 the module's pre+post ran
+        // HERE (isolated children of denylisted apps got modules).
+        _exit(dispatched_early ? 3 : 0);
+    }
+    int st = 0;
+    ZS_CHECK(waitpid(pid, &st, 0) == pid);
+    ZS_CHECK(WEXITSTATUS(st) == 0);
+
+    // Now the setcontext half — same child shape, name first.
+    rec_reset();
+    fflush(nullptr);
+    pid = fork();
+    ZS_CHECK(pid >= 0);
+    if (pid == 0) {
+        fn_reset_child();
+        fn_setresgid(99123);
+        fn_setresuid(99123);       // deferred: nothing dispatched
+        long rv = fn_setcontext(99123, 0, nullptr, "com.other.app:svc");
+        // The deferred dispatch ran at setcontext (pre + post), and
+        // the fake real's rv was relayed through the impl.
+        _exit((rec_count() == 2 && rv == 4242) ? 0 : 4);
+    }
+    st = 0;
+    ZS_CHECK(waitpid(pid, &st, 0) == pid);
+    ZS_CHECK(WEXITSTATUS(st) == 0);
+    // Parent-side view: the child's RecPage writes are shared.
+    ZS_CHECK(rec_count() == 2);
+    ZS_CHECK(rec(0)->cb == ZS_CB_PRE_APP);
+    ZS_CHECK(rec(1)->cb == ZS_CB_POST_APP);
+    // The module saw the FULL isolated name (Round 36: the
+    // nice_name_override — the uid map alone had nothing for 99123,
+    // and /proc/self/cmdline still held the test binary's name).
+    ZS_CHECK(strcmp(rec(0)->nice_name, "com.other.app:svc") == 0);
+    // The fake real setcontext ran FIRST (recorded uid in the args
+    // the module then saw).
+    ZS_CHECK(rec(0)->uid == 99123);
+    rec_reset();
+    fn_install_setcontext(nullptr);
+    fn_setcontext_live(0);   // leave clean for later tests
+}
+
+// Bug A (the coverage): a denylisted owner's isolated child HIDES at
+// setcontext — no module callbacks ever run in it, and the fake
+// real's rv is relayed.
+ZS_TEST(isolated_uid_setcontext_hides_denylisted_owner) {
+    r36_syms();
+    fn_install_setcontext(r36_fake_setcontext);
+    ZS_CHECK(fn_setcontext_is_live() == 1);
+
+    rec_reset();
+    fflush(nullptr);
+    pid_t pid = fork();
+    ZS_CHECK(pid >= 0);
+    if (pid == 0) {
+        fn_reset_child();
+        fn_force_deny_name("com.deny.app");
+        fn_setresgid(99555);
+        fn_setresuid(99555);       // deferred (isolated)
+        long rv = fn_setcontext(99555, 0, nullptr,
+                                "com.deny.app:com.deny.Svc");
+        // Modules never ran in this child (the hide contract), and
+        // the real call's rv was relayed through the Tier B path.
+        _exit((rec_count() == 0 && rv == 4242) ? 0 : 5);
+    }
+    int st = 0;
+    ZS_CHECK(waitpid(pid, &st, 0) == pid);
+    ZS_CHECK(WEXITSTATUS(st) == 0);
+    ZS_CHECK(rec_count() == 0);   // no module callbacks anywhere
+    rec_reset();
+    fn_install_setcontext(nullptr);
+    fn_setcontext_live(0);
+}
+
+// The degradation guard: with the setcontext hook NOT live (a vendor
+// build without the symbol), isolated children keep the pre-R36
+// uid-drop dispatch — modules keep working.
+ZS_TEST(isolated_uid_without_hook_dispatches_at_uid_time) {
+    r36_syms();
+    ZS_CHECK(fn_setcontext_is_live() == 0);   // cleaned by prior tests
+
+    rec_reset();
+    fflush(nullptr);
+    pid_t pid = fork();
+    ZS_CHECK(pid >= 0);
+    if (pid == 0) {
+        fn_reset_child();
+        fn_setresgid(99123);
+        fn_setresuid(99123);   // NO setcontext hook: dispatch NOW
+        _exit(rec_count() == 2 ? 0 : 6);
+    }
+    int st = 0;
+    ZS_CHECK(waitpid(pid, &st, 0) == pid);
+    ZS_CHECK(WEXITSTATUS(st) == 0);
+    ZS_CHECK(rec_count() == 2);
+    ZS_CHECK(rec(0)->cb == ZS_CB_PRE_APP);
+    ZS_CHECK(rec(1)->cb == ZS_CB_POST_APP);
+    rec_reset();
+}
+
+// Bug B: the EARLY FORCE mount phase actually unshares/unmounts.
+// Pre-R36 the log below stayed EMPTY for a non-denylisted FORCE
+// child (the g_will_hide gate no-op'd the whole path) — this is the
+// assertion shape that would have caught the dead gate in Round 12.
+static int r36_rec_unshare(int) { fn_mount_log_append_c('u'); return 0; }
+static int r36_rec_slave(void) { fn_mount_log_append_c('s'); return 0; }
+static int r36_rec_umount(const char*, int) {
+    fn_mount_log_append_c('m');
+    return 0;
+}
+
+ZS_TEST(force_unmount_mount_phase_actually_unmounts) {
+    r36_syms();
+    // Arm FORCE the way onLoad does in the zygote (children inherit).
+    fn_set_force_unmount(1);
+    // Mount recorders through the extern-C seams (the dispatch test
+    // cannot reach the C++-namespace recorders test_hide uses).
+    fn_set_mount_fns_c(r36_rec_unshare, r36_rec_slave, r36_rec_umount);
+
+    rec_reset();
+    fflush(nullptr);
+    pid_t pid = fork();
+    ZS_CHECK(pid >= 0);
+    if (pid == 0) {
+        fn_reset_child();
+        fn_mount_log_reset_c();
+        // Non-denylisted app uid: the dispatch path (not the hide
+        // path) — the FORCE arm's exact production shape.
+        fn_setresgid(10195);
+        fn_setresuid(10195);
+        const char* log = fn_mount_log_c();
+        // The namespace dance ran: unshare + slave + (any) umounts.
+        int has_u = strchr(log, 'u') != nullptr;
+        int has_s = strchr(log, 's') != nullptr;
+        _exit((has_u && has_s) ? 0 : 7);
+    }
+    int st = 0;
+    ZS_CHECK(waitpid(pid, &st, 0) == pid);
+    ZS_CHECK(WEXITSTATUS(st) == 0);
+    // The module callbacks still ran (FORCE unmounts, it does not
+    // suppress dispatch).
+    ZS_CHECK(rec_count() == 2);
+    rec_reset();
+
+    // Restore: prod mount fns + FORCE off for later tests.
+    fn_set_mount_fns_c(nullptr, nullptr, nullptr);
+    fn_set_force_unmount(0);
+}
+
+// ----------------------------------------------------------------------
 ZS_TEST(props_file_mode_detection_uses_the_stat_form) {
     static int (*fn_detect)(const char*) =
         (int (*)(const char*))sym("zs_test_prop_file_mode_detected");

@@ -525,6 +525,19 @@ static JNIEnv* zs_module_ensure_env() {
 // retry path (zs_module_lazy_daemon_init) can run the SAME code once
 // the daemon finally answers.
 static void load_modules_from(std::vector<LoadedModule>&& list) {
+    // ROUND 36: REPLACE, never append. The fetch latch
+    // (g_module_fetch_done) makes this a no-op in production (one
+    // successful fetch per boot); but the documented invariant next
+    // to the latch ("must not double-load") is now ENFORCED here
+    // rather than assumed: any path that ever re-fetches (a test
+    // seam resetting the latch, a future production retry) swaps the
+    // set instead of appending duplicates — a double-loaded module
+    // would run every callback twice (2x pre, 2x post) and nobody
+    // downstream would notice. The stale instances are simply
+    // dropped (their dl_handles keep the refcount dlopen gave them;
+    // no dlclose needed for correctness here — the .so stays mapped
+    // and its records stay registered for the unmap set).
+    g_modules.clear();
     g_modules.reserve(list.size());
     for (auto& m : list) {
         // Register the module .so path BEFORE dlopen'ing so the
@@ -822,7 +835,13 @@ int zs_module_force_unmount() {
 // Fill the app args from in-child observables. Only reads /proc when
 // a module actually asked for names (PROCESS_UNPRIORITY); the package
 // name comes from the packages.list map the hide layer already loads.
-static void fill_app_args(uid_t uid) {
+// Round 36: `nice_name_override` is non-null on the deferred
+// isolated-process dispatch (called from the setcontext hook, where
+// the full nice_name finally exists). It wins over the cmdline
+// probe — at specialization time /proc/self/cmdline still holds the
+// ZYGOTE's name (the runtime rewrites argv later, after RuntimeInit
+// starts), so the probe was always a fallback anyway.
+static void fill_app_args(uid_t uid, const char* nice_name_override) {
     g_child.uid = (jint)uid;
     // The setresgid hook recorded the gid the runtime installed; if
     // it never fired, getgid() reflects the actual current state.
@@ -843,6 +862,13 @@ static void fill_app_args(uid_t uid) {
     }
 
     g_child.nice_name[0] = '\0';
+    if (nice_name_override) {
+        // Round 36 — the isolated-process deferral path: the name
+        // from selinux_android_setcontext (bounded copy).
+        strncpy(g_child.nice_name, nice_name_override,
+                sizeof g_child.nice_name - 1);
+        g_child.nice_name[sizeof g_child.nice_name - 1] = '\0';
+    } else {
     int wants_names = 0;
     for (auto& m : g_modules) {
         if (m.instance->caps() & zygisk::PROCESS_UNPRIORITY) {
@@ -869,6 +895,7 @@ static void fill_app_args(uid_t uid) {
             }
         }
     }
+    }
 
     g_child.app_args.uid          = &g_child.uid;
     g_child.app_args.gid          = &g_child.gid;
@@ -878,7 +905,8 @@ static void fill_app_args(uid_t uid) {
 }
 
 ZsChildKind zs_module_pre_specialize(uid_t uid, uid_t* out_uid,
-                                     uid_t* out_gid) {
+                                     uid_t* out_gid,
+                                     const char* nice_name_override) {
     if (g_modules.empty() || g_pre_done.load(std::memory_order_acquire))
         return ZS_CHILD_NONE;
 
@@ -899,7 +927,7 @@ ZsChildKind zs_module_pre_specialize(uid_t uid, uid_t* out_uid,
         for (auto& m : g_modules)
             m.instance->preServerSpecialize(env, &g_child.server_args);
     } else {
-        fill_app_args(uid);
+        fill_app_args(uid, nice_name_override);
         for (auto& m : g_modules)
             m.instance->preAppSpecialize(env, &g_child.app_args);
     }
@@ -932,6 +960,15 @@ extern "C" void zs_test_set_drop_seam(const ZsDropSeam* seam) {
     else memset(&g_drop_seam, 0, sizeof g_drop_seam);
 }
 extern "C" ZsDropSeam* zs_test_drop_seam() { return &g_drop_seam; }
+
+// ROUND 36 (Bug B): arm/clear FORCE_DENYLIST_UNMOUNT the way onLoad
+// does in the zygote — the test process is the zygote stand-in and
+// onLoad is one-shot, so the early-FORCE arm (which runs BEFORE
+// preAppSpecialize) needs a direct driver. Children inherit the
+// flag through fork's copy-on-write, exactly like production.
+extern "C" void zs_test_set_force_unmount(int on) {
+    g_force_unmount.store(on ? 1 : 0, std::memory_order_release);
+}
 #endif
 
 // The zygote-name capture lives here (not in zs_module_init) so the

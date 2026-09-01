@@ -148,6 +148,36 @@ zs_setuid_wrapper:
     pop  %rbp
     ret
 
+# Round 35 — the isolated-process coverage wrapper.
+# selinux_android_setcontext(uid, isSystemServer, seInfo, niceName):
+# SysV puts the four call arguments in rdi/rsi/rdx/rcx and the FIFTH
+# (our inserted wrapper_fp) in r8.
+    .global zs_setcontext_wrapper
+    .type   zs_setcontext_wrapper, @function
+zs_setcontext_wrapper:
+    push %rbp
+    mov  %rsp, %rbp
+    push %rbx
+    push %r12
+    push %r13
+    push %r14
+    push %r15
+    sub  $8, %rsp
+    mov  %rcx, %r8
+    mov  %rdx, %rcx
+    mov  %rsi, %rdx
+    mov  %rdi, %rsi
+    mov  %rbp, %rdi
+    call zs_impl_setcontext
+    add  $8, %rsp
+    pop  %r15
+    pop  %r14
+    pop  %r13
+    pop  %r12
+    pop  %rbx
+    pop  %rbp
+    ret
+
 // ---------------------------------------------------------------------------
 // The position-independent trampoline blob.
 //

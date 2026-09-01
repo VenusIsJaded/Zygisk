@@ -87,7 +87,31 @@ int  hide_setup_for_target(const char* package_name);
 // Decide whether to hide for this target (uid key; matches on the
 // appId family, uid % 100000, so user 0 / 10 / work profiles all
 // match). Returns 1 if yes, 0 if no.
+//
+// Round 35 — SDK-sandbox processes (Android 13+; the uid range
+// FIRST_SDK_SANDBOX_UID..LAST_SDK_SANDBOX_UID = 20000..29999 in the
+// appId frame) are remapped to their owning app before the lookup:
+// AOSP's Process.getAppUidForSdkSandboxUid() is exactly
+// "uid - (FIRST_SDK_SANDBOX_UID - FIRST_APPLICATION_UID)" — the
+// one-1-1 range mapping documented in Process.java. Isolated
+// processes (appId 90000..99999) are NOT handled here — their
+// uid-to-owner mapping is allocation-order state inside system
+// server (ProcessList.IsolatedUidRangeAllocator), not a formula;
+// see hide_setup_for_isolated_name.
 int  hide_setup_for_target_uid(uid_t uid);
+
+// Round 35 — decide whether to hide an ISOLATED process by its
+// (uid, nice_name) pair. Isolated process names are built by
+// ActiveServices.getProcessNameForService() as
+//   sInfo.processName + ":" + className      (regular isolated)
+//   callingPackage + ":ishared:" + instance  (shared isolated)
+// — i.e. they always START WITH the owning package (or its declared
+// android:process name). The matcher accepts an exact denylist-entry
+// equality or a "<entry>:" prefix. `nice_name` may be null (some
+// specializations pass none) — returns 0 then. Only meaningful in a
+// forked child; like the uid matcher it reads the denylist cache the
+// zygote loaded/refreshed pre-fork (children inherit it via COW).
+int  hide_setup_for_isolated_name(const char* nice_name);
 
 // Round 12 — look up the package name that owns `uid` (appId family,
 // first entry wins for shared-appId packages). Fills out[0..cap) with
@@ -121,6 +145,18 @@ void hide_register_root_path_prefix(const char* prefix);
 // meaningful if hide_setup_for_target*() returned 1. Must be called
 // while the child is still root (before the real privilege drop).
 void hide_apply_for_target(const char* package_name);
+
+// Round 36 (Bug B) — the FORCE_DENYLIST_UNMOUNT mount phase. Runs the
+// SAME fail-closed namespace dance (unshare(CLONE_NEWNS) + MS_SLAVE
+// remount + detach the module mounts) WITHOUT the denylist decision
+// gate: a module that set FORCE_DENYLIST_UNMOUNT asked for exactly
+// this even though the child's target is not denylisted (g_will_hide
+// == 0 — the gate that silently no-op'd this path from Round 12
+// until Round 36). The spoofed-properties bind mount is NOT done
+// here (that mount belongs to hidden children's property spoofing).
+// Must be called while the child is still root, like
+// hide_apply_for_target.
+void hide_mount_phase_forced();
 
 // ------------------------------------------------------------------------
 // Round 19 — execve-proof property spoofing.
@@ -306,6 +342,10 @@ int zs_atexit_finalize(uintptr_t dso_handle);
 // Test-only: inject a uid into the deny set (no root access to
 // packages.list on the host).
 void hide_test_force_deny_uid(uid_t uid);
+
+// Round 35 — test-only: inject a package name into the denylist
+// cache (drives the isolated-process name matcher on the host).
+void hide_test_force_deny_name(const char* pkg);
 
 // Test-only: replace the record set (drives Tier A preprocessing
 // against synthetic records without loading real .so files).

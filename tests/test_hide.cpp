@@ -1429,3 +1429,126 @@ ZS_TEST(atexit_finalize_purges_matching_entries_only) {
     ZS_CHECK_EQ(zs_atexit_finalize((uintptr_t)&before), 1);
     ZS_CHECK_EQ(g_r30_sentinel_calls, before + 3);
 }
+
+// ----------------------------------------------------------------------
+// Round 35 — SDK-sandbox uid coverage (Android 13+).
+//
+// AOSP Process.java (verified at android-13.0.0_r1 / main; absent in
+// 12.0.0_r1): FIRST_SDK_SANDBOX_UID = 20000, LAST = 29999, and
+//   getAppUidForSdkSandboxUid(uid) = uid - (20000 - 10000)
+// — a 1-1 mapping. A denylisted app's SDK-sandbox process must hide.
+// ----------------------------------------------------------------------
+
+ZS_TEST(sdk_sandbox_uid_maps_to_owning_app_and_hides) {
+    g_deny_app_ids.clear();
+    g_deny_app_ids.insert(10432);   // com.sensitive.banking (user 0)
+    g_uid_map_loaded.store(1);
+    g_will_hide.store(0);
+
+    // User 0: sandbox uid 20432 -> owning app 10432.
+    ZS_CHECK_EQ(hide_setup_for_target_uid(20432), 1);
+    // User 10: sandbox uid 1020432 -> owning app 1010432.
+    ZS_CHECK_EQ(hide_setup_for_target_uid(1020432), 1);
+    // The boundary values of the range remap to the boundary apps:
+    // 20000 -> 10000, 29999 -> 19999 (both must be denylisted to hit).
+    g_deny_app_ids.insert(10000);
+    g_deny_app_ids.insert(19999);
+    ZS_CHECK_EQ(hide_setup_for_target_uid(20000), 1);
+    ZS_CHECK_EQ(hide_setup_for_target_uid(29999), 1);
+    // One past the end: 30000 is a normal appId (no remap) — only
+    // maps to a denylisted app if THAT app is denylisted.
+    ZS_CHECK_EQ(hide_setup_for_target_uid(30000), 0);
+    // A sandbox uid whose owning app is NOT denylisted.
+    ZS_CHECK_EQ(hide_setup_for_target_uid(20500), 0);
+    // A denylisted app whose appId would collide with the range when
+    // shifted: appId 10432 must NOT match sandbox 30432 (out of range
+    // -> no remap -> no match unless 30432 itself is denylisted).
+    g_deny_app_ids.insert(30432);
+    ZS_CHECK_EQ(hide_setup_for_target_uid(30432), 1);   // direct, no remap
+    ZS_CHECK_EQ(hide_setup_for_target_uid(20432), 1);
+}
+
+ZS_TEST(sdk_sandbox_uid_never_hits_when_denylist_empty) {
+    g_deny_app_ids.clear();
+    g_uid_map_loaded.store(1);
+    g_will_hide.store(0);
+    ZS_CHECK_EQ(hide_setup_for_target_uid(20432), 0);
+    ZS_CHECK_EQ(hide_setup_for_target_uid(1020432), 0);
+}
+
+// ----------------------------------------------------------------------
+// Round 35 — isolated-process name matching.
+//
+// AOSP ActiveServices.getProcessNameForService (verified in main):
+//   regular isolated: sInfo.processName + ":" + className
+//   shared isolated:  callingPackage + ":ishared:" + instance
+// The denylist stores package names; the matcher accepts an exact
+// equality or a "<entry>:" prefix (the colon prevents stem
+// collisions like com.bank.app vs com.bank.app.evil).
+// ----------------------------------------------------------------------
+
+ZS_TEST(isolated_name_matcher_prefix_and_equality) {
+    g_denylist_cache.clear();
+    g_denylist_cache.insert("com.sensitive.banking");
+    g_uid_map_loaded.store(1);
+    g_will_hide.store(0);
+
+    // Regular isolated: "<pkg>:<class>".
+    ZS_CHECK_EQ(
+        hide_setup_for_isolated_name(
+            "com.sensitive.banking:com.sensitive.bank.DetectService"), 1);
+    // Shared isolated: "<pkg>:ishared:<inst>".
+    ZS_CHECK_EQ(
+        hide_setup_for_isolated_name(
+            "com.sensitive.banking:ishared:0"), 1);
+    // App-declared ":suffix" process name.
+    ZS_CHECK_EQ(
+        hide_setup_for_isolated_name(
+            "com.sensitive.banking:sandboxed"), 1);
+    // EXACT equality (a process whose whole name IS the package).
+    ZS_CHECK_EQ(
+        hide_setup_for_isolated_name("com.sensitive.banking"), 1);
+    // A DIFFERENT package's isolated process: no match.
+    ZS_CHECK_EQ(
+        hide_setup_for_isolated_name(
+            "com.other.app:com.other.app.Service"), 0);
+    // Stem collision: the prefix must not swallow a longer package
+    // sharing the stem ("com.bank.app" vs "com.bank.app.evil").
+    g_denylist_cache.insert("com.bank.app");
+    ZS_CHECK_EQ(
+        hide_setup_for_isolated_name(
+            "com.bank.app.evil:com.bank.app.evil.Svc"), 0);
+    // But the denylisted stem itself still matches.
+    ZS_CHECK_EQ(
+        hide_setup_for_isolated_name(
+            "com.bank.app:com.bank.app.Svc"), 1);
+}
+
+ZS_TEST(isolated_name_matcher_edge_inputs) {
+    g_denylist_cache.clear();
+    g_denylist_cache.insert("com.sensitive.banking");
+    g_uid_map_loaded.store(1);
+    g_will_hide.store(0);
+
+    // Null / empty names: refuse.
+    ZS_CHECK_EQ(hide_setup_for_isolated_name(nullptr), 0);
+    ZS_CHECK_EQ(hide_setup_for_isolated_name(""), 0);
+    // Empty denylist: refuse everything.
+    g_denylist_cache.clear();
+    ZS_CHECK_EQ(
+        hide_setup_for_isolated_name("com.sensitive.banking:svc"), 0);
+    // An EMPTY denylist entry must not match an empty name or act as
+    // a universal ":" prefix.
+    g_denylist_cache.insert(std::string());
+    ZS_CHECK_EQ(hide_setup_for_isolated_name("anything:else"), 0);
+}
+
+// A process name shorter than the entry can never prefix-match it,
+// and an entry longer than the name must not over-read.
+ZS_TEST(isolated_name_matcher_length_safety) {
+    g_denylist_cache.clear();
+    g_denylist_cache.insert("com.verylong.packagename.that.exceeds.the.process.name");
+    g_uid_map_loaded.store(1);
+    ZS_CHECK_EQ(hide_setup_for_isolated_name("com.verylong"), 0);
+    ZS_CHECK_EQ(hide_setup_for_isolated_name("short"), 0);
+}

@@ -129,13 +129,25 @@ int zs_trampoline_supported();
 
 // Assembly entry points (defined in unmap_trampoline_<arch>.S).
 // The wrappers save the frame, shuffle arguments to
-// zs_impl_<name>(wrapper_fp, a0, a1, a2) and restore on return.
+// zs_impl_<name>(wrapper_fp, a0, a1, a2[, a3]) and restore on return.
 extern "C" {
 long zs_fork_wrapper(void);
 long zs_setresgid_wrapper(long, long, long);
 long zs_setresuid_wrapper(long, long, long);
 long zs_setgid_wrapper(long);
 long zs_setuid_wrapper(long);
+// Round 35 — the isolated-process coverage hook. AOSP's
+// SpecializeCommon calls selinux_android_setcontext(uid,
+// isSystemServer, seInfo, niceName) AFTER the uid drop (verified at
+// android-5.0.0_r1 AND refs/heads/main: the call shape is identical
+// across the entire supported range). It is the ONLY call in the
+// specialization chain that receives the FULL, UNtruncated nice_name
+// together with the uid — the data the uid-only matcher cannot
+// derive for Android's isolated-uid ranges (99000-99999 regular,
+// 90000-98999 app-zygote; allocation is range-per-app and
+// order-dependent in ProcessList, not a formula). See
+// zs_impl_setcontext for the decision logic.
+long zs_setcontext_wrapper(long, long, long, long);
 // The PIC blob boundaries.
 extern const unsigned char zs_trampoline_code_start[];
 extern const unsigned char zs_trampoline_code_end[];

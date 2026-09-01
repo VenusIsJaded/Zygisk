@@ -674,3 +674,27 @@ actions/runner-images documentation).
   contains neither, which only matters for non-Magisk managers —
   the scripts guard `command -v setsid` and degrade to a plain
   background launch.
+
+## Round 36 — the setcontext contract across the range, and 32-bit parity
+
+The isolated-process coverage hooks
+`selinux_android_setcontext(uid, isSystemServer, seInfo, niceName)`
+from libselinux. Verified per release: the symbol exists with the
+same C signature at 5.0.0_r1 (external/libselinux/src/android.c)
+and on main (libselinux/src/android/android_device.c — bool vs int
+is ABI-identical); the call site in SpecializeCommon runs after
+setresuid on 5.0.0_r1, 10.0.0_r1, 12.0.0_r1, 16.0.0_r1 and main,
+with the same four-argument shape and a nullable nice_name. The
+hook degrades cleanly: a vendor build that hides the symbol leaves
+the hook unregistered and isolated children keep the pre-R36
+uid-drop dispatch (modules keep working; no coverage, no crash).
+
+32-bit parity: armeabi-v7a and x86 get the plain-C wrapper stub
+(null frame = the documented Tier B input), so the isolated
+coverage, the deferral and the matcher all work there — only the
+Tier A self-unmap is absent, exactly like the other five wrappers
+on no-blob arches (Round 32's class, caught by the same 4-ABI
+cross-build gate). The SDK-sandbox uid remap is Android 13+ only
+by construction: pre-13 platforms never allocate appId
+20000-29999 (absent in 12.0.0_r1's Process.java), so the branch is
+dead there and harmless.

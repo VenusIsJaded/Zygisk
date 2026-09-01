@@ -557,3 +557,403 @@ int main() {
                  "=== Zygisk Study self-unmap trampoline tests ===\n");
     return zstest::run_all();
 }
+
+// ----------------------------------------------------------------------
+// Round 35 — the isolated-process coverage path through the REAL
+// zs_setcontext_wrapper. On a device this fires from the patched GOT
+// slot of selinux_android_setcontext(uid, isSystemServer, seInfo,
+// niceName) — the last call of AOSP's SpecializeCommon that carries
+// the FULL nice_name. Here we drive the wrapper directly with an
+// isolated-range uid (99123) and the process name of an isolated
+// service of a denylisted package, with a FAKE real setcontext
+// (recorder + deterministic rv) installed through the same seam the
+// host build uses.
+//
+// The child must: (1) call the fake real FIRST (args forwarded), (2)
+// survive, (3) get libpayload unmapped (Tier A), (4) get the
+// residual page scrubbed, (5) receive the fake real's rv through the
+// trampoline — the value the runtime would have seen.
+// ----------------------------------------------------------------------
+
+// The fake "real" setcontext: records its arguments and returns a
+// distinctive value we can verify was relayed by the trampoline.
+static long g_r35_real_calls = 0;
+static long g_r35_real_uid   = 0;
+static char g_r35_real_name[128] = {0};
+static long r35_fake_real_setcontext(long uid, long is_sys,
+                                     const char* seinfo,
+                                     const char* nice_name) {
+    (void)is_sys; (void)seinfo;
+    ++g_r35_real_calls;
+    g_r35_real_uid = uid;
+    if (nice_name) {
+        strncpy(g_r35_real_name, nice_name, sizeof g_r35_real_name - 1);
+    }
+    return 42;
+}
+
+ZS_TEST(setcontext_wrapper_tier_a_hides_isolated_process) {
+    using SetCtxFn = long (*)(long, long, long, long);
+    using NameFn   = void (*)(const char*);
+    using InstFn   = void (*)(long (*)(long, long, const char*,
+                                       const char*));
+
+    VoidFn init = nullptr;
+    SetResGidFn wrapper_unused = nullptr;
+    ForceUidFn force = nullptr;
+    PendingFn pending = nullptr;
+    CountFn count = nullptr;
+    void* h = open_payload_so(&init, &wrapper_unused, &force,
+                              &pending, &count);
+    if (!h) return;
+
+    SetCtxFn ctx_wrapper =
+        (SetCtxFn)dlsym(h, "zs_setcontext_wrapper");
+    NameFn force_name = (NameFn)dlsym(h, "zs_test_force_deny_name");
+    InstFn install =
+        (InstFn)dlsym(h, "zs_test_install_setcontext");
+    ZS_CHECK(ctx_wrapper != nullptr);
+    ZS_CHECK(force_name != nullptr);
+    ZS_CHECK(install != nullptr);
+    if (!ctx_wrapper || !force_name || !install) { dlclose(h); return; }
+
+    init();
+    ZS_CHECK_EQ(count() > 0, 1);      // the snapshot found the .so
+
+    int pipefd[2];
+    ZS_CHECK(pipe(pipefd) == 0);
+
+    pid_t pid = fork();
+    ZS_CHECK(pid >= 0);
+    if (pid == 0) {
+        // ---- child: the "isolated specialization" stand-in ----
+        close(pipefd[0]);
+
+        // Denylist the OWNING package; the isolated child's uid
+        // (99123) is not package-backed and the earlier uid hooks
+        // decided nothing.
+        force_name("com.bank.app");
+        // Install the fake real setcontext (records + rv 42).
+        install(r35_fake_real_setcontext);
+
+        // Drive the REAL wrapper: Tier A must unmap libpayload and
+        // "return" here with the fake real's 42.
+        long r = ctx_wrapper(
+            99123,                       // uid: isolated range
+            0,                           // is_system_server
+            (long)"u:r:untrusted_app:s0",
+            (long)"com.bank.app:com.bank.app.DetectService");
+
+        int still_mapped = child_maps_contains_libpayload();
+        int scrubbed = child_jit_page_scrubbed();
+        char msg[192];
+        int n = snprintf(msg, sizeof msg,
+                         "r=%ld real=%ld uid=%ld name=%.40s "
+                         "mapped=%d scrub=%d",
+                         r, g_r35_real_calls, g_r35_real_uid,
+                         g_r35_real_name, still_mapped, scrubbed);
+        write(pipefd[1], msg, (size_t)n);
+        close(pipefd[1]);
+        _exit(0);
+    }
+
+    // ---- parent ----
+    close(pipefd[1]);
+    char buf[192] = {0};
+    ssize_t n = read(pipefd[0], buf, sizeof buf - 1);
+    close(pipefd[0]);
+    int status = 0;
+    waitpid(pid, &status, 0);
+
+    ZS_CHECK(n > 0);
+    ZS_CHECK(WIFEXITED(status));
+    ZS_CHECK_EQ(WEXITSTATUS(status), 0);
+
+    long r = -1, real_calls = -1, real_uid = -1;
+    int mapped = -1, scrub = -1;
+    char name[48] = {0};
+    if (n > 0) {
+        sscanf(buf, "r=%ld real=%ld uid=%ld name=%47s mapped=%d "
+                     "scrub=%d",
+               &r, &real_calls, &real_uid, name, &mapped, &scrub);
+    }
+    // The fake real ran exactly once, with the isolated uid and the
+    // FULL nice name forwarded.
+    ZS_CHECK_EQ(real_calls, 1);
+    ZS_CHECK_EQ(real_uid, 99123);
+    ZS_CHECK_STR_EQ(name, "com.bank.app:com.bank.app.DetectService");
+    // The trampoline relayed the fake real's return value.
+    ZS_CHECK_EQ(r, 42);
+    // libpayload is GONE from the child's maps.
+    ZS_CHECK_EQ(mapped, 0);
+    // The residual jit page carries no forensic data.
+    ZS_CHECK_EQ(scrub, 1);
+
+    dlclose(h);
+}
+
+// A NULL nice_name on an isolated-range uid: AOSP passes nullptr
+// when the specialization carries no name (nice_name.has_value() is
+// false — verified: nice_name_ptr = has_value ? c_str : nullptr).
+// The matcher must refuse (nothing to match), the real call must
+// still run and be relayed, and NOTHING may unmap — the child keeps
+// the payload exactly as the pre-R36 uid path treated every
+// undecidable isolated uid.
+ZS_TEST(setcontext_wrapper_null_name_skips_matcher) {
+    using SetCtxFn = long (*)(long, long, long, long);
+    using InstFn   = void (*)(long (*)(long, long, const char*,
+                                       const char*));
+
+    VoidFn init = nullptr;
+    SetResGidFn wrapper_unused = nullptr;
+    ForceUidFn force = nullptr;
+    PendingFn pending = nullptr;
+    CountFn count = nullptr;
+    void* h = open_payload_so(&init, &wrapper_unused, &force,
+                              &pending, &count);
+    if (!h) return;
+
+    SetCtxFn ctx_wrapper = (SetCtxFn)dlsym(h, "zs_setcontext_wrapper");
+    InstFn install = (InstFn)dlsym(h, "zs_test_install_setcontext");
+    ZS_CHECK(ctx_wrapper != nullptr);
+    ZS_CHECK(install != nullptr);
+    if (!ctx_wrapper || !install) { dlclose(h); return; }
+
+    init();
+
+    int pipefd[2];
+    ZS_CHECK(pipe(pipefd) == 0);
+    pid_t pid = fork();
+    ZS_CHECK(pid >= 0);
+    if (pid == 0) {
+        close(pipefd[0]);
+        install(r35_fake_real_setcontext);
+        long r = ctx_wrapper(99777, 0, (long)"u:r:isolated_app:s0", 0);
+        int still_mapped = child_maps_contains_libpayload();
+        char msg[96];
+        int n = snprintf(msg, sizeof msg, "r=%ld real=%ld mapped=%d",
+                         r, g_r35_real_calls, still_mapped);
+        write(pipefd[1], msg, (size_t)n);
+        close(pipefd[1]);
+        _exit(0);
+    }
+    close(pipefd[1]);
+    char buf[96] = {0};
+    ssize_t n = read(pipefd[0], buf, sizeof buf - 1);
+    close(pipefd[0]);
+    int status = 0;
+    waitpid(pid, &status, 0);
+
+    ZS_CHECK(n > 0);
+    ZS_CHECK(WIFEXITED(status));
+    ZS_CHECK_EQ(WEXITSTATUS(status), 0);
+    long r = -1, real_calls = -1;
+    int mapped = -1;
+    if (n > 0) sscanf(buf, "r=%ld real=%ld mapped=%d",
+                      &r, &real_calls, &mapped);
+    ZS_CHECK_EQ(real_calls, 1);
+    ZS_CHECK_EQ(r, 42);
+    ZS_CHECK_EQ(mapped, 1);   // no hide without a name
+    dlclose(h);
+}
+
+// A NON-isolated uid never reaches the name matcher at all: an
+// ordinary app uid with a name that WOULD match a denylisted package
+// is none of setcontext's business (the uid hooks own that decision;
+// reaching it from here would double-decide after a dispatch).
+ZS_TEST(setcontext_wrapper_ordinary_uid_skips_matcher) {
+    using SetCtxFn = long (*)(long, long, long, long);
+    using NameFn   = void (*)(const char*);
+    using InstFn   = void (*)(long (*)(long, long, const char*,
+                                       const char*));
+
+    VoidFn init = nullptr;
+    SetResGidFn wrapper_unused = nullptr;
+    ForceUidFn force = nullptr;
+    PendingFn pending = nullptr;
+    CountFn count = nullptr;
+    void* h = open_payload_so(&init, &wrapper_unused, &force,
+                              &pending, &count);
+    if (!h) return;
+
+    SetCtxFn ctx_wrapper = (SetCtxFn)dlsym(h, "zs_setcontext_wrapper");
+    NameFn force_name = (NameFn)dlsym(h, "zs_test_force_deny_name");
+    InstFn install = (InstFn)dlsym(h, "zs_test_install_setcontext");
+    ZS_CHECK(ctx_wrapper != nullptr);
+    ZS_CHECK(force_name != nullptr);
+    ZS_CHECK(install != nullptr);
+    if (!ctx_wrapper || !force_name || !install) { dlclose(h); return; }
+
+    init();
+
+    int pipefd[2];
+    ZS_CHECK(pipe(pipefd) == 0);
+
+    pid_t pid = fork();
+    ZS_CHECK(pid >= 0);
+    if (pid == 0) {
+        close(pipefd[0]);
+        force_name("com.bank.app");
+        install(r35_fake_real_setcontext);
+        // Ordinary app uid (10432), matching name — must NOT hide:
+        // the uid-range guard rejects it before the matcher.
+        long r = ctx_wrapper(10432, 0, (long)"u:r:untrusted_app:s0",
+                             (long)"com.bank.app:whatever");
+        int still_mapped = child_maps_contains_libpayload();
+        char msg[96];
+        int n = snprintf(msg, sizeof msg, "r=%ld real=%ld mapped=%d",
+                         r, g_r35_real_calls, still_mapped);
+        write(pipefd[1], msg, (size_t)n);
+        close(pipefd[1]);
+        _exit(0);
+    }
+    close(pipefd[1]);
+    char buf[96] = {0};
+    ssize_t n = read(pipefd[0], buf, sizeof buf - 1);
+    close(pipefd[0]);
+    int status = 0;
+    waitpid(pid, &status, 0);
+
+    ZS_CHECK(n > 0);
+    ZS_CHECK(WIFEXITED(status));
+    ZS_CHECK_EQ(WEXITSTATUS(status), 0);
+    long r = -1, real_calls = -1;
+    int mapped = -1;
+    if (n > 0) sscanf(buf, "r=%ld real=%ld mapped=%d",
+                      &r, &real_calls, &mapped);
+    ZS_CHECK_EQ(real_calls, 1);
+    ZS_CHECK_EQ(r, 42);
+    ZS_CHECK_EQ(mapped, 1);   // no hide for an ordinary uid from here
+    dlclose(h);
+}
+
+// ROUND 36 — the PRODUCTION ORDER regression. On a device the
+// specialization sequence is (verified 5.0.0_r1 .. main):
+//     setresgid -> setresuid -> selinux_android_setcontext
+// so the uid-drop hooks run BEFORE the setcontext wrapper. The Round
+// 35 WIP only drove the wrapper in isolation — the sequence that
+// would have exposed the dead-guard bug (the uid hook latching
+// g_dispatch_done and screening the matcher out) was never modeled.
+// Here the child drives the REAL uid-hook impls (with drop-seam
+// recorders so the "real" privilege drop is a no-op) and THEN the
+// wrapper: the deferral must leave the child unlatched, and the
+// wrapper must still deliver the full Tier A hide.
+static long r36_seam_resgid(gid_t, gid_t, gid_t) { return 0; }
+static long r36_seam_resuid(uid_t, uid_t, uid_t) { return 0; }
+static long r36_seam_setgid(gid_t) { return 0; }
+static long r36_seam_setuid(uid_t) { return 0; }
+
+ZS_TEST(setcontext_tier_a_survives_the_production_uid_first_order) {
+    using SetCtxFn = long (*)(long, long, long, long);
+    using NameFn   = void (*)(const char*);
+    using InstFn   = void (*)(long (*)(long, long, const char*,
+                                       const char*));
+    using SetResGidImpl = long (*)(long);
+    using SetResUidImpl = long (*)(long);
+    using SetSeamFn = void (*)(const void*);
+
+    VoidFn init = nullptr;
+    SetResGidFn wrapper_unused = nullptr;
+    ForceUidFn force = nullptr;
+    PendingFn pending = nullptr;
+    CountFn count = nullptr;
+    void* h = open_payload_so(&init, &wrapper_unused, &force,
+                              &pending, &count);
+    if (!h) return;
+
+    SetCtxFn ctx_wrapper = (SetCtxFn)dlsym(h, "zs_setcontext_wrapper");
+    NameFn force_name = (NameFn)dlsym(h, "zs_test_force_deny_name");
+    InstFn install = (InstFn)dlsym(h, "zs_test_install_setcontext");
+    SetResGidImpl impl_gid = (SetResGidImpl)dlsym(h, "zs_test_setresgid");
+    SetResUidImpl impl_uid = (SetResUidImpl)dlsym(h, "zs_test_setresuid");
+    SetSeamFn set_seam = (SetSeamFn)dlsym(h, "zs_test_set_drop_seam");
+    ZS_CHECK(ctx_wrapper != nullptr);
+    ZS_CHECK(force_name != nullptr);
+    ZS_CHECK(install != nullptr);
+    ZS_CHECK(impl_gid != nullptr);
+    ZS_CHECK(impl_uid != nullptr);
+    ZS_CHECK(set_seam != nullptr);
+    if (!ctx_wrapper || !force_name || !install || !impl_gid ||
+        !impl_uid || !set_seam) { dlclose(h); return; }
+
+    init();
+    ZS_CHECK_EQ(count() > 0, 1);
+
+    int pipefd[2];
+    ZS_CHECK(pipe(pipefd) == 0);
+
+    pid_t pid = fork();
+    ZS_CHECK(pid >= 0);
+    if (pid == 0) {
+        // ---- child: the production SpecializeCommon order ----
+        close(pipefd[0]);
+
+        // The "real" privilege drops are recorders (the deferral's
+        // call_real path — no privilege change in the test child).
+        struct Seam {
+            long (*setresgid)(gid_t, gid_t, gid_t);
+            long (*setresuid)(uid_t, uid_t, uid_t);
+            long (*setgid)(gid_t);
+            long (*setuid)(uid_t);
+        } seam{r36_seam_resgid, r36_seam_resuid, r36_seam_setgid,
+               r36_seam_setuid};
+        set_seam(&seam);
+
+        force_name("com.bank.app");
+        install(r35_fake_real_setcontext);
+
+        // (1) the gid hook: undecidable uid, no latch.
+        long g = impl_gid(99123);
+        // (2) the uid hook: the Round 36 DEFERRAL — no dispatch, no
+        // latches; the child stays reachable for setcontext.
+        long u = impl_uid(99123);
+        // (3) the setcontext wrapper: the full Tier A hide.
+        long r = ctx_wrapper(
+            99123, 0, (long)"u:r:isolated_app:s0",
+            (long)"com.bank.app:com.bank.app.DetectService");
+
+        int still_mapped = child_maps_contains_libpayload();
+        int scrubbed = child_jit_page_scrubbed();
+        char msg[128];
+        int n = snprintf(msg, sizeof msg,
+                         "g=%ld u=%ld r=%ld real=%ld mapped=%d "
+                         "scrub=%d",
+                         g, u, r, g_r35_real_calls, still_mapped,
+                         scrubbed);
+        write(pipefd[1], msg, (size_t)n);
+        close(pipefd[1]);
+        _exit(0);
+    }
+
+    // ---- parent ----
+    close(pipefd[1]);
+    char buf[128] = {0};
+    ssize_t n = read(pipefd[0], buf, sizeof buf - 1);
+    close(pipefd[0]);
+    int status = 0;
+    waitpid(pid, &status, 0);
+
+    ZS_CHECK(n > 0);
+    ZS_CHECK(WIFEXITED(status));
+    ZS_CHECK_EQ(WEXITSTATUS(status), 0);
+
+    long g = -1, u = -1, r = -1, real_calls = -1;
+    int mapped = -1, scrub = -1;
+    if (n > 0) {
+        sscanf(buf, "g=%ld u=%ld r=%ld real=%ld mapped=%d scrub=%d",
+               &g, &u, &r, &real_calls, &mapped, &scrub);
+    }
+    // The deferred uid hooks returned normally (the recorders' 0).
+    ZS_CHECK_EQ(g, 0);
+    ZS_CHECK_EQ(u, 0);
+    // The fake real setcontext ran exactly once.
+    ZS_CHECK_EQ(real_calls, 1);
+    // The trampoline relayed its return value.
+    ZS_CHECK_EQ(r, 42);
+    // Tier A completed: libpayload is gone, the residual page is
+    // scrubbed.
+    ZS_CHECK_EQ(mapped, 0);
+    ZS_CHECK_EQ(scrub, 1);
+
+    dlclose(h);
+}

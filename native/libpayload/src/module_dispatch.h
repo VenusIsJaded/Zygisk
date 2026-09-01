@@ -111,8 +111,20 @@ ZsChildKind zs_module_classify(uid_t uid);
 // forward the returned values to the real privilege-drop calls.
 // Returns ZS_CHILD_NONE when nothing was dispatched (caller keeps
 // the original arguments).
+//
+// Round 36 — `nice_name_override` (nullable): the isolated-process
+// deferral dispatch calls this from the selinux_android_setcontext
+// hook, AFTER the uid drop, where the FULL untruncated nice_name is
+// finally available (it is not an argument of setresuid, and
+// /proc/self/cmdline still holds the zygote's name at that point).
+// When non-null it is copied into the module-visible
+// AppSpecializeArgs.niceName verbatim ("com.pkg:svc" — the shape
+// real Zygisk reports for isolated processes); the package_name
+// lookup stays uid-based (isolated uids own no package — the field
+// is empty, same as the uid-map path).
 ZsChildKind zs_module_pre_specialize(uid_t uid, uid_t* out_uid,
-                                     uid_t* out_gid);
+                                     uid_t* out_gid,
+                                     const char* nice_name_override = nullptr);
 
 // Dispatch postAppSpecialize / postServerSpecialize. Called right
 // after the real privilege drop (the module .so's are still mapped —

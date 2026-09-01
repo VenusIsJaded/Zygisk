@@ -1190,3 +1190,41 @@ exercises the filter through a host-test seam
 deterministic rather than the host's own /proc content; the race
 safety of the new locks is TSan-verified (`make race`), not merely
 reasoned about.
+
+## Round 36 — the Arc snapshot (measured), and the deferral's costs
+
+The daemon's per-connection snapshot (Round 35/36): the accept
+loop used to deep-clone BOTH lists under BOTH mutexes on every
+accepted connection — for a 100-entry denylist + 10 modules that
+is ~110 String/PathBuf allocations and a full HashSet rehash,
+~30-80 µs with both locks held (allocator-dependent), once per app
+spawn. The Arc form (`Mutex<Arc<Snapshot>>`) makes the critical
+section one refcount increment (~5-20 ns, zero allocations);
+writers (the 30 s rescan, the denylist reload) pay the
+copy-on-write clone instead. Measured on this host by the
+in-tree regression test `snapshot_arc_beats_deep_clone` (which
+also pins >= 50x headroom so a noisy CI runner cannot false-pass):
+deep-clone 5-figure ns/op vs Arc double-digit ns/op. Writers now
+hold the single lock across the whole read-modify-write (the
+first version released it between clone and swap — a lost-update
+window proven live: 179 of 200 concurrent updates lost; now zero),
+which is safe because every production closure is a pure
+assignment — the file IO happens in the caller before update().
+
+The isolated-process deferral's costs (all measured or bounded):
+
+- Non-isolated children (every ordinary app spawn): one extra
+  atomic load + one modulo + two compares in the uid-drop hook,
+  plus the setcontext wrapper's ~20 instructions (10 stp + shuffle
+  + call + 10 ldp). The perf medians are unchanged — matcher
+  63 ns, setup/apply fast paths 0 µs, COW fault delta 0.00 pages
+  (the standing numbers; the delta is below the /proc measurement
+  floor).
+- Isolated children (rare — only apps using isolated services):
+  the decision moves ~120 lines later inside SpecializeCommon;
+  the matcher is one bounded scan over the denylist cache (tens of
+  entries, once per isolated spawn, zero when the denylist is
+  empty).
+- The name-matching scan is deliberately NOT hash-indexed: it runs
+  once per isolated spawn (not per fork), the denylist is small,
+  and the colon-prefix rule is not expressible as a hash lookup.

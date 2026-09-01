@@ -5073,3 +5073,24 @@ ZS_TEST(memfd_fallback_fails_closed_without_a_dir) {
     close(input_fd);
     zs_test_disable_memfd(0);
 }
+
+// Round 35 — the isolated-coverage hook's symbol contract. The hook
+// is registered under the EXACT name libandroid_runtime imports from
+// libselinux ("selinux_android_setcontext" — C symbol, verified in
+// AOSP 5.0.0_r1..main). A typo here would silently disable every
+// device's isolated coverage while all host tests stayed green (the
+// GOT walker matches slots by this name only).
+ZS_TEST(hook_registry_resolves_the_setcontext_symbol_name) {
+    // Same registration entry.cpp performs (when the real resolves).
+    hide_advanced_register_got_hook(
+        "selinux_android_setcontext", (void*)0x51515151);
+    ZS_CHECK_EQ((uintptr_t)zs_test_match_registered_hook(
+                    "selinux_android_setcontext"),
+                (uintptr_t)0x51515151);
+    // Lookalike names must NOT resolve (guards against case/typo
+    // drift in either the registration or a future refactor).
+    ZS_CHECK_EQ((uintptr_t)zs_test_match_registered_hook(
+                    "selinux_android_setContext"), (uintptr_t)0);
+    ZS_CHECK_EQ((uintptr_t)zs_test_match_registered_hook(
+                    "selinux_android_setcontext2"), (uintptr_t)0);
+}
