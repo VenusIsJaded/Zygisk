@@ -182,7 +182,7 @@ static void* daemon_thread(void* arg) {
                                                       slash - module_path + 1)
                                         : std::string("./");
                 std::string line = "stub;" + dir + "libzs_test_module.so\n";
-                (void)write(c, line.c_str(), line.size());
+                (void)send(c, line.c_str(), line.size(), MSG_NOSIGNAL);
             } else if (verb == 'C') {
                 ++*cfg->companion_hits;
                 // Hold the connection open (the real daemon's
@@ -222,15 +222,15 @@ static void* daemon_thread(void* arg) {
                                 fclose(fp);
                                 g_last_props_content = area;
                                 std::string reply = "1" + path + "\n";
-                                (void)write(c, reply.c_str(), reply.size());
+                                (void)send(c, reply.c_str(), reply.size(), MSG_NOSIGNAL);
                             } else {
-                                (void)write(c, "0\n", 2);
+                                (void)send(c, "0\n", 2, MSG_NOSIGNAL);
                             }
                         } else {
-                            (void)write(c, "0\n", 2);
+                            (void)send(c, "0\n", 2, MSG_NOSIGNAL);
                         }
                     } else {
-                        (void)write(c, "0\n", 2);
+                        (void)send(c, "0\n", 2, MSG_NOSIGNAL);
                     }
                 }
             }
@@ -1383,6 +1383,301 @@ ZS_TEST(lazy_init_builds_the_platform_property_file_path) {
     fn_set_mode(-1);
     fn_reset_lazy();
     fn_set_sock(saved.c_str());
+}
+
+// ----------------------------------------------------------------------
+// ROUND 37 — the four bugs this round closed, each with its own
+// regression test:
+//   Bug 1  the frozen daemon-socket path (the session file is read
+//          ONCE at native-bridge init — BEFORE the daemon exists; the
+//          randomized per-boot path written at daemon start was never
+//          picked up: module fetch + props send + companions were
+//          dead on every real boot).
+//   Bug 2  the 'P' send's unbounded socket (connect/recv could park
+//          the zygote's main thread forever — the one daemon_sock.h
+//          client that was never converted).
+//   Bug 3  the SDK-sandbox remap missing from the package lookup
+//          (module args carried empty package/data-dir for sandboxed
+//          processes on Android 13+).
+//   Bug 4  the dispatch latches inherited from a dispatched app
+//          zygote blocked its isolated children's own coverage.
+// ----------------------------------------------------------------------
+
+// Bug 1: the production boot order, end to end — the session file
+// APPEARS only after payload init (the daemon starts at the late
+// service stage). The lazy retry must pick the new path up.
+ZS_TEST(lazy_daemon_init_rereads_session_when_daemon_appears_late) {
+    static void (*fn_reset_lazy)() =
+        (void (*)())sym("zs_test_reset_lazy_init");
+    static int (*fn_lazy)() =
+        (int (*)())sym("zs_module_lazy_daemon_init_c");
+    static void (*fn_set_sock)(const char*) =
+        (void (*)(const char*))sym("zs_test_set_daemon_socket");
+
+    // Payload init (already done, socket pinned): the "zygote" now
+    // starts a FRESH boot simulation — unpin the socket so the active
+    // path is the obfuscated DEFAULT (dead on the host, exactly like
+    // a real device before the daemon binds), and point the session
+    // file at a path that does NOT exist yet.
+    char sess[] = "/tmp/zs_test_sess_late_XXXXXX";
+    int fd = mkstemp(sess);
+    ZS_CHECK(fd >= 0);
+    close(fd);
+    unlink(sess);   // the daemon has not started: no session record
+    fn_set_session_file(sess);
+    fn_set_session_file_alt("/tmp/zs_test_sess_late_alt_absent");
+    fn_set_sock(nullptr);
+    fn_reset_lazy();
+
+    // Fork #1: connect to the dead default fails; the post-failure
+    // session re-read finds nothing. Nothing latches (retry).
+    ZS_CHECK_EQ(fn_lazy(), 0);
+
+    // The daemon "starts" (service stage): it writes its randomized
+    // socket path into the session file. The fake daemon thread has
+    // been listening at g_sock_path all along.
+    FILE* f = fopen(sess, "w");
+    ZS_CHECK(f != nullptr);
+    if (f) {
+        std::fprintf(f, "%s\n", g_sock_path.c_str());
+        fclose(f);
+    }
+
+    // Fork #2: the fetch still fails against the default path (the
+    // connect ran before the re-read), but the re-read now parses the
+    // session file and SWITCHES the socket — the next fork connects.
+    ZS_CHECK_EQ(fn_lazy(), 0);
+    // Fork #3..N: connects through the session-derived path, loads
+    // the module list, latches everything (the props builder is
+    // final-unavailable on the host, which counts as latched). The
+    // retry loop is deliberately generous: the fake daemon serves
+    // companion connections with 50 ms sleeps, so the 'L' can sit in
+    // the accept backlog past the 100 ms io bound — which the R37
+    // reply classification now treats as RETRY (Bug 5), never as the
+    // final empty list.
+    int latched = 0;
+    for (int i = 0; i < 30 && !latched; ++i) {
+        latched = fn_lazy();
+        if (!latched) usleep(50 * 1000);
+    }
+    ZS_CHECK_EQ(latched, 1);
+    // The module really (re)loaded through the session path.
+    ZS_CHECK_EQ(fn_dispatch_wanted(), 1);
+
+    // Restore: no session file, the pinned socket, fresh latches.
+    fn_set_session_file(nullptr);
+    fn_set_session_file_alt(nullptr);
+    fn_set_sock(g_sock_path.c_str());
+    fn_reset_lazy();
+    unlink(sess);
+}
+
+// Bug 2: a daemon that ACCEPTS the 'P' connection and then never
+// reads the body and never replies — the exact stall the Round 34
+// bounding exists for, on the one client that was never converted.
+// The send must return (0 = retry later) within seconds, not park
+// the caller forever (pre-R37: an unbounded recv() — the test binary
+// itself would hang).
+static void* r37_stalled_daemon_thread(void* arg) {
+    const char* path = (const char*)arg;
+    int lfd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (lfd < 0) return nullptr;
+    struct sockaddr_un a{};
+    a.sun_family = AF_UNIX;
+    strncpy(a.sun_path, path, sizeof(a.sun_path) - 1);
+    unlink(path);
+    if (bind(lfd, (struct sockaddr*)&a, sizeof a) != 0 ||
+        listen(lfd, 4) != 0) {
+        close(lfd);
+        return nullptr;
+    }
+    int c = accept(lfd, nullptr, nullptr);
+    if (c >= 0) {
+        char b[5];
+        (void)read(c, b, 1);   // consume the verb byte, then STALL:
+        sleep(30);             // no body read, no reply, fd held
+        close(c);
+    }
+    close(lfd);
+    return nullptr;
+}
+
+ZS_TEST(props_send_is_bounded_against_a_stalled_daemon) {
+    static int (*fn_send)(const char*, size_t) =
+        (int (*)(const char*, size_t))sym("zs_test_send_props_file");
+    static void (*fn_set_sock)(const char*) =
+        (void (*)(const char*))sym("zs_test_set_daemon_socket");
+
+    char spath[] = "/tmp/zs_test_stalled_XXXXXX";
+    int fd = mkstemp(spath);
+    ZS_CHECK(fd >= 0);
+    close(fd);
+    unlink(spath);
+    pthread_t th;
+    ZS_CHECK(pthread_create(&th, nullptr, r37_stalled_daemon_thread,
+                            (void*)spath) == 0);
+    usleep(100 * 1000);   // let the listener bind
+
+    std::string saved = g_sock_path;
+    fn_set_sock(spath);
+
+    // A real-format area (magic@8, version@12).
+    std::string area(64, 'x');
+    uint32_t magic = 0x504f5250u, version = 0xfc6ed0abu;
+    memcpy(&area[8], &magic, 4);
+    memcpy(&area[12], &version, 4);
+
+    struct timespec t0{}, t1{};
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    int rv = fn_send(area.data(), area.size());
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double ms = (t1.tv_sec - t0.tv_sec) * 1000.0 +
+                (t1.tv_nsec - t0.tv_nsec) / 1e6;
+
+    // Retry semantics (0) — and BOUNDED: the 1 s SO_RCVTIMEO is the
+    // backstop; generous scheduler slack for a loaded CI host.
+    ZS_CHECK_EQ(rv, 0);
+    ZS_CHECK(ms < 5000.0);
+
+    fn_set_sock(saved.c_str());
+    pthread_detach(th);
+}
+
+// Bug 3: an SDK-sandbox uid (Android 13+; FIRST_SDK_SANDBOX_UID =
+// 20000, getAppUidForSdkSandboxUid = uid - 10000, verified from
+// AOSP Process.java 13.0.0_r1..main) resolves its OWNING app in the
+// specialize args — empty strings pre-R37.
+ZS_TEST(sdk_sandbox_args_carry_owning_package) {
+    // appId 20234 = the SDK sandbox of com.example.app (10234).
+    rec_reset();
+    fflush(nullptr);
+    pid_t pid = fork();
+    ZS_CHECK(pid >= 0);
+    if (pid == 0) {
+        fn_reset_child();
+        fn_setresgid(20234);
+        fn_setresuid(20234);
+        _exit(0);
+    }
+    int st = 0;
+    ZS_CHECK(waitpid(pid, &st, 0) == pid);
+    ZS_CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    ZS_CHECK(rec_count() == 2);
+    ZS_CHECK(rec(0)->cb == ZS_CB_PRE_APP);
+    // The owning app's identity (the R37 remap), not empty strings.
+    ZS_CHECK_STR_EQ(rec(0)->package_name, "com.example.app");
+    ZS_CHECK_STR_EQ(rec(0)->app_data_dir, "/data/user/0/com.example.app");
+    // The uid/gid fields carry the sandbox uid itself (verbatim).
+    ZS_CHECK_EQ(rec(0)->uid, 20234);
+    ZS_CHECK_EQ(rec(0)->gid, 20234);
+    // And the plain (non-sandbox) lookup is unchanged.
+    ZS_CHECK_STR_EQ(rec(0)->nice_name, "com.example.app");
+    rec_reset();
+}
+
+// Bug 4: the app-zygote shape — a dispatched process (forked from the
+// zygote stand-in) forks an ISOLATED child (appId 90000-98999). The
+// child inherits the parent's dispatch latches through copy-on-write;
+// pre-R37 those latches bounced it off every guard: no name check, no
+// pre/post callbacks (real Zygisk dispatches for every
+// specialization).
+static long r37_fake_setcontext(long uid, long is_sys, const char* se,
+                                const char* name) {
+    (void)uid; (void)is_sys; (void)se; (void)name;
+    return 4343;   // distinctive rv, NO recorder side effects
+}
+
+ZS_TEST(app_zygote_isolated_child_gets_own_dispatch) {
+    r36_syms();
+    fn_install_setcontext(r37_fake_setcontext);
+    ZS_CHECK(fn_setcontext_is_live() == 1);
+
+    rec_reset();
+    fflush(nullptr);
+    // Level 1 — the "app zygote": a zygote fork that dispatches in
+    // itself (the standard app-specialization shape).
+    pid_t a = fork();
+    ZS_CHECK(a >= 0);
+    if (a == 0) {
+        fn_reset_child();
+        fn_setresgid(10234);
+        fn_setresuid(10234);   // dispatch latches with pid = A
+        // Level 2 — the ISOLATED child, forked from the DISPATCHED
+        // app zygote. NO fn_reset_child(): inheriting A's latches is
+        // the bug's exact mechanism (production children get the
+        // latches through copy-on-write, not through a reset).
+        pid_t b = fork();
+        ZS_CHECK(b >= 0);
+        if (b == 0) {
+            fn_setresgid(90234);   // appId 90234: app-zygote isolated
+            fn_setresuid(90234);   // DEFERS (isolated range, hook live)
+            long rv = fn_setcontext(90234, 0, nullptr,
+                                    "com.example.app:IsolatedSvc");
+            // The real setcontext's rv relayed through the impl.
+            _exit(rv == 4343 ? 0 : 8);
+        }
+        int stb = 0;
+        waitpid(b, &stb, 0);
+        _exit(WIFEXITED(stb) ? WEXITSTATUS(stb) : 9);
+    }
+    int st = 0;
+    ZS_CHECK(waitpid(a, &st, 0) == a);
+    ZS_CHECK(WEXITSTATUS(st) == 0);
+
+    // BOTH levels dispatched: A's pre+post AND B's pre+post (pre-R37:
+    // only A's 2 records — B's callbacks were the missing half).
+    ZS_CHECK(rec_count() == 4);
+    int pre_idx = -1, post_idx = -1, pres = 0;
+    for (int i = 0; i < rec_count(); ++i) {
+        if (rec(i)->cb == ZS_CB_PRE_APP) { pre_idx = i; ++pres; }
+        if (rec(i)->cb == ZS_CB_POST_APP) { post_idx = i; }
+    }
+    ZS_CHECK_EQ(pres, 2);
+    // B's pre is the LAST pre record: the FULL isolated name (the
+    // setcontext deferral's whole point) and B's own uid.
+    ZS_CHECK_STR_EQ(rec(pre_idx)->nice_name,
+                    "com.example.app:IsolatedSvc");
+    ZS_CHECK_EQ(rec(pre_idx)->uid, 90234);
+    ZS_CHECK(post_idx > pre_idx);   // B's post followed B's pre
+    rec_reset();
+    fn_install_setcontext(nullptr);
+    fn_setcontext_live(0);
+}
+
+// Bug 4 (the negative case): a NON-isolated child of a dispatched
+// process — an app's own fork() worker that re-calls setresuid with
+// the app uid — is NOT a zygote specialization: the inherited latch
+// correctly keeps it from re-dispatching (the pre-R37 semantics for
+// this case, preserved on purpose).
+ZS_TEST(app_zygote_plain_worker_child_stays_inherited) {
+    rec_reset();
+    fflush(nullptr);
+    pid_t a = fork();
+    ZS_CHECK(a >= 0);
+    if (a == 0) {
+        fn_reset_child();
+        fn_setresgid(10234);
+        fn_setresuid(10234);   // A dispatches (2 records)
+        pid_t w = fork();
+        ZS_CHECK(w >= 0);
+        if (w == 0) {
+            // The worker: same app uid, latches inherited, no reset.
+            fn_setresgid(10234);
+            fn_setresuid(10234);
+            _exit(0);
+        }
+        int stw = 0;
+        waitpid(w, &stw, 0);
+        _exit(0);
+    }
+    int st = 0;
+    ZS_CHECK(waitpid(a, &st, 0) == a);
+    ZS_CHECK(WEXITSTATUS(st) == 0);
+    // Only A's dispatch — the worker correctly did NOT re-dispatch.
+    ZS_CHECK(rec_count() == 2);
+    ZS_CHECK(rec(0)->cb == ZS_CB_PRE_APP);
+    ZS_CHECK(rec(1)->cb == ZS_CB_POST_APP);
+    rec_reset();
 }
 
 // Runs LAST (registration order): it closes the test's own handle on

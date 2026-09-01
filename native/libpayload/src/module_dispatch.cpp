@@ -264,6 +264,16 @@ void zs_module_set_daemon_socket(const char* path) {
 // (zero extra syscalls in the healthy case); a device where the
 // module tree is blocked falls back transparently. The parser
 // (96-byte cap, absolute-path check, trim) is shared by both.
+//
+// ROUND 37: the function is IDEMPOTENT — when the parsed path is the
+// one already active, it returns without re-registering the path
+// prefixes (the filter tables are bounded and not deduped). The lazy
+// daemon init now re-reads this file on every FAILED connect (see
+// zs_module_lazy_daemon_init): the daemon starts at the late service
+// stage — AFTER the zygote froze the default/stale path at
+// native-bridge init — and the re-read is what picks the randomized
+// per-boot path up. Without it the payload connected to a dead path
+// for the whole boot (no modules, no props file, no companions).
 int zs_module_load_session_socket() {
     int fd = open(session_file(), O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
@@ -289,6 +299,12 @@ int zs_module_load_session_socket() {
         path[--n] = '\0';
     }
     if (path[0] != '/') return 0;          // sanity: absolute path
+
+    // ROUND 37: same path as the one already active? Nothing to do —
+    // and no prefix re-registration (bounded, non-deduped tables).
+    if (g_daemon_socket && strcmp(path, g_daemon_socket) == 0) {
+        return 1;
+    }
 
     zs_module_set_daemon_socket(path);
 
@@ -334,21 +350,43 @@ static std::vector<LoadedModule> fetch_module_list_from_daemon(
     if (was_connected) *was_connected = 0;
     // ROUND 34: this runs on the ZYGOTE'S MAIN THREAD inside the
     // fork hook — a stalled daemon must not freeze every app launch.
-    // 100 ms is ~100x a local request/reply and bounds the damage;
-    // a timeout behaves exactly like "daemon not up" (retry next
-    // fork through the existing latch machinery).
+    // 100 ms is ~100x a local request/reply and bounds the damage.
+    //
+    // ROUND 37 (Bug 5 — the timeout-vs-latch misclassification): the
+    // Round 19 contract is "an empty list is a valid FINAL answer;
+    // a failed connect means not up yet, retry". The R34 io bound
+    // introduced a third state the old *was_connected=1-at-connect
+    // conflated with the first: CONNECTED but the reply never arrived
+    // within the bound (recv() = -1 EAGAIN — a daemon whose accept
+    // backlog is draining slow handlers, exactly like the test's
+    // 50 ms-sleeping companion serves). Latching THAT as the final
+    // answer permanently loaded an EMPTY module list: zero modules
+    // for the whole boot from one slow accept. The wire is
+    // distinguishable and the classification now follows it:
+    //   n  >  0 : the list arrived — FINAL (was_connected = 1);
+    //   n ==  0 : clean EOF with zero data = the daemon child's
+    //             definitive EMPTY list (the Rust child write_all()s
+    //             an empty String and exits — the pre-R34 semantics
+    //             of EOF were already "final") — FINAL;
+    //   n  <  0 : the io bound fired / the connection reset — NO
+    //             answer — TRANSIENT: was_connected stays 0 and the
+    //             lazy retry treats it exactly like "daemon not up".
     int sock = zs_daemon_connect_bounded(daemon_socket(), 100, 100);
     if (sock < 0) return out;
-    if (was_connected) *was_connected = 1;
     char req = 'L';
     if (send(sock, &req, 1, MSG_NOSIGNAL) != 1) {
+        // The handshake died mid-flight (the daemon's child crashed
+        // or the socket reset between connect and send): transient —
+        // the next fork retries through the latch machinery.
         close(sock);
         return out;
     }
     char buf[8192];
     ssize_t n = recv(sock, buf, sizeof buf - 1, 0);
     close(sock);
-    if (n <= 0) return out;
+    if (n < 0) return out;              // no answer yet: retry
+    if (was_connected) *was_connected = 1;   // a definitive answer
+    if (n == 0) return out;             // the definitive EMPTY list
     buf[n] = '\0';
 
     char* save_outer = nullptr;
@@ -605,8 +643,10 @@ int zs_module_lazy_daemon_init() {
     }
 
     // (a) Module list: retry until the daemon ANSWERS (an empty list
-    // is a valid, final answer — the registry file is empty; only a
-    // failed CONNECT means "not up yet, retry"). g_module_fetch_done
+    // is a valid, final answer — the registry file is empty; anything
+    // short of a reply — failed connect, send reset, io-bound timeout
+    // — means "not up yet, retry"; see the R37 wire classification in
+    // fetch_module_list_from_daemon). g_module_fetch_done
     // is the single latch — g_modules_loaded is a legacy flag kept
     // for the R12 hot-path contract, not a retry gate (the failed
     // connect retry must stay cheap AND must not double-load).
@@ -616,9 +656,19 @@ int zs_module_lazy_daemon_init() {
         if (was_connected) {
             load_modules_from(std::move(list));
             g_module_fetch_done.store(1, std::memory_order_release);
+        } else {
+            // else: connect() failed — the daemon is not up yet (or
+            // moved). ROUND 37 (the frozen-session-path bug): the
+            // session file was read exactly once, at native-bridge
+            // init — BEFORE the daemon (service stage) wrote its
+            // randomized per-boot path into it. So the path we just
+            // failed to connect to may simply be the stale/default
+            // one; re-read the session file now (idempotent: same
+            // path = no-op). Cost: two opens of a 96-byte file, only
+            // while a daemon step is unlatched. The props send (b)
+            // below runs in the SAME attempt with the fresh path.
+            zs_module_load_session_socket();
         }
-        // else: connect() failed — the daemon is not up yet; a failed
-        // connect costs ~1 usec, retried on the next fork.
     }
 
     // (b) Properties file: build once, send when the daemon is up.
@@ -647,10 +697,15 @@ int zs_module_lazy_daemon_init() {
                 g_props_sent.store(1, std::memory_order_release);
                 free(g_props_area);
                 g_props_area = nullptr;
+            } else {
+                // daemon not up / refused / stalled — keep the buffer
+                // and retry on the next fork (bounded by the daemon
+                // actually starting; the window is a few seconds of
+                // boot). ROUND 37: same session re-read as (a) — the
+                // failed connect may have been against the stale
+                // pre-daemon path (idempotent when unchanged).
+                zs_module_load_session_socket();
             }
-            // else: daemon not up / refused — keep the buffer and
-            // retry on the next fork (bounded by the daemon actually
-            // starting; the window is a few seconds of boot).
         }
     }
     return g_module_fetch_done.load(std::memory_order_acquire) &&
@@ -672,22 +727,30 @@ static int send_props_file_to_daemon(const char* area, size_t size) {
     // (bytes_used + serial + magic + version); anything shorter is
     // not a sane image — final, not a retry.
     if (!area || size < 16) return 1;
-    int sock = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    // ROUND 37 (the one daemon_sock.h client that was never
+    // converted): this runs on the ZYGOTE'S MAIN THREAD — at
+    // native-bridge init AND at every fork retry — exactly the
+    // call-site class native/common/daemon_sock.h was created for
+    // (its header comment even lists this function). The raw
+    // socket()+connect()+recv() here could block the zygote
+    // indefinitely: an unbounded connect() stalls on a full accept
+    // backlog, and an unbounded recv() stalls on a daemon that
+    // accepted but never replies — every subsequent app launch on
+    // the device hangs behind it. Bounded like the module fetch:
+    // 100 ms for the handshake, 1 s for the I/O (the image can be a
+    // megabyte; a local unix socket moves that in ~1 ms — the bound
+    // is only the stall backstop, and a timeout behaves exactly like
+    // "daemon not up" through the existing retry latch).
+    int sock = zs_daemon_connect_bounded(daemon_socket(), 100, 1000);
     if (sock < 0) return 0;
-    struct sockaddr_un addr{};
-    addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, daemon_socket(), sizeof(addr.sun_path) - 1);
-    if (connect(sock, (struct sockaddr*)&addr, sizeof addr) != 0) {
-        ZS_LOGD("props send: connect(%s) failed: %s", daemon_socket(),
-                strerror(errno));
-        close(sock);
-        return 0;   // daemon not up: retry
-    }
     uint32_t len = (uint32_t)size;
     char hdr[5] = {'P', (char)(len & 0xff), (char)((len >> 8) & 0xff),
                    (char)((len >> 16) & 0xff), (char)((len >> 24) & 0xff)};
     size_t off = 0;
     while (off < sizeof hdr) {
+        // SO_SNDTIMEO (1 s, installed by zs_daemon_connect_bounded)
+        // bounds a daemon that stops reading: send() returns
+        // EAGAIN and the whole attempt degrades to "retry later".
         ssize_t n = send(sock, hdr + off, sizeof hdr - off, MSG_NOSIGNAL);
         if (n <= 0) { close(sock); return 0; }
         off += (size_t)n;
@@ -700,7 +763,9 @@ static int send_props_file_to_daemon(const char* area, size_t size) {
         if (n <= 0) { close(sock); return 0; }
         off += (size_t)n;
     }
-    // Reply: "1<path>\n" or "0\n".
+    // Reply: "1<path>\n" or "0\n". Bounded by SO_RCVTIMEO (1 s):
+    // a daemon that accepted but never answers no longer parks the
+    // zygote's main thread here forever (ROUND 37).
     char reply[160];
     ssize_t n = recv(sock, reply, sizeof reply - 1, 0);
     close(sock);
@@ -783,6 +848,12 @@ static gid_t g_child_gid_recorded = 0;   // from the setresgid hook
 static std::atomic<int> g_pre_done{0};
 static std::atomic<int> g_post_done{0};
 static ZsChildKind      g_child_kind = ZS_CHILD_NONE;
+// ROUND 37 (Bug 4): pid-of-latch for the two guards above — an
+// INHERITED latch (an app zygote that dispatched, then forked an
+// isolated child) must not block the child's own pre/post. See
+// zs_module_pre_specialize's comment for the full story.
+static pid_t            g_pre_pid  = 0;
+static pid_t            g_post_pid = 0;
 
 #ifdef ZS_HOST_TEST
 extern "C" void zs_test_reset_child_state() {
@@ -790,7 +861,20 @@ extern "C" void zs_test_reset_child_state() {
     g_pre_done.store(0);
     g_post_done.store(0);
     g_child_kind = ZS_CHILD_NONE;
+    g_pre_pid  = 0;
+    g_post_pid = 0;
     memset(&g_child, 0, sizeof g_child);
+}
+// ROUND 37 (Bug 4): arm the dispatch latches the way a REAL ancestor
+// dispatch leaves them — done=1 with the latch pid = THIS process.
+// Drives the app-zygote simulation: the caller (a forked child that
+// already dispatched in itself) then forks ANOTHER child, which
+// inherits done=1 with a pid != its own.
+extern "C" void zs_test_set_dispatched_here() {
+    g_pre_pid  = getpid();
+    g_pre_done.store(1, std::memory_order_release);
+    g_post_pid = getpid();
+    g_post_done.store(1);
 }
 #endif
 
@@ -907,12 +991,23 @@ static void fill_app_args(uid_t uid, const char* nice_name_override) {
 ZsChildKind zs_module_pre_specialize(uid_t uid, uid_t* out_uid,
                                      uid_t* out_gid,
                                      const char* nice_name_override) {
-    if (g_modules.empty() || g_pre_done.load(std::memory_order_acquire))
+    // ROUND 37 (Bug 4): pid-aware guards, same rationale as entry.cpp's
+    // g_dispatch_pid. g_pre_done/g_post_done are copy-on-write
+    // INHERITED by children of a dispatched process: an app zygote's
+    // isolated child would otherwise bounce off the ANCESTOR's pre
+    // latch and never run its own pre/post callbacks (the deferred
+    // setcontext dispatch calls this AFTER the ancestor's latch was
+    // inherited). A latch set in THIS process keeps short-circuiting.
+    if (g_modules.empty() ||
+        (g_pre_done.load(std::memory_order_acquire) &&
+         g_pre_pid == getpid())) {
         return ZS_CHILD_NONE;
+    }
 
     ZsChildKind kind = zs_module_classify(uid);
     if (kind == ZS_CHILD_NONE) return ZS_CHILD_NONE;
 
+    g_pre_pid = getpid();               // R37: BEFORE the release store
     g_pre_done.store(1, std::memory_order_release);
     g_child_kind = kind;
 
@@ -940,9 +1035,25 @@ ZsChildKind zs_module_pre_specialize(uid_t uid, uid_t* out_uid,
 
 void zs_module_post_specialize() {
     if (g_modules.empty()) return;
-    if (!g_pre_done.load(std::memory_order_acquire)) return;
-    int expected = 0;
-    if (!g_post_done.compare_exchange_strong(expected, 1)) return;
+    // R37: pid-aware — see zs_module_pre_specialize's comment.
+    if (!g_pre_done.load(std::memory_order_acquire) ||
+        g_pre_pid != getpid()) {
+        return;
+    }
+    // R37 (Bug 4, the second half): the post-once guard. The old
+    // compare_exchange(expected=0) bounced off an INHERITED
+    // g_post_done==1 (the app zygote's own post) exactly the way pre
+    // did — the isolated child's post callback never fired even after
+    // pre ran. The pid check replaces the CAS's "already posted"
+    // half: done==1 with THIS pid = this process already posted
+    // (the double-entry guard, same thread discipline as before);
+    // done==1 with an ANCESTOR's pid = this child still owes its post.
+    if (g_post_done.load(std::memory_order_acquire) &&
+        g_post_pid == getpid()) {
+        return;
+    }
+    g_post_pid = getpid();               // BEFORE the release store
+    g_post_done.store(1, std::memory_order_release);
 
     if (g_child_kind == ZS_CHILD_SERVER) {
         for (auto& m : g_modules)

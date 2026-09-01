@@ -105,7 +105,34 @@ static std::atomic<int> g_hide_done{0};
 // Round 12: set once the module post-dispatch + forced-unmount phase
 // has run (guards the setresuid hook against double-entry the same
 // way g_hide_done guards the hide pipeline).
+//
+// ROUND 37 (Bug 4): the latch is now PID-AWARE. g_dispatch_done is
+// copy-on-write INHERITED by children of a dispatched process — the
+// app-zygote case: AOSP forks the app zygote from the system zygote
+// (our uid-drop hook dispatches modules in IT), and the app zygote
+// then forks isolated children (appId 90000-98999, verified from
+// Process.java FIRST/LAST_APP_ZYGOTE_ISOLATED_UID, present since
+// Android 10). Those children inherited done=1 and the guards below
+// bounced them off — the isolated child of a NON-denylisted owner
+// (payload resident, modules loaded) got neither the setcontext name
+// check nor its own pre/post callbacks, while real Zygisk dispatches
+// for every specialization. The pid field records WHICH process
+// latched; an inherited latch (pid mismatch) re-arms the isolated
+// coverage. A latch set in THIS process still short-circuits exactly
+// as before. (A latch holder is always an ancestor of the current
+// process, and a live process' pid differs from any ancestor's, so
+// pid reuse cannot false-positive.)
 static std::atomic<int> g_dispatch_done{0};
+static pid_t            g_dispatch_pid = 0;   // R37: set BEFORE the
+                                               // release store above
+
+// ROUND 37 (Bug 4): is the dispatch latch set by THIS process?
+// (acquire-loads pair with the pid store preceding the latch's
+// release store: seeing done==1 implies the pid field is visible.)
+static int dispatch_latched_in_this_process() {
+    return g_dispatch_done.load(std::memory_order_acquire) &&
+           g_dispatch_pid == getpid();
+}
 
 // Round 36: set when the selinux_android_setcontext GOT hook is
 // actually REGISTERED (the real symbol resolved — it does on every
@@ -430,8 +457,24 @@ static long uid_drop_hook(void* wrapper_fp, uid_t id,
                           long (*call_real)(void*), void* real_ctx,
                           int arg_count) {
     if (getpid() != g_origin_pid &&
-        !g_hide_done.load(std::memory_order_acquire) &&
-        !g_dispatch_done.load(std::memory_order_acquire)) {
+        !g_hide_done.load(std::memory_order_acquire)) {
+        // ROUND 37 (Bug 4): an ANCESTOR's dispatch latch (an app
+        // zygote that dispatched — see g_dispatch_pid's comment) must
+        // block re-dispatch only for NON-isolated children: an app's
+        // own fork() worker is not a zygote specialization, so it
+        // keeps the inherited "already dispatched" semantics (exactly
+        // the pre-R37 behavior for that case). Isolated-range children
+        // (appId 90000-99999) keep their OWN coverage: the deny check,
+        // the setcontext deferral, the deferred module dispatch.
+        int own_dispatch = dispatch_latched_in_this_process();
+        int ancestor_dispatch =
+            !own_dispatch &&
+            g_dispatch_done.load(std::memory_order_acquire);
+        uid_t app_id = (uid_t)(id % 100000);
+        int isolated_range = (app_id >= 90000 && app_id <= 99999);
+        if (own_dispatch || (ancestor_dispatch && !isolated_range)) {
+            return call_real(real_ctx);
+        }
         // The DenyList check in case the gid drop did not fire (or
         // decided on a DIFFERENT key — uid != gid): denylisted
         // children hide instead of dispatching. Round 14: when the
@@ -525,6 +568,8 @@ static long uid_drop_hook(void* wrapper_fp, uid_t id,
                 long rv = call_real(real_ctx);
 
                 zs_module_post_specialize();
+                // R37: pid BEFORE the release store (acquire readers).
+                g_dispatch_pid = getpid();
                 g_dispatch_done.store(1, std::memory_order_release);
 
                 // Re-read the flag: a module may have called
@@ -644,10 +689,16 @@ extern "C" long zs_impl_setcontext(void* wrapper_fp, long a0, long a1,
     }
 
     // Isolated coverage: forked children only, undecidable ranges
-    // only, once only.
+    // only, once only. ROUND 37 (Bug 4): the dispatch-latch bounce is
+    // now pid-aware — an INHERITED latch (an app zygote that
+    // dispatched) must not disable this hook for the app zygote's own
+    // isolated children (the deferral was shipped for exactly them;
+    // the guard was the last link that made it unreachable). A latch
+    // set in THIS process still returns: this child already
+    // dispatched (own uid-drop or this same hook earlier).
     if (ZS_LIKELY(getpid() == g_origin_pid) ||
         g_hide_done.load(std::memory_order_acquire) ||
-        g_dispatch_done.load(std::memory_order_acquire)) {
+        dispatch_latched_in_this_process()) {
         return rv;
     }
     uid_t app_id = (uid_t)(((uid_t)a0) % 100000);
@@ -684,6 +735,8 @@ extern "C" long zs_impl_setcontext(void* wrapper_fp, long a0, long a1,
             // overrides — INERT here by the documented residual; the
             // runtime's own drop already ran.
             zs_module_post_specialize();
+            // R37: pid BEFORE the release store (acquire readers).
+            g_dispatch_pid = getpid();
             g_dispatch_done.store(1, std::memory_order_release);
         }
     }
@@ -1138,6 +1191,23 @@ long zs_test_setcontext(long uid, long is_sys, const char* seinfo,
 extern "C" __attribute__((visibility("default")))
 void zs_test_first_fork() {
     zs_module_on_first_fork();
+}
+
+// ROUND 37 (Bug 4): arm the uid-drop dispatch latch exactly the way a
+// real dispatched ancestor leaves it (done=1, pid=THIS process). The
+// app-zygote simulation forks a child that already dispatched in
+// itself, then that child forks ANOTHER one which inherits the latch.
+extern "C" __attribute__((visibility("default")))
+void zs_test_arm_dispatch_latch() {
+    g_dispatch_pid = getpid();
+    g_dispatch_done.store(1, std::memory_order_release);
+}
+
+// ROUND 37 (Bug 4): clear it again (test isolation).
+extern "C" __attribute__((visibility("default")))
+void zs_test_clear_dispatch_latch() {
+    g_dispatch_done.store(0, std::memory_order_release);
+    g_dispatch_pid = 0;
 }
 
 extern "C" __attribute__((visibility("default")))

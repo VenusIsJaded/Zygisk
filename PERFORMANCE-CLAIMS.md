@@ -1228,3 +1228,25 @@ The isolated-process deferral's costs (all measured or bounded):
 - The name-matching scan is deliberately NOT hash-indexed: it runs
   once per isolated spawn (not per fork), the denylist is small,
   and the colon-prefix rule is not expressible as a hash lookup.
+
+## Round 37 — a termination proof, not a new optimization
+
+No new fast path landed this round. What landed is the discovery
+that the module system's lazy-retry cost NEVER TERMINATED on real
+devices: the payload's daemon socket path was frozen at
+native-bridge init (before the daemon writes the session file), so
+every zygote fork paid a doomed connect + full retry for the whole
+boot. With the session re-read, the retry latches once after the
+daemon starts and the per-fork hot path returns to the documented
+two atomic loads. The 'P' send moves to the bounded socket
+(connect 100 ms / I/O 1 s): a healthy daemon's ~1 MB image moves
+over a local unix socket in ~1 ms, so the bound only fires on a
+stalled daemon — where the old code hung the zygote indefinitely
+instead. The fetch's new reply-vs-timeout classification (EOF =
+the definitive empty list; recv<0 = retry) removes a whole class
+of false "final empty answer" latches that permanently disabled
+the module system. The pid-aware dispatch latches add two
+getpid-adjacent loads to the uid-drop/setcontext guards —
+immeasurable against the syscall they already wrap; the
+app-zygote isolated dispatch they enable runs once per isolated
+spawn, same shape as the R36 deferral.

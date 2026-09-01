@@ -698,3 +698,29 @@ cross-build gate). The SDK-sandbox uid remap is Android 13+ only
 by construction: pre-13 platforms never allocate appId
 20000-29999 (absent in 12.0.0_r1's Process.java), so the branch is
 dead there and harmless.
+
+## Round 37 — the R36 coverage extended to app-zygote children (Android 10+)
+
+The R36 isolated-process coverage shipped with a second guard gap
+found this round: the dispatch latches are copy-on-write INHERITED,
+and an app zygote (Android 10+; FIRST_APP_ZYGOTE_ISOLATED_UID=90000
+verified absent at 9.0.0_r1, present 10.0.0_r1..main) sets every
+latch when its own specialization dispatches modules. Its isolated
+children (appId 90000-98999) then bounced off the inherited state —
+no setcontext name check, no pre/post callbacks — on every Android
+version with app zygotes (10, 11, 12, 13, 14, 15, 16). The latches
+now record the pid they were set in: an inherited latch re-arms the
+isolated-range coverage (deny check, deferral, deferred dispatch
+with the full nice_name), while a non-isolated child of a dispatched
+process (an app's own fork() worker re-calling setresuid with the
+app uid — not a specialization) keeps the inherited semantics
+exactly as before. Pid-reuse cannot false-positive: a latch holder
+is always an ancestor of the reading process, and a live process'
+pid differs from every ancestor's.
+
+Also this round: the SDK-sandbox remap (Android 13-16) now applies
+in the package-name lookup too (module args carry the owning app's
+package/data dir for sandboxed processes; pre-13 the branch is dead
+as before), and the daemon-client plumbing (session-file re-read +
+bounded 'P' socket + reply-vs-timeout classification) is version-
+independent — it runs in the zygote on every supported release.

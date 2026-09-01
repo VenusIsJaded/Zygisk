@@ -3073,3 +3073,82 @@ the name arrives AFTER the last root window):
   before the dispatch point). Ordinary (package-uid) children keep
   the pre-R36 root-window dispatch — the deferral only engages for
   the two isolated uid ranges.
+
+## Round 37 — five more device-real bugs, all verified from fetched sources
+
+Research base this round (fetched and read; none from memory):
+
+* frameworks/base `core/java/android/os/Process.java` at
+  android-13.0.0_r1, android-16.0.0_r1 and refs/heads/main:
+  FIRST_SDK_SANDBOX_UID=20000 / LAST_SDK_SANDBOX_UID=29999 with
+  `getAppUidForSdkSandboxUid = uid - (FIRST_SDK_SANDBOX_UID -
+  FIRST_APPLICATION_UID)` (ABSENT at android-12.0.0_r1 — the range is
+  Android 13+); FIRST_ISOLATED_UID=99000/LAST=99999;
+  FIRST_APP_ZYGOTE_ISOLATED_UID=90000/LAST=98999 (absent at
+  9.0.0_r1, present 10.0.0_r1..main — app zygotes are Android 10+).
+* system/core `libcutils/include/private/android_filesystem_config.h`
+  (main): the native-side AID view — AID_SDK_SANDBOX_PROCESS_START
+  20000 / END 29999, AID_ISOLATED_START 90000 / END 99999 — agreeing
+  with Java's split at the 98999/99000 boundary.
+* frameworks/base `core/jni/com_android_internal_os_Zygote.cpp`
+  (main): the specialization order re-verified —
+  BindMountSyspropOverride (Android 15+ appcompat property overrides;
+  absent in 14.0.0_r1, present 15.0.0_r1+) runs BEFORE setresgid;
+  setresgid → setresuid → __android_log_close →
+  selinux_android_setcontext(uid, isSystemServer, seInfo, niceName) —
+  exactly the ordering every hook here relies on. (Noted: AOSP's own
+  bind-mount of /dev/__properties__/appcompat_override over
+  /dev/__properties__ is already accounted for in hide.cpp's mount
+  comments; the module's spoofed-serial mount fails closed and
+  reverts on any interference, by design.)
+* frameworks/base ActiveServices.java (main): isolated naming
+  re-verified — `sInfo.processName + ":" + className` (regular),
+  `callingPackage + ":ishared:" + instanceName` (shared). The
+  ":isolatedComputeApp" string is a seInfo suffix, NOT part of the
+  process name — no matcher change needed.
+
+Fixes (each with a regression test; severity / affected versions):
+
+1. **Fatal, Android 5.0-16 (all):** the payload froze the daemon
+   socket path at native-bridge init — before the daemon (service
+   stage) writes the session file with its randomized per-boot path
+   (Round 13's stealth feature). Module fetch, the 'P' send and
+   companion connects were dead on every randomized boot since R13;
+   host tests never saw it because the fake daemon binds before
+   payload init. The lazy init now re-reads the session file on
+   every failed connect (idempotent), so the first retry after
+   daemon start picks the real path up.
+2. **High, Android 5.0-16 (all):** the 'P' properties send was the
+   last unbounded daemon client on the zygote main thread — a daemon
+   that accepts and stalls parked every subsequent app launch.
+   Converted to zs_daemon_connect_bounded(100, 1000) with the
+   timeout degrading to the existing retry semantics.
+3. **Medium, Android 13-16:** the SDK-sandbox uid remap was missing
+   from the package-name lookup (module args carried empty
+   package/data-dir for sandboxed processes; the filter-fallback's
+   safe scratch dir lookup failed). The lookup now applies the same
+   remap as the deny decision.
+4. **Medium, Android 10-16:** the copy-on-write-inherited dispatch
+   latches blocked app-zygote isolated children (appId 90000-98999)
+   from their own setcontext name check and pre/post callbacks.
+   Every latch now records its pid; an inherited latch re-arms the
+   isolated-range coverage while non-isolated children of a
+   dispatched process (an app's plain fork() worker) keep the
+   inherited no-re-dispatch semantics.
+5. **High, Android 5.0-16 (all):** the R34 io bound conflated "no
+   reply within 100 ms" (recv EAGAIN — backlog draining) with the
+   daemon's definitive EMPTY list (clean EOF, recv == 0) and latched
+   it forever. The reply classification now follows the wire;
+   timeouts retry.
+
+Honest residuals (unchanged from R36, plus this round's honesty
+note): the module system's on-device deadness between Rounds 13 and
+37 was invisible to the entire host suite — the five new regression
+tests pin the production boot order (session file appears after
+payload init; the daemon can be slow to answer), but a real-device
+smoke test (an app-side module that logs through the companion
+socket) remains the only end-to-end proof that would close the class
+for good. No performance or stealth mechanism beyond the fixes'
+own effects landed this round: the lazy retry now terminates (it
+previously retried a dead path forever), and the props-spoof
+staging + module system + companion API are live on device again.

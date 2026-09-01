@@ -1192,3 +1192,37 @@ spoofed normally); and module callbacks for isolated children run
 post-drop (unprivileged, uid/gid writes inert, logd already
 closed). All three are strictly better than Magisk's behavior for
 the same processes (which injects modules and hides nothing).
+
+## Round 37 — the app-zygote extension, and the daemon plumbing that made the hide pipeline's props half real on device
+
+Two classes of fixes touch the hide story this round. First, the
+R36 isolated coverage now actually reaches app-zygote children
+(appId 90000-98999, Android 10+): the inherited dispatch latches
+previously bounced them off every guard — the denylisted-owner
+check by name never ran for the isolated children of a dispatched
+app zygote, and neither did their module callbacks. The latches are
+pid-aware now (inherited = re-armed for isolated-range uids;
+inherited + non-isolated = the pre-R37 no-re-dispatch semantics).
+
+Second — and this is the round's central finding — the
+spoofed-properties staging has been dead on real devices since
+Round 13 introduced the randomized daemon socket: the payload read
+the session file once, at native-bridge init, before the daemon
+(late service stage) wrote it. The 'P' send, the module fetch and
+companion sockets all connected to a frozen dead path for the whole
+boot, on every Android version, while the host suite stayed green
+(its fake daemon binds before init — the same class Round 19
+documented). The lazy init re-reads the session file on every
+failed connect now (idempotent), the 'P' send uses the bounded
+socket (a stalled daemon could previously park the zygote's main
+thread — and with it every app launch on the device), and the
+fetch distinguishes the daemon's definitive EMPTY list (clean EOF)
+from a 100 ms no-reply (retry) — the old classification latched
+the empty answer permanently from one slow accept.
+
+Stealth effect: the entire property-spoof half of the hide pipeline
+(the exec'd-helper bind mount, the stat fictions, the absent-key
+hooks) is reachable on device again. No NEW stealth mechanism
+landed; the round's honest conclusion is that Rounds 13-36 shipped
+stealth features whose daemon-dependent halves were unreachable,
+and the fix is plumbing, not design.

@@ -119,6 +119,12 @@ int  hide_setup_for_isolated_name(const char* nice_name);
 // same packages.list parse the DenyList uid map uses (no extra file
 // reads). Used by the module dispatch layer to fill the real
 // specialize arguments.
+//
+// ROUND 37: applies the SAME SDK-sandbox remap as
+// hide_setup_for_target_uid (appId 20000..29999 -> owning app, the
+// Process.getAppUidForSdkSandboxUid() formula) — an SDK-sandbox
+// process's args carry its OWNING app's name/data dir instead of
+// empty strings. Isolated uids (90000..99999) still own nothing.
 void hide_lookup_package_for_uid(uid_t uid, char* out, size_t cap);
 int hide_data_dir_for_uid(uid_t uid, char* out, size_t cap);
 

@@ -1277,7 +1277,24 @@ void hide_lookup_package_for_uid(uid_t uid, char* out, size_t cap) {
     if (ZS_UNLIKELY(!g_uid_map_loaded.load(std::memory_order_acquire))) {
         load_denylist();
     }
-    auto it = g_pkg_map.find((uid_t)(uid % 100000));
+    // ROUND 37 (Bug 3 — the lookup missed the SDK-sandbox remap the
+    // deny decision has since Round 35): AOSP Process.java (verified
+    // this round from android-13.0.0_r1 / 16.0.0_r1 / main — the
+    // range is ABSENT in 12.0.0_r1) reserves appId 20000..29999 for
+    // SDK-sandbox processes, with
+    //   getAppUidForSdkSandboxUid(uid) = uid - (20000 - 10000)
+    // naming the OWNING app. hide_setup_for_target_uid remapped;
+    // this lookup did not — so an SDK-sandbox child's module args
+    // carried EMPTY package_name / app_data_dir while the hide
+    // decision for the same uid resolved the owner, and
+    // hide_data_dir_for_uid (the pre-3.17-kernel filter fallback's
+    // "only safe directory") failed for sandboxed processes. The
+    // remap makes all three agree.
+    uid_t app_id = (uid_t)(uid % 100000);
+    if (app_id >= 20000 && app_id < 30000) {
+        app_id = (uid_t)(app_id - 10000);
+    }
+    auto it = g_pkg_map.find(app_id);
     if (it == g_pkg_map.end()) return;
     strncpy(out, it->second.c_str(), cap - 1);
     out[cap - 1] = '\0';

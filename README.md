@@ -1677,3 +1677,118 @@ race suite green, trampoline binary verification green (with the
 setcontext shuffle gates for both blobs), script E2E + daemon E2E
 ALL GREEN, and the 4-ABI flashable zip built with every stealth
 gate (stripped, no SONAME, banned strings, 16 KB alignment) green.
+
+### Round 37 — the daemon path that never answered, and the latch that blocked its own coverage
+
+One round of auditing the newest code (R35/36) plus the
+daemon-client plumbing it sits on. Every fact below was re-verified
+against AOSP sources fetched this round (Process.java at
+13.0.0_r1/16.0.0_r1/main for the uid ranges;
+com_android_internal_os_Zygote.cpp at main for the specialization
+order; libcutils' android_filesystem_config.h for the native AID
+view), nothing from memory.
+
+- **Bug 1 (Fatal, all versions Android 5.0-16):** the payload read
+  the daemon's session file (the randomized per-boot socket path
+  handoff) exactly ONCE — at native-bridge init, i.e. during
+  Runtime::Init's dlopen in the zygote, BEFORE the daemon (started
+  by service.sh at the late service stage) ever writes it. On every
+  real boot the module fetch, the 'P' properties send and module
+  companion sockets all connected to the frozen default or stale
+  previous-boot path forever: **no modules ever loaded, the props
+  spoof file never staged, companions never connected** — while the
+  host tests stayed green precisely because their fake daemon was
+  listening before init (the exact "host green, device dead" class
+  Round 19 documented, reintroduced by Round 13's randomization).
+  The daemon's own comment even claimed "hand the path to the
+  payload BEFORE binding so a fast zygote never races a missing
+  file" — the payload never re-read it. Fix: the lazy daemon init
+  re-reads the session file on every FAILED connect (idempotent —
+  the same path registers nothing twice; two opens of a 96-byte
+  file, only while a daemon step is unlatched; zero steady-state
+  cost once latched). The regression test replays the production
+  boot order end to end: dead default path → session file appears
+  → the retry switches and latches through it.
+- **Bug 2 (High, all versions):** `send_props_file_to_daemon` was
+  the one `daemon_sock.h` client never converted to the bounded
+  socket — raw blocking `socket()/connect()/recv()` on the zygote's
+  MAIN THREAD (native-bridge init + every fork retry). A daemon
+  that accepts and then stalls (wedged handler, backlog draining
+  slow handlers) parked the zygote indefinitely: every subsequent
+  app launch on the device hung behind it. The header comment of
+  daemon_sock.h even lists this function as one of the two
+  zygote-main-thread clients it was created for. Fix: the same
+  `zs_daemon_connect_bounded(path, 100, 1000)` the module fetch
+  uses (1 s I/O bound: the image can be ~1 MB, a local unix socket
+  moves that in ~1 ms — the bound is the stall backstop, and a
+  timeout degrades to "retry later" through the existing latch).
+  The regression test runs the 'P' send against a daemon that
+  accepts and never replies: bounded return in ~1 s where the old
+  code hung forever.
+- **Bug 3 (Medium, Android 13-16):** `hide_lookup_package_for_uid`
+  missed the SDK-sandbox remap that `hide_setup_for_target_uid`
+  has since Round 35 (AOSP Process.java, verified this round:
+  FIRST/LAST_SDK_SANDBOX_UID = 20000/29999, absent in 12.0.0_r1,
+  present 13.0.0_r1..main; `getAppUidForSdkSandboxUid(uid)` =
+  `uid - (20000 - 10000)`). An SDK-sandbox process's module args
+  carried EMPTY package_name/app_data_dir while the hide decision
+  for the same uid resolved the owning app — and
+  `hide_data_dir_for_uid` (the pre-3.17-kernel filter fallback's
+  only safe scratch directory) failed for sandboxed processes.
+  Fix: the same remap in the lookup (all three paths now agree).
+  Regression test drives a 20234-uid child and asserts the owner's
+  package and data dir in the recorded module args.
+- **Bug 4 (Medium, Android 10-16):** the dispatch latches are
+  copy-on-write INHERITED — and an app zygote (forked from the
+  system zygote, uid = the app's) sets every one of them when its
+  own specialization dispatches. Its isolated children (appId
+  90000-98999, verified present from 10.0.0_r1, absent in 9.0.0_r1)
+  then bounced off the inherited `g_dispatch_done` / `g_pre_done` /
+  `g_post_done`: no setcontext name check, no pre/post callbacks —
+  while real Zygisk dispatches for every specialization. The R36
+  comment even said these children "deserve the same check" — the
+  guards were the last link making it unreachable. Fix: every
+  latch now records the pid it was set in; an inherited latch (pid
+  mismatch) re-arms the isolated-range coverage, while a
+  NON-isolated child of a dispatched process (an app's own fork()
+  worker — not a specialization) keeps the inherited "already
+  dispatched" semantics exactly as before. (A latch holder is
+  always an ancestor, and a live process' pid differs from any
+  ancestor's, so pid reuse cannot false-positive.) Regression
+  tests: the nested app-zygote → isolated-child chain produces
+  pre+post at BOTH levels with the full isolated name; the
+  plain-worker chain correctly produces only the ancestor's pair.
+- **Bug 5 (High, all versions — found BY the new test):** the
+  Round 34 io bound let `fetch_module_list_from_daemon` conflate
+  "connected but the reply never arrived within 100 ms" (recv
+  EAGAIN — a daemon whose accept backlog is draining slow
+  handlers) with "the daemon's definitive EMPTY list": the fetch
+  latched the empty answer and the module system was dead for the
+  whole boot from one slow accept. The wire is distinguishable:
+  the Rust child's real empty list arrives as a clean EOF
+  (recv == 0 — it write_all()s an empty String and exits), a
+  timeout is recv < 0. The classification now follows the wire;
+  timeouts retry through the existing latch machinery.
+- **Test-harness fix:** the fake daemon's reply writes used plain
+  `write()` — a client that hit its io bound and closed the socket
+  SIGPIPE'd the whole test process (the real Rust daemon ignores
+  SIGPIPE; the harness now matches with MSG_NOSIGNAL).
+
+The performance and stealth effects of the round ride on the bug
+fixes: with Bug 1 fixed, the per-fork lazy-retry cost actually
+TERMINATES (previously every fork paid a doomed connect +
+session-less retry forever — now it latches once and the hot path
+is two atomic loads), and the entire props-spoof staging + module
+system + companion API work on device again. No separate
+optimization landed: the honest finding of this round is that the
+module system had been dead on real devices since Round 13's
+randomization, and no host test could see it.
+
+**273/273 host tests** (46 hide / 116 advanced / 20 stealth / 5
+e2e / 6 perf / 8 trampoline / 32 dispatch / 11 version-compat / 16
+zn_loader / 8 obfstr / 5 race — the dispatch suite grew by the
+five Round 37 regression tests) + 50/50 cargo + clippy clean,
+ASan+UBSan+leaks green, TSan race suite green, trampoline binary
+verification green, script E2E + daemon E2E ALL GREEN, and the
+4-ABI flashable zip built with every stealth gate (stripped, no
+SONAME, banned strings, 16 KB alignment) green.
