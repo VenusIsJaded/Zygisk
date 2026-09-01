@@ -71,6 +71,21 @@ FAKE_LOG = """#!/bin/sh
 exit 0
 """
 
+FAKE_GETPROP = """#!/bin/sh
+# Fake Android `getprop` — the compat layer's last-resort read and the
+# customize.sh detections use it. Values come from ZS_FAKE_GETPROP_*.
+case "$1" in
+  ro.dalvik.vm.native.bridge)
+    if [ -n "${ZS_FAKE_PROP_STATE:-}" ] && [ -s "$ZS_FAKE_PROP_STATE" ]; then
+      cat "$ZS_FAKE_PROP_STATE"; exit 0
+    fi
+    printf '%s\\n' "${ZS_FAKE_GETPROP_BRIDGE:-0}"; exit 0 ;;
+  ro.product.cpu.abilist)
+    printf '%s\\n' "${ZS_FAKE_GETPROP_ABILIST:-arm64-v8a}"; exit 0 ;;
+  *) printf '%s\\n' "" ; exit 0 ;;
+esac
+"""
+
 STUB_DAEMON = """#!/bin/sh
 # Stub zygiskd: records its argv and exits 0.
 printf '%s\\n' "$*" >> "${ZS_STUB_DAEMON_LOG:?}"
@@ -104,11 +119,12 @@ class FakeMagisk:
         os.makedirs(self.sysroot)
         os.makedirs(self.bindir)
         for script in ("post-fs-data.sh", "service.sh", "uninstall.sh",
-                       "customize.sh"):
+                       "customize.sh", "zs_compat.sh", "post-mount-hook.sh"):
             shutil.copy(os.path.join(REPO_ROOT, script),
                         os.path.join(self.moddir, script))
         write_exec(os.path.join(self.bindir, "resetprop"), FAKE_RESETPROP)
         write_exec(os.path.join(self.bindir, "log"), FAKE_LOG)
+        write_exec(os.path.join(self.bindir, "getprop"), FAKE_GETPROP)
         self.resetprop_log = os.path.join(self.root, "resetprop.log")
         self.stub_daemon_log = os.path.join(self.root, "stub_daemon.log")
         self.prop_value = "0"
@@ -482,15 +498,26 @@ def test_uninstall_deletes_when_backup_empty(mk):
 
 def test_uninstall_empty_fallback_on_old_resetprop(mk):
     mk.delete_fail = "1"
+    # The compat layer's last resort is the module's own daemon binary
+    # — the stub records its argv (on a real device the built-in
+    # property engine performs the actual deletion).
+    installed_layout(mk, with_symlink=True)
     os.makedirs(mk.workdir, exist_ok=True)
     with open(os.path.join(mk.workdir, ".native_bridge_backup"), "w") as fp:
         fp.write("")
     proc = mk.run_script("uninstall.sh")
     calls = mk.resetprop_calls()
-    check("uninstall falls back to set-empty on --delete failure",
+    # Round 31: the resetprop --delete failure now falls through to the
+    # daemon's built-in engine (the stub records the CLI invocation).
+    stub_calls = []
+    if os.path.exists(mk.stub_daemon_log):
+        with open(mk.stub_daemon_log) as fp:
+            stub_calls = [l.strip() for l in fp if l.strip()]
+    check("uninstall --delete failure falls back to the built-in engine",
           proc.returncode == 0
-          and calls == ["--delete ro.dalvik.vm.native.bridge",
-                        "ro.dalvik.vm.native.bridge "], str(calls))
+          and calls == ["--delete ro.dalvik.vm.native.bridge"]
+          and stub_calls == ["prop delete ro.dalvik.vm.native.bridge"],
+          f"resetprop={calls} stub={stub_calls}")
 
 
 def test_uninstall_cleans_random_session_dir(mk):
@@ -539,6 +566,470 @@ def test_uninstall_leaves_foreign_paths_alone(mk):
 
 # ---------------------------------------------------------------------------
 
+
+
+# ---------------------------------------------------------------------------
+# Round 31 — root-manager / custom-ROM compatibility scenarios
+# ---------------------------------------------------------------------------
+
+def build_prop_area_file(path, props, a10=True, total=8192):
+    """Build a bionic-shaped property area file (independent of the
+    Rust engine: this is the same format the fixture builder in
+    props.rs emits, written again here in Python so the E2E exercises
+    the engine against a THIRD implementation of the format)."""
+    import struct
+    buf = bytearray(total)
+    struct.pack_into("<IIII", buf, 0, 0, 0, 0x504f5250, 0xfc6ed0ab)
+    used = 20 + (92 if a10 else 0)
+
+    def alloc_node(frag):
+        nonlocal used
+        off = used
+        span = 20 + len(frag) + 1
+        buf[128 + off:128 + off + span] = b"\0" * span
+        struct.pack_into("<I", buf, 128 + off, len(frag))
+        buf[128 + off + 20:128 + off + 20 + len(frag)] = frag.encode()
+        used += (span + 3) & ~3
+        return off
+
+    def bst_insert(root_off, frag):
+        cur = root_off
+        while True:
+            namelen = struct.unpack_from("<I", buf, 128 + cur)[0]
+            name = bytes(buf[128 + cur + 20:128 + cur + 20 + namelen]).decode()
+            if (len(frag), frag) == (len(name), name):
+                return cur
+            field = 8 if frag < name else 12
+            child = struct.unpack_from("<I", buf, 128 + cur + field)[0]
+            if child:
+                cur = child
+                continue
+            off = alloc_node(frag)
+            struct.pack_into("<I", buf, 128 + cur + field, off)
+            return off
+
+    for name, value in props:
+        current = 0
+        frags = name.split(".")
+        for i, frag in enumerate(frags):
+            children = struct.unpack_from("<I", buf, 128 + current + 16)[0]
+            if children == 0:
+                off = alloc_node(frag)
+                struct.pack_into("<I", buf, 128 + current + 16, off)
+                child_root = off
+            else:
+                child_root = children
+            current = bst_insert(child_root, frag)
+            if i == len(frags) - 1:
+                pi = used
+                total_pi = 96 + len(name) + 1
+                buf[128 + pi:128 + pi + total_pi] = b"\0" * total_pi
+                struct.pack_into("<I", buf, 128 + pi, len(value) << 24)
+                buf[128 + pi + 4:128 + pi + 4 + len(value)] = value.encode()
+                buf[128 + pi + 96:128 + pi + 96 + len(name)] = name.encode()
+                used += (total_pi + 3) & ~3
+                struct.pack_into("<I", buf, 128 + current + 4, pi)
+    struct.pack_into("<I", buf, 0, used)
+    if path.parent and not path.parent.exists():
+        path.parent.mkdir(parents=True)
+    path.write_bytes(bytes(buf))
+
+
+def read_prop_from_area(path, name):
+    """Third implementation of the trie reader for verification."""
+    import struct
+    buf = path.read_bytes()
+    magic, version = struct.unpack_from("<II", buf, 8)
+    if magic != 0x504f5250 or version != 0xfc6ed0ab:
+        return None
+
+    def node(off):
+        namelen = struct.unpack_from("<I", buf, 128 + off)[0]
+        nm = bytes(buf[128 + off + 20:128 + off + 20 + namelen]).decode()
+        prop, left, right, children = struct.unpack_from("<IIII", buf, 128 + off + 4)
+        return nm, prop, left, right, children
+
+    def find_bst(root, frag):
+        scan = root
+        while scan:
+            nm2, prop2, left2, right2, children2 = node(scan)
+            if nm2 == frag:
+                return scan, prop2
+            scan = left2 if frag < nm2 else right2
+        return None, 0
+
+    cur = 0
+    rest = name
+    prop = 0
+    while True:
+        nm, prop, left, right, children = node(cur)
+        frag, sep, tail = rest.partition(".")
+        if children == 0:
+            return None
+        scan, prop = find_bst(children, frag)
+        if scan is None:
+            return None
+        cur = scan
+        if not sep:
+            break
+        rest = tail
+    if prop == 0:
+        return None
+    serial = struct.unpack_from("<I", buf, 128 + prop)[0]
+    if serial & (1 << 16):
+        long_off = struct.unpack_from("<I", buf, 128 + prop + 60)[0]
+        base = 128 + prop + long_off
+        end = buf.index(0, base)
+        return buf[base:end].decode()
+    ln = serial >> 24
+    return bytes(buf[128 + prop + 4:128 + prop + 4 + ln]).decode()
+
+
+REAL_DAEMON = None
+
+
+def find_real_daemon():
+    """Build (once) the real zygiskd for the property-engine E2E."""
+    global REAL_DAEMON
+    if REAL_DAEMON is not None:
+        return REAL_DAEMON
+    import shutil as _sh
+    cargo = _sh.which("cargo") or os.path.expanduser("~/.cargo/bin/cargo")
+    if not cargo:
+        REAL_DAEMON = ""
+        return ""
+    zygd = os.path.join(REPO_ROOT, "native", "zygiskd")
+    try:
+        subprocess.run([cargo, "build", "--release"], cwd=zygd,
+                       capture_output=True, timeout=600, check=True)
+    except Exception:
+        REAL_DAEMON = ""
+        return ""
+    binp = os.path.join(zygd, "target", "release", "zygiskd")
+    REAL_DAEMON = binp if os.path.exists(binp) else ""
+    return REAL_DAEMON
+
+
+def _populate_modpath(modpath, abis=("arm64-v8a",), with_daemon=None):
+    for abi in abis:
+        d = os.path.join(modpath, "libs", abi)
+        os.makedirs(d, exist_ok=True)
+        for f in ("libzygisk.so", "libpayload.so", "libzn_loader.so"):
+            with open(os.path.join(d, f), "wb") as fp:
+                # EI_CLASS (byte 4) = 1 = ELF32 — customize.sh's
+                # Round 31 dual-arch gate validates this byte.
+                fp.write(b"\x7fELF\x01" + b"A" * 40)
+        if with_daemon:
+            shutil.copy(with_daemon, os.path.join(d, "zygiskd"))
+            os.chmod(os.path.join(d, "zygiskd"), 0o755)
+        else:
+            write_exec(os.path.join(d, "zygiskd"), "#!/bin/sh\nexit 0\n")
+    # the hook source customize.sh copies
+    shutil.copy(os.path.join(REPO_ROOT, "post-mount-hook.sh"),
+                os.path.join(modpath, "post-mount-hook.sh"))
+
+
+FAKE_UI = """#!/bin/sh
+echo "ui: $*"
+"""
+
+FAKE_ABORT = """#!/bin/sh
+echo "ABORT: $*"
+exit 1
+"""
+
+
+def test_real_engine_swap_without_resetprop(mk):
+    """KernelSU/APatch scenario: NO resetprop binary exists; the module's
+    own daemon engine performs the swap against a real (fixture)
+    property area."""
+    daemon = find_real_daemon()
+    if not daemon:
+        check("real daemon built (cargo available)", False, "cargo build failed")
+        return
+    check("real daemon built (cargo available)", True)
+    # Remove resetprop from PATH: only log/getprop fakes remain.
+    os.unlink(os.path.join(mk.bindir, "resetprop"))
+    # The real daemon installed as the module launcher (customize.sh
+    # creates a relative symlink; the test copies the binary).
+    installed_layout(mk, with_symlink=False)
+    os.unlink(os.path.join(mk.moddir, "libs", "arm64-v8a", "zygiskd"))
+    shutil.copy(daemon, os.path.join(mk.moddir, "zygiskd"))
+    os.chmod(os.path.join(mk.moddir, "zygiskd"), 0o755)
+    # A randomized loader name + a fixture property area with stock "0".
+    names = os.path.join(mk.moddir, ".loader_names")
+    with open(names, "w") as fp:
+        fp.write("bridge=lib0123abcd.so\npayload=lib0123abcd-p.so\n")
+    proot = os.path.join(mk.root, "props")
+    os.makedirs(proot, exist_ok=True)
+    area = os.path.join(proot, "u:object_r:dalvik_config_prop:s0")
+    build_prop_area_file(__import__("pathlib").Path(area),
+                         [("ro.dalvik.vm.native.bridge", "0"),
+                          ("ro.build.version.sdk", "34")])
+    build_prop_area_file(__import__("pathlib").Path(
+        os.path.join(proot, "properties_serial")), [])
+    proc = subprocess.run(
+        ["sh", os.path.join(mk.moddir, "post-fs-data.sh")],
+        env=mk.env({"ZS_PROP_ROOT": proot}),
+        capture_output=True, text=True, timeout=120)
+    check("no-resetprop post-fs-data exits 0", proc.returncode == 0,
+          proc.stderr[-300:])
+    val = read_prop_from_area(__import__("pathlib").Path(area),
+                              "ro.dalvik.vm.native.bridge")
+    check("engine swapped the bridge in the fixture area",
+          val == "lib0123abcd.so", str(val))
+    check("other props untouched by the engine",
+          read_prop_from_area(__import__("pathlib").Path(area),
+                              "ro.build.version.sdk") == "34")
+    check("backup file records stock 0", mk.backup_value() == "0")
+    applied = os.path.join(mk.workdir, ".native_bridge_applied")
+    if os.path.exists(applied):
+        with open(applied) as fp:
+            check(".native_bridge_applied records the engine swap",
+                  fp.read() == "lib0123abcd.so")
+    else:
+        check(".native_bridge_applied records the engine swap", False, "missing")
+
+
+def test_mount_pending_and_post_mount_hook(mk):
+    """KernelSU order: post-fs-data runs BEFORE module mounting, so the
+    loader is invisible; the flag is set. The post-mount hook then
+    rolls back cleanly (the host cannot see /system, so the resolution
+    branch is device-only; the ROLLBACK branch is fully testable)."""
+    installed_layout(mk, with_symlink=True)
+    with open(os.path.join(mk.moddir, ".loader_names"), "w") as fp:
+        fp.write("bridge=lib5566ffee.so\npayload=lib5566ffee-p.so\n")
+    os.makedirs(os.path.join(mk.moddir, "system", "lib64"), exist_ok=True)
+    with open(os.path.join(mk.moddir, "system", "lib64", "lib5566ffee.so"), "wb") as fp:
+        fp.write(b"\x7fELF")
+    mk.prop_value = "0"
+    proc = mk.run_script("post-fs-data.sh")
+    check("KSU-order post-fs-data exits 0", proc.returncode == 0, proc.stderr[-300:])
+    pend = os.path.join(mk.workdir, ".mount_pending")
+    check("mount pending flag set (loader invisible)", os.path.exists(pend))
+    # Install the hook where the manager would run it from, with a
+    # remapped /data/adb pointing at the module dir (the hook's
+    # MODDIR_REAL). On the host /system/lib64 stays invisible, so the
+    # expected branch is the rollback.
+    adbroot = os.path.join(mk.root, "adb")
+    os.makedirs(os.path.join(adbroot, "modules"), exist_ok=True)
+    shutil.copytree(mk.moddir, os.path.join(adbroot, "modules", "zygisk_study"),
+                    dirs_exist_ok=True)
+    hook = os.path.join(adbroot, "post-mount.d", "zygisk_study-mount.sh")
+    os.makedirs(os.path.dirname(hook), exist_ok=True)
+    shutil.copy(os.path.join(mk.moddir, "post-mount-hook.sh"), hook)
+    os.chmod(hook, 0o755)
+    proc2 = subprocess.run(["sh", hook], capture_output=True, text=True,
+                           env=mk.env({"ZS_TEST_ADB_ROOT": adbroot}),
+                           timeout=120)
+    check("post-mount hook exits 0 (rollback branch on host)",
+          proc2.returncode == 0, proc2.stderr[-300:])
+    check("hook rolled the bridge back (stock 0 restored)",
+          "ro.dalvik.vm.native.bridge 0" in mk.resetprop_calls(),
+          str(mk.resetprop_calls()))
+    check("hook cleared the pending flag", not os.path.exists(pend))
+    check("hook stood the guard down",
+          not os.path.exists(os.path.join(mk.workdir, ".native_bridge_applied")))
+
+
+def test_post_mount_noop_without_pending(mk):
+    """The hook runs on EVERY post-mount event; with nothing pending it
+    must exit 0 fast and never touch the property."""
+    installed_layout(mk, with_symlink=True)
+    mk.prop_value = "0"
+    mk.run_script("post-fs-data.sh")
+    # Simulate the Magisk case: the loader WAS visible, so post-fs-data
+    # cleared the flag itself.
+    pend = os.path.join(mk.workdir, ".mount_pending")
+    if os.path.exists(pend):
+        os.unlink(pend)
+    hook = os.path.join(mk.moddir, "post-mount-hook.sh")
+    adbroot = os.path.join(mk.root, "adb")
+    os.makedirs(os.path.join(adbroot, "modules"), exist_ok=True)
+    shutil.copytree(mk.moddir, os.path.join(adbroot, "modules", "zygisk_study"),
+                    dirs_exist_ok=True)
+    n_before = len(mk.resetprop_calls())
+    proc = subprocess.run(["sh", hook], capture_output=True, text=True,
+                          env=mk.env({"ZS_TEST_ADB_ROOT": adbroot}),
+                          timeout=120)
+    check("hook no-ops without a pending flag",
+          proc.returncode == 0 and len(mk.resetprop_calls()) == n_before,
+          str(mk.resetprop_calls()))
+
+
+def test_service_late_resolution(mk):
+    """service.sh with a still-pending mount and skip_mount: it rolls
+    back (the module boots inert) instead of leaving a dangling
+    reference."""
+    installed_layout(mk, with_symlink=True)
+    with open(os.path.join(mk.moddir, ".loader_names"), "w") as fp:
+        fp.write("bridge=lib11223344.so\npayload=lib11223344-p.so\n")
+    os.makedirs(os.path.join(mk.moddir, "system", "lib64"), exist_ok=True)
+    with open(os.path.join(mk.moddir, "system", "lib64", "lib11223344.so"), "wb") as fp:
+        fp.write(b"\x7fELF")
+    with open(os.path.join(mk.moddir, "skip_mount"), "w") as fp:
+        fp.write("")
+    mk.prop_value = "0"
+    mk.run_script("post-fs-data.sh")
+    check("pending before service", os.path.exists(
+        os.path.join(mk.workdir, ".mount_pending")))
+    proc = mk.run_script("service.sh")
+    check("service.sh exits 0 with pending rollback", proc.returncode == 0,
+          proc.stderr[-300:])
+    check("service rollback restored 0",
+          "ro.dalvik.vm.native.bridge 0" in mk.resetprop_calls(),
+          str(mk.resetprop_calls()))
+    check("service rollback cleared pending", not os.path.exists(
+        os.path.join(mk.workdir, ".mount_pending")))
+
+
+def _run_customize(mk, modpath, extra_env=None, abilist=None, bridge="0"):
+    """Shared customize.sh runner with a remapped /data/adb."""
+    env = mk.env(extra_env or {})
+    env["MODPATH"] = str(modpath)
+    env["ARCH"] = "arm64-v8a"
+    env["IS64BIT"] = "true"
+    env["API"] = "30"
+    env["ZS_TEST_ADB_ROOT"] = str(mk.root)  # remap /data/adb
+    if abilist is not None:
+        env["ZS_FAKE_GETPROP_ABILIST"] = abilist
+    env["ZS_FAKE_GETPROP_BRIDGE"] = bridge
+    write_exec(os.path.join(mk.bindir, "ui_print"), FAKE_UI)
+    write_exec(os.path.join(mk.bindir, "abort"), FAKE_ABORT)
+    proc = subprocess.run(["sh", os.path.join(mk.moddir, "customize.sh")],
+                          env=env, capture_output=True, text=True, timeout=120)
+    return proc
+
+
+def test_customize_installs_post_mount_hook(mk):
+    modpath = os.path.join(mk.root, "modpath")
+    os.makedirs(modpath, exist_ok=True)
+    _populate_modpath(modpath)
+    proc = _run_customize(mk, modpath)
+    check("customize (clean env) exits 0", proc.returncode == 0,
+          proc.stdout[-400:] + proc.stderr[-200:])
+    hook = os.path.join(mk.root, "post-mount.d", "zygisk_study-mount.sh")
+    check("post-mount.d hook installed", os.path.exists(hook))
+    check("post-mount.d hook executable",
+          os.path.exists(hook) and os.access(hook, os.X_OK))
+
+
+def test_customize_conflict_detection(mk):
+    # 1. Magisk's own Zygisk enabled
+    modpath = os.path.join(mk.root, "modpath1")
+    os.makedirs(modpath, exist_ok=True)
+    _populate_modpath(modpath)
+    proc = _run_customize(mk, modpath, {"ZYGISK_ENABLED": "1"})
+    check("customize aborts when Magisk Zygisk is enabled",
+          proc.returncode != 0 and "CONFLICT" in proc.stdout, proc.stdout[-200:])
+    # 2. zygisksu module present
+    modpath = os.path.join(mk.root, "modpath2")
+    os.makedirs(modpath, exist_ok=True)
+    _populate_modpath(modpath)
+    os.makedirs(os.path.join(mk.root, "modules", "zygisksu"), exist_ok=True)
+    proc = _run_customize(mk, modpath)
+    check("customize aborts when zygisksu module is installed",
+          proc.returncode != 0 and "zygisksu" in proc.stdout, proc.stdout[-200:])
+    # 3. rezygisk work dir present
+    mk2 = FakeMagisk()
+    modpath = os.path.join(mk2.root, "modpath3")
+    os.makedirs(modpath, exist_ok=True)
+    _populate_modpath(modpath)
+    os.makedirs(os.path.join(mk2.root, "rezygisk"), exist_ok=True)
+    proc = _run_customize(mk2, modpath)
+    check("customize aborts when rezygisk workdir exists",
+          proc.returncode != 0 and "rezygisk" in proc.stdout, proc.stdout[-200:])
+    mk2.cleanup()
+    # 4. live property = libzygisk.so
+    mk3 = FakeMagisk()
+    modpath = os.path.join(mk3.root, "modpath4")
+    os.makedirs(modpath, exist_ok=True)
+    _populate_modpath(modpath)
+    proc = _run_customize(mk3, modpath, bridge="libzygisk.so")
+    check("customize aborts when live bridge is libzygisk.so",
+          proc.returncode != 0 and "libzygisk.so" in proc.stdout, proc.stdout[-200:])
+    mk3.cleanup()
+
+
+def test_customize_dual_arch(mk):
+    # Dual-arch device with 32-bit artifacts: both lib dirs populated.
+    modpath = os.path.join(mk.root, "modpath1")
+    os.makedirs(modpath, exist_ok=True)
+    _populate_modpath(modpath, ("arm64-v8a", "armeabi-v7a"))
+    proc = _run_customize(mk, modpath, abilist="arm64-v8a,armeabi-v7a")
+    check("dual-arch customize exits 0", proc.returncode == 0,
+          proc.stdout[-300:] + proc.stderr[-200:])
+    names_file = os.path.join(modpath, ".loader_names")
+    with open(names_file) as fp:
+        lines = dict(l.split("=", 1) for l in fp.read().splitlines())
+    bridge = lines["bridge"]
+    check("32-bit bridge placed in system/lib",
+          os.path.exists(os.path.join(modpath, "system", "lib", bridge)))
+    check("64-bit bridge placed in system/lib64",
+          os.path.exists(os.path.join(modpath, "system", "lib64", bridge)))
+    # Dual-arch device WITHOUT 32-bit artifacts: warns, still succeeds.
+    mk2 = FakeMagisk()
+    modpath2 = os.path.join(mk2.root, "modpath2")
+    os.makedirs(modpath2, exist_ok=True)
+    _populate_modpath(modpath2, ("arm64-v8a",))
+    proc2 = _run_customize(mk2, modpath2, abilist="arm64-v8a,armeabi-v7a")
+    check("dual-arch without 32-bit artifacts still installs",
+          proc2.returncode == 0 and "32-bit zygote" in proc2.stdout,
+          proc2.stdout[-300:])
+    check("no system/lib created without 32-bit artifacts",
+          not os.path.exists(os.path.join(modpath2, "system", "lib")))
+    mk2.cleanup()
+    # A 64-bit (EI_CLASS=2) artifact in the 32-bit dir is REFUSED —
+    # the 32-bit zygote could never load it (Round 31 gate).
+    mk3 = FakeMagisk()
+    modpath3 = os.path.join(mk3.root, "modpath3")
+    os.makedirs(modpath3, exist_ok=True)
+    _populate_modpath(modpath3, ("arm64-v8a", "armeabi-v7a"))
+    bad = os.path.join(modpath3, "libs", "armeabi-v7a", "libzygisk.so")
+    with open(bad, "wb") as fp:
+        fp.write(b"\x7fELF\x02" + b"A" * 40)   # EI_CLASS = 2 = ELF64
+    proc3 = _run_customize(mk3, modpath3, abilist="arm64-v8a,armeabi-v7a")
+    check("64-bit artifact in 32-bit dir is refused",
+          proc3.returncode == 0
+          and "not a 32-bit ELF" in proc3.stdout
+          and not os.path.exists(
+              os.path.join(modpath3, "system", "lib")),
+          proc3.stdout[-200:])
+    mk3.cleanup()
+
+
+def test_customize_root_manager_envs(mk):
+    for env_name, label in (("KSU", "KernelSU"), ("APATCH", "APatch")):
+        mkx = FakeMagisk()
+        modpath = os.path.join(mkx.root, "modpath_x")
+        os.makedirs(modpath, exist_ok=True)
+        _populate_modpath(modpath)
+        proc = _run_customize(mkx, modpath, {env_name: "true"})
+        check(f"customize runs clean under {label} env",
+              proc.returncode == 0 and label in proc.stdout,
+              proc.stdout[-200:])
+        mkx.cleanup()
+
+
+def test_uninstall_removes_hook(mk):
+    installed_layout(mk, with_symlink=True)
+    hook_dir = os.path.join(mk.root, "post-mount.d")
+    os.makedirs(hook_dir, exist_ok=True)
+    hook = os.path.join(hook_dir, "zygisk_study-mount.sh")
+    shutil.copy(os.path.join(REPO_ROOT, "post-mount-hook.sh"), hook)
+    foreign = os.path.join(hook_dir, "other-module-hook.sh")
+    with open(foreign, "w") as fp:
+        fp.write("#!/system/bin/sh\nexit 0\n")
+    os.makedirs(mk.workdir, exist_ok=True)
+    with open(os.path.join(mk.workdir, ".native_bridge_backup"), "w") as fp:
+        fp.write("0")
+    proc = mk.run_script("uninstall.sh", {"ZS_TEST_ADB_ROOT": mk.root})
+    check("uninstall exits 0 with hook present", proc.returncode == 0,
+          proc.stderr[-200:])
+    check("uninstall removes OUR post-mount hook", not os.path.exists(hook))
+    check("uninstall leaves FOREIGN hooks alone", os.path.exists(foreign))
+
+
 def main():
     cases = [
         ("post-fs-data: current=0 swaps (Round 29 core fix)",
@@ -578,6 +1069,24 @@ def main():
          test_uninstall_workdir_record_fallback),
         ("uninstall: foreign session path ignored",
          test_uninstall_leaves_foreign_paths_alone),
+        ("Round 31: engine swap without resetprop (real zygiskd)",
+         test_real_engine_swap_without_resetprop),
+        ("Round 31: mount pending + post-mount rollback",
+         test_mount_pending_and_post_mount_hook),
+        ("Round 31: post-mount no-op without pending",
+         test_post_mount_noop_without_pending),
+        ("Round 31: service.sh late rollback",
+         test_service_late_resolution),
+        ("Round 31: customize installs post-mount.d hook",
+         test_customize_installs_post_mount_hook),
+        ("Round 31: customize conflict detection",
+         test_customize_conflict_detection),
+        ("Round 31: customize dual-arch install",
+         test_customize_dual_arch),
+        ("Round 31: customize under KSU/APatch env",
+         test_customize_root_manager_envs),
+        ("Round 31: uninstall removes the post-mount hook",
+         test_uninstall_removes_hook),
     ]
     for title, fn in cases:
         print(f"\n== {title}")

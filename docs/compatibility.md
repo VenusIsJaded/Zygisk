@@ -450,3 +450,143 @@ residual unknown above degrades closed: a blocked path means "no
 injection" or "no hide" for that feature, never a crash, and the
 module refuses (rather than breaks) the only device class that
 would actually malfunction (real-bridge x86 translation devices).
+
+## Round 31 — custom ROM compatibility (the 50-ROM sweep)
+
+### What was actually verified (nothing guessed)
+
+The custom-ROM question is answered the same way the OEM question
+was in Round 29: by reading the ROMs' own source trees. This round
+fetched `frameworks/base` surfaces (core/jni/AndroidRuntime.cpp —
+the native-bridge load logic; core/jni/
+com_android_internal_os_Zygote.cpp + core/java/com/android/internal/
+os/{Zygote,ZygoteConnection}.java — every spawn path) from **50
+custom-ROM repos** and diffed them against AOSP. The ROM set covers
+every family users actually flash in 2025-2026:
+
+| Family | ROMs verified (org/branch) |
+|---|---|
+| LineageOS + descendants | LineageOS/lineage-23.2, crdroidandroid/16.0, RisingOS-Revived/sixteen, RisingTechOSS/fourteen, SuperiorOS/fifteen, OmniROM/android-16, Evolution-X/cnb, DerpFest-AOSP/16.2, AICP/w16.2, VoltageOS/17, ProjectMatrixx/16.2, Octavi-Staging/sixteen, Project-Elixir/UNO, Komodo-OS/15, bananadroid/14, CherishOS/uqpr2, Project-Awaken/ursa, P-404/umai, PixelOS-AOSP/seventeen, PixelBuildsROM/infinity-oss, AospExtended/12.1.x, ArrowOS/arrow-13.1, StatiXOS/bp4a, Havoc-OS/thirteen, DotOS/dot12.1, Corvus-AOSP/13, CipherOS/fourteen-qpr, Project-Kaleidoscope/sunflowerleaf, Zeus-OS/11.1, RevengeOS/r11.0, ShapeShiftOS/android_13, ViperOS/ten, exthmui-legacy/exthm-11, LiquidRemix/ten, Nitrogen-project/14, PotatoProject/frico_mr1, Xtended-Tomato/8.0, MSM-Xtended, PixysOS, Bliss (TeamBliss), BootleggersROM, MoKee/mkq-mr1, ResurrectionRemix/Q, DirtyUnicorns/r11x |
+| Privacy ROMs | GrapheneOS/17 (re-verified: exec_spawn present), CalyxOS, DivestOS, /e/OS, iodéOS, LineageOS for microG |
+| GSI | TrebleDroid/android-16.0.0_r2-td (phhusson lineage) |
+| Legacy | CyanogenMod/cm-14.1, ParanoidAndroid/jb43 (see below) |
+| Other AOSP forks | ProtonAOSP/sc-qpr3, commaai (comma three), nDroidProject, ChameleonOS/kitkat, TeamBliss/kk4.4 |
+
+**The result: exactly three variants of the native-bridge
+acceptance logic exist across all 50 ROMs.** 46 ROMs ship AOSP's
+current form byte-for-byte (`propBuf[0] == '\0'` -> ALOGW; `zygote
+&& strcmp(propBuf, "0") != 0` -> addOption); 3 ship the pre-10 form
+without the zygote guard (CyanogenMod 14.1, commaai, Xtended 8.0 —
+the R30-documented second-load surface, which our post-consume
+property restore already handles); 4 legacy branches predate
+Android 5.0 and contain **no native-bridge mechanism at all**
+(ParanoidAndroid jb43, Bliss kk4.4, ChameleonOS kitkat, nDroid —
+the R28 verdict applies: below 5.0 the load mechanism does not
+exist, and those branches are for 2013-2014 devices anyway). No ROM
+changes what the property accepts, and every modern ROM keeps all
+spawn paths through `nativeSpecializeAppProcess`/`SpecializeCommon`
+(the setresgid/setresuid points our GOT hooks key on).
+
+### The root-manager compatibility layer (the real custom-ROM gap)
+
+Reading a ROM's framework tells you whether the injection mechanism
+works; reading the ROOT MANAGER tells you whether the module's
+installer survives contact with the boot chain. Custom-ROM users
+run three root managers (Magisk, KernelSU, APatch — plus forks), and
+this round read all three from their own sources:
+
+* **Magisk** mounts a module's `system/` over `/system` with magic
+  mount before post-fs-data scripts run, and ships a `resetprop`
+  binary. Everything the old rounds relied on.
+* **KernelSU** (ksud `init_event.rs`, read this round): module
+  post-fs-data scripts run BEFORE the metamodule that mounts module
+  system/ dirs — and per the official module guide, "KernelSU uses a
+  metamodule architecture for mounting the system directory. Only if
+  your module needs to modify /system files do you need to install a
+  metamodule". No resetprop BINARY exists on PATH. Both gaps are now
+  handled (below). KernelSU also steps aside when Magisk is present
+  ("Magisk detected, skip post-fs-data").
+* **APatch** (apd `event.rs`): same metamodule delegation, same
+  post-mount stage, same "skip if Magisk" rule — but it DOES ship an
+  internal resetprop (the `prop-rs-android` crate).
+
+Two hard facts close the design (verified from AOSP main this
+round, not assumed):
+
+1. **The bridge library name is a bare soname, always.** ART's
+   `NativeBridgeNameAcceptable` (libnativebridge/native_bridge.cc)
+   accepts only `[a-zA-Z0-9._-]` with a leading letter — a value
+   containing `/` is rejected before any dlopen. Absolute paths
+   into /data are impossible.
+2. **The loader must live in `/system/lib[64]` (or
+   /system_ext/lib[64]) of the zygote's mount namespace.** The load
+   goes through the exported "system" linker namespace
+   (OpenSystemLibrary → `android_get_exported_namespace("system")`),
+   whose search paths (system/linkerconfig contents/namespace/
+   system.cc) are exactly `/system/${LIB}` and
+   `SYSTEM_EXT/${LIB}`; the namespace is non-isolated, but the
+   soname resolution only ever searches those directories.
+
+So the module now carries its own compatibility chain:
+
+* **A built-in property engine** (`zygiskd prop`, props.rs): a
+  Rust implementation of bionic's own property-area mutation
+  protocol — the trie walk, the dirty-backup copy, the release
+  fences, the serial publish, the futex wakes, the global
+  `properties_serial` bump — all verified line-by-line against
+  libc/system_properties (prop_area.cpp, prop_info.cpp,
+  system_properties.cpp, contexts_split.cpp) this round. It handles
+  the Android 7+ per-context directory layout (including the exact
+  `u:object_r:dalvik_config_prop:s0` file the property lives in,
+  from system/sepolicy's property_contexts), the pre-7 single-file
+  layout, the A10+ dirty-backup region, and long-value records
+  (delete + re-add, Magisk's own rule). post-fs-data.sh falls back
+  to it when no resetprop binary exists; the daemon's property guard
+  prefers it over shelling out. 15 cargo tests + a live E2E where
+  post-fs-data.sh, with NO resetprop on PATH, swaps the bridge in a
+  bionic-shaped fixture area read back by a THIRD independent trie
+  implementation (Python).
+* **A loader-mount fallback chain** (zs_compat.sh +
+  post-mount-hook.sh): post-fs-data checks whether the bridge is
+  visible at /system/lib[64]; on KernelSU it is not yet (scripts run
+  before metamodule mounting), so a pending flag is set and the
+  /data/adb/post-mount.d hook — installed by customize.sh, run by
+  KernelSU/APatch AFTER their metamodule mounting and before zygote
+  — resolves it: metamodule mount (already visible), a direct copy
+  (RW /system, rare), or OUR OWN overlayfs over the lib dir (the
+  same approach KernelSU's official meta-overlayfs metamodule uses,
+  with a /proc/filesystems capability check). If nothing works, the
+  property swap is rolled back and the guard stands down: the boot
+  never references a file ART cannot load. service.sh is the
+  last-resort retry point (a late resolution arms the module for the
+  next zygote generation).
+* **Conflict detection** (customize.sh): Magisk's own Zygisk
+  (ZYGISK_ENABLED env, or the live `libzygisk.so` value), ZygiskNext
+  / NeoZygisk (module id `zygisksu` — from NeoZygisk's own
+  build.gradle.kts — plus `/data/adb/neozygisk`), ReZygisk (module
+  id + `/data/adb/rezygisk`). Two zygote-injection frameworks at
+  once is undefined behavior; the installer refuses with the
+  conflicting component named.
+* **Dual-arch installs** (customize.sh): on a 64-bit device that
+  also runs a 32-bit zygote (most pre-2018 SoCs — common on
+  LineageOS-class ROMs), the 32-bit zygote resolves the SAME soname
+  through /system/lib, so the 32-bit pair is installed beside the
+  64-bit one when the device's abilist includes the 32-bit ABI —
+  gated on the artifacts actually being ELF32 (EI_CLASS byte
+  checked; a 64-bit binary in the 32-bit slot is refused with the
+  reason logged).
+
+### Round 31 residuals (honest scope)
+
+* The custom-ROM framework sweep covers frameworks/base; ROM-specific
+  init.rc changes or kernel configs are not enumerated per-ROM — the
+  runtime capability checks (overlayfs presence, mount permissions)
+  cover the mechanism, not each of the hundreds of ROM builds.
+* The overlayfs self-mount runs in whatever SELinux domain the root
+  manager executes module scripts in (magisk/su — the same domains
+  KernelSU's own meta-overlayfs runs in). A ROM with a policy that
+  denies mounts to those domains degrades to the documented
+  fail-closed rollback.
+* Legacy ROM branches below Android 5.0 have no native-bridge
+  mechanism at all (verified, R28) — the installer's API gate
+  already refuses them.

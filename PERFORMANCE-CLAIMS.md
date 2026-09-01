@@ -1137,3 +1137,56 @@ with-modules case must be priced:
   prop-set hooks are gated by the same one-atomic-load Tier B
   check, and the fdopendir classification readlink runs only for
   dirfds that no earlier hook registered (rare by construction).
+
+
+## Round 31 — profile-driven filter optimization (gprofng)
+
+Method: `gprofng collect-app` on a dedicated workload binary
+(tests/test_profile.cpp) replaying every runtime-hot operation at
+production scale — 2 MB smaps images through the streaming filter,
+hook-matcher storms, walk passes, per-fork decisions. The profile
+attributed **43.06% of exclusive CPU to zs_filter_record** (the
+per-line record filter), with the rest split between libc memcpy
+internals (54%) and syscalls (pread/write, ~27% inclusive).
+
+### What changed (both semantics-preserving, proven by tests)
+
+1. **'/'-hop token scanning** (proc_line_has_hidden_token): a
+   hidden token must START with '/' — the byte-by-byte whole-line
+   walk is replaced by vectorized memchr hops between '/' bytes,
+   checking only whether each '/' begins a token
+   (record-start-or-whitespace-preceded). Tokenization equivalence
+   is exact for every input (non-slash tokens can never match;
+   slash-mid-token positions are not token starts). The hidden-path
+   unit tests — which caught TWO bad hand-counted table lengths in
+   the first version of change #2 — pin the behavior.
+2. **Compile-time-length tables**: kHiddenExactPaths /
+   kHiddenRootFieldPrefixes now carry `sizeof(literal) - 1` lengths
+   (constexpr) instead of runtime strlen per token per line.
+
+### Measured (identical 12 GB workload, gprofng, same host)
+
+| Metric | Before | After | Delta |
+|---|---|---|---|
+| Total workload CPU | 2.812 s | 2.111 s | **-25.0%** |
+| Filter path (inclusive) | 2.522 s | 1.811 s | **-28.2%** |
+| zs_filter_record (exclusive) | 1.211 s | 0.620 s | **-48.8%** |
+| 500-line filter median | 30 µs | 30 µs | unchanged (measurement floor) |
+| Hook matcher median | 65 ns | 65 ns | unchanged (already indexed) |
+| Setup/apply fast paths | 0 µs | 0 µs | unchanged |
+| Per-fork COW delta | 0.00 pages | 0.00 pages | unchanged |
+
+New locked contract: the 2 MB smaps filter (test:
+make_filtered_memfd_filters_2mb_smaps_under_3ms) — ~1.5 ms median
+on the dev host, 3 ms budget unsanitized, 12 ms under ASan. For
+scale: the kernel itself takes 10-20 ms to SERVE a smaps of that
+size, so the filtered path remains several times cheaper than the
+unfiltered one it replaces.
+
+Honest notes: the gprofng numbers are host x86_64 (ARM64 shifts
+absolutes; the ~10x budgets absorb that); the profiling harness
+exercises the filter through a host-test seam
+(zs_test_filter_memfd_from_buffer) so the workload input is
+deterministic rather than the host's own /proc content; the race
+safety of the new locks is TSan-verified (`make race`), not merely
+reasoned about.

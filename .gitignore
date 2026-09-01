@@ -16,3 +16,6 @@ target/
 *.o
 *.so.tmp
 tests/test_zn_loader
+tests/test_race
+tests/test_profile
+tests/race_fixture.so

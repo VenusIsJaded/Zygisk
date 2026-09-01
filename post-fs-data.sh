@@ -97,28 +97,55 @@ if [ -z "$RESETPROP" ]; then
   done
 fi
 
-if [ -n "$RESETPROP" ]; then
-  CURRENT="$($RESETPROP ro.dalvik.vm.native.bridge 2>/dev/null)"
+# Round 31: the compat layer (zs_compat.sh) provides the property
+# write chain (resetprop binary -> our daemon's built-in engine) and
+# the loader-visibility/mount chain. Sourcing it does nothing by
+# itself; zs_compat_init reads .loader_names and sets ZS_* state.
+. "$MODDIR/zs_compat.sh"
+zs_compat_init
+
+if [ -n "$RESETPROP" ] || [ -x "$ZS_DAEMON" ]; then
+  CURRENT="$(zs_prop_get ro.dalvik.vm.native.bridge)"
   # Round 29: "" and "0" are the two documented no-bridge values.
   if [ -z "$CURRENT" ] || [ "$CURRENT" = "0" ]; then
     if [ ! -f "$WORKDIR/.native_bridge_backup" ]; then
       printf '%s' "$CURRENT" > "$WORKDIR/.native_bridge_backup" 2>/dev/null
     fi
-    "$RESETPROP" ro.dalvik.vm.native.bridge "$BRIDGE_LIB"
+    zs_prop_set ro.dalvik.vm.native.bridge "$BRIDGE_LIB"
     # Round 30: record the value we just installed so the daemon's
     # property guard can (a) restore the stock value once the zygote
     # has consumed it and (b) re-apply this exact value after a
     # zygote crash-restart. Written ONLY on a successful swap — its
     # absence (or a mismatch with the live value) means the guard
     # stays inert.
-    if [ "$($RESETPROP ro.dalvik.vm.native.bridge 2>/dev/null)" = "$BRIDGE_LIB" ]; then
+    if [ "$(zs_prop_get ro.dalvik.vm.native.bridge)" = "$BRIDGE_LIB" ]; then
       printf '%s' "$BRIDGE_LIB" > "$WORKDIR/.native_bridge_applied" 2>/dev/null
     fi
     log -t ZygiskStudy "native.bridge set to $BRIDGE_LIB (was: ${CURRENT:-<absent>})"
+    # ROUND 31 (KernelSU / APatch / metamodule-less environments):
+    # on Magisk the root manager has ALREADY magic-mounted
+    # $MODPATH/system over /system, so the loader is visible right
+    # now. On KernelSU (ksud runs module post-fs-data scripts BEFORE
+    # the metamodule mount, verified from init_event.rs) it is NOT —
+    # and without any metamodule it never will be by itself. Mark the
+    # mount as pending; the post-mount.d hook (KernelSU/APatch run it
+    # AFTER their metamodule mounting, still before zygote) and
+    # service.sh (last resort) resolve it or roll the swap back.
+    if zs_loader_visible; then
+      rm -f "$WORKDIR/.mount_pending" 2>/dev/null
+    else
+      : > "$WORKDIR/.mount_pending" 2>/dev/null
+      log -t ZygiskStudy "loader not visible at /system yet; mount check deferred"
+    fi
   else
-    # A real bridge is in use — do not touch it.
-    log -t ZygiskStudy "native.bridge already set ($CURRENT); leaving it alone"
+    # A real bridge is in use — do not touch it. Magisk's own Zygisk
+    # (if enabled) sets exactly "libzygisk.so" here.
+    if [ "$CURRENT" = "libzygisk.so" ]; then
+      log -t ZygiskStudy "Magisk's own Zygisk is active (libzygisk.so); refusing to double-inject"
+    else
+      log -t ZygiskStudy "native.bridge already set ($CURRENT); leaving it alone"
+    fi
   fi
 else
-  log -t ZygiskStudy "resetprop not found; cannot set native.bridge"
+  log -t ZygiskStudy "no property writer available (resetprop / zygiskd); cannot set native.bridge"
 fi

@@ -2449,3 +2449,167 @@ Honest residuals:
   `/proc/<pid>/stat` per-fork deltas to confirm the zero-page
   result on real hardware. The existing perf medians (41 ns hook
   matcher, 0 us setup/apply) remain at the floor.
+
+## Round 31 — custom ROMs, race conditions, and profile-driven perf
+
+### Version research actually performed this round
+
+Per the standing instruction, every fact below was fetched and READ
+(this round's full source list — nothing from memory):
+
+* **50 custom-ROM frameworks/base trees** (see compatibility.md's
+  Round 31 table for the org/branch list): AndroidRuntime.cpp's
+  native-bridge acceptance block, Zygote.cpp's spawn inventory
+  (nativeSpecializeAppProcess / SpecializeCommon / nativeForkApp),
+  Zygote.java/ZygoteConnection.java. Three variants total (46×
+  current AOSP form, 3× pre-10 no-zygote-guard, 4× pre-5.0 no
+  mechanism); no ROM altered the semantics.
+* **ART's loader chain end-to-end**: libnativebridge/native_bridge.cc
+  (OpenSystemLibrary uses the exported "system" namespace;
+  NativeBridgeNameAcceptable rejects '/' — bare sonames only),
+  system/linkerconfig contents/namespace/system.cc (search paths
+  /system/${LIB} + /system_ext/${LIB}, non-isolated),
+  bionic linker/linker_namespaces.cpp (non-isolated ⇒ any path —
+  irrelevant given the name validator).
+* **Root managers from their own source**: KernelSU
+  userspace/ksud/src/init_event.rs (module post-fs-data scripts run
+  BEFORE metamodule mounting; post-mount stage runs AFTER it; "Magisk
+  detected, skip post-fs-data"), APatch apd/src/event.rs (same
+  architecture + internal resetprop via the prop-rs-android crate),
+  Magisk native/src/core/resetprop/{mod.rs,cli.rs,sys.cpp} (the
+  ro.* direct-modification protocol: delete-long-then-add, update2,
+  add2, the property_service bypass), KernelSU's module guide
+  (metamodule requirement), APatch's APM guide (overlayfs mounts,
+  APATCH env var, "Magisk detected" skip).
+* **Bionic property-area internals** (the engine's provenance):
+  libc/system_properties/prop_area.h (128-byte header, trie node
+  layout, the A10+ 92-byte dirty-backup region), prop_info.h
+  (serial@0, value[92]@4, name@96; kLongFlag 1<<16; long offset at
+  +60), prop_area.cpp (find_property/find_prop_trie_node
+  allocation + release-store semantics), system_properties.cpp
+  SystemProperties::Update (the full concurrent-reader protocol:
+  backup copy → release fence → dirty bit → value → release fence →
+  (len<<24)|((serial+1)&0xffffff) → futex wake → global serial bump
+  → futex wake), contexts_split.cpp (per-context files named by
+  their context string, properties_serial), system/sepolicy
+  private/property_contexts (`ro.dalvik.vm.native.bridge
+  u:object_r:dalvik_config_prop:s0 exact string`).
+* **Bionic linker locking for the deadlock analysis**: dlfcn.cpp:101
+  (`g_dl_mutex` is PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP) and
+  linker.cpp ("dlopen calling constructors" — constructors run under
+  that lock). This is why the walk serialization is a single-walker
+  CAS protocol instead of a mutex: a plain lock held across
+  dl_iterate_phdr (which takes g_dl_mutex) deadlocks against a
+  constructor that dlopens.
+* **Conflict markers**: Magisk docs/guides.md (ZYGISK_ENABLED=1),
+  NeoZygisk build.gradle.kts (moduleId "zygisksu", workdir
+  /data/adb/neozygisk), ReZygisk module sources (id "rezygisk",
+  /data/adb/rezygisk), ZygiskNext distribution (zygisksu on
+  modules.kernelsu.org).
+* **ksu_props / prop-rs** (KernelSU+APatch's shared resetprop
+  implementation, read for design cross-checks — UNLICENSED, so
+  nothing was copied; our engine is an independent implementation
+  from the bionic sources above).
+
+### Real bugs found and fixed this round
+
+* **RACE-1 (crash-grade, since Round 8)**: concurrent dlopen hooks
+  ran the GOT re-walk unserialized from any app thread — torn
+  g_walked_dsos/g_patched_slots counts (OOB reads), interleaved
+  mprotect/write/mprotect on the same GOT page (the thread-induced
+  version of the Round 17 lazy-binding crash). PROVEN: a TSan
+  harness against the pre-fix code reports **8 data races**
+  (dso_already_walked vs mark_dso_walked, gc_walked_dso_set vs
+  marking); the fixed code reports **zero** under the identical
+  hammering (plus the whole 112-test advanced suite under TSan).
+  The fix is the single-walker protocol (see the hide_advanced.cpp
+  comment block) — deadlock-free by construction because no lock is
+  held while calling into the linker.
+* **RACE-2 (correctness, since Round 8)**: fd shadow registration
+  from concurrent filtered opens tore g_fd_shadow_count (two
+  registers → same slot twice / count past the array) and lookups
+  could read half-filled records. Fixed with a LEAF mutex +
+  copy-out views (FdShadowView) — no inversion possible (the
+  critical sections only memcpy/fstat; fstat is not intercepted).
+* **RACE-3 (correctness, since Round 16)**: the cwd /proc prefix was
+  written by chdir/fchdir hooks (any thread) and read by relative
+  opens — a torn read handed the open filter a garbage prefix (wrong
+  hidden/not-hidden decision). Fixed with a leaf mutex + snapshot
+  reader; the new race test hammers chdir against relative opens.
+* **RACE-4 (torn index, since Round 8)**: the hook-index lazy
+  rebuild ran on whichever matcher thread first saw dirty==1 — two
+  concurrent rebuilds produced torn reads for other threads. The
+  matcher now NEVER mutates: dirty (atomic, release) ⇒ linear scan
+  of the stable registry; rebuilds happen only in the single-walker
+  pass or at hide time.
+* **Dead-code bug in the new engine (caught by its own tests)**:
+  hand-counted table lengths in the '/'-hop optimization were wrong
+  twice — replaced with sizeof(literal)-1 (compile-time exact); the
+  hidden-path tests caught both before anything shipped.
+* **Bounds bug in the new engine (caught by self-review)**: obj()
+  validated only the START offset of multi-byte accesses — a
+  corrupt area could push a 96-byte read or 92-byte write past the
+  mapping end. All accesses now range-check [off, off+size).
+
+### Performance work (profile-driven, measured)
+
+`gprofng collect-app` on a replay of every runtime-hot operation at
+production scale (2 MB smaps images, matcher storms, walk passes,
+per-fork decisions) attributed **43% of exclusive CPU to
+zs_filter_record**'s byte-by-byte token walk. Two changes, both
+semantics-preserving (verified by the full 243-test suite + the
+hidden-path tests that caught the bad hand-counted lengths):
+
+* **'/'-hop token scanning**: a hidden token must START with '/'
+  (proc_line_token_is_hidden's first check), so the filter now hops
+  between '/' bytes with vectorized memchr instead of walking every
+  byte of every token. Tokenization equivalence is exact (a '/'
+  begins a token iff record-start-or-whitespace-precedes; the token
+  then extends to the next whitespace — the same tokens the byte
+  walk produced, minus the ones that could never match).
+* **Compile-time-length tables**: kHiddenExactPaths and
+  kHiddenRootFieldPrefixes carry their lengths (sizeof-1), removing
+  the per-token strlen calls from the hot loop.
+
+Measured (identical 12 GB workload, gprofng): total CPU 2.812s →
+2.111s (**-25%**); the filter path 2.522s → 1.811s (**-28%**);
+zs_filter_record exclusive 1.211s → 0.620s (**-49%**). A new perf
+test locks the realistic-scale contract (2 MB smaps, ~1.5 ms
+median on the dev host, 3 ms budget unsanitized / 12 ms under
+ASan — the kernel itself needs 10-20 ms to serve a smaps that
+size). The standing medians are unchanged: 30 µs/500-line filter,
+0 µs setup/apply, 65 ns matcher, 0.00 pages COW delta.
+
+### Verification additions this round
+
+15 cargo tests for the property engine (formats, atomic protocol,
+the three layout generations, scrub-on-delete, cross-engine
+visibility through the shared mapping) + the live daemon E2E guard
+test with NO resetprop on PATH (3 checks) + 88 script-E2E checks
+(was 53): the no-resetprop engine swap E2E (fixture area read back
+by a third independent Python trie implementation), the KernelSU
+mount-pending flow, the post-mount rollback, the service
+late-resolution, conflict detection (all four markers), dual-arch
+installs (positive, missing-artifacts, wrong-ELF-class), the
+post-mount.d hook lifecycle (install + ours-only uninstall), and
+the KSU/APatch env passes. Plus the race suite: 5 stress tests in
+the normal suite, 5 under ASan+UBSan, and `make race` — the TSan
+run that must stay at zero reports (the old code's 8 reports are
+reproducible on demand via the proof harness documented in the
+Makefile).
+
+Honest residuals:
+
+- The hooks remain non-async-signal-safe (same as any allocator-
+  using hook; pthread_mutex under a signal handler that interrupts
+  the lock holder would deadlock). No known detector reads /proc
+  from signal handlers.
+- TSan coverage is the payload's C++ hot layer; the daemon's Rust
+  side is covered by its unit tests + the Send-sync discipline,
+  not TSan.
+- The gprofng numbers are host x86_64; Android's ARM64 cores and
+  the real kernel's page-cache behavior shift absolutes (the
+  budgets are calibrated ~10x for that).
+- The 50-ROM sweep reads frameworks/base + the root managers; a
+  ROM could still patch its own kernel/sepolicy in ways that only
+  device testing would surface (the boot chain degrades closed).

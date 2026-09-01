@@ -7,7 +7,7 @@ INCLUDES  = -I../native/common -I.. -DZS_HOST_TEST
 
 TESTS = test_hide test_hide_advanced test_hide_stealth test_e2e_hide \
 	test_perf test_unmap_trampoline test_module_dispatch \
-	test_version_compat test_zn_loader
+	test_version_compat test_zn_loader test_race
 
 # The REAL payload, built as a shared library so the trampoline test
 # can dlopen it and exercise the actual Tier A code path. Named
@@ -81,6 +81,36 @@ test_version_compat: test_version_compat.cpp libzygisk.so \
 	test_framework.h ../native/common/log.h
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -o $@ $< -ldl
 
+# Round 31 — race-condition suite: multithreaded hammering of the
+# hook layer (dlopen/dlclose churn, concurrent filtered opens,
+# chdir-vs-relative-open). Plain build = stress + integrity checks;
+# `make race` re-runs it under ThreadSanitizer.
+race_fixture.so: race_fixture.c
+	$(CC) -shared -fPIC -o $@ $<
+
+test_race: test_race.cpp ../native/libpayload/src/hide_advanced.cpp \
+	../native/libpayload/src/hide.cpp ../native/common/log.h \
+	test_framework.h race_fixture.so
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -o $@ $< \
+		../native/libpayload/src/hide.cpp -ldl -pthread
+
+.PHONY: race
+race: test_race.cpp ../native/libpayload/src/hide_advanced.cpp \
+	../native/libpayload/src/hide.cpp race_fixture.c test_framework.h
+	$(CC) -shared -fPIC -o race_fixture.so race_fixture.c
+	$(CXX) -std=c++17 -O1 -g -fsanitize=thread $(INCLUDES) -o \
+		/tmp/test_race_tsan $< ../native/libpayload/src/hide.cpp \
+		-ldl -pthread 2>/dev/null || true
+	@echo "== TSan race suite =="
+	@if /tmp/test_race_tsan 2>&1 | tee /tmp/zs_tsan_out.txt | \
+		grep -q "WARNING: ThreadSanitizer"; then \
+	    echo "TSAN: DATA RACES FOUND"; \
+	    grep -c "WARNING: ThreadSanitizer" /tmp/zs_tsan_out.txt; exit 1; \
+	else \
+	    echo "TSAN: no data races"; \
+	fi
+	@./test_race
+
 # Round 28 — libzn_loader (the init-oriented API bridge) gets its
 # first dedicated test binary. Compiles the REAL entry.cpp with
 # -DZS_HOST_TEST (the zs_test_zn_* seams) and exercises the
@@ -136,7 +166,7 @@ verify-public-header:
 SAN_CXXFLAGS = -std=c++17 -O1 -g -Wall -Wextra -fno-omit-frame-pointer \
 	-fsanitize=address,undefined
 SAN_TESTS = test_hide test_hide_advanced test_hide_stealth \
-	test_e2e_hide test_perf
+	test_e2e_hide test_perf test_race
 
 .PHONY: run-sanitize
 

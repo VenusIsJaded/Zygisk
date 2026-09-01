@@ -729,6 +729,62 @@ minor-fault delta per child on host — the module's per-fork memory
 cost is below the measurement floor, and the standing perf
 medians (41 ns hook matcher, 0 us setup/apply) are unchanged.
 
+### Round 31 — custom ROMs, race conditions, profiled performance
+
+The user's brief: "search up every single custom ROM that exists and
+make sure it is compatible ... do some race condition testing ... find
+out what has the highest cost to run and make it take less resources
+without messing anything up." All three, verified the usual way:
+
+1. **The 50-ROM sweep** (compatibility.md has the full org/branch
+   table): frameworks/base fetched from every major ROM family —
+   LineageOS and its descendants, the privacy ROMs, TrebleDroid GSI,
+   the legacy branches. Exactly THREE variants of the native-bridge
+   acceptance logic exist across all of them; nobody changed what the
+   property accepts, and every modern ROM keeps the spawn paths our
+   hooks key on. The real custom-ROM gap was never the ROM — it was
+   the ROOT MANAGER: the module now works on KernelSU and APatch
+   (no resetprop binary, no magic mount without a metamodule) via
+   its own bionic-exact property engine (`zygiskd prop`, 15 cargo
+   tests + a live E2E against an independently built property area)
+   and a loader-mount fallback chain (root-manager mount → direct
+   copy → our own overlayfs → fail-closed rollback), driven by a
+   /data/adb/post-mount.d hook on the managers that run it. Plus
+   conflict detection (Magisk's Zygisk, ZygiskNext/NeoZygisk
+   "zygisksu", ReZygisk) and dual-arch installs for the 32-bit
+   zygote (ELF32-verified).
+2. **Race-condition testing**: the hidden app is multithreaded, and
+   every round before this one tested single-threaded. TSan against
+   the pre-fix code reports **8 data races** (concurrent GOT
+   re-walks, the mark-set GC, fd-shadow registration, the cwd
+   prefix); the fix is a deadlock-free single-walker protocol (a
+   plain mutex would AB-BA with bionic's recursive g_dl_mutex —
+   constructors run under it, verified from dlfcn.cpp:101 +
+   linker.cpp) plus leaf locks with copy-out views. `make race` now
+   runs the TSan gate in CI; the proof harness reproduces the old
+   code's 8 reports on demand.
+3. **Profile-driven performance**: `gprofng collect-app` on a
+   production-scale workload put 43% of exclusive CPU in
+   zs_filter_record's byte-by-byte token walk. Two
+   semantics-preserving changes ('/'-hop scanning with vectorized
+   memchr — a hidden token must start with '/' — and compile-time
+   length tables; the hidden-path tests caught two bad hand-counted
+   lengths before anything shipped) cut the filter path **28%**
+   (2.522s → 1.811s on an identical 12 GB workload) and the hot
+   function **49%**. A new perf test locks the realistic 2 MB smaps
+   contract; the standing medians are unchanged.
+
+Final state: **243/243 host tests** (41 hide / 112 advanced / 20
+stealth / 5 e2e / 6 perf / 4 trampoline / 23 dispatch / 11
+version-compat / 16 zn_loader / 5 race) + `make race` (TSan: zero
+data races — the old code's 8 are reproducible via the proof
+harness) + `make run-sanitize` green, 45/45 cargo tests, `make
+verify-daemon` 30 live checks (incl. the engine-driven guard with
+no resetprop on PATH), `make verify-scripts` 88 live checks, 0
+warnings, perf medians unchanged. The full research trail with every source cited:
+`docs/ANDROID-REALISM.md` (Round 31) and `docs/compatibility.md`
+(custom ROM section).
+
 ## License
 
 Apache-2.0. See `LICENSE`.

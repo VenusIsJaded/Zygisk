@@ -115,6 +115,57 @@ ZS_TEST(make_filtered_memfd_filters_500_lines_under_200us) {
 }
 
 // ----------------------------------------------------------------------
+// Round 31 — the realistic-scale filter: a 2 MB /proc/self/smaps
+// image (real apps run 1-3 MB) with the R8-calibrated ~2% hidden
+// entry mix. The Round 31 profile-driven optimization ('/'-hop token
+// scanning + compile-time-length tables) cut the 2 MB filter from
+// 420 µs to ~300 µs on this host (gprofng, identical workload —
+// see PERFORMANCE-CLAIMS.md). Budget is calibrated ~10x the median.
+// ----------------------------------------------------------------------
+ZS_TEST(make_filtered_memfd_filters_2mb_smaps_under_3ms) {
+    std::string content = make_fake_maps(21000);
+    ZS_CHECK(content.size() > 1500000);  // sanity: ~2 MB
+
+    int warmup_fd = syscall_memfd_create("warmup2", 0);
+    ZS_CHECK(warmup_fd >= 0);
+    write(warmup_fd, content.data(), content.size());
+    lseek(warmup_fd, 0, SEEK_SET);
+    int warmup_out = make_filtered_memfd(warmup_fd, "/proc/self/smaps");
+    ZS_CHECK(warmup_out >= 0);
+    close(warmup_fd); close(warmup_out);
+
+    constexpr int N = 12;
+    long long durations_us[N];
+    for (int i = 0; i < N; ++i) {
+        int fd = syscall_memfd_create("perf2", 0);
+        ZS_CHECK(fd >= 0);
+        write(fd, content.data(), content.size());
+        lseek(fd, 0, SEEK_SET);
+        auto t0 = clk::now();
+        int out = make_filtered_memfd(fd, "/proc/self/smaps");
+        auto t1 = clk::now();
+        durations_us[i] = std::chrono::duration_cast<
+            std::chrono::microseconds>(t1 - t0).count();
+        close(fd);
+        close(out);
+    }
+    std::sort(durations_us, durations_us + N);
+    long long median = durations_us[N / 2];
+    std::fprintf(stderr, "  [perf] 2 MB smaps filter median: %lld us\n",
+                 median);
+    // ~300 µs median on the dev host; 3 ms is the calibrated ceiling
+    // (~10x, covering ARM64 and profiler noise). A real smaps read
+    // via the kernel costs 10-20 ms at this size — we stay far under.
+    // Sanitizer builds (run-sanitize) run 2-5x slower — the ceiling
+    // scales with them; the unsanitized budget is the real contract.
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
+    ZS_CHECK(median < 12000);
+#else
+    ZS_CHECK(median < 3000);
+#endif
+}
+
+// ----------------------------------------------------------------------
 // Test 2: hide_setup_for_target() fast path completes in under
 // 5 µs on the host when the target is NOT on the denylist.
 // ----------------------------------------------------------------------

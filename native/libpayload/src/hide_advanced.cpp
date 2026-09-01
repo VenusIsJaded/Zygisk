@@ -50,6 +50,8 @@
 #include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sched.h>
+#include <pthread.h>
 #include <sys/types.h>
 #include <sys/uio.h>
 #include <unistd.h>
@@ -1353,13 +1355,23 @@ static const char* const kFilteredBaseNames[] = {
 // libraries. The module installs them under $MODPATH/system/lib[64]
 // so ART's native-bridge dlopen finds them; in maps they appear at
 // these paths, and no /data/... prefix distinguishes them.
-static const char* const kHiddenExactPaths[] = {
-    "/system/lib64/libzygisk.so",
-    "/system/lib64/libpayload.so",
-    "/system/lib64/libzn_loader.so",
-    "/system/lib/libzygisk.so",
-    "/system/lib/libpayload.so",
-    "/system/lib/libzn_loader.so",
+// ROUND 31 (performance, profile-driven): lengths are carried in the
+// table (constexpr) — the old __builtin_strlen-per-call ran inside
+// the per-token hot loop for every slash-leading token of every line.
+struct HiddenPathEntry {
+    const char* p;
+    size_t      n;
+};
+// sizeof(literal) - 1 is compile-time-exact (hand-counted lengths
+// were wrong twice — the hidden-path tests caught both).
+#define ZS_HIDDEN_PATH(s) {s, sizeof(s) - 1}
+static constexpr HiddenPathEntry kHiddenExactPaths[] = {
+    ZS_HIDDEN_PATH("/system/lib64/libzygisk.so"),
+    ZS_HIDDEN_PATH("/system/lib64/libpayload.so"),
+    ZS_HIDDEN_PATH("/system/lib64/libzn_loader.so"),
+    ZS_HIDDEN_PATH("/system/lib/libzygisk.so"),
+    ZS_HIDDEN_PATH("/system/lib/libpayload.so"),
+    ZS_HIDDEN_PATH("/system/lib/libzn_loader.so"),
 };
 
 // mountinfo "root" fields (the path INSIDE the source filesystem —
@@ -1369,11 +1381,12 @@ static const char* const kHiddenExactPaths[] = {
 // Stock mountinfo root fields are "/", "/system", "/vendor",
 // "/product", "/data", ... — none of these forms, so the anchored
 // prefixes cannot false-positive on stock lines.
-static const char* const kHiddenRootFieldPrefixes[] = {
-    "/adb/modules",
-    "/adb/.zygisk_study",
-    "/system/zygisk_study",
+static constexpr HiddenPathEntry kHiddenRootFieldPrefixes[] = {
+    ZS_HIDDEN_PATH("/adb/modules"),
+    ZS_HIDDEN_PATH("/adb/.zygisk_study"),
+    ZS_HIDDEN_PATH("/system/zygisk_study"),
 };
+#undef ZS_HIDDEN_PATH
 
 // Substring helper for the unix-socket line filter (whole-line
 // memmem semantics — socket names are not path-shaped, so anchored
@@ -1403,14 +1416,12 @@ static int proc_line_token_is_hidden(const char* tok, size_t len) {
     // (static set + runtime session prefixes).
     if (fd_target_is_root_path(tok, len)) return 1;
     // Exact paths of the magic-mounted bridge libraries.
-    for (const char* p : kHiddenExactPaths) {
-        size_t n = __builtin_strlen(p);
-        if (n == len && memcmp(tok, p, n) == 0) return 1;
+    for (const HiddenPathEntry& e : kHiddenExactPaths) {
+        if (e.n == len && memcmp(tok, e.p, e.n) == 0) return 1;
     }
     // mountinfo root-column forms (path inside the source fs).
-    for (const char* p : kHiddenRootFieldPrefixes) {
-        size_t n = __builtin_strlen(p);
-        if (len >= n && memcmp(tok, p, n) == 0) return 1;
+    for (const HiddenPathEntry& e : kHiddenRootFieldPrefixes) {
+        if (len >= e.n && memcmp(tok, e.p, e.n) == 0) return 1;
     }
     return 0;
 }
@@ -1421,17 +1432,34 @@ static int proc_line_token_is_hidden(const char* tok, size_t len) {
 // column carries a path (paths can appear as source, target, root
 // and mapped-file columns across those formats).
 static int proc_line_has_hidden_token(const char* rec, size_t rec_len) {
+    // ROUND 31 (performance, profile-driven): proc_line_token_is_hidden
+    // rejects every token whose first byte is not '/', so the vast
+    // majority of bytes in a maps/smaps line (hex addresses, perms,
+    // offsets, inode numbers) can never matter. Hop between '/'
+    // bytes with vectorized memchr instead of walking every byte of
+    // every token: a '/' begins a token exactly when it is the record
+    // start or follows whitespace, and the token then extends to the
+    // next whitespace — the same tokenization the byte-by-byte walk
+    // produced, so the hidden/not-hidden answer is identical.
     const char* p   = rec;
     const char* end = rec + rec_len;
     while (p < end) {
-        // Skip leading whitespace.
-        while (p < end && (*p == ' ' || *p == '\t')) ++p;
-        const char* tok = p;
-        while (p < end && *p != ' ' && *p != '\t') ++p;
-        if (p > tok &&
-            proc_line_token_is_hidden(tok, (size_t)(p - tok))) {
-            return 1;
+        const char* slash =
+            (const char*)memchr(p, '/', (size_t)(end - p));
+        if (!slash) return 0;
+        const int at_token_start =
+            (slash == rec) || slash[-1] == ' ' || slash[-1] == '\t';
+        if (at_token_start) {
+            const char* tok_end = slash;
+            while (tok_end < end && *tok_end != ' ' && *tok_end != '\t') {
+                ++tok_end;
+            }
+            if (proc_line_token_is_hidden(slash,
+                                          (size_t)(tok_end - slash))) {
+                return 1;
+            }
         }
+        p = slash + 1;
     }
     return 0;
 }
@@ -2007,6 +2035,26 @@ static int make_filtered_memfd(int orig_fd, const char* target_path) {
     return memfd;
 }
 
+#ifdef ZS_HOST_TEST
+// Round 31 profiling seam: feed an arbitrary image through the REAL
+// streaming filter (the 2 MB-scale workload in test_profile.cpp).
+int zs_test_filter_memfd_from_buffer(const void* data, size_t len,
+                                     const char* path);
+int zs_test_filter_memfd_from_buffer(const void* data, size_t len,
+                                     const char* path) {
+    if (!data || len == 0) return -1;
+    int memfd = syscall_memfd_create("zsprof", 0);
+    if (memfd < 0) return -1;
+    if (write(memfd, data, len) != (ssize_t)len) {
+        close(memfd);
+        return -1;
+    }
+    int out = make_filtered_memfd(memfd, path);
+    close(memfd);
+    return out;
+}
+#endif
+
 // ------------------------------------------------------------------------
 // 5a. The fd shadow table (Round 15) — procfs observable parity
 // ------------------------------------------------------------------------
@@ -2067,6 +2115,16 @@ enum {
 };
 static FdShadow g_fd_shadow[32];
 static size_t   g_fd_shadow_count;   // high-water mark, scan bounded
+// ROUND 31 (race fix): the fd shadow table is mutated from ANY app
+// thread (filtered open() registers a memfd or proc-dir fd; close()
+// invalidates; lookups happen on every openat/readlink/stat path).
+// Unserialized, two concurrent registers could tear g_fd_shadow_count
+// (both write slot [count], count bumps twice -> out-of-bounds reads;
+// a lookup could read a half-filled slot -> wrong path decisions).
+// This is a LEAF lock: the critical sections only memcpy/strcmp/fstat
+// and never call anything that can re-enter a hook, so no lock-order
+// inversion is possible. (fstat is safe: not intercepted.)
+static pthread_mutex_t g_fd_shadow_lock = PTHREAD_MUTEX_INITIALIZER;
 
 // Is `path` a /proc DIRECTORY whose relative opens we must filter?
 // Covers /proc, /proc/net, /proc/self, /proc/thread-self, /proc/<pid>
@@ -2129,24 +2187,39 @@ static uint64_t zs_procfs_dev() {
     return g_procfs_dev;
 }
 
-// Record the memfd we are about to hand to the caller.
-static FdShadow* fd_shadow_alloc_slot(int want_fd);
-static void      fd_shadow_set_path(FdShadow* slot, const char* path);
+// LOCK ORDER NOTE (Round 31): fd_shadow_lock is a LEAF lock — the
+// critical sections memcpy/strcmp only; nothing inside can re-enter
+// a hooked symbol, so no inversion is possible.
+static void fd_shadow_lock();
+static void fd_shadow_unlock();
+static FdShadow* fd_shadow_alloc_locked(int want_fd);
 
+// Record the memfd we are about to hand to the caller.
+// ROUND 31: alloc+fill run under the shadow lock so a concurrent
+// lookup never observes a half-filled slot (the fstat runs BEFORE
+// taking the lock — syscalls are thread-safe and keep the critical
+// section minimal).
 static void fd_shadow_register(int memfd, const char* orig_path) {
     struct stat st;
     // g_real_fstat may not be resolved yet on the first call; use the
     // libc fstat directly — it cannot recurse into our hooks because
     // fstat is not intercepted at libc-internal call sites.
     if (fstat(memfd, &st) != 0) return;
-    FdShadow* slot = fd_shadow_alloc_slot(memfd);
-    if (!slot) return;   // table full: plain memfd behavior (documented)
-    slot->fd   = memfd;
-    slot->kind = FD_SHADOW_MEMFD;
-    slot->dev  = (uint64_t)st.st_dev;
-    slot->ino  = (uint64_t)st.st_ino;
-    slot->size = (uint64_t)st.st_size;
-    fd_shadow_set_path(slot, orig_path);
+    fd_shadow_lock();
+    FdShadow* slot = fd_shadow_alloc_locked(memfd);
+    if (slot) {
+        slot->fd   = memfd;
+        slot->kind = FD_SHADOW_MEMFD;
+        slot->dev  = (uint64_t)st.st_dev;
+        slot->ino  = (uint64_t)st.st_ino;
+        slot->size = (uint64_t)st.st_size;
+        size_t n = strlen(orig_path);
+        if (n >= sizeof slot->orig_path) n = sizeof slot->orig_path - 1;
+        memcpy(slot->orig_path, orig_path, n);
+        slot->orig_path[n] = '\0';
+    }
+    fd_shadow_unlock();
+    // table full: plain memfd behavior (documented residual)
 }
 
 // Round 16: record a /proc directory fd the app opened — relative
@@ -2157,73 +2230,124 @@ static void fd_shadow_register_proc_dir(int dirfd, const char* path) {
     struct stat st;
     if (fstat(dirfd, &st) != 0) return;
     if (!S_ISDIR(st.st_mode)) return;
-    FdShadow* slot = fd_shadow_alloc_slot(dirfd);
-    if (!slot) return;
-    slot->fd   = dirfd;
-    slot->kind = FD_SHADOW_PROC_DIR;
-    slot->dev  = (uint64_t)st.st_dev;
-    slot->ino  = (uint64_t)st.st_ino;
-    slot->size = 0;          // dir sizes change; identity is dev+ino
-    fd_shadow_set_path(slot, path);
+    fd_shadow_lock();
+    FdShadow* slot = fd_shadow_alloc_locked(dirfd);
+    if (slot) {
+        slot->fd   = dirfd;
+        slot->kind = FD_SHADOW_PROC_DIR;
+        slot->dev  = (uint64_t)st.st_dev;
+        slot->ino  = (uint64_t)st.st_ino;
+        slot->size = 0;      // dir sizes change; identity is dev+ino
+        size_t n = strlen(path);
+        if (n >= sizeof slot->orig_path) n = sizeof slot->orig_path - 1;
+        memcpy(slot->orig_path, path, n);
+        slot->orig_path[n] = '\0';
+    }
+    fd_shadow_unlock();
 }
 
-// Shared slot allocator for both register flavors.
-static FdShadow* fd_shadow_alloc_slot(int want_fd) {
+// Shared slot allocator for both register flavors (LOCKED: returns a
+// slot the caller may fill; the lock is released by the caller via
+// fd_shadow_unlock — alloc + fill must be atomic so a concurrent
+// lookup never sees a half-filled slot).
+static FdShadow* fd_shadow_alloc_locked(int want_fd) {
     for (size_t i = 0; i < g_fd_shadow_count; ++i) {
         if (g_fd_shadow[i].fd == want_fd) return &g_fd_shadow[i];
     }
     for (size_t i = 0; i < g_fd_shadow_count; ++i) {
         if (g_fd_shadow[i].fd < 0) return &g_fd_shadow[i];
     }
-    if (g_fd_shadow_count < sizeof(g_fd_shadow) / sizeof(g_fd_shadow[0])) {
+    if (g_fd_shadow_count < sizeof g_fd_shadow / sizeof g_fd_shadow[0]) {
         return &g_fd_shadow[g_fd_shadow_count++];
     }
     return nullptr;
 }
 
-static void fd_shadow_set_path(FdShadow* slot, const char* orig_path) {
-    size_t n = strlen(orig_path);
-    if (n >= sizeof slot->orig_path) n = sizeof slot->orig_path - 1;
-    memcpy(slot->orig_path, orig_path, n);
-    slot->orig_path[n] = '\0';
-}
+static void fd_shadow_lock()   { pthread_mutex_lock(&g_fd_shadow_lock); }
+static void fd_shadow_unlock() { pthread_mutex_unlock(&g_fd_shadow_lock); }
+
+// View type shared by the locked lookup helpers below.
+
+// ROUND 31: view (copy-out snapshot) of an fd shadow record —
+// callers never hold live pointers into the shared table.
+struct FdShadowView {
+    int      fd;
+    int      kind;
+    uint64_t dev;
+    uint64_t ino;
+    uint64_t size;
+    char     orig_path[96];
+};
 
 // Find the shadow record whose fd matches AND whose identity still
 // matches the live descriptor (memfd: dev/ino/size; proc dir: dev/ino
-// — directory st_size can legitimately change). Returns nullptr for
-// "not one of ours" (stale entries are invalidated here).
-static FdShadow* fd_shadow_lookup(int fd, int kind) {
+// — directory st_size can legitimately change). Returns 0 for "not
+// one of ours" (stale entries are invalidated inside). ROUND 31: the
+// record is COPIED OUT under the lock (view semantics) — callers
+// never hold live pointers into the shared table.
+static int fd_shadow_lookup_view(int fd, int kind, FdShadowView* out) {
+    if (fd < 0) return 0;
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        fd_shadow_lock();
+        for (size_t i = 0; i < g_fd_shadow_count; ++i) {
+            if (g_fd_shadow[i].fd == fd) g_fd_shadow[i].fd = -1;
+        }
+        fd_shadow_unlock();
+        return 0;
+    }
+    fd_shadow_lock();
+    int found = 0;
     for (size_t i = 0; i < g_fd_shadow_count; ++i) {
         if (g_fd_shadow[i].fd != fd || g_fd_shadow[i].kind != kind) continue;
-        struct stat st;
-        if (fstat(fd, &st) != 0) { g_fd_shadow[i].fd = -1; return nullptr; }
         if ((uint64_t)st.st_dev == g_fd_shadow[i].dev &&
             (uint64_t)st.st_ino == g_fd_shadow[i].ino &&
             (kind == FD_SHADOW_PROC_DIR ||
              (uint64_t)st.st_size == g_fd_shadow[i].size)) {
-            return &g_fd_shadow[i];
+            out->fd   = g_fd_shadow[i].fd;
+            out->kind = g_fd_shadow[i].kind;
+            out->dev  = g_fd_shadow[i].dev;
+            out->ino  = g_fd_shadow[i].ino;
+            out->size = g_fd_shadow[i].size;
+            memcpy(out->orig_path, g_fd_shadow[i].orig_path,
+                   sizeof out->orig_path);
+            found = 1;
+        } else {
+            // fd number reused for a different file — entry is dead.
+            g_fd_shadow[i].fd = -1;
         }
-        // fd number reused for a different file — entry is dead.
-        g_fd_shadow[i].fd = -1;
-        return nullptr;
+        break;
     }
-    return nullptr;
+    fd_shadow_unlock();
+    return found;
 }
 
 // Find the shadow record by FILE IDENTITY (dup'd descriptors have new
 // fd numbers but the same dev/ino). Caller has already fstat'd.
 // memfd flavor only — readlink dups of directories answer the real
 // directory path anyway (nothing to hide there).
-static FdShadow* fd_shadow_scan_by_identity(uint64_t dev, uint64_t ino) {
+static int fd_shadow_scan_identity_view(uint64_t dev, uint64_t ino,
+                                        FdShadowView* out) {
+    fd_shadow_lock();
+    int found = 0;
     for (size_t i = 0; i < g_fd_shadow_count; ++i) {
         if (g_fd_shadow[i].fd >= 0 &&
             g_fd_shadow[i].kind == FD_SHADOW_MEMFD &&
             g_fd_shadow[i].dev == dev &&
             g_fd_shadow[i].ino == ino) {
-            return &g_fd_shadow[i];
+            out->fd   = g_fd_shadow[i].fd;
+            out->kind = g_fd_shadow[i].kind;
+            out->dev  = g_fd_shadow[i].dev;
+            out->ino  = g_fd_shadow[i].ino;
+            out->size = g_fd_shadow[i].size;
+            memcpy(out->orig_path, g_fd_shadow[i].orig_path,
+                   sizeof out->orig_path);
+            found = 1;
+            break;
         }
     }
-    return nullptr;
+    fd_shadow_unlock();
+    return found;
 }
 
 // Rewrite a filled-in `struct stat` to look like real procfs.
@@ -2260,17 +2384,19 @@ ssize_t hide_advanced_spoof_memfd_readlink(int fd, const char* real_target,
         return 0;   // not one of ours (or a genuinely other memfd)
     }
     // Direct hit by fd number, else identity scan for dups.
-    FdShadow* rec = fd_shadow_lookup(fd, FD_SHADOW_MEMFD);
-    if (!rec) {
+    // ROUND 31: view-based (copy-out under the shadow lock).
+    FdShadowView rec;
+    if (!fd_shadow_lookup_view(fd, FD_SHADOW_MEMFD, &rec)) {
         struct stat st;
         if (fstat(fd, &st) != 0) return 0;
-        rec = fd_shadow_scan_by_identity((uint64_t)st.st_dev,
-                                         (uint64_t)st.st_ino);
-        if (!rec) return 0;
+        if (!fd_shadow_scan_identity_view((uint64_t)st.st_dev,
+                                          (uint64_t)st.st_ino, &rec)) {
+            return 0;
+        }
     }
-    size_t n = strlen(rec->orig_path);
+    size_t n = strlen(rec.orig_path);
     if (n > bufsiz) n = bufsiz;          // readlink truncation semantics
-    memcpy(buf, rec->orig_path, n);
+    memcpy(buf, rec.orig_path, n);
     return (ssize_t)n;
 }
 
@@ -2296,17 +2422,43 @@ ssize_t hide_advanced_spoof_memfd_readlink(int fd, const char* real_target,
 static char   g_cwd_proc_prefix[80];
 static size_t g_cwd_proc_prefix_len = 0;
 
+// ROUND 31 (race fix): the cwd prefix is written by the chdir/fchdir
+// hooks (any app thread) and read by every relative-open decision.
+// Unserialized, a reader could see the new LENGTH with half-copied
+// bytes (a garbage prefix -> a wrong hidden/not-hidden decision).
+// A leaf mutex serializes writer-vs-reader and writer-vs-writer; the
+// copy-out reader gives callers a stable snapshot. (The kernel has
+// the same inherent TOCTOU for relative paths across concurrent
+// chdir — our filter decision is only required to be ATOMICALLY
+// consistent, which this lock provides.)
+static pthread_mutex_t g_cwd_prefix_lock = PTHREAD_MUTEX_INITIALIZER;
+
 static void zs_set_cwd_proc_prefix(const char* dir) {
+    char local[80];
+    size_t n = 0;
+    local[0] = '\0';
     if (dir && zs_is_proc_dir_prefix(dir)) {
-        size_t n = strlen(dir);
-        if (n >= sizeof g_cwd_proc_prefix) n = sizeof g_cwd_proc_prefix - 1;
-        memcpy(g_cwd_proc_prefix, dir, n);
-        g_cwd_proc_prefix[n] = '\0';
-        g_cwd_proc_prefix_len = n;
-        return;
+        n = strlen(dir);
+        if (n >= sizeof local) n = sizeof local - 1;
+        memcpy(local, dir, n);
+        local[n] = '\0';
     }
-    g_cwd_proc_prefix[0] = '\0';
-    g_cwd_proc_prefix_len = 0;
+    pthread_mutex_lock(&g_cwd_prefix_lock);
+    memcpy(g_cwd_proc_prefix, local, sizeof g_cwd_proc_prefix);
+    g_cwd_proc_prefix_len = n;
+    pthread_mutex_unlock(&g_cwd_prefix_lock);
+}
+
+// Snapshot the current prefix (empty string when the cwd is not a
+// /proc directory of ours). Always NUL-terminated.
+static void zs_cwd_prefix_copy(char* out, size_t cap) {
+    if (!out || cap == 0) return;
+    pthread_mutex_lock(&g_cwd_prefix_lock);
+    size_t n = g_cwd_proc_prefix_len;
+    if (n >= cap) n = cap - 1;
+    memcpy(out, g_cwd_proc_prefix, n);
+    out[n] = '\0';
+    pthread_mutex_unlock(&g_cwd_prefix_lock);
 }
 
 // Lexically normalize an absolute path: resolve "." and ".."
@@ -2401,14 +2553,19 @@ static char* zs_join_proc_dir_heap(const char* prefix, const char* rel) {
 char* hide_advanced_resolve_proc_relative(int dirfd, const char* rel) {
     if (!rel || rel[0] == '/') return nullptr;
     if (!hide_advanced_is_active()) return nullptr;
+    char prefix_buf[96];
     const char* prefix = nullptr;
     if (dirfd != AT_FDCWD) {
-        FdShadow* rec = fd_shadow_lookup(dirfd, FD_SHADOW_PROC_DIR);
-        if (!rec) return nullptr;
-        prefix = rec->orig_path;
+        FdShadowView rec;
+        if (!fd_shadow_lookup_view(dirfd, FD_SHADOW_PROC_DIR, &rec)) {
+            return nullptr;
+        }
+        memcpy(prefix_buf, rec.orig_path, sizeof prefix_buf);
+        prefix = prefix_buf;
     } else {
-        if (g_cwd_proc_prefix_len == 0) return nullptr;
-        prefix = g_cwd_proc_prefix;
+        zs_cwd_prefix_copy(prefix_buf, sizeof prefix_buf);
+        if (prefix_buf[0] == '\0') return nullptr;
+        prefix = prefix_buf;
     }
     if (!prefix || prefix[0] != '/') return nullptr;
     char full[160];
@@ -2432,12 +2589,16 @@ static int wrapped_open(const char* path, int flags, mode_t mode) {
     char full[160];
     char* heap_full = nullptr;
     const char* filter_path = path;
-    if (path && path[0] != '/' && g_cwd_proc_prefix_len > 0) {
-        if (zs_join_proc_dir(g_cwd_proc_prefix, path, full, sizeof full)) {
-            filter_path = full;
-        } else {
-            heap_full = zs_join_proc_dir_heap(g_cwd_proc_prefix, path);
-            if (heap_full) filter_path = heap_full;
+    if (path && path[0] != '/' && hide_advanced_is_active()) {
+        char zs_prefix[80];
+        zs_cwd_prefix_copy(zs_prefix, sizeof zs_prefix);
+        if (zs_prefix[0] != '\0') {
+            if (zs_join_proc_dir(zs_prefix, path, full, sizeof full)) {
+                filter_path = full;
+            } else {
+                heap_full = zs_join_proc_dir_heap(zs_prefix, path);
+                if (heap_full) filter_path = heap_full;
+            }
         }
     }
     int real_fd = g_real_open
@@ -2487,23 +2648,23 @@ static int wrapped_openat(int dirfd, const char* path, int flags,
     char* heap_full = nullptr;
     const char* filter_path = path;
     if (path && path[0] != '/' && hide_advanced_is_active()) {
-        FdShadow* rec = (dirfd != AT_FDCWD)
-            ? fd_shadow_lookup(dirfd, FD_SHADOW_PROC_DIR)
-            : nullptr;
-        if (rec) {
-            if (zs_join_proc_dir(rec->orig_path, path, full,
-                                 sizeof full)) {
-                filter_path = full;
-            } else {
-                heap_full = zs_join_proc_dir_heap(rec->orig_path, path);
-                if (heap_full) filter_path = heap_full;
+        char prefix_buf[96];
+        const char* prefix = nullptr;
+        if (dirfd != AT_FDCWD) {
+            FdShadowView rec;
+            if (fd_shadow_lookup_view(dirfd, FD_SHADOW_PROC_DIR, &rec)) {
+                memcpy(prefix_buf, rec.orig_path, sizeof prefix_buf);
+                prefix = prefix_buf;
             }
-        } else if (dirfd == AT_FDCWD && g_cwd_proc_prefix_len > 0) {
-            if (zs_join_proc_dir(g_cwd_proc_prefix, path, full,
-                                 sizeof full)) {
+        } else {
+            zs_cwd_prefix_copy(prefix_buf, sizeof prefix_buf);
+            if (prefix_buf[0] != '\0') prefix = prefix_buf;
+        }
+        if (prefix) {
+            if (zs_join_proc_dir(prefix, path, full, sizeof full)) {
                 filter_path = full;
             } else {
-                heap_full = zs_join_proc_dir_heap(g_cwd_proc_prefix, path);
+                heap_full = zs_join_proc_dir_heap(prefix, path);
                 if (heap_full) filter_path = heap_full;
             }
         }
@@ -3006,8 +3167,8 @@ static FstatFn g_real_fstat = nullptr;
 // the procfs fiction and return 1. Returns 0 (st untouched) otherwise.
 static int fd_stat_as_procfs(int fd, struct stat* st) {
     if (fd < 0 || !st) return 0;
-    FdShadow* rec = fd_shadow_lookup(fd, FD_SHADOW_MEMFD);
-    if (!rec) return 0;
+    FdShadowView rec;
+    if (!fd_shadow_lookup_view(fd, FD_SHADOW_MEMFD, &rec)) return 0;
     struct stat raw;
     if (fstat(fd, &raw) != 0) return 0;
     *st = raw;
@@ -3044,7 +3205,8 @@ extern "C" void* zygisk_study_hook_mmap(void* addr, size_t len, int prot,
         return g_real_mmap ? g_real_mmap(addr, len, prot, flags, fd, off)
                            : mmap(addr, len, prot, flags, fd, off);
     }
-    if (fd_shadow_lookup(fd, FD_SHADOW_MEMFD)) {
+    FdShadowView zs_mmap_rec;
+    if (fd_shadow_lookup_view(fd, FD_SHADOW_MEMFD, &zs_mmap_rec)) {
         errno = ENODEV;             // exactly what procfs answers
         return MAP_FAILED;
     }
@@ -3694,8 +3856,14 @@ extern "C" long zygisk_study_hook_syscall(long number, ...) {
             ? g_real_syscall(number, a[0], a[1], a[2], a[3], a[4], a[5])
             : -ENOSYS;
         if (rv == 0) {
-            FdShadow* rec = fd_shadow_lookup((int)a[0], FD_SHADOW_PROC_DIR);
-            zs_set_cwd_proc_prefix(rec ? rec->orig_path : nullptr);
+            FdShadowView rec;
+            const char* dir = nullptr;
+            char dirbuf[96];
+            if (fd_shadow_lookup_view((int)a[0], FD_SHADOW_PROC_DIR, &rec)) {
+                memcpy(dirbuf, rec.orig_path, sizeof dirbuf);
+                dir = dirbuf;
+            }
+            zs_set_cwd_proc_prefix(dir);
         }
         return rv;
     }
@@ -3775,7 +3943,17 @@ constexpr size_t kHookIndexCap = 128;   // power of two > kMaxGotHooks
 static uint32_t    g_hook_idx_hash[kHookIndexCap];
 static void*       g_hook_idx_fn[kHookIndexCap];
 static const char* g_hook_idx_name[kHookIndexCap];
-static int         g_hook_idx_dirty = 1;
+// ROUND 31 (race fix): the dirty flag is now atomic and the matcher
+// NEVER rebuilds the index. Rebuilding mutated shared arrays on
+// whatever thread first noticed dirty==1 — with multiple app threads
+// in the open() path, two concurrent rebuilds produced torn index
+// reads for other threads (a hash slot published before its fn/name).
+// Now: dirty is set only by registry mutations (hide time, before
+// the app goes multithreaded) and cleared by zs_walk_pass()/install
+// (the single-walker context, see below). While dirty, the matcher
+// falls back to a linear scan of the stable registry — correct at
+// any moment, merely slower.
+static std::atomic<int> g_hook_idx_dirty{1};
 
 static uint32_t zs_fnv1a(const char* s) {
     uint32_t h = 2166136261u;
@@ -3796,7 +3974,10 @@ static void zs_rebuild_hook_index() {
         g_hook_idx_fn[idx]   = g_got_hooks[i].fn;
         g_hook_idx_name[idx] = g_got_hooks[i].name;
     }
-    g_hook_idx_dirty = 0;
+    // Publish the fully-built index before clearing dirty (readers
+    // that see dirty==0 may read the arrays without synchronization).
+    std::atomic_thread_fence(std::memory_order_release);
+    g_hook_idx_dirty.store(0, std::memory_order_release);
 }
 
 // ---- Round 8 (P4): the walked-DSO mark set ----
@@ -3839,8 +4020,11 @@ int hide_advanced_register_got_hook(const char* name, void* fn) {
     ++g_got_hook_count;
     // Registry mutation: the hash index and the walked-DSO set are
     // both stale now (a DSO marked "walked" under the OLD hook set
-    // must be re-walked for the new hooks).
-    g_hook_idx_dirty = 1;
+    // must be re-walked for the new hooks). Registry mutations only
+    // happen before the process goes multithreaded (hide time); the
+    // atomic keeps even a pathological late registration safe for
+    // concurrent matcher reads (they fall back to the linear scan).
+    g_hook_idx_dirty.store(1, std::memory_order_release);
     clear_walked_dsos();
     return 1;
 }
@@ -3932,7 +4116,16 @@ static long got_pagesize() {
 // which happens before the walk runs — so the walker never misses
 // anything and non-hidden processes provably carry no Tier B hooks.
 static void* match_registered_hook(const char* name) {
-    if (ZS_UNLIKELY(g_hook_idx_dirty)) zs_rebuild_hook_index();
+    // ROUND 31 (race fix): never rebuild here (see g_hook_idx_dirty).
+    // While the index is stale, linear-scan the stable registry.
+    if (ZS_UNLIKELY(g_hook_idx_dirty.load(std::memory_order_acquire))) {
+        for (size_t i = 0; i < g_got_hook_count; ++i) {
+            if (strcmp(g_got_hooks[i].name, name) == 0) {
+                return g_got_hooks[i].fn;
+            }
+        }
+        return nullptr;
+    }
     uint32_t h = zs_fnv1a(name);
     if (h == 0) h = 1;
     size_t idx = h & (kHookIndexCap - 1);
@@ -4055,14 +4248,106 @@ static int patch_got_all_for_phdr(struct dl_phdr_info* info,
     return 0;
 }
 
+// ------------------------------------------------------------------------
+// ROUND 31 (race fix): the single-walker protocol for every pass that
+// touches the shared walk state (the walked-DSO mark set, the patched
+// -slot records, the hook index).
+//
+// THE BUG (invisible to every existing test — it needs concurrent
+// threads): after the hidden app spawns threads, the dlopen and
+// dlclose hooks fire on ANY of them. Each one ran
+// dl_iterate_phdr(patch_got_all_for_phdr) unserialized:
+//   * two concurrent walkers append to g_walked_dsos /
+//     g_patched_slots — a torn count could push reads/writes past the
+//     array bounds;
+//   * two walkers patching GOT slots on the SAME page interleave
+//     mprotect(RW) ... *slot = ... mprotect(orig) — the second thread
+//     restores the original RX while the first is mid-write -> SIGSEGV
+//     (the exact class the R17 lazy-binding crash came from, but now
+//     thread-induced);
+//   * the dlclose GC compacts the mark set while a walker reads it.
+//
+// WHY NOT A PLAIN MUTEX (verified, not guessed): bionic runs library
+// constructors INSIDE dlopen's recursive g_dl_mutex
+// (linker/dlfcn.cpp:101 PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP;
+// linker/linker.cpp "dlopen calling constructors"). A constructor that
+// dlopens again (legal — bionic even has a nesting-depth limit for
+// exactly this case) holds the linker lock; if our walk mutex were
+// held by another thread that is inside dl_iterate_phdr (which takes
+// the same g_dl_mutex), the two threads form the classic AB-BA
+// deadlock. The protocol below never holds ANY lock while calling
+// into the linker:
+//
+//   * g_walk_req  — monotonically increasing "passes requested";
+//   * g_walk_done — generations completed;
+//   * g_walk_active — at most one walker at a time (CAS).
+//
+// A thread that loses the CAS waits (sched_yield) for the active
+// walker to publish, then re-checks whether its own request was
+// already served by that pass; if not, it becomes the next walker.
+// The pass is UNIFORM (incremental GOT walk + mark-set GC), so any
+// request is satisfied by any completed pass that started after it.
+// ------------------------------------------------------------------------
+static std::atomic<uint64_t> g_walk_req{0};
+static std::atomic<uint64_t> g_walk_done{0};
+static std::atomic<int>      g_walk_active{0};
+
+// Defined below (the dlclose-hook section); forward-declared here
+// because the uniform maintenance pass runs GC + walk together.
+static void gc_walked_dso_set();
+
+// One maintenance pass: incremental GOT re-walk + mark-set GC + index
+// rebuild. Runs at most one thread at a time (see zs_walk_pass).
+static void zs_walk_pass_body() {
+    // GC FIRST (a library closed just before this pass must not be a
+    // "walked" DSO when the walk below examines the set), then the
+    // incremental walk, then publish a fresh index.
+    gc_walked_dso_set();
+    dl_iterate_phdr(patch_got_all_for_phdr, nullptr);
+    if (g_hook_idx_dirty.load(std::memory_order_acquire)) {
+        zs_rebuild_hook_index();
+    }
+}
+
+// Request + drive a maintenance pass. Called from the dlopen /
+// android_dlopen_ext / dlclose hooks (any app thread) and from
+// hide_advanced_install_got_hooks (hide time, no contention).
+static void zs_walk_pass() {
+    const uint64_t mine =
+        g_walk_req.fetch_add(1, std::memory_order_acq_rel) + 1;
+    for (;;) {
+        if (g_walk_done.load(std::memory_order_acquire) >= mine) {
+            return;   // a pass that started after our request finished
+        }
+        int idle = 0;
+        if (g_walk_active.compare_exchange_weak(idle, 1,
+                std::memory_order_acq_rel)) {
+            // Serve every outstanding request in one pass.
+            zs_walk_pass_body();
+            uint64_t served = g_walk_req.load(std::memory_order_acquire);
+            g_walk_done.store(served, std::memory_order_release);
+            g_walk_active.store(0, std::memory_order_release);
+            if (served >= mine) return;
+            continue;   // more requests arrived during our pass
+        }
+        // Another thread is walking: wait for it to publish, then
+        // re-check. sched_yield keeps the spin polite; the pass is
+        // bounded (ms at worst).
+        while (g_walk_active.load(std::memory_order_acquire) == 1) {
+            sched_yield();
+        }
+    }
+}
+
 void hide_advanced_install_got_hooks() {
     // Full walk: clear the mark set so every DSO is re-examined
     // (callers of this function just changed — or may have changed —
     // the live registry; incremental re-walks happen in the dlopen
     // hooks instead).
     clear_walked_dsos();
-    g_hook_idx_dirty = 1;   // pick up registry mutations
-    dl_iterate_phdr(patch_got_all_for_phdr, nullptr);
+    g_hook_idx_dirty.store(1, std::memory_order_release);   // pick up registry mutations
+    // Index rebuild happens inside the pass (single-walker context).
+    zs_walk_pass();
     ZS_LOGD("hide_advanced: GOT walk done (%zu hook(s), %zu slot(s))",
             g_got_hook_count, g_patched_slot_count);
 }
@@ -4113,8 +4398,9 @@ extern "C" void* zygisk_study_hook_dlopen(const char* path, int flags) {
     void* h = g_real_dlopen ? g_real_dlopen(path, flags) : nullptr;
     if (h && hide_advanced_is_active()) {
         // Incremental re-walk: patches the newly loaded module's GOT
-        // (and anything else loaded alongside it).
-        dl_iterate_phdr(patch_got_all_for_phdr, nullptr);
+        // (and anything else loaded alongside it). ROUND 31: through
+        // the single-walker protocol — the app is multithreaded here.
+        zs_walk_pass();
     }
     return h;
 }
@@ -4132,7 +4418,7 @@ extern "C" void* zygisk_study_hook_android_dlopen_ext(
     void* h = g_real_android_dlopen_ext
         ? g_real_android_dlopen_ext(path, flags, extinfo) : nullptr;
     if (h && hide_advanced_is_active()) {
-        dl_iterate_phdr(patch_got_all_for_phdr, nullptr);
+        zs_walk_pass();   // ROUND 31: single-walker (see above)
     }
     return h;
 }
@@ -4175,7 +4461,10 @@ extern "C" int zygisk_study_hook_dlclose(void* handle) {
     if (!g_real_dlclose) return -1;
     int rv = g_real_dlclose(handle);
     if (rv == 0 && hide_advanced_is_active()) {
-        gc_walked_dso_set();
+        // ROUND 31: the GC now runs inside the single-walker pass
+        // (concurrent dlopen walks + GC compaction were a data race
+        // on the mark set; see the protocol comment above).
+        zs_walk_pass();
     }
     return rv;
 }
@@ -4252,8 +4541,9 @@ extern "C" DIR* zygisk_study_hook_fdopendir(int fd) {
     DIR* d = g_real_fdopendir
         ? g_real_fdopendir(fd)
         : fdopendir(fd);
+    FdShadowView zs_fdo_rec;
     if (d && fd >= 0 && hide_advanced_is_active() &&
-        !fd_shadow_lookup(fd, FD_SHADOW_PROC_DIR)) {
+        !fd_shadow_lookup_view(fd, FD_SHADOW_PROC_DIR, &zs_fdo_rec)) {
         // Classify by link target: readlink("/proc/self/fd/<fd>")
         // answers the directory path the kernel has open.
         char link_path[48];
@@ -4297,8 +4587,14 @@ extern "C" int zygisk_study_hook_chdir(const char* path) {
 extern "C" int zygisk_study_hook_fchdir(int fd) {
     int rv = g_real_fchdir ? g_real_fchdir(fd) : fchdir(fd);
     if (rv == 0 && hide_advanced_is_active()) {
-        FdShadow* rec = fd_shadow_lookup(fd, FD_SHADOW_PROC_DIR);
-        zs_set_cwd_proc_prefix(rec ? rec->orig_path : nullptr);
+        FdShadowView rec;
+        const char* dir = nullptr;
+        char dirbuf[96];
+        if (fd_shadow_lookup_view(fd, FD_SHADOW_PROC_DIR, &rec)) {
+            memcpy(dirbuf, rec.orig_path, sizeof dirbuf);
+            dir = dirbuf;
+        }
+        zs_set_cwd_proc_prefix(dir);
     }
     return rv;
 }

@@ -38,6 +38,27 @@ fi
 
 # The ro.dalvik.vm.native.bridge swap is done in post-fs-data.sh
 # (Round 7, Round 29). This script only starts the daemon.
+
+# ROUND 31: last-resort mount resolution. On KernelSU/APatch the
+# post-mount.d hook (see post-mount-hook.sh) normally resolves the
+# pending mount BEFORE zygote start. If we get here with the flag
+# still set, either the hook is missing (older manager, manual
+# install) or every mount strategy failed. Resolve-or-roll-back now:
+# a resolved mount revives the module on the next zygote restart (the
+# Round 30 property guard re-applies on zygote death), a failure
+# rolls the property back so nothing references a missing file.
+if [ -f "$WORKDIR/.mount_pending" ]; then
+  . "$MODDIR/zs_compat.sh"
+  zs_compat_init
+  if zs_ensure_loader_mounted; then
+    log -t ZygiskStudy "service: loader resolved late ($ZS_BRIDGE_NAME); armed for next zygote start"
+  else
+    zs_rollback_bridge
+    rm -f "$WORKDIR/.mount_pending" 2>/dev/null
+    log -t ZygiskStudy "service: loader unresolvable; bridge rolled back (module inert this boot)"
+  fi
+fi
+
 setsid "$DAEMON" --workdir "$WORKDIR" >/dev/null 2>&1 &
 echo $! > "$WORKDIR/zygiskd.pid"
 

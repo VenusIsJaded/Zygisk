@@ -127,6 +127,112 @@ chmod 0644 "$SYS_LIB_DIR/$BRIDGE_NAME" "$SYS_LIB_DIR/$PAYLOAD_NAME"
 printf 'bridge=%s\npayload=%s\n' "$BRIDGE_NAME" "$PAYLOAD_NAME"   > "$MODPATH/.loader_names"
 ui_print "- Systemless bridge layout at $SYS_LIB_DIR ($BRIDGE_NAME)"
 
+# ROUND 31 (custom-ROM / dual-arch compatibility): on a 64-bit device
+# that ALSO runs a 32-bit zygote (most pre-2018 SoCs, still common on
+# LineageOS-class custom ROMs), the 32-bit zygote resolves the SAME
+# property value through ITS search path (/system/lib) and dlopens a
+# 32-bit build. Verified from AOSP main this round: ART validates the
+# bridge name with NativeBridgeNameAcceptable (no slashes — a bare
+# soname), then dlopens it via the exported "system" linker namespace
+# whose search paths are per-bitness (/system/${LIB}). The two
+# zygotes each search their own directory, so the SAME soname must
+# exist in both. Install the 32-bit pair when the device's abilist
+# includes a 32-bit ABI AND the user built the 32-bit artifacts.
+if [ "$IS64BIT" = "true" ]; then
+  ABILIST="$(getprop ro.product.cpu.abilist 2>/dev/null)"
+  ZS32_SRC=""
+  case "$ABILIST" in
+    *armeabi-v7a*) ZS32_SRC="$MODPATH/libs/armeabi-v7a" ;;
+    *x86*)         ZS32_SRC="$MODPATH/libs/x86" ;;
+    *)             ZS32_SRC="" ;;
+  esac
+  # ROUND 31 hardening: verify the 32-bit artifacts are actually
+  # ELF32 (EI_CLASS byte 1 at offset 4). A 64-bit build dropped in
+  # libs/armeabi-v7a would install a bridge the 32-bit zygote can
+  # never load — the dlopen would fail silently at boot.
+  ZS32_OK=0
+  if [ -n "$ZS32_SRC" ] && [ -f "$ZS32_SRC/libzygisk.so" ] && \
+     [ -f "$ZS32_SRC/libpayload.so" ]; then
+    ZS32_OK=1
+    for f in "$ZS32_SRC/libzygisk.so" "$ZS32_SRC/libpayload.so"; do
+      CLS="$(od -An -tu1 -j4 -N1 "$f" 2>/dev/null | tr -d ' \t')"
+      if [ "$CLS" != "1" ]; then
+        ui_print "! $f is not a 32-bit ELF (EI_CLASS=$CLS); skipping 32-bit install"
+        ZS32_OK=0
+        break
+      fi
+    done
+  fi
+  if [ "$ZS32_OK" = "1" ]; then
+    mkdir -p "$MODPATH/system/lib"
+    cp "$ZS32_SRC/libzygisk.so"  "$MODPATH/system/lib/$BRIDGE_NAME"
+    cp "$ZS32_SRC/libpayload.so" "$MODPATH/system/lib/$PAYLOAD_NAME"
+    chmod 0644 "$MODPATH/system/lib/$BRIDGE_NAME" "$MODPATH/system/lib/$PAYLOAD_NAME"
+    ui_print "- Dual-arch install: 32-bit bridge also placed in system/lib"
+  elif [ -n "$ZS32_SRC" ]; then
+    ui_print "- NOTE: device is dual-arch but no 32-bit artifacts in $ZS32_SRC"
+    ui_print "- 32-bit zygote apps will NOT be injected (64-bit side works)"
+  fi
+fi
+
+# ROUND 31 (conflict detection — all markers verified online):
+#   * Magisk's own Zygisk sets ZYGISK_ENABLED=1 in the installer env
+#     (Magisk docs/guides.md) and sets the property to "libzygisk.so".
+#   * ZygiskNext / NeoZygisk: module id "zygisksu" (NeoZygisk
+#     build.gradle.kts: moduleId by extra("zygisksu")), work dir
+#     /data/adb/neozygisk.
+#   * ReZygisk: module id "rezygisk", work dir /data/adb/rezygisk.
+# Double injection is undefined behavior (two zygote injection
+# frameworks fighting over the same processes) — refuse cleanly.
+# ZS_TEST_ADB_ROOT remaps /data/adb for the host script tests.
+ZS_ADB_ROOT="${ZS_TEST_ADB_ROOT:-/data/adb}"
+CONFLICT=""
+[ "$ZYGISK_ENABLED" = "1" ] && CONFLICT="Magisk's built-in Zygisk (disable it in Magisk settings)"
+for mid in zygisksu zygisk_next rezygisk neozygisk; do
+  [ -d "$ZS_ADB_ROOT/modules/$mid" ] && [ -z "$CONFLICT" ] && \
+    CONFLICT="the $mid module (remove it or this one)"
+done
+for wd in "$ZS_ADB_ROOT/neozygisk" "$ZS_ADB_ROOT/rezygisk"; do
+  [ -d "$wd" ] && [ -z "$CONFLICT" ] && CONFLICT="$wd (another zygisk implementation)"
+done
+if [ -z "$CONFLICT" ]; then
+  LIVE_BRIDGE="$(getprop ro.dalvik.vm.native.bridge 2>/dev/null)"
+  if [ "$LIVE_BRIDGE" = "libzygisk.so" ]; then
+    CONFLICT="the live native-bridge value libzygisk.so (Magisk Zygisk or a fixed-name loader)"
+  fi
+fi
+if [ -n "$CONFLICT" ]; then
+  ui_print "! CONFLICT: $CONFLICT"
+  ui_print "! Two zygote-injection frameworks cannot run at once."
+  abort "! Resolve the conflict, then reinstall."
+fi
+ui_print "- No conflicting zygisk implementation detected"
+
+# ROUND 31 (root-manager compatibility): install the post-mount.d
+# hook. KernelSU and APatch run /data/adb/post-mount.d scripts AFTER
+# their metamodule mounting (ksud init_event.rs / apd event.rs
+# run_stage("post-mount")) and before zygote start — exactly where a
+# pending loader mount gets resolved. Magisk ignores the directory
+# (harmless dead file; on Magisk magic mount already handles us).
+# ReZygisk uses the same mechanism for the same reason.
+POSTMOUNT_DIR="$ZS_ADB_ROOT/post-mount.d"
+if mkdir -p "$POSTMOUNT_DIR" 2>/dev/null && \
+   cp "$MODPATH/post-mount-hook.sh" "$POSTMOUNT_DIR/zygisk_study-mount.sh" 2>/dev/null; then
+  chmod 0755 "$POSTMOUNT_DIR/zygisk_study-mount.sh" 2>/dev/null
+  ui_print "- post-mount.d hook installed (KernelSU / APatch mount resolution)"
+else
+  ui_print "- NOTE: post-mount.d not writable; KernelSU mount resolution deferred to service.sh"
+fi
+# Root-manager messaging (detection is behavior-neutral; the boot
+# scripts work identically on all managers).
+if [ "$KSU" = "true" ]; then
+  ui_print "- KernelSU detected: mount fallback chain active (metamodule or self-overlay)"
+elif [ "$APATCH" = "true" ]; then
+  ui_print "- APatch detected: mount fallback chain active (metamodule or self-overlay)"
+else
+  ui_print "- Magisk (or compatible) detected: magic mount + built-in property engine"
+fi
+
 # Round 29: service.sh launches the daemon from $MODPATH/zygiskd.
 # Before this round NOBODY created that path — customize.sh only
 # ever placed the binary at libs/<abi>/zygiskd, so service.sh's

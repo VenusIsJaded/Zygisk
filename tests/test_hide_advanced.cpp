@@ -32,6 +32,15 @@
 
 // Pull in the production source directly so we can test its internals.
 #include "../native/libpayload/src/hide_advanced.cpp"
+namespace zygisk_study {
+// ROUND 31: the fd shadow API became view-based (copy-out under the
+// lock); this probe answers the old "is there a live record" question.
+static int fd_shadow_probe(int fd, int kind) {
+    FdShadowView v;
+    return fd_shadow_lookup_view(fd, kind, &v);
+}
+} // namespace zygisk_study
+
 
 #include <cstdio>
 #include <cstring>
@@ -2311,7 +2320,7 @@ ZS_TEST(fd_shadow_stale_entries_self_heal) {
     hide_advanced_set_active(1);
     int fd = zygisk_study_hook_open("/proc/self/maps", O_RDONLY);
     ZS_CHECK(fd >= 0);
-    ZS_CHECK(fd_shadow_lookup(fd, FD_SHADOW_MEMFD) != nullptr);
+    ZS_CHECK(fd_shadow_probe(fd, FD_SHADOW_MEMFD));
     close(fd);
 
     // Reuse the number deterministically: dup to force the SAME
@@ -2328,7 +2337,7 @@ ZS_TEST(fd_shadow_stale_entries_self_heal) {
     ZS_CHECK_EQ(st.st_mode & 0777, (mode_t)0600);
     if (reg == fd) {
         // The number WAS reused — the entry must have been dropped.
-        ZS_CHECK(fd_shadow_lookup(reg, FD_SHADOW_MEMFD) == nullptr);
+        ZS_CHECK(!fd_shadow_probe(reg, FD_SHADOW_MEMFD));
     }
     unlink(tmpl);
     close(reg);
@@ -2757,7 +2766,7 @@ ZS_TEST(relative_openat_against_proc_dirfd) {
 
     int dirfd = zygisk_study_hook_open("/proc/self", O_RDONLY);
     ZS_CHECK(dirfd >= 0);
-    ZS_CHECK(fd_shadow_lookup(dirfd, FD_SHADOW_PROC_DIR) != nullptr);
+    ZS_CHECK(fd_shadow_probe(dirfd, FD_SHADOW_PROC_DIR));
 
     int fd = zygisk_study_hook_openat(dirfd, "maps", O_RDONLY);
     ZS_CHECK(fd >= 0);
@@ -3002,7 +3011,7 @@ ZS_TEST(fstat_hook_passes_proc_dir_fds_through) {
     ZS_CHECK(S_ISDIR(st.st_mode));          // still a directory
     ZS_CHECK(st.st_size != 0 || st.st_size == 0);   // real answer, whatever it is
     // The memfd fiction never applied:
-    ZS_CHECK(fd_shadow_lookup(dirfd, FD_SHADOW_MEMFD) == nullptr);
+    ZS_CHECK(!fd_shadow_probe(dirfd, FD_SHADOW_MEMFD));
     close(dirfd);
     hide_advanced_set_active(0);
 }
@@ -3294,7 +3303,7 @@ ZS_TEST(opendir_dirfd_registers_proc_dir_for_relative_opens) {
         ZS_CHECK(dfd >= 0);
         // The shadow record now exists (this lookup is the exact
         // miss that produced the pre-Round-20 bypass).
-        ZS_CHECK(fd_shadow_lookup(dfd, FD_SHADOW_PROC_DIR) != nullptr);
+        ZS_CHECK(fd_shadow_probe(dfd, FD_SHADOW_PROC_DIR));
 
         int fd = zygisk_study_hook_openat(dfd, "maps", O_RDONLY);
         ZS_CHECK(fd >= 0);

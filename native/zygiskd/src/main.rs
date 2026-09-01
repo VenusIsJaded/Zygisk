@@ -68,6 +68,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
+mod props;
+use props::PropEngine;
+
 // ----------------------------------------------------------------------
 // Constants — paths and the process cloaking name.
 //
@@ -1175,11 +1178,99 @@ fn bridge_mapped_in(pid: u32, bridge_name: &str) -> bool {
     false
 }
 
+/// Round 31 — one-shot property CLI (the module's built-in
+/// resetprop equivalent). Runs the engine directly: no daemon, no
+/// socket, exits immediately. Exit codes follow resetprop's
+/// conventions loosely: 0 = success (get prints the value, set/delete
+/// mutate), 1 = failure (not found, denied, bad args).
+///
+/// This exists because KernelSU and APatch (the root managers custom
+/// ROM users commonly run) do not ship a resetprop BINARY on PATH,
+/// and post-fs-data.sh needs a forced ro.* write at boot. The engine
+/// implements bionic's own mutation protocol (see props.rs).
+fn prop_cli_main(rest: &[String]) -> i32 {
+    let usage = || {
+        eprintln!("usage: zygiskd prop get NAME | set NAME VALUE | delete NAME");
+        1
+    };
+    // zygiskd prop [--root DIR] get|set|delete ...
+    let mut root: Option<String> = None;
+    let mut rest: &[String] = rest;
+    if rest.len() >= 2 && rest[0] == "--root" {
+        root = Some(rest[1].clone());
+        rest = &rest[2..];
+    }
+    if rest.len() < 2 {
+        return usage();
+    }
+    let engine = match root {
+        // An explicit root overrides the ZS_PROP_ROOT environment; both
+        // exist for the host E2E (the fixture property area is a temp
+        // dir, not /dev/__properties__).
+        Some(r) => PropEngine::with_root(Path::new(&r)),
+        None => PropEngine::new(),
+    };
+    match rest[0].as_str() {
+        "get" => {
+            match engine.get(&rest[1]) {
+                Some(v) => {
+                    println!("{}", v);
+                    0
+                }
+                None => 1,
+            }
+        }
+        "set" => {
+            if rest.len() < 3 {
+                return usage();
+            }
+            match engine.set(&rest[1], &rest[2]) {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("zygiskd: prop set failed: {}", e);
+                    1
+                }
+            }
+        }
+        "delete" => match engine.delete(&rest[1]) {
+            Ok(_) => 0,
+            Err(e) => {
+                eprintln!("zygiskd: prop delete failed: {}", e);
+                1
+            }
+        },
+        _ => usage(),
+    }
+}
+
 /// Invoke resetprop (forced ro-property write — the same tool
 /// post-fs-data.sh used for the swap). Candidate order matches the
 /// script's: PATH first, then the well-known Magisk locations. On
 /// the host E2E the harness injects a fake `resetprop` into PATH.
+///
+/// ROUND 31: the built-in engine (props.rs) is tried FIRST — it is
+/// the same algorithm resetprop implements, self-contained, and
+/// works on every root manager. The external binaries remain as
+/// fallbacks (their behavior is already proven in the E2E suite) for
+/// the case where direct mmap of the property files is denied while
+/// exec'ing a helper is not (e.g. an exotic SELinux policy).
 fn run_resetprop(args: &[&str]) -> bool {
+    // 1. The built-in engine (props.rs) — works on every root manager.
+    //    Args arrive in resetprop CLI shape: either [NAME, VALUE] (set),
+    //    or ["--delete", NAME] (delete).
+    {
+        let engine = PropEngine::new();
+        let ok = if args.len() >= 2 && args[0] == "--delete" {
+            engine.delete(args[1]).unwrap_or(false)
+        } else if args.len() >= 2 {
+            engine.set(args[0], args[1]).is_ok()
+        } else {
+            false
+        };
+        if ok {
+            return true;
+        }
+    }
     let candidates: Vec<(String, Vec<String>)> = vec![
         ("resetprop".to_string(), args.iter().map(|s| s.to_string()).collect()),
         ("/data/adb/magisk/resetprop".to_string(),
@@ -1393,11 +1484,34 @@ fn setup_random_socket() -> Option<String> {
 fn main() {
     // Parse args.
     let mut workdir = remap_path(WORKDIR);
-    let mut args = std::env::args().skip(1);
-    while let Some(a) = args.next() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut prop_cli: Option<Vec<String>> = None;
+    let mut i = 0usize;
+    while i < args.len() {
+        let a = &args[i];
         if a == "--workdir" {
-            if let Some(v) = args.next() { workdir = v; }
+            if i + 1 < args.len() {
+                workdir = args[i + 1].clone();
+            }
+            i += 2;
+        } else if a == "prop" {
+            // Round 31 — one-shot property CLI (the module's built-in
+            // resetprop equivalent; see props.rs for the full provenance).
+            // Usage:
+            //   zygiskd prop get NAME
+            //   zygiskd prop set NAME VALUE
+            //   zygiskd prop delete NAME
+            // post-fs-data.sh uses this when no resetprop binary exists
+            // (KernelSU / APatch environments).
+            prop_cli = Some(args[i + 1..].to_vec());
+            break;
+        } else {
+            i += 1;
         }
+    }
+
+    if let Some(rest) = prop_cli {
+        std::process::exit(prop_cli_main(&rest));
     }
 
     // Round 28 — reap connection children. The accept loop forks one

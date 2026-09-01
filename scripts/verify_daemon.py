@@ -365,6 +365,7 @@ def run_checks(binary, tree, env, proc):
     # `--zygote` argv token that mmaps the fake bridge library, so
     # the daemon's REAL /proc/<pid>/maps check sees it mapped).
     run_prop_guard_checks(binary, tree, env)
+    run_prop_guard_engine_checks(binary, tree, env)
 
 
 def start_fake_zygote(bridge_file):
@@ -548,6 +549,180 @@ def run_prop_guard_checks(binary, tree, env):
               ok, open(proplog2).read() if os.path.exists(proplog2) else "")
         zygote_down(z)
     finally:
+        proc.send_signal(signal.SIGTERM)
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+
+
+def run_prop_guard_engine_checks(binary, tree, env):
+    """Round 31: the guard's property writes with NO resetprop binary at
+    all — the built-in engine (props.rs) mutates a bionic-shaped
+    fixture property area directly, verified by a third (Python)
+    implementation of the trie reader."""
+    import struct
+    print("== Round 31: property guard via the built-in engine ==")
+
+    def build_area(path, props, total=8192):
+        buf = bytearray(total)
+        struct.pack_into("<IIII", buf, 0, 0, 0, 0x504f5250, 0xfc6ed0ab)
+        used = 20 + 92
+
+        def alloc_node(frag):
+            nonlocal used
+            off = used
+            span = 20 + len(frag) + 1
+            buf[128 + off:128 + off + span] = b"\0" * span
+            struct.pack_into("<I", buf, 128 + off, len(frag))
+            buf[128 + off + 20:128 + off + 20 + len(frag)] = frag.encode()
+            used += (span + 3) & ~3
+            return off
+
+        def bst(root, frag):
+            cur = root
+            while True:
+                nl = struct.unpack_from("<I", buf, 128 + cur)[0]
+                nm = bytes(buf[128 + cur + 20:128 + cur + 20 + nl]).decode()
+                if nm == frag:
+                    return cur
+                f = 8 if frag < nm else 12
+                ch = struct.unpack_from("<I", buf, 128 + cur + f)[0]
+                if ch:
+                    cur = ch
+                    continue
+                off = alloc_node(frag)
+                struct.pack_into("<I", buf, 128 + cur + f, off)
+                return off
+
+        for name, value in props:
+            cur = 0
+            frs = name.split(".")
+            for i, fr in enumerate(frs):
+                ch = struct.unpack_from("<I", buf, 128 + cur + 16)[0]
+                if ch == 0:
+                    off = alloc_node(fr)
+                    struct.pack_into("<I", buf, 128 + cur + 16, off)
+                    ch = off
+                cur = bst(ch, fr)
+                if i == len(frs) - 1:
+                    pi = used
+                    tot = 96 + len(name) + 1
+                    buf[128 + pi:128 + pi + tot] = b"\0" * tot
+                    struct.pack_into("<I", buf, 128 + pi, len(value) << 24)
+                    buf[128 + pi + 4:128 + pi + 4 + len(value)] = value.encode()
+                    buf[128 + pi + 96:128 + pi + 96 + len(name)] = name.encode()
+                    used += (tot + 3) & ~3
+                    struct.pack_into("<I", buf, 128 + cur + 4, pi)
+        struct.pack_into("<I", buf, 0, used)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(bytes(buf))
+
+    def read_prop(path, name):
+        buf = open(path, "rb").read()
+
+        def node(off):
+            nl = struct.unpack_from("<I", buf, 128 + off)[0]
+            nm = bytes(buf[128 + off + 20:128 + off + 20 + nl]).decode()
+            prop, left, right, ch = struct.unpack_from("<IIII", buf, 128 + off + 4)
+            return nm, prop, left, right, ch
+
+        cur, prop = 0, 0
+        rest = name
+        while True:
+            nm, prop, left, right, ch = node(cur)
+            frag, sep, tail = rest.partition(".")
+            if ch == 0:
+                return None
+            scan = ch
+            found = None
+            while scan:
+                nm2, p2, l2, r2, c2 = node(scan)
+                if nm2 == frag:
+                    found = (scan, p2)
+                    break
+                scan = l2 if frag < nm2 else r2
+            if not found:
+                return None
+            cur, prop = found
+            if not sep:
+                break
+            rest = tail
+        if prop == 0:
+            return None
+        serial = struct.unpack_from("<I", buf, 128 + prop)[0]
+        ln = serial >> 24
+        return bytes(buf[128 + prop + 4:128 + prop + 4 + ln]).decode()
+
+    BRIDGE = "libengine98.so"
+    backup = os.path.join(tree.workdir, ".native_bridge_backup")
+    applied = os.path.join(tree.workdir, ".native_bridge_applied")
+    with open(backup, "w") as f:
+        f.write("0")
+    with open(applied, "w") as f:
+        f.write(BRIDGE)
+    bridge_file = os.path.join(tree.workdir, BRIDGE)
+    with open(bridge_file, "wb") as f:
+        f.write(b"\x7fELF-fake-bridge\n" * 8)
+
+    proot = os.path.join(tree.root, "props")
+    area = os.path.join(proot, "u:object_r:dalvik_config_prop:s0")
+    build_area(area, [("ro.dalvik.vm.native.bridge", BRIDGE),
+                      ("ro.build.version.sdk", "36")])
+    build_area(os.path.join(proot, "properties_serial"), [])
+
+    e = dict(env)
+    e["ZS_TEST_ROOT"] = tree.root
+    e["ZS_TEST_POLL_MS"] = "100"
+    e["ZS_TEST_ZYGOTE_GRACE_MS"] = "600"
+    e["ZS_PROP_ROOT"] = proot
+    # NO resetprop anywhere: pure engine path.
+    bindir = os.path.join(tree.root, "bin_noprop")
+    os.makedirs(bindir, exist_ok=True)
+    e["PATH"] = bindir + ":/system/bin:/usr/bin"
+
+    zygotes = []
+
+    def zygote_up():
+        z = start_fake_zygote(bridge_file)
+        zygotes.append(z)
+        return z
+
+    def wait_for(pred, timeout=6.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if pred():
+                return True
+            time.sleep(0.1)
+        return False
+
+    proc = subprocess.Popen(
+        [binary, "--workdir", tree.workdir],
+        env=e, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        deadline = time.time() + 5
+        while time.time() < deadline and not os.path.exists(tree.session_file):
+            time.sleep(0.05)
+        z1 = zygote_up()
+        ok = wait_for(lambda: read_prop(area, "ro.dalvik.vm.native.bridge") == "0")
+        check("guard restores stock THROUGH THE ENGINE (no resetprop)",
+              ok, str(read_prop(area, "ro.dalvik.vm.native.bridge")))
+        check("engine guard leaves other props intact",
+              read_prop(area, "ro.build.version.sdk") == "36")
+        z1.kill(); z1.wait()
+        ok = wait_for(lambda: read_prop(
+            area, "ro.dalvik.vm.native.bridge") == BRIDGE)
+        check("guard re-applies the loader value through the engine",
+              ok, str(read_prop(area, "ro.dalvik.vm.native.bridge")))
+    finally:
+        for z in list(zygotes):
+            try:
+                z.kill(); z.wait()
+            except OSError:
+                pass
         proc.send_signal(signal.SIGTERM)
         try:
             proc.wait(timeout=3)

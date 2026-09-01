@@ -20,29 +20,41 @@ MODDIR=${0%/*}
 # (scripts/verify_scripts.py); unset on a real device.
 ZS_SYS_ROOT="${ZS_TEST_ROOT:-/data/system}"
 WORKDIR="$ZS_SYS_ROOT/zygisk_study"
-RESETPROP="$(command -v resetprop || true)"
-[ -z "$RESETPROP" ] && [ -x /data/adb/magisk/resetprop ] && RESETPROP=/data/adb/magisk/resetprop
 
-if [ -n "$RESETPROP" ]; then
-  if [ -f "$WORKDIR/.native_bridge_backup" ]; then
-    OLD="$(cat "$WORKDIR/.native_bridge_backup")"
-    if [ -n "$OLD" ]; then
-      "$RESETPROP" ro.dalvik.vm.native.bridge "$OLD"
-    else
-      # It was empty before we touched it. Delete the prop outright —
-      # Round 28: the previous sequence ran --delete AND THEN set the
-      # prop to "", which re-created it as an empty-value property.
-      # No stock device has an empty ro.dalvik.vm.native.bridge ENTRY
-      # (stock is either absent or "0"), so the leftover empty entry
-      # was visible via getprop after uninstall. ART treats absent and
-      # empty identically (same ALOGW path in AndroidRuntime.cpp at
-      # 5.0 and 16.0 — verified), so deleting is the correct restore.
-      # The empty-value fallback runs only when --delete is not
-      # supported by an old resetprop binary.
-      if ! "$RESETPROP" --delete ro.dalvik.vm.native.bridge 2>/dev/null; then
-        "$RESETPROP" ro.dalvik.vm.native.bridge ""
-      fi
-    fi
+# ROUND 31: use the compat layer's property chain so the uninstall
+# also works on KernelSU / APatch (no resetprop binary there — the
+# daemon's built-in engine does the write).
+. "$MODDIR/zs_compat.sh" 2>/dev/null || true
+zs_compat_init 2>/dev/null || {
+  # Module dir already half-removed (defensive): fall back to the
+  # binary chain alone.
+  ZS_DAEMON="$MODDIR/zygiskd"
+}
+
+# ROUND 31: remove the post-mount.d hook customize.sh installed (only
+# if it is OURS — check the header marker, never blindly delete a
+# name that another package could own).
+ZS_ADB_ROOT="${ZS_TEST_ADB_ROOT:-/data/adb}"
+for hook in "$ZS_ADB_ROOT/post-mount.d/zygisk_study-mount.sh"; do
+  if [ -f "$hook" ] && head -n 3 "$hook" 2>/dev/null | grep -q "zygisk_study-mount"; then
+    rm -f "$hook" 2>/dev/null
+  fi
+done
+
+if [ -f "$WORKDIR/.native_bridge_backup" ]; then
+  OLD="$(cat "$WORKDIR/.native_bridge_backup")"
+  if [ -n "$OLD" ]; then
+    zs_prop_set ro.dalvik.vm.native.bridge "$OLD"
+  else
+    # It was empty before we touched it. Delete the prop outright —
+    # Round 28: the previous sequence ran --delete AND THEN set the
+    # prop to "", which re-created it as an empty-value property.
+    # No stock device has an empty ro.dalvik.vm.native.bridge ENTRY
+    # (stock is either absent or "0"), so the leftover empty entry
+    # was visible via getprop after uninstall. ART treats absent and
+    # empty identically (same ALOGW path in AndroidRuntime.cpp at
+    # 5.0 and 16.0 — verified), so deleting is the correct restore.
+    zs_prop_delete ro.dalvik.vm.native.bridge
   fi
 fi
 
