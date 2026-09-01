@@ -599,6 +599,10 @@ void* zs_trampoline_prepare(const ZsTrampRecord* records, size_t count,
     // STEALTH: name the page so /proc/self/maps shows
     // "[anon:jit-cache]" — ART processes legitimately carry
     // executable anon pages; a bare rwxp anon page is rarer.
+    // (PR_SET_VMA: Android-born, upstreamed to mainline in 5.17 —
+    // verified from include/uapi/linux/prctl.h; on older kernels
+    // the prctl fails silently and the page stays unnamed, which
+    // is why the host test accepts BOTH shapes.)
     constexpr int kPrSetVma = 0x53564d41;
     constexpr int kPrSetVmaAnonName = 0;
     const char kPageName[] = "jit-cache";

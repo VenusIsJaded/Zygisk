@@ -127,11 +127,12 @@ static int child_jit_page_scrubbed() {
     }
     close(fd);
     if (total <= 0) return -1;
-    // Find the trampoline page: an UNNAMED anonymous r-x mapping (the
-    // "jit-cache" name only exists on Android kernels with PR_SET_VMA;
-    // the host leaves the page unnamed). [vdso]/[vvar]/[stack] carry
-    // bracket names and are excluded by the "unnamed" filter; so are
-    // file-backed mappings. Every candidate's tail must be scrubbed.
+    // Find the trampoline page: an r-x mapping either NAMED
+    // "[anon:jit-cache]" (PR_SET_VMA — upstreamed to mainline 5.17,
+    // so both real Android AND modern CI runners name it) or UNNAMED
+    // (older host kernels where the prctl fails). [vdso]/[vvar]/
+    // [stack] and file-backed mappings are excluded. Every
+    // candidate's tail must be scrubbed.
     char* line = buf;
     char* end = buf + total;
     int checked = 0;
@@ -157,8 +158,22 @@ static int child_jit_page_scrubbed() {
         int got = sscanf(lcopy, "%lx-%lx %7s %*x %*s %*lu %127s",
                          &lo, &hi, perms, name);
         (void)stop;
+        // ROUND 34 (the runner-vs-host divergence): the trampoline
+        // page is named with PR_SET_VMA ("jit-cache"). PR_SET_VMA is
+        // ANDROID-born but UPSTREAMED INTO MAINLINE (include/uapi/
+        // asm-generic... include/uapi/linux/prctl.h defines
+        // PR_SET_VMA 0x53564d41; merged 5.17) — so on kernels >= 5.17
+        // (the CI runner: 6.8) the page appears as "[anon:jit-cache]"
+        // while on the older dev host (5.10) the prctl fails and the
+        // page stays UNNAMED. Accept both shapes: the named form is
+        // the production Android case; the unnamed form covers the
+        // old-host case. Every other named or file-backed r-x page
+        // (vdso, vvar, libc...) is excluded.
+        bool named_jit = got >= 4 && name[0] == '['
+                         && strstr(name, "jit-cache") != nullptr;
+        bool unnamed = (got < 4 || name[0] == '\0');
         if (got >= 3 && perms[0] == 'r' && perms[2] == 'x'
-            && (got < 4 || name[0] == '\0') && hi > lo) {
+            && (named_jit || unnamed) && hi > lo) {
             // Unnamed executable anon page. Check its page tail.
             uintptr_t page_end = lo + (size_t)ps;
             if (page_end > hi) page_end = hi;
