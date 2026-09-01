@@ -181,25 +181,21 @@ static int child_jit_page_scrubbed() {
         line = nl ? nl + 1 : end;
     }
     if (checked == 0) {
-        // DEBUG: dump maps + parse diagnostics.
-        FILE* df = fopen("/tmp/zs_maps_debug.txt", "w");
-        if (df) {
-            fwrite(buf, 1, total, df);
-            fprintf(df, "=== checked=0; scanning lines ===\n");
-            for (char* l2 = buf; l2 < end; ) {
-                char* nl2 = (char*)memchr(l2, '\n', end - l2);
-                size_t ll = (nl2 ? nl2 : end) - l2;
-                char copy[512];
-                size_t cl = ll < sizeof copy - 1 ? ll : sizeof copy - 1;
-                memcpy(copy, l2, cl); copy[cl] = '\0';
-                unsigned long lo2 = 0, hi2 = 0; char pr2[8] = {0};
-                int g2 = sscanf(copy, "%lx-%lx %7s", &lo2, &hi2, pr2);
-                fprintf(df, "parse got=%d [%s] perms=[%s]\n", g2, copy, pr2);
-                l2 = nl2 ? nl2 + 1 : end;
-            }
-            fclose(df);
-        }
-        return -1;      // no trampoline page found
+        // DIAGNOSTIC (permanent): a -1 here has environment-dependent
+        // causes — the CI runner caught one the dev host did not.
+        // Print enough to diagnose from the log alone.
+        std::fprintf(stderr,
+                     "[scrub-check] no candidate page: total=%zd "
+                     "checked=%d errno=%d; maps head:\n",
+                     total, checked, errno);
+        std::fwrite(buf, 1, (size_t)(total < 2048 ? total : 2048),
+                    stderr);
+        return -1;
+    }
+    if (!all_zero) {
+        std::fprintf(stderr, "[scrub-check] candidate pages found "
+                             "(checked=%d) but a tail is non-zero\n",
+                     checked);
     }
     return all_zero ? 1 : 0;
 }
