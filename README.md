@@ -1792,3 +1792,55 @@ ASan+UBSan+leaks green, TSan race suite green, trampoline binary
 verification green, script E2E + daemon E2E ALL GREEN, and the
 4-ABI flashable zip built with every stealth gate (stripped, no
 SONAME, banned strings, 16 KB alignment) green.
+### Round 38 — the uninstall that left things behind, and Android 16 QPR2 / One UI 8.5 / GhostLock
+
+The removal paths verified from the managers' own sources (Magisk
+`native/src/core/module.rs`, KernelSU `userspace/ksud/src/module.rs`,
+APatch `apd/src/module.rs`): the remove-marker flow runs uninstall.sh
+at the NEXT boot with the daemon already dead — but `magisk
+--remove-modules` at runtime and a manual `sh uninstall.sh` run it
+with the daemon STILL ALIVE, and a bare `rm -rf` of the module dir
+runs nothing at all. Four leftover classes closed:
+
+- **U1**: uninstall.sh now terminates a live daemon FIRST (pid file
+  with a comm check for pid-reuse safety, plus a /proc comm scan that
+  matches only our cloak name — no other root tool runs as
+  "subsysd"), so the armed property guard can never re-set
+  `ro.dalvik.vm.native.bridge` to a deleted library after the
+  restore, and the daemon/its hiding stop at removal time.
+- **U2**: the daemon watches its own module dir; sustained absence
+  (60 s grace, far above a module-update swap window) triggers
+  restore-stock + full artifact cleanup + clean exit — the manual
+  `rm -rf` "uninstall" no longer leaves `/data/system` leftovers
+  forever. A `MODULE_GONE` flag stands the guard down under a
+  property-write lock so no re-arm can race the shutdown.
+- **U3**: a backup-less restore now falls back to the documented
+  stock `"0"` when the live value still equals our applied name.
+- **U4**: overlay unmounts fall back to lazy `umount -l` when the
+  plain umount hits EBUSY from still-mapped files (the mount line
+  leaves /proc/mounts immediately instead of at reboot).
+- **U2b**: crash-window orphan `.<8-hex>` socket dirs (created but
+  never recorded) are swept structurally at daemon start.
+
+Android 16 QPR2 — the base of Samsung One UI 8.5 — verified from
+`android16-qpr2-release` directly: the setresgid → setresuid →
+`__android_log_close` → `selinux_android_setcontext(uid, isSystemServer,
+seInfo, niceName)` sequence, the `zygote && strcmp(propBuf, "0")`
+native-bridge load path, and the isolated/app-zygote/SDK-sandbox uid
+ranges are all unchanged from 16.0.0_r1. GhostLock (CVE-2026-43499,
+the futex-PI kernel UAF used for bootloader-locked "soft root" with
+KernelSU via ksud) is supported through the Round-31 no-Magisk chain
+(prop engine, post-mount.d/overlay self-mount, Samsung session-file
+fallback), plus the new inert guard backoff: a late-armed daemon with
+a live, never-consuming zygote now drops from the 250 ms full-census
+cadence to the 2 s death-detection cadence instead of burning CPU
+forever (the exact one-tap-per-boot shape).
+
+**273/273 host tests** (the R37 session's five new dispatch
+regressions included) + **54/54 cargo** (the four new Round-38
+unit tests on top of R36's 50) + clippy clean,
+ASan+UBSan+leaks green, TSan race suite green, trampoline binary
+verification green, **script E2E 120 checks ALL GREEN** (6 new
+Round-38 cases), **daemon E2E 58 checks ALL GREEN** (4 new Round-38
+suites: module-gone self-exit, inert backoff lifecycle, orphan
+sweep, live uninstall.sh vs the real daemon).

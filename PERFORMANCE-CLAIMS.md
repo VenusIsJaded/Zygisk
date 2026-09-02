@@ -1250,3 +1250,25 @@ getpid-adjacent loads to the uid-drop/setcontext guards —
 immeasurable against the syscall they already wrap; the
 app-zygote isolated dispatch they enable runs once per isolated
 spawn, same shape as the R36 deferral.
+## Round 38 — the inert guard backoff (the GhostLock late-root shape)
+
+The R34 C4 backoff covered only the post-consume state
+(`st.restored`). A late-armed daemon (GhostLock one-tap root: the
+daemon starts minutes after the zygote) tracks a zygote that is
+STABLE and never consumes the bridge — the guard stayed in fast
+mode forever: a full /proc census (read_dir + one cmdline open/read
+per process, 300-600 processes on a real phone) plus the zygote
+maps re-read, every 250 ms, indefinitely: ~2-8 ms of CPU per
+second, 4 wakeups/second blocking deep idle, on battery, for as
+long as the user keeps the phone up before the next zygote restart.
+
+The inert state (stable + unconsumed for 30 s) drops to the slow
+cadence (2 s default): one `/proc/<pid>` existence check per tick
+with a periodic full census every ~30 s (the existing slow-path
+machinery), and death detection at the same 2 s bound. A new zygote
+generation (death or replacement) re-enters fast mode immediately.
+Verified deterministically by the daemon E2E via an env-gated
+cadence trace (CPU-time measurement was rejected as flaky on quiet
+hosts): fast real observations, the `SsI` inert transition, then
+death → re-apply → new bridge-mapping generation → stock restore —
+the full late-root lifecycle.

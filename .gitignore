@@ -21,3 +21,4 @@ tests/test_race
 tests/test_profile
 tests/race_fixture.so
 test_race_tsan
+__pycache__/

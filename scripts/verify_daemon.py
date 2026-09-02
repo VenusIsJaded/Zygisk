@@ -439,6 +439,12 @@ def run_checks(binary, tree, env, proc):
     # the daemon's REAL /proc/<pid>/maps check sees it mapped).
     run_prop_guard_checks(binary, tree, env)
     run_prop_guard_engine_checks(binary, tree, env)
+    # ROUND 38: self-exit / inert backoff / orphan sweep /
+    # live-uninstall integration.
+    run_module_gone_checks(binary, env)
+    run_inert_backoff_checks(binary, env)
+    run_orphan_sweep_checks(binary, env)
+    run_live_uninstall_checks(binary, env)
 
 
 def start_fake_zygote(bridge_file):
@@ -646,6 +652,288 @@ def run_prop_guard_checks(binary, tree, env):
             proc.kill()
 
 
+
+
+# ---------------------------------------------------------------------------
+# ROUND 38 — the manual-removal self-exit (U2), the inert-mode guard
+# backoff (P1, the GhostLock late-root shape), the crash-window orphan
+# sweep (U2b), and the LIVE uninstall.sh integration (U1).
+# ---------------------------------------------------------------------------
+
+def start_plain_zygote():
+    """A zygote-shaped process that does NOT map the bridge: the
+    late-root / GhostLock shape (the daemon armed after the zygote
+    booted; injection waits for the next zygote restart)."""
+    script = "import time\ntime.sleep(600)\n"
+    return subprocess.Popen(
+        [sys.executable, "-c", script, "--zygote"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def write_guard_records(tree, backup="0", applied="libtest1234.so"):
+    os.makedirs(tree.workdir, exist_ok=True)
+    with open(os.path.join(tree.workdir, ".native_bridge_backup"), "w") as f:
+        f.write(backup)
+    with open(os.path.join(tree.workdir, ".native_bridge_applied"), "w") as f:
+        f.write(applied)
+    bridge_file = os.path.join(tree.workdir, applied)
+    with open(bridge_file, "wb") as f:
+        f.write(b"\x7fELF-fake-bridge\n" * 8)
+    return bridge_file
+
+
+def fake_resetprop_on(tree):
+    bindir = os.path.join(tree.root, "bin")
+    os.makedirs(bindir, exist_ok=True)
+    proplog = os.path.join(tree.root, "proplog.txt")
+    resetprop = os.path.join(bindir, "resetprop")
+    with open(resetprop, "w") as f:
+        f.write(f"#!/bin/sh\necho \"$@\" >> {proplog}\nexit 0\n")
+    os.chmod(resetprop, 0o755)
+    return bindir, proplog
+
+
+def run_module_gone_checks(binary, env):
+    """U2: `rm -rf /data/adb/modules/zygisk_study` (no manager script
+    ever covers it) — the daemon notices the sustained absence,
+    restores stock, removes every runtime artifact, exits."""
+    print("== Round 38: module-gone self-exit ==")
+    tmp = tempfile.mkdtemp(prefix="zs_gone_")
+    tree = Tree(tmp)
+    bridge_file = write_guard_records(tree)
+    bindir, proplog = fake_resetprop_on(tree)
+    try:
+        e = dict(env)
+        e["ZS_TEST_ROOT"] = tree.root
+        e["ZS_TEST_MODULE_GRACE_MS"] = "400"
+        e["PATH"] = bindir + ":" + e.get("PATH", "")
+        proc = start_daemon(binary, tree, e)
+        try:
+            sock_dir = os.path.dirname(read_session_path(tree))
+            check("daemon alive before the module dir is removed",
+                  proc.poll() is None)
+            shutil.rmtree(os.path.join(tree.modules_root, "zygisk_study"))
+            deadline = time.time() + 10
+            while proc.poll() is None and time.time() < deadline:
+                time.sleep(0.1)
+            check("daemon exited after sustained module absence",
+                  proc.poll() is not None and proc.returncode == 0,
+                  f"rc={proc.returncode}")
+            check("stock property restored on self-exit",
+                  "ro.dalvik.vm.native.bridge 0" in
+                  [l.strip() for l in open(proplog) if l.strip()],
+                  proplog)
+            check("workdir removed on self-exit",
+                  not os.path.exists(tree.workdir))
+            check("random socket dir removed on self-exit",
+                  not os.path.exists(sock_dir))
+            check("module-dir session record removed on self-exit",
+                  not os.path.exists(tree.session_file))
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def run_inert_backoff_checks(binary, env):
+    """P1: the GhostLock late-root shape. A stable zygote that never
+    consumed the bridge flips the guard into INERT slow cadence
+    (fast forever was the perf bug); death detection still works, a
+    NEW bridge-mapping generation re-arms, consumes, restores."""
+    print("== Round 38: inert-mode guard backoff ==")
+    tmp = tempfile.mkdtemp(prefix="zs_inert_")
+    tree = Tree(tmp)
+    bridge_file = write_guard_records(tree)
+    bindir, proplog = fake_resetprop_on(tree)
+    trace = os.path.join(tree.root, "guard_trace.txt")
+    try:
+        e = dict(env)
+        e["ZS_TEST_ROOT"] = tree.root
+        e["ZS_TEST_POLL_MS"] = "100"
+        e["ZS_TEST_SLOW_MS"] = "150"
+        e["ZS_TEST_ZYGOTE_GRACE_MS"] = "500"
+        e["ZS_TEST_INERT_AFTER_MS"] = "800"
+        e["ZS_TEST_GUARD_TRACE"] = trace
+        e["PATH"] = bindir + ":" + e.get("PATH", "")
+        z1 = start_plain_zygote()
+        proc = None
+        try:
+            proc = start_daemon(binary, tree, e)
+            # Fast real observations, then the inert transition.
+            deadline = time.time() + 8
+            lines = []
+            while time.time() < deadline:
+                if os.path.exists(trace):
+                    lines = [l.strip() for l in open(trace) if l.strip()]
+                    if any(l == "SsI" for l in lines):
+                        break
+                time.sleep(0.1)
+            check("guard drops to the inert slow cadence "
+                  "(trace shows SsI)", any(l == "SsI" for l in lines),
+                  repr(lines[-10:]))
+            check("fast real observations ran before inert",
+                  any(l == "Fr-" for l in lines), repr(lines[:10]))
+            # Death detection in inert mode: kill the plain zygote
+            # and WAIT for the guard to observe the Absent window and
+            # re-arm (a fast replace would legitimately skip the
+            # re-apply — the prop is still ours, unconsumed).
+            z1.kill()
+            z1.wait(timeout=5)
+            deadline = time.time() + 8
+            calls = []
+            reapply = "ro.dalvik.vm.native.bridge libtest1234.so"
+            while time.time() < deadline:
+                if os.path.exists(proplog):
+                    calls = [l.strip() for l in open(proplog) if l.strip()]
+                    if reapply in calls:
+                        break
+                time.sleep(0.1)
+            check("inert guard still detects death and re-arms",
+                  reapply in calls, repr(calls))
+            # NOW a BRIDGE-MAPPING generation: it consumes the
+            # re-applied value and the guard restores stock — the
+            # full late-root lifecycle (the GhostLock soft-reboot
+            # shape).
+            z2 = start_fake_zygote(bridge_file)
+            try:
+                deadline = time.time() + 10
+                while time.time() < deadline:
+                    if os.path.exists(proplog):
+                        calls = [l.strip() for l in open(proplog)
+                                 if l.strip()]
+                        if "ro.dalvik.vm.native.bridge 0" in calls:
+                            break
+                    time.sleep(0.1)
+                check("new generation consumes and restores stock",
+                      "ro.dalvik.vm.native.bridge 0" in calls, repr(calls))
+                if reapply in calls and "ro.dalvik.vm.native.bridge 0" in calls:
+                    check("re-apply lands BEFORE the stock restore",
+                          calls.index(reapply) <
+                          calls.index("ro.dalvik.vm.native.bridge 0"))
+                check("daemon still alive after the full cycle",
+                      proc.poll() is None)
+            finally:
+                z2.kill()
+                z2.wait(timeout=5)
+        finally:
+            if proc is not None and proc.poll() is None:
+                proc.send_signal(signal.SIGTERM)
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+            if z1.poll() is None:
+                z1.kill()
+                z1.wait(timeout=5)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def run_orphan_sweep_checks(binary, env):
+    """U2b: crash-window orphans — 8-hex dirs holding only our socket
+    file are swept at daemon start; lookalikes are left alone."""
+    print("== Round 38: crash-window orphan sweep ==")
+    tmp = tempfile.mkdtemp(prefix="zs_orphan_")
+    tree = Tree(tmp)
+    try:
+        base = os.path.join(tree.root, "data/system")
+        # (a) a genuine orphan: 8-hex dir, only entry 's'.
+        orphan = os.path.join(base, ".feedface")
+        os.makedirs(orphan)
+        open(os.path.join(orphan, "s"), "w").close()
+        # (b) an EMPTY 8-hex dir (crash before the bind).
+        empty = os.path.join(base, ".0badcafe")
+        os.makedirs(empty)
+        # (c) a foreign dir with the same naming class but other
+        # content — must NOT be touched.
+        foreign = os.path.join(base, ".1337c0de")
+        os.makedirs(foreign)
+        with open(os.path.join(foreign, "keepme"), "w") as f:
+            f.write("x")
+        # (d) 8 chars but not hex.
+        nonhex = os.path.join(base, ".abcdefgh")
+        os.makedirs(nonhex)
+        proc = start_daemon(binary, tree, dict(env))
+        try:
+            time.sleep(0.4)
+            check("orphan socket dir swept", not os.path.exists(orphan))
+            check("empty crash-window dir swept", not os.path.exists(empty))
+            check("foreign same-class dir untouched",
+                  os.path.exists(os.path.join(foreign, "keepme")))
+            check("non-hex lookalike untouched", os.path.exists(nonhex))
+        finally:
+            proc.send_signal(signal.SIGTERM)
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def run_live_uninstall_checks(binary, env):
+    """U1 integration: the REAL uninstall.sh against the REAL live
+    daemon — pid-file kill by comm, property restore AFTER the death,
+    every artifact cleaned."""
+    print("== Round 38: live uninstall.sh vs the real daemon ==")
+    tmp = tempfile.mkdtemp(prefix="zs_unins_")
+    tree = Tree(tmp)
+    bridge_file = write_guard_records(tree)
+    bindir, proplog = fake_resetprop_on(tree)
+    # The module dir needs the scripts uninstall.sh sources.
+    moddir = os.path.join(tree.modules_root, "zygisk_study")
+    for s in ("uninstall.sh", "zs_compat.sh", "post-mount-hook.sh"):
+        shutil.copy(os.path.join(REPO_ROOT, s), os.path.join(moddir, s))
+    try:
+        e = dict(env)
+        e["ZS_TEST_ROOT"] = tree.root
+        e["PATH"] = bindir + ":" + e.get("PATH", "")
+        proc = start_daemon(binary, tree, e)
+        sock_dir = os.path.dirname(read_session_path(tree))
+        try:
+            check("daemon alive before uninstall",
+                  proc.poll() is None)
+            # IMPORTANT (found the hard way): the script's ZS_TEST_ROOT
+            # IS the /data/system sysroot (the verify_scripts.py
+            # convention), while the daemon's is a PATH PREFIX — pass
+            # each consumer the convention it expects.
+            script_env = {**os.environ,
+                          "ZS_TEST_ROOT": os.path.join(tree.root,
+                                                       "data", "system"),
+                          "ZS_TEST_ADB_ROOT": os.path.join(tree.root,
+                                                           "data", "adb"),
+                          "PATH": bindir + ":" + os.environ.get("PATH", "")}
+            u = subprocess.run(
+                ["sh", os.path.join(moddir, "uninstall.sh")],
+                env=script_env,
+                capture_output=True, text=True, timeout=60)
+            check("uninstall.sh exits 0 against the live daemon",
+                  u.returncode == 0, u.stderr[-300:])
+            deadline = time.time() + 5
+            while proc.poll() is None and time.time() < deadline:
+                time.sleep(0.1)
+            check("uninstall.sh killed the real daemon (comm match)",
+                  proc.poll() is not None)
+            calls = []
+            if os.path.exists(proplog):
+                calls = [l.strip() for l in open(proplog) if l.strip()]
+            check("uninstall restored the stock property",
+                  "ro.dalvik.vm.native.bridge 0" in calls, repr(calls))
+            check("uninstall removed the workdir",
+                  not os.path.exists(tree.workdir))
+            check("uninstall removed the random socket dir",
+                  not os.path.exists(sock_dir))
+            check("uninstall removed both session records",
+                  not os.path.exists(tree.session_file) and
+                  not os.path.exists(tree.session_file_alt))
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def run_prop_guard_engine_checks(binary, tree, env):

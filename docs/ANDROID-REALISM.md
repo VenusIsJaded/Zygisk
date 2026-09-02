@@ -3152,3 +3152,95 @@ for good. No performance or stealth mechanism beyond the fixes'
 own effects landed this round: the lazy retry now terminates (it
 previously retried a dead path forever), and the props-spoof
 staging + module system + companion API are live on device again.
+## Round 38 — removal realism: what the managers actually do, and the leftovers no script covered
+
+Research base (all fetched and read this round, nothing from
+memory):
+
+- Magisk master `native/src/core/module.rs` (remove-marker flow:
+  uninstall.sh at next boot, BBEXEC `sh <full-path>`, then
+  `remove_all`; `remove_modules()` runs every uninstall.sh at
+  RUNTIME then deletes the module root), `LocalModule.kt` (the
+  manager only creates the marker), `scripting.cpp` (`exec_script`
+  → BBEXEC_CMD with the full script path — `$0` semantics for
+  `MODDIR=${0%/*}`).
+- KernelSU main `userspace/ksud/src/module.rs` (marker → boot:
+  exec_script(uninstall.sh, full path) → remove_dir_all) and
+  APatch main `apd/src/module.rs` (`prune_modules`, same order).
+- One UI 8.5 = Android 16 QPR2 (Samsung's own announcements and the
+  release-branch check below); sources fetched from
+  `android16-qpr2-release`: `com_android_internal_os_Zygote.cpp`
+  (setresgid l.2018 → setresuid l.2032 → `__android_log_close` +
+  `AStatsSocket_close` l.2145 → `selinux_android_setcontext` l.2150,
+  nullable se_info/nice_name), `AndroidRuntime.cpp` l.1123-1134
+  (""→warn, "0"→disabled, else `-XX:NativeBridge=` only for the
+  zygote), `Process.java` (isolated 99000-99999,
+  app-zygote-isolated 90000-98999, SDK sandbox 20000-29999).
+- GhostLock = CVE-2026-43499 (15-year futex-PI stack UAF), used for
+  bootloader-locked soft root + KernelSU via ksud per KMI (the
+  2026 ports: ghostlock-app, ghostlock-oneplus, ghostlock-emerald,
+  the S23U port — no Knox trip, standalone). No interaction with
+  our userland mechanisms beyond the environment shape: KernelSU
+  without Magisk (covered by the R31 chain) and LATE daemon start
+  (covered by the new inert backoff).
+
+Findings and fixes:
+
+- **U1 (the live-daemon uninstall)**: on the runtime removal paths
+  the armed Round-30 guard held the applied loader name in memory
+  and would re-set `ro.dalvik.vm.native.bridge` after our restore
+  on the next zygote death — an identifying leftover (getprop shows
+  the randomized soname; ART warns at every zygote start) for the
+  rest of the boot, plus a root daemon still serving the denylist
+  after "removal". uninstall.sh now kills the daemon first (pid
+  file + comm verify; comm-scan fallback matching ONLY our cloak
+  name), making the script's restore the last write. Test order
+  assertion: the TERM marker precedes the restore in one shared
+  log.
+- **U2 (the manual rm -rf)**: no manager script ever runs, so the
+  workdir, the random socket dir and the (until reboot) live daemon
+  survived forever. The daemon's rescan thread now tracks its own
+  module dir; 60 s sustained absence (module UPDATE swaps are
+  sub-second) triggers: guard stand-down (MODULE_GONE atomic +
+  PROP_WRITE_LOCK so a re-apply can never race the shutdown
+  restore), stock restore with uninstall.sh's exact semantics
+  (backup / empty→delete / missing→"0"), removal of both session
+  records + the random socket dir + the workdir, exit(0).
+- **U3 (backup-less restore)**: with the backup record missing but
+  the live value still our applied name, the old script restored
+  nothing (dangling prop until reboot). Now falls back to "0"
+  (169/173 real devices; ART-equivalent to absent). A live value
+  that is neither ours nor a no-bridge default is a foreign bridge
+  — untouched, same rule as post-fs-data.sh.
+- **U4 (EBUSY umount)**: at runtime-removal time the zygote still
+  maps files through our overlay — the plain umount fails EBUSY
+  (silenced) and the mount line stayed world-readable in
+  /proc/mounts until reboot. Fallback to lazy `umount -l` now.
+- **U2b (crash-window orphans)**: a daemon dying between
+  create_dir_all and the session-record write left a random dir
+  named by NOTHING — the next boot's record-based cleanup could not
+  see it. Structural sweep at every daemon start: `.<8-hex>` dirs
+  whose only entry is our socket file "s" (or empty) are removed;
+  same-class dirs with foreign content are untouched (tested).
+- **P1 (inert guard)**: the late-root performance bug (see
+  PERFORMANCE-CLAIMS.md R37) — fast-cadence full /proc census
+  forever when the zygote never consumes the bridge.
+
+Honest residuals:
+
+- The uninstall kill's comm-scan matches one exact name
+  ("subsysd"); a hypothetical future root tool choosing the same
+  cloak name would be TERMed (never SIGKILLed) by our uninstall —
+  the name is deliberately unused by any real Android service.
+- module_gone_shutdown's property restore can race a guard re-apply
+  that was ALREADY in flight (sub-millisecond window) — narrowed,
+  not eliminated, by the write lock; the uninstall.sh path (kill
+  first) has no such window.
+- Between a GhostLock one-tap arm and the next zygote restart the
+  bridge property is visible via getprop (late-root inherent).
+- The pid-file kill's `sleep 1` adds one second to the runtime
+  removal path only (the marker path finds a dead pid and sleeps
+  nothing).
+- Orphan .o overlay-scratch dirs from a manually-deleted workdir
+  are still not swept (the workdir record is the source of truth;
+  covered by uninstall.sh and the self-exit when the record lives).

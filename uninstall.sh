@@ -1,5 +1,16 @@
 #!/system/bin/sh
-# uninstall.sh — runs when the module is removed (Magisk).
+# uninstall.sh — runs when the module is removed.
+#
+# WHEN this runs (verified from the managers' own sources, Round 38):
+#   * Magisk (master native/src/core/module.rs): the manager only
+#     creates a `remove` marker; at the NEXT BOOT magiskd runs
+#     uninstall.sh (BBEXEC: busybox `sh <full-path>`), then deletes
+#     the module dir immediately.
+#   * KernelSU (userspace/ksud/src/module.rs) and APatch
+#     (apd/src/module.rs): identical remove-marker flow at boot.
+#   * `magisk --remove-modules` (native/src/core/module.rs
+#     remove_modules()) and a manual `sh uninstall.sh` run the script
+#     AT RUNTIME with the daemon STILL ALIVE.
 #
 # Round 7: restore the native-bridge property we changed in
 # post-fs-data.sh. The systemless /system files disappear with the
@@ -20,6 +31,60 @@ MODDIR=${0%/*}
 # (scripts/verify_scripts.py); unset on a real device.
 ZS_SYS_ROOT="${ZS_TEST_ROOT:-/data/system}"
 WORKDIR="$ZS_SYS_ROOT/zygisk_study"
+
+# ---------------------------------------------------------------------------
+# ROUND 38 (U1 — the live-daemon uninstall): terminate the daemon
+# BEFORE anything else. On the runtime removal paths
+# (`magisk --remove-modules`, manual script run) the daemon is still
+# running while this script executes, and a live daemon carries:
+#
+#   a) an ARMED property guard (Round 30) holding the applied loader
+#      name in memory. If the zygote restarts after we restore the
+#      stock value — crash, `stop/start zygote`, a soft reboot — the
+#      guard RE-SETS ro.dalvik.vm.native.bridge to our loader name on
+#      a device where the module is being removed: `getprop` then
+#      shows the randomized soname (an identifying artifact) and ART
+#      logs the missing-library warning at every zygote start, for
+#      the rest of the boot.
+#   b) the daemon process itself (mlockall'd, root, running until
+#      reboot) and the denylist hiding it still serves.
+#
+# Killing it FIRST makes the property restore below the last write
+# that ever lands. Pid-reuse safety: a pid from the file is only
+# killed when /proc/<pid>/comm matches our process name. The
+# /proc scan fallback covers a daemon whose pid file was lost; it
+# matches ONLY the cloak name ("subsysd" — deliberately not used by
+# any real Android service or other root tool, so no collateral
+# damage; ReZygisk's daemon, for example, runs as "zygiskd" and is
+# never touched). ZS_TEST_DAEMON_COMM overrides the expected name for
+# the host script E2E.
+ZS_DAEMON_COMM="${ZS_TEST_DAEMON_COMM:-subsysd}"
+if [ -f "$WORKDIR/zygiskd.pid" ]; then
+  _dpid="$(cat "$WORKDIR/zygiskd.pid" 2>/dev/null | tr -d ' \r\n')"
+  case "$_dpid" in
+    *[!0-9]* | "") ;;
+    *)
+      if [ -r "/proc/$_dpid/comm" ] && \
+         [ "$(cat "/proc/$_dpid/comm" 2>/dev/null)" = "$ZS_DAEMON_COMM" ]; then
+        kill -TERM "$_dpid" 2>/dev/null && {
+          # Give it a moment to die; SIGKILL as the last resort.
+          sleep 1
+          kill -KILL "$_dpid" 2>/dev/null
+        }
+      fi
+      ;;
+  esac
+fi
+# Comm-scan fallback (pid file missing/stale but the daemon lives).
+for _p in /proc/[0-9]*; do
+  [ -r "$_p/comm" ] || continue
+  read -r _c < "$_p/comm" 2>/dev/null
+  [ "$_c" = "$ZS_DAEMON_COMM" ] || continue
+  _dp="${_p#/proc/}"
+  kill -TERM "$_dp" 2>/dev/null
+  # never SIGKILL from the blind scan: an unverified pid gets one
+  # clean TERM, nothing more.
+done
 
 # ROUND 31: use the compat layer's property chain so the uninstall
 # also works on KernelSU / APatch (no resetprop binary there — the
@@ -93,6 +158,30 @@ if [ -f "$WORKDIR/.native_bridge_backup" ]; then
     # 5.0 and 16.0 — verified), so deleting is the correct restore.
     zs_prop_delete ro.dalvik.vm.native.bridge
   fi
+else
+  # ROUND 38 (U3 — the backup-less restore gap): no backup record
+  # (workdir partially wiped by the user, a denied write, an
+  # interrupted first boot), but the LIVE value may still be OUR
+  # applied name. Leaving it set means the prop points at a library
+  # that no longer exists until reboot — the exact leftover class
+  # this script exists to prevent. When the live value matches our
+  # recorded applied name, restore the documented no-bridge default
+  # "0" (169 of 173 real devices in the
+  # getActivity/AndroidSystemPropertyCollect firmware collection ship
+  # exactly "0"; ART treats "0" and absent identically — the
+  # `zygote && strcmp(propBuf, "0")` path verified at 5.0.0_r1,
+  # 16.0.0_r1 and android16-qpr2-release). A live value that is
+  # neither ours nor a no-bridge default is a foreign bridge: same
+  # rule as post-fs-data.sh — never touch it.
+  if [ -f "$WORKDIR/.native_bridge_applied" ]; then
+    _applied="$(cat "$WORKDIR/.native_bridge_applied" 2>/dev/null | tr -d ' \r\n')"
+    if [ -n "$_applied" ]; then
+      _live="$(zs_prop_get ro.dalvik.vm.native.bridge 2>/dev/null)"
+      if [ "$_live" = "$_applied" ]; then
+        zs_prop_set ro.dalvik.vm.native.bridge "0"
+      fi
+    fi
+  fi
 fi
 
 # ROUND 34 (B8 — uninstall hygiene): undo what zs_ensure_loader_mounted
@@ -115,7 +204,15 @@ if [ -f "$WORKDIR/.uninstall_manifest" ]; then
       "overlay "*)
         _dir="${_line#overlay }"
         _dir="${_dir%% *}"
-        umount "$_dir" 2>/dev/null
+        # ROUND 38 (U4 — EBUSY on the runtime-removal path): while the
+        # zygote still maps files through the overlay, plain umount
+        # fails EBUSY and the mount line stays in /proc/mounts
+        # (world-readable) until reboot. Fall back to a LAZY detach:
+        # the line disappears immediately and already-mapped files
+        # keep working. (busybox and toybox umount both support -l;
+        # verified from Magisk's busybox applet list and toybox
+        # umount.c.)
+        umount "$_dir" 2>/dev/null || umount -l "$_dir" 2>/dev/null
         ;;
       "copy "*)
         _f="${_line#copy }"

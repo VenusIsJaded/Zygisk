@@ -64,9 +64,11 @@ use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
+use std::time::Instant;
 
 mod props;
 use props::PropEngine;
@@ -131,6 +133,30 @@ const SESSION_FILE_ALT: &str = "/data/system/zygisk_study/session.sock";
 const MODULES_ROOT:  &str = "/data/adb/modules";
 /// The denylist file.
 const DENYLIST_FILE: &str = "/data/system/zygisk_study/denylist";
+/// ROUND 38 — OUR module directory. When it disappears SUSTAINEDLY
+/// (see rescan_thread_main), the module was removed by hand
+/// (`rm -rf /data/adb/modules/zygisk_study` — an "uninstall" path no
+/// manager script ever covers) and the daemon restores the stock
+/// property, removes its runtime artifacts, and exits.
+const MODULE_DIR: &str = "/data/adb/modules/zygisk_study";
+
+// ----------------------------------------------------------------------
+// ROUND 38 — process-wide shutdown coordination.
+// ----------------------------------------------------------------------
+/// Set by module_gone_shutdown() before it restores the stock property:
+/// the property guard must never RE-APPLY the loader name on a device
+/// where the module is being removed (the re-arm would leave
+/// ro.dalvik.vm.native.bridge pointing at a deleted library for the
+/// rest of the boot — the exact "uninstall left something behind"
+/// failure this round closes).
+static MODULE_GONE: AtomicBool = AtomicBool::new(false);
+/// Serializes property writes between the guard thread and
+/// module_gone_shutdown: the shutdown's stock restore must never be
+/// overwritten by a guard re-apply that was already in flight.
+static PROP_WRITE_LOCK: Mutex<()> = Mutex::new(());
+/// The bound socket path (set once in main() after the bind) so
+/// module_gone_shutdown can remove the random socket directory.
+static SOCK_PATH_CELL: OnceLock<String> = OnceLock::new();
 
 /// The fake process title we set via prctl(PR_SET_NAME).
 ///
@@ -1150,6 +1176,26 @@ enum GuardAction {
     RollbackAndStop,
 }
 
+// ----------------------------------------------------------------------
+// ROUND 38 (P1 — the inert-mode decision, factored pure for tests):
+// what should happen to the guard's INERT bookkeeping after one
+// observation? `Keep` = a stable zygote that has not (yet) consumed
+// the bridge: keep counting the unconsumed window; the caller arms
+// inert once the window passes the threshold. `Reset` = the bridge
+// appeared, the observation is unstable, or the guard already
+// restored: back to fast cadence.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum InertSignal { Keep, Reset }
+
+fn inert_signal(restored: bool, obs: &ZygoteObservation) -> InertSignal {
+    match obs {
+        ZygoteObservation::Present { stable: true,
+                                     bridge_loaded: false, .. }
+            if !restored => InertSignal::Keep,
+        _ => InertSignal::Reset,
+    }
+}
+
 #[derive(Debug)]
 struct GuardState {
     /// The zygote pid the guard currently tracks.
@@ -1157,6 +1203,13 @@ struct GuardState {
     /// Whether the stock value has been restored for the CURRENT
     /// zygote generation.
     restored: bool,
+    /// ROUND 38: the tracked zygote is STABLE but has NEVER consumed
+    /// the bridge (the late-root / GhostLock shape: the daemon armed
+    /// long after the zygote booted, so injection waits for the next
+    /// zygote restart). While inert, the guard drops to the SLOW
+    /// cadence — see the P1 comment in prop_guard_thread — but death
+    /// detection continues, and a new generation re-enters fast mode.
+    inert: bool,
     /// Zygote restarts seen this boot.
     restarts: u32,
     /// The guard has given up (bootloop protection).
@@ -1166,6 +1219,7 @@ struct GuardState {
 impl GuardState {
     fn new() -> Self {
         GuardState { known_pid: None, restored: false,
+                     inert: false,
                      restarts: 0, stood_down: false }
     }
 }
@@ -1431,6 +1485,82 @@ fn guard_reapply(applied: &str) -> bool {
     run_resetprop(&[PROP_KEY, applied])
 }
 
+/// ROUND 38 — take the process-wide property-write lock (guards the
+/// guard-vs-shutdown write ordering; see PROP_WRITE_LOCK). Poisoned
+/// lock: a panic while held must not wedge the guard forever — take
+/// it anyway (into_inner).
+fn lock_props() -> std::sync::MutexGuard<'static, ()> {
+    PROP_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+// ----------------------------------------------------------------------
+// ROUND 38 (U2 — manual-removal self-exit).
+//
+// `rm -rf /data/adb/modules/zygisk_study` is the one "uninstall"
+// no manager script ever covers: uninstall.sh is never run, so the
+// workdir, the randomized socket dir, the overlay scratch and the
+// (until reboot) live daemon all survive; after the reboot that
+// kills the daemon they are PERMANENT root-owned leftovers in
+// /data/system. The rescan thread (which already watches the module
+// root) now also tracks OUR directory: when it is gone for a
+// sustained window (default 60 s — far longer than the sub-second
+// gap of a module UPDATE swap, which deletes and re-renames the
+// dir), the daemon executes this shutdown: stand the property guard
+// down, restore the stock property, remove every runtime artifact,
+// exit. The manager-driven uninstall paths are unaffected: on the
+// remove-marker flow (Magisk/KernelSU/APatch, verified from their
+// sources this round) the daemon is already dead at boot when
+// uninstall.sh runs, and the runtime path (`magisk
+// --remove-modules`) kills the daemon inside uninstall.sh (U1)
+// before it ever reaches this watch.
+fn module_gone_shutdown() -> ! {
+    let workdir = remap_path(WORKDIR);
+    // 1. Stand the property guard down BEFORE the restore: with the
+    //    module gone, ReapplyLoader must never fire again (U1).
+    MODULE_GONE.store(true, Ordering::Release);
+    // 2. Restore the stock property — only if we ever swapped it
+    //    (a non-empty .native_bridge_applied record). Mirror
+    //    uninstall.sh's semantics exactly: existing backup -> set it
+    //    / empty backup -> delete / missing backup -> the documented
+    //    no-bridge default "0" (169/173 real devices).
+    let applied = std::fs::read_to_string(
+            format!("{}/.native_bridge_applied", workdir))
+        .unwrap_or_default();
+    if !applied.trim().is_empty() {
+        let _lock = lock_props();
+        match std::fs::read_to_string(
+                format!("{}/.native_bridge_backup", workdir)) {
+            Ok(b) if !b.trim().is_empty() => {
+                let _ = guard_restore_stock(b.trim());
+            }
+            Ok(_) => {
+                let _ = guard_restore_stock("");
+            }
+            Err(_) => {
+                let _ = run_resetprop(&[PROP_KEY, "0"]);
+            }
+        }
+    }
+    // 3. Remove our runtime artifacts. The random socket dir (from
+    //    the recorded bind path), both session records, then the
+    //    workdir itself (takes the workdir session record, the pid
+    //    file, the denylist and markers with it).
+    if let Some(sock) = SOCK_PATH_CELL.get() {
+        let dev_prefix = remap_path("/data/system/.");
+        if sock.starts_with(&dev_prefix) && sock.len() > dev_prefix.len() {
+            if let Some(dir) = sock.rfind('/').map(|i| &sock[..i]) {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        }
+        // (the legacy fixed path lives INSIDE the workdir — removed
+        // with it below)
+    }
+    let _ = std::fs::remove_file(remap_path(SESSION_FILE));
+    let _ = std::fs::remove_dir_all(&workdir);
+    std::process::exit(0);
+}
+
+
 /// The guard thread body. Config (poll interval, zygote grace
 /// period) is overridable through the environment for the host
 /// E2E; unset = device defaults.
@@ -1511,10 +1641,36 @@ fn prop_guard_thread(grim: Arc<ChildGrim>) {
     // mode, regressing dead-child reaping to the 30 s rescan tick).
     let mut sweeper_only = false;
     let mut slow_ticks: u32 = 0;
+    // ROUND 38 (P1 test seam): env-gated trace of the guard's
+    // cadence/observation decisions — absent in production, used by
+    // scripts/verify_daemon.py to assert the inert backoff
+    // deterministically (CPU-time measurement was too flaky on
+    // quiet hosts).
+    let guard_trace: Option<String> = std::env::var("ZS_TEST_GUARD_TRACE").ok();
+    // ROUND 38 (P1): inert-mode bookkeeping. `unconsumed_since` is
+    // when the CURRENT tracked zygote was first seen stable WITHOUT
+    // our bridge; once that window passes inert_after_ms, the guard
+    // flips to the slow cadence (see the P1 comment in the loop).
+    let inert_after_ms: u64 = std::env::var("ZS_TEST_INERT_AFTER_MS").ok()
+        .and_then(|v| v.parse().ok()).unwrap_or(30_000);
+    let mut unconsumed_since: Option<Instant> = None;
     loop {
         // Slow mode: stock restored for the tracked zygote. Fast
         // mode: waiting for the consume, or hunting a new zygote.
-        let slow = st.restored && st.known_pid.is_some();
+        // ROUND 38 (P1 — the inert-mode backoff): `slow` now also
+        // covers the INERT state — a stable zygote that has never
+        // consumed the bridge. This is the late-root shape (GhostLock:
+        // CVE-2026-43499 soft root + KernelSU via ksud, one tap per
+        // boot — the daemon arms LONG after the zygote booted, and
+        // injection must wait for the next zygote restart). Before
+        // this fix the guard polled at the FAST 250 ms cadence with a
+        // FULL /proc census (300-600 processes, readdirs + cmdline
+        // reads, plus the maps re-read) forever — the R34 C4 backoff
+        // only covered the post-consume state. Inert slow mode keeps
+        // death detection (the same pid-liveness + periodic census
+        // path) and re-enters fast mode the moment a NEW generation
+        // appears.
+        let slow = (st.restored || st.inert) && st.known_pid.is_some();
         thread::sleep(Duration::from_millis(
             if slow { slow_ms } else { poll_ms }));
         // Round 34: the guard runs on the shortest timer in the
@@ -1526,6 +1682,7 @@ fn prop_guard_thread(grim: Arc<ChildGrim>) {
             // reaping never stops.
             continue;
         }
+        let mut synthesized = false;
         let obs = if slow {
             // Cheap path: is the KNOWN pid still alive? A periodic
             // full census re-syncs (pid reuse, drift).
@@ -1535,12 +1692,17 @@ fn prop_guard_thread(grim: Arc<ChildGrim>) {
                     &format!("/proc/{}", p)).exists())
                 .unwrap_or(false);
             if alive && slow_ticks < CENSUS_EVERY_SLOW_TICKS {
+                synthesized = true;
                 // Synthesized "nothing changed" observation: same
-                // pid, no new consume to detect (already restored).
-                // The step function sees the tracked pid and idles.
+                // pid. bridge_loaded mirrors `restored`: in the
+                // post-consume state that keeps the step function
+                // idling exactly as before; in the INERT state it
+                // stays false so a synthesized observation can never
+                // trigger RestoreStock for a bridge that was never
+                // consumed (that would disarm the pending swap).
                 ZygoteObservation::Present {
                     pid: st.known_pid.unwrap_or(0),
-                    bridge_loaded: true,
+                    bridge_loaded: st.restored,
                     stable: true,
                 }
             } else {
@@ -1550,15 +1712,56 @@ fn prop_guard_thread(grim: Arc<ChildGrim>) {
         } else {
             full_observation(&applied, &mut first_seen, grace_ms)
         };
+        if let Some(path) = &guard_trace {
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true).append(true).open(path) {
+                let _ = std::io::Write::write_fmt(&mut f, format_args!(
+                    "{}{}{}\n",
+                    if slow { "S" } else { "F" },
+                    if synthesized { "s" } else { "r" },
+                    if st.inert { "I" } else { "-" }));
+            }
+        }
+        // ROUND 38 (P1): advance the inert bookkeeping from the REAL
+        // observation only (synthesized ones carry no new signal —
+        // Keep would be a no-op, Reset would flap the cadence).
+        if !synthesized {
+            match inert_signal(st.restored, &obs) {
+                InertSignal::Keep => {
+                    if unconsumed_since.is_none() {
+                        unconsumed_since = Some(Instant::now());
+                    }
+                    if unconsumed_since.map(|t| t.elapsed().as_millis() as u64)
+                            .unwrap_or(0) >= inert_after_ms {
+                        st.inert = true;
+                    }
+                }
+                InertSignal::Reset => {
+                    unconsumed_since = None;
+                    st.inert = false;
+                }
+            }
+        }
         match prop_guard_step(&mut st, obs) {
             GuardAction::None => {}
             GuardAction::RestoreStock => {
+                let _lock = lock_props();
                 let _ = guard_restore_stock(&backup);
             }
             GuardAction::ReapplyLoader => {
-                let _ = guard_reapply(&applied);
+                // ROUND 38 (U1/U2): never re-arm on a device where the
+                // module is gone (manual rm -rf / runtime module
+                // removal): stand down to the sweeper instead of
+                // re-pointing the property at a deleted library.
+                if MODULE_GONE.load(Ordering::Acquire) {
+                    sweeper_only = true;
+                } else {
+                    let _lock = lock_props();
+                    let _ = guard_reapply(&applied);
+                }
             }
             GuardAction::RollbackAndStop => {
+                let _lock = lock_props();
                 let _ = guard_restore_stock(&backup);
                 // C8: stand down from GUARDING; keep REAPING.
                 sweeper_only = true;
@@ -1666,6 +1869,41 @@ fn setup_random_socket() -> Option<String> {
             // Strip the socket file name to get the directory.
             if let Some(dir) = old.rfind('/').map(|i| &old[..i]) {
                 let _ = std::fs::remove_dir_all(dir);
+            }
+        }
+    }
+
+    // ROUND 38 (U2b — the crash-window orphans): if a previous
+    // daemon died between create_dir_all and the session-record
+    // write (or between the bind and the record), its random dir is
+    // named by NOTHING — the next boot's record-based cleanup above
+    // cannot see it, and it would survive in /data/system forever.
+    // Sweep the naming class: any ".<8-hex>" directory whose only
+    // entry is our socket file "s" (or which is empty) is ours — no
+    // documented Android component or root tool creates that exact
+    // shape, and the check is structural, not name-based luck.
+    if let Ok(rd) = std::fs::read_dir(remap_path("/data/system")) {
+        for e in rd.flatten() {
+            let name = e.file_name();
+            let name = match name.to_str() { Some(s) => s, None => continue };
+            // ".<8-hex>" — the dot is part of the file name.
+            if !name.starts_with('.') { continue; }
+            let hex = &name[1..];
+            if hex.len() != 8
+                || !hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+            {
+                continue;
+            }
+            let p = e.path();
+            if !p.is_dir() { continue; }
+            let mut only_ours = true;
+            if let Ok(rd2) = std::fs::read_dir(&p) {
+                for c in rd2.flatten() {
+                    if c.file_name() != "s" { only_ours = false; }
+                }
+            }
+            if only_ours {
+                let _ = std::fs::remove_dir_all(&p);
             }
         }
     }
@@ -1854,6 +2092,11 @@ fn main() {
     // the first millisecond and nothing could trust it. The daemon
     // knows its own pid; written after the bind so the file only ever
     // appears for a fully-started daemon.
+    // ROUND 38: publish the bound socket path so
+    // module_gone_shutdown() can remove the random socket directory
+    // when the module dir disappears (U2).
+    let _ = SOCK_PATH_CELL.set(sock_path.clone());
+
     let pid_path = format!("{}/zygiskd.pid", workdir);
     let _ = std::fs::write(&pid_path,
         format!("{}\n", std::process::id()));
@@ -1952,6 +2195,23 @@ fn rescan_thread_main(state: Arc<DaemonState>, grim: Arc<ChildGrim>) {
     let mut last_modules_mtime: Option<std::time::SystemTime> = None;
     let mut last_denylist_mtime: Option<std::time::SystemTime> = None;
 
+    // ROUND 38 (U2 — the module-gone watch): our own module dir,
+    // sustained absence, and the shutdown it triggers (see
+    // module_gone_shutdown). The grace window (default 60 s) rides
+    // above both the inotify event cadence and the poll timeout so a
+    // module UPDATE's delete-then-rename swap (sub-second) never
+    // trips it. Env-overridable for the host E2E.
+    let module_dir = remap_path(MODULE_DIR);
+    let module_grace_ms: u64 = std::env::var("ZS_TEST_MODULE_GRACE_MS").ok()
+        .and_then(|v| v.parse().ok()).unwrap_or(60_000);
+    let mut module_absent_since: Option<Instant> = None;
+    // The loop's maximum sleep (inotify poll timeout / fallback
+    // sleep) must stay well under the grace window, or a small test
+    // grace would still wait 30 s per observation. Device default
+    // (60 s grace) keeps the historical 30 s cadence.
+    let loop_sleep_ms: u32 = 30_000u64
+        .min(module_grace_ms.saturating_mul(2).max(250)) as u32;
+
     // Try to set up an inotify watch on MODULES_ROOT.
     // IN_NONBLOCK so the read() below never blocks (we use poll()
     // to wait); IN_CLOEXEC so the fd doesn't leak into children.
@@ -1981,16 +2241,29 @@ fn rescan_thread_main(state: Arc<DaemonState>, grim: Arc<ChildGrim>) {
         // companion children whose client vanished between accepts
         // leave the zombie state here at the latest.
         grim.reap();
+        // ROUND 38 (U2): the module-gone watch — checked on EVERY
+        // wakeup (inotify event or timeout/poll tick).
+        if Path::new(&module_dir).exists() {
+            module_absent_since = None;
+        } else if module_absent_since.is_none() {
+            module_absent_since = Some(Instant::now());
+        } else if module_absent_since
+                .map(|t| t.elapsed().as_millis() as u64)
+                .unwrap_or(0) >= module_grace_ms {
+            module_gone_shutdown();
+        }
         if inotify_fd >= 0 && inotify_wd >= 0 {
-            // Block on poll() with a 30s timeout. If events arrive,
-            // drain them; if timeout, fall through to mtime check.
+            // Block on poll() with a timeout (30s on device; scaled
+            // to the module-gone grace window for the host E2E). If
+            // events arrive, drain them; if timeout, fall through to
+            // the mtime check.
             let mut pfd = [libc::pollfd {
                 fd: inotify_fd,
                 events: libc::POLLIN,
                 revents: 0,
             }];
             let ret = unsafe {
-                libc::poll(pfd.as_mut_ptr(), 1, 30_000)
+                libc::poll(pfd.as_mut_ptr(), 1, loop_sleep_ms as i32)
             };
             if ret > 0 && (pfd[0].revents & libc::POLLIN) != 0 {
                 // Drain inotify events. The kernel writes one
@@ -2059,8 +2332,9 @@ fn rescan_thread_main(state: Arc<DaemonState>, grim: Arc<ChildGrim>) {
             // any events inotify might have missed, e.g. if the
             // directory was replaced rather than modified).
         } else {
-            // No inotify — sleep 30s then do the mtime checks.
-            thread::sleep(Duration::from_secs(30));
+            // No inotify — sleep (30s on device; scaled for the host
+            // E2E) then do the mtime checks.
+            thread::sleep(Duration::from_millis(loop_sleep_ms as u64));
         }
 
         // Cheap mtime check on the module directory. This is the
@@ -2692,7 +2966,6 @@ mod tests {
                 "child failed the snapshot checks: status={}", status);
         holder.join().unwrap();
     }
-}
 
     /// ROUND 35 — the measured evidence for the Arc snapshot. The
     /// pre-R35 snapshot deep-cloned a Vec of module entries and a
@@ -2809,3 +3082,70 @@ mod tests {
         assert_eq!(snap.denylist.len(), N,
             "lost denylist updates: {} of {}", snap.denylist.len(), N);
     }
+
+    // ------------------------------------------------------------------
+    // ROUND 38 — inert-mode decision (the pure function) + the
+    // module-gone coordination state.
+    // ------------------------------------------------------------------
+    #[test]
+    fn inert_signal_covers_the_late_root_shape() {
+        // Stable zygote, bridge NOT loaded, not yet restored: the
+        // late-root / GhostLock shape -> KEEP counting.
+        assert_eq!(inert_signal(false, &ZygoteObservation::Present {
+            pid: 42, bridge_loaded: false, stable: true }), InertSignal::Keep);
+        // The bridge appeared (or was there all along): fast mode.
+        assert_eq!(inert_signal(false, &ZygoteObservation::Present {
+            pid: 42, bridge_loaded: true, stable: true }), InertSignal::Reset);
+        // Already restored for this generation: never inert.
+        assert_eq!(inert_signal(true, &ZygoteObservation::Present {
+            pid: 42, bridge_loaded: false, stable: true }), InertSignal::Reset);
+        // Unstable (new zygote inside the grace window): fast mode.
+        assert_eq!(inert_signal(false, &ZygoteObservation::Present {
+            pid: 43, bridge_loaded: false, stable: false }), InertSignal::Reset);
+        // No zygote at all (between restarts): fast mode.
+        assert_eq!(inert_signal(false, &ZygoteObservation::Absent),
+                   InertSignal::Reset);
+    }
+
+    #[test]
+    fn guard_state_inert_round_trip() {
+        let mut st = GuardState::new();
+        assert!(!st.inert);
+        st.inert = true;
+        // A step with a synthesized inert observation (stable, bridge
+        // not loaded) must neither act nor clear the inert flag.
+        let act = prop_guard_step(&mut st, ZygoteObservation::Present {
+            pid: 7, bridge_loaded: false, stable: true });
+        assert_eq!(act, GuardAction::None);
+        assert!(st.inert, "synthesized inert observation cleared inert");
+        // Absent (the zygote died) -> the step re-arms the loader;
+        // inertness is the caller's to reset via InertSignal::Reset.
+        let act = prop_guard_step(&mut st, ZygoteObservation::Absent);
+        assert_eq!(act, GuardAction::ReapplyLoader);
+    }
+
+    #[test]
+    fn module_gone_flag_guards_the_reapply() {
+        // The atomic starts false and flips exactly once.
+        assert!(!MODULE_GONE.load(Ordering::Acquire));
+        MODULE_GONE.store(true, Ordering::Release);
+        assert!(MODULE_GONE.load(Ordering::Acquire));
+        // Restore for the next test (atomics are process-global in
+        // the test binary).
+        MODULE_GONE.store(false, Ordering::Release);
+    }
+
+    #[test]
+    fn prop_write_lock_survives_poisoning() {
+        // A panic while the lock is held poisons it; lock_props must
+        // still return (into_inner recovery) instead of wedging the
+        // guard thread forever.
+        let _ = std::panic::catch_unwind(|| {
+            let _g = lock_props();
+            struct PanicOnDrop;
+            impl Drop for PanicOnDrop { fn drop(&mut self) { panic!("boom"); } }
+            let _p = PanicOnDrop;
+        });
+        let _g2 = lock_props();
+    }
+}

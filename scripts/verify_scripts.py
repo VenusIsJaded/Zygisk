@@ -732,6 +732,193 @@ def test_uninstall_leaves_foreign_paths_alone(mk):
 
 
 # ---------------------------------------------------------------------------
+# ROUND 38 — the live-daemon uninstall (U1), the backup-less restore
+# (U3), the lazy-umount fallback (U4).
+# ---------------------------------------------------------------------------
+
+FAKE_DAEMON_PY = """\
+import signal, sys, time
+log = sys.argv[1]
+def on_term(sig, frame):
+    with open(log, "a") as f:
+        f.write("DAEMON_TERM\\n")
+    sys.exit(0)
+signal.signal(signal.SIGTERM, on_term)
+with open(log, "a") as f:
+    f.write("DAEMON_START\\n")
+while True:
+    time.sleep(0.5)
+"""
+
+
+def spawn_fake_daemon(mk, name="fakedaemon"):
+    """A live process whose /proc/<pid>/comm is a UNIQUE name, so the
+    uninstall's kill logic can be exercised without endangering any
+    real process. Executing a symlink to python named `fakedaemon`
+    gives comm=fakedaemon (the kernel derives comm from the executed
+    dentry name) — verified on this host before the test was written.
+    The comm-scan in uninstall.sh matches by exact name, so only this
+    process can ever be a victim."""
+    exe = os.path.join(mk.root, name)
+    if not os.path.exists(exe):
+        os.symlink(sys.executable, exe)
+    log = os.path.join(mk.root, "fake_daemon.log")
+    proc = subprocess.Popen(
+        [exe, "-c", FAKE_DAEMON_PY, log],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        if os.path.exists(log):
+            break
+        time.sleep(0.05)
+    return proc, log
+
+
+def test_uninstall_kills_daemon_and_restores_after(mk):
+    """U1: a LIVE daemon at uninstall time (the `magisk
+    --remove-modules` / manual-run path) must die BEFORE the property
+    restore — the restore has to be the last write that lands (the
+    guard would otherwise re-arm on the next zygote restart)."""
+    os.makedirs(mk.workdir, exist_ok=True)
+    with open(os.path.join(mk.workdir, ".native_bridge_backup"), "w") as fp:
+        fp.write("0")
+    proc, dlog = spawn_fake_daemon(mk)
+    try:
+        with open(os.path.join(mk.workdir, "zygiskd.pid"), "w") as fp:
+            fp.write(f"{proc.pid}\\n")
+        # The fake resetprop calls and the daemon's TERM marker share
+        # ONE log so the ORDER is assertable.
+        p = mk.run_script("uninstall.sh", extra_env={
+            "ZS_TEST_DAEMON_COMM": "fakedaemon",
+            "ZS_FAKE_RESETPROP_LOG": dlog,
+        })
+        check("uninstall exits 0 with a live daemon present",
+              p.returncode == 0)
+        deadline = time.time() + 5
+        while proc.poll() is None and time.time() < deadline:
+            time.sleep(0.1)
+        check("uninstall killed the live daemon (pid-file path)",
+              proc.poll() is not None)
+        with open(dlog) as fp:
+            lines = [l.strip() for l in fp if l.strip()]
+        ok = False
+        try:
+            t = lines.index("DAEMON_TERM")
+            r = next(i for i, l in enumerate(lines)
+                     if l == "ro.dalvik.vm.native.bridge 0")
+            ok = t < r
+        except (ValueError, StopIteration):
+            ok = False
+        check("property restore lands AFTER the daemon death", ok,
+              repr(lines))
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+
+
+def test_uninstall_comm_scan_kills_orphan_daemon(mk):
+    """U1 fallback: the pid file is gone but the daemon lives — the
+    /proc comm scan must find and terminate it."""
+    os.makedirs(mk.workdir, exist_ok=True)
+    proc, _ = spawn_fake_daemon(mk)
+    try:
+        # NO zygiskd.pid: only the comm scan can find it.
+        p = mk.run_script("uninstall.sh",
+                          extra_env={"ZS_TEST_DAEMON_COMM": "fakedaemon"})
+        check("uninstall exits 0 (comm-scan path)", p.returncode == 0)
+        deadline = time.time() + 5
+        while proc.poll() is None and time.time() < deadline:
+            time.sleep(0.1)
+        check("comm-scan fallback killed the orphan daemon",
+              proc.poll() is not None)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+
+
+def test_uninstall_pid_reuse_safety(mk):
+    """U1 safety: a pid-file pid whose comm does NOT match ours (pid
+    reuse, foreign process) must never be killed."""
+    os.makedirs(mk.workdir, exist_ok=True)
+    exe = os.path.join(mk.root, "otherproc")
+    if not os.path.exists(exe):
+        os.symlink(sys.executable, exe)
+    proc = subprocess.Popen(
+        [exe, "-c", "import time; time.sleep(60)"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        time.sleep(0.3)
+        with open(os.path.join(mk.workdir, "zygiskd.pid"), "w") as fp:
+            fp.write(f"{proc.pid}\\n")
+        p = mk.run_script("uninstall.sh",
+                          extra_env={"ZS_TEST_DAEMON_COMM": "fakedaemon"})
+        time.sleep(0.3)
+        check("wrong-comm pid is NOT killed (pid-reuse safety)",
+              proc.poll() is None)
+        check("uninstall still exits 0", p.returncode == 0)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+
+
+def test_uninstall_backup_missing_restores_zero(mk):
+    """U3: no backup record, but the LIVE value is our applied name —
+    restore the documented stock "0" instead of leaving the prop
+    pointing at a deleted library until reboot."""
+    os.makedirs(mk.workdir, exist_ok=True)
+    with open(os.path.join(mk.workdir, ".native_bridge_applied"), "w") as fp:
+        fp.write("libtest1234.so")
+    with open(mk.prop_state, "w") as fp:
+        fp.write("libtest1234.so\n")
+    p = mk.run_script("uninstall.sh")
+    calls = mk.resetprop_calls()
+    check("backup-less restore sets the documented stock 0",
+          "ro.dalvik.vm.native.bridge 0" in calls, repr(calls))
+    check("uninstall exits 0", p.returncode == 0)
+    check("workdir removed", not os.path.exists(mk.workdir))
+
+
+def test_uninstall_backup_missing_leaves_foreign_bridge(mk):
+    """U3 guard: no backup, and the live value is a FOREIGN bridge —
+    never touch it (same rule as post-fs-data.sh)."""
+    os.makedirs(mk.workdir, exist_ok=True)
+    with open(os.path.join(mk.workdir, ".native_bridge_applied"), "w") as fp:
+        fp.write("libtest1234.so")
+    with open(mk.prop_state, "w") as fp:
+        fp.write("librealbridge.so\n")
+    p = mk.run_script("uninstall.sh")
+    calls = mk.resetprop_calls()
+    check("foreign bridge untouched when backup is missing",
+          not any("ro.dalvik.vm.native.bridge" in c for c in calls),
+          repr(calls))
+
+
+def test_uninstall_lazy_umount_fallback(mk):
+    """U4: a live overlay mount umounts EBUSY at runtime-uninstall
+    time — the lazy `-l` fallback must run after the plain attempt
+    fails."""
+    os.makedirs(mk.workdir, exist_ok=True)
+    with open(os.path.join(mk.workdir, ".uninstall_manifest"), "w") as fp:
+        fp.write("overlay /system/lib64 /data/system/.abcd1234.o_system_lib64\n")
+    fake_umount = os.path.join(mk.bindir, "umount")
+    ulog = os.path.join(mk.root, "umount.log")
+    with open(fake_umount, "w") as fp:
+        fp.write(f'#!/bin/sh\necho "$*" >> {ulog}\n'
+                 'if [ "$1" = "-l" ]; then exit 0; fi\nexit 1\n')
+    os.chmod(fake_umount, 0o755)
+    p = mk.run_script("uninstall.sh")
+    lines = []
+    if os.path.exists(ulog):
+        with open(ulog) as fp:
+            lines = [l.strip() for l in fp if l.strip()]
+    check("plain umount attempted first",
+          "/system/lib64" in lines, repr(lines))
+    check("lazy umount -l fallback used",
+          "-l /system/lib64" in lines, repr(lines))
+    check("uninstall exits 0", p.returncode == 0)
+
+
+# ---------------------------------------------------------------------------
 
 
 
@@ -1310,6 +1497,18 @@ def main():
          test_uninstall_workdir_record_fallback),
         ("uninstall: foreign session path ignored",
          test_uninstall_leaves_foreign_paths_alone),
+        ("Round 38: live daemon killed BEFORE the property restore",
+         test_uninstall_kills_daemon_and_restores_after),
+        ("Round 38: comm-scan fallback kills an orphan daemon",
+         test_uninstall_comm_scan_kills_orphan_daemon),
+        ("Round 38: wrong-comm pid never killed (pid-reuse safety)",
+         test_uninstall_pid_reuse_safety),
+        ("Round 38: backup-less restore falls back to stock 0",
+         test_uninstall_backup_missing_restores_zero),
+        ("Round 38: backup-less restore never touches a foreign bridge",
+         test_uninstall_backup_missing_leaves_foreign_bridge),
+        ("Round 38: EBUSY overlay falls back to umount -l",
+         test_uninstall_lazy_umount_fallback),
         ("Round 31: engine swap without resetprop (real zygiskd)",
          test_real_engine_swap_without_resetprop),
         ("Round 31: mount pending + post-mount rollback",

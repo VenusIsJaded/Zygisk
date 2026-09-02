@@ -1226,3 +1226,18 @@ hooks) is reachable on device again. No NEW stealth mechanism
 landed; the round's honest conclusion is that Rounds 13-36 shipped
 stealth features whose daemon-dependent halves were unreachable,
 and the fix is plumbing, not design.
+## Round 38 — removal-time stealth closures
+
+Three removal-path leaks closed: the armed property guard could
+re-set the randomized bridge soname on a removed module (visible
+via getprop + ART warning at every zygote start until reboot) —
+uninstall.sh kills the daemon first and the daemon stands its guard
+down under the module-gone flag; a runtime overlay unmount that
+hits EBUSY (the zygote still maps our loader) kept the mount line
+in world-readable /proc/mounts until reboot — lazy `umount -l`
+detaches immediately; and the manual `rm -rf` path used to leave
+the workdir, the random socket dir and the daemon's hidden-process
+behavior alive forever — the module-gone self-exit now restores
+stock and removes every artifact. The daemon kill matches the
+cloak comm only ("subsysd"), so the removal itself never names the
+module in any log.

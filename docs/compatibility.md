@@ -724,3 +724,90 @@ package/data dir for sandboxed processes; pre-13 the branch is dead
 as before), and the daemon-client plumbing (session-file re-read +
 bounded 'P' socket + reply-vs-timeout classification) is version-
 independent — it runs in the zygote on every supported release.
+## Round 38 — removal semantics (verified from the managers), Android 16 QPR2 / One UI 8.5, and GhostLock
+
+### When uninstall.sh actually runs (and when the daemon is still alive)
+
+Read from the current sources, not assumed:
+
+- **Magisk** (master, `native/src/core/module.rs`): the manager app
+  only creates a `remove` marker (`LocalModule.kt`); at the NEXT
+  BOOT the module scan runs `run_uninstall_script` →
+  `exec_script` → BBEXEC (busybox `sh <full-path>`, so `$0` is the
+  full path and `MODDIR=${0%/*}` derives correctly) and then
+  `dir.remove_all()`. `magisk --remove-modules`
+  (`remove_modules()`) instead runs every uninstall.sh AT RUNTIME
+  and then deletes the whole modules root — **the daemon is alive
+  during that script**.
+- **KernelSU** (main, `userspace/ksud/src/module.rs`): remove
+  marker → boot-time `mark_remove` path: exec_script(uninstall.sh)
+  then `remove_dir_all`.
+- **APatch** (main, `apd/src/module.rs`): identical to KernelSU
+  (`prune_modules`).
+- **No manager at all**: `rm -rf /data/adb/modules/zygisk_study`
+  never runs any script — the daemon now covers this itself
+  (module-gone self-exit, 60 s sustained-absence grace).
+
+Consequences fixed this round: uninstall.sh kills a live daemon
+before the property restore (pid file + `/proc/<pid>/comm` match —
+"subsysd", a name no real service or other root tool uses;
+ReZygisk's daemon runs as "zygiskd" and is never touched), the
+backup-less restore falls back to stock "0" when the live value is
+ours, and overlay unmounts fall back to `umount -l` on EBUSY.
+
+### Android 16 QPR2 — the base of Samsung One UI 8.5
+
+One UI 8.5 is based on **Android 16 QPR2** (Samsung's second
+Android-16 platform update; One UI 8.0 = Android 16). Verified from
+the `android16-qpr2-release` branch of AOSP directly (fetched this
+round):
+
+- `core/jni/com_android_internal_os_Zygote.cpp`:
+  `setresgid` (l.2018) → `setresuid` (l.2032) → capabilities →
+  `__android_log_close()` + `AStatsSocket_close()` (l.2145) →
+  `selinux_android_setcontext(uid, is_system_server, se_info_ptr,
+  nice_name_ptr)` (l.2150) — the same four-argument contract with a
+  nullable nice_name that the Round-36 setcontext hook implements;
+  16.0.0_r1 and main were already verified.
+- `core/jni/AndroidRuntime.cpp` (l.1123-1134): the native-bridge
+  property is still consumed exactly once per zygote start, `""`
+  warns and loads nothing, `"0"` is disabled, anything else is
+  passed as `-XX:NativeBridge=<name>` — and only for the zygote.
+- `core/java/android/os/Process.java`: isolated 99000-99999,
+  app-zygote-isolated 90000-98999, SDK sandbox 20000-29999 — the
+  R36 uid-range contract unchanged.
+
+Samsung-specific handling is unchanged from earlier rounds: the
+173-device firmware collection shows Samsung ships
+`ro.dalvik.vm.native.bridge = "0"` (the swap guard's most common
+case), and the ReZygisk #380 Samsung class (kernel path rules
+blocking app_process from `/data/adb/modules`) is covered by the
+workdir session-record fallback.
+
+### GhostLock (CVE-2026-43499) support
+
+GhostLock is the 15-year Linux kernel futex-PI use-after-free
+(CVE-2026-43499, stack UAF in the PI requeue path) used since 2026
+for "soft root" on bootloader-locked devices — no Knox trip, no
+unlocked bootloader — typically installing **KernelSU via ksud**
+(one tap per boot; the ports embed kernelsu.ko per KMI). What that
+environment means for this module, and what changed:
+
+- No Magisk, no resetprop binary, no magic mount: the Round-31
+  no-Magisk chain already covers it (the daemon's built-in property
+  engine, the post-mount.d hook that KernelSU/APatch run after
+  metamodule mounting, our own overlayfs self-mount, the fail-closed
+  rollback).
+- **Late start**: the daemon arms long after the zygote booted (the
+  one-tap flow), so the zygote has already consumed nothing — the
+  property swap stays pending until the next zygote restart (the
+  soft-reboot / crash that the ghostlock flows perform), which the
+  Round-30 guard re-arm handles. The NEW inert-mode backoff (R37)
+  makes that wait cheap: the guard drops from the 250 ms
+  full-/proc-census cadence to the 2 s death-detection cadence
+  while the zygote is stable and unconsuming, and returns to fast
+  mode on any new generation.
+- Honest residual: between the tap and the next zygote restart,
+  `getprop ro.dalvik.vm.native.bridge` shows the loader name —
+  inherent to late root; apps launched in that window can read it
+  (documented, not hidden).
