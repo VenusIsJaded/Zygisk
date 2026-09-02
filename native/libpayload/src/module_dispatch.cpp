@@ -92,6 +92,97 @@ static std::atomic<int>          g_modules_loaded{0};
 static std::atomic<int> g_module_fetch_done{0};   // latched: daemon answered the 'L'
 static std::atomic<int> g_props_sent{0};          // latched: 'P' answered or permanently off
 
+// ------------------------------------------------------------------------
+// ROUND 39 (C1) — the fail-inert environment gate.
+//
+// THE CRASH (Android 7.1.1 x86_64 emulator, enforcing SELinux, module
+// installed, verified with debug traces + tombstones): the zygote
+// domain is POLICY-DENIED access to the module's own infrastructure —
+// avc: "denied { write } ... name=s ... scontext=u:r:zygote:s0
+// tcontext=u:object_r:system_data_file:s0 tclass=sock_file" and the
+// /data/adb search denial. The fork-child pipeline (module dispatch +
+// hide machinery driven from the uid-drop hooks) then runs against a
+// half-initialized daemon/session state, and the system_server child
+// crash-loops: SEGV executing de-permissioned payload pages
+// (tombstone: r-- anon regions), children re-entering
+// ZygoteInit.main ("Accepting command socket connections" from
+// system-server pids, ENOTSOCK accept deaths, cascading re-forks).
+// Boot never completes; Magisk itself stays healthy (module-disabled
+// control boot: zero zygote kills).
+//
+// EACCES distinguishes a POLICY fact from "daemon not up yet"
+// (ENOENT / ECONNREFUSED — retry later, exactly as before). On
+// environments where the policy grants the zygote the socket (the
+// Android 5.0 emulator run this round: daemon link proven live),
+// nothing changes. When the gate trips, the child-side machinery
+// turns itself off for the boot: the wrappers relay every call
+// untouched (zs_module_env_denied checks in entry.cpp), the module
+// stays injected and mounted, apps and boot stay healthy. Stability
+// over function — the honest trade for a host we cannot safely run
+// the pipeline on.
+// ------------------------------------------------------------------------
+static std::atomic<int> g_env_denied{0};
+
+static const char* daemon_socket();   // defined below (session override)
+static const char* kSessionFile();      // ZS_OBFS_PATH accessor, below
+static const char* kSessionFileAlt();   // ZS_OBFS_PATH accessor, below
+
+int zs_module_env_denied() {
+    return g_env_denied.load(std::memory_order_acquire);
+}
+
+// One bounded probe: does POLICY (not absence) block our socket?
+// Called at payload init and from the lazy-init failure arm — the
+// cost is a socket+connect+close (~1 usec).
+static void zs_env_denied_probe() {
+    const char* path = daemon_socket();
+    if (!path || path[0] == '\0') return;
+    int s = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (s < 0) return;
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
+    int rc = connect(s, (struct sockaddr*)&addr, sizeof addr);
+    int err = (rc != 0) ? errno : 0;
+    close(s);
+    if (err == EACCES) {
+        if (!g_env_denied.exchange(1)) {
+            ZS_LOGW("modules: SELinux policy denies the zygote context "
+                    "the daemon socket; child pipeline disabled "
+                    "(fail-inert) for this boot");
+        }
+    }
+}
+
+int zs_module_env_probe() {
+    // Refresh the session path first (the daemon may be from this
+    // boot already), then probe the socket and the session file.
+    zs_module_load_session_socket();
+    zs_env_denied_probe();
+    // Session-file read denial is the same class of policy fact
+    // (both documented locations; kSessionFile is defined below, so
+    // the open() goes through the same constants the real reader
+    // uses — declared at the top of this file).
+    int fd = open(kSessionFile(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        if (errno == EACCES) {
+            g_env_denied.store(1, std::memory_order_release);
+        }
+    } else {
+        close(fd);
+    }
+    fd = open(kSessionFileAlt(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        if (errno == EACCES) {
+            g_env_denied.store(1, std::memory_order_release);
+        }
+    } else {
+        close(fd);
+    }
+    return g_env_denied.load(std::memory_order_acquire);
+}
+
 // Round 19: the spoofed property-area image. Built ONCE (the
 // build reads /proc/self/maps + the real area file); held until the
 // daemon accepts it, then freed. Null + build_attempted = feature
@@ -668,6 +759,10 @@ int zs_module_lazy_daemon_init() {
             // while a daemon step is unlatched. The props send (b)
             // below runs in the SAME attempt with the fresh path.
             zs_module_load_session_socket();
+            // ROUND 39 (C1): a POLICY denial (EACCES) is permanent
+            // for this boot — trip the fail-inert gate so the
+            // fork-child pipeline stops running on half-state.
+            zs_env_denied_probe();
         }
     }
 

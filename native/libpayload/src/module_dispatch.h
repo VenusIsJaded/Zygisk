@@ -57,6 +57,14 @@ void zs_module_init();
 // dead code on device without this retry. Returns 1 when everything
 // is latched (or definitively unavailable), 0 = retry next fork.
 int  zs_module_lazy_daemon_init();
+// ROUND 39 (C1): 1 when the zygote-context module infrastructure is
+// denied by SELinux POLICY (EACCES on the daemon/session socket),
+// not merely "daemon not up" (ENOENT). See module_dispatch.cpp.
+int  zs_module_env_denied();
+// ROUND 39 (C1): one bounded probe (socket connect) + the session
+// file read. Trips the gate ONLY on a POLICY denial (EACCES).
+// Called at payload init, before any GOT hook is installed.
+int  zs_module_env_probe();
 
 // Round 13 — read /data/adb/modules/zygisk_study/session.sock (the
 // daemon's randomized per-boot socket path handoff; root-only

@@ -1767,6 +1767,202 @@ ZS_TEST(got_walker_skips_self_dso_by_address) {
     hide_test_set_records(saved, saved_n);
 }
 
+// ----------------------------------------------------------------------
+// ROUND 39 (A1 + A2): the GOT walker must survive — and correctly
+// patch — a synthetic DSO built the way BIONIC leaves it:
+//
+//   * .dynamic DT_ d_ptr values are LINK-TIME virtual addresses
+//     (unrebased — the convention on every Android release; glibc is
+//     the environment that rebasees them in memory, which is why this
+//     was invisible to every host test before Round 39 and fatal on
+//     the Android 7.1.1 emulator: zygote64 SEGV'd at 0x12ec reading
+//     jmprel=0x12e0 as a pointer).
+//
+//   * PLT relocations can be ElfW(Rel) (DT_PLTREL == DT_REL — the
+//     32-bit ABI form; 64-bit REL also parses through the same code).
+//
+// The image below is assembled by hand inside one RW mapping; the
+// mapping's own address acts as the load bias (dlpi_addr), exactly
+// like a real library load. The four cases:
+//   1. bionic raw convention (RELA entries)  -> slot patched
+//   2. glibc rebased convention (RELA)       -> slot patched
+//   3. undecided convention (garbage d_ptr)  -> DSO skipped, no crash
+//   4. bionic raw convention (REL entries)   -> slot patched
+// ----------------------------------------------------------------------
+namespace {
+constexpr size_t kR39ImgSize   = 0x4000;   // 4 pages
+constexpr size_t kR39PhdrOff   = 0x0080;   // program headers
+constexpr size_t kR39SymOff    = 0x0200;   // .dynsym (2 entries)
+constexpr size_t kR39DynOff    = 0x0400;   // .dynamic
+constexpr size_t kR39StrOff    = 0x1000;   // .dynstr
+constexpr size_t kR39PltOff    = 0x2000;   // .rel[a].plt
+constexpr size_t kR39GotOff    = 0x3000;   // patch target slot
+const char kR39HookName[] = "zs_test_r39_plt_sym";
+void* kR39HookFn = (void*)0x51525354;
+
+struct R39Image {
+    void*  base = nullptr;
+    size_t size = kR39ImgSize;
+    char*  at(size_t link_va) { return (char*)base + link_va; }
+};
+
+void r39_prepare_image(R39Image& img, bool rela_form) {
+    img.base = mmap(nullptr, img.size, PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ZS_CHECK(img.base != MAP_FAILED);
+    memset(img.base, 0, img.size);
+
+    // phdr table (dlpi_phdr points here at runtime; p_vaddr are
+    // link-time).
+    ElfW(Phdr)* ph = (ElfW(Phdr)*)img.at(kR39PhdrOff);
+    ph[0].p_type   = PT_LOAD;  ph[0].p_vaddr = 0;
+    ph[0].p_memsz  = kR39StrOff;
+    ph[0].p_flags  = PF_R;
+    ph[1].p_type   = PT_LOAD;  ph[1].p_vaddr = kR39StrOff;
+    ph[1].p_memsz  = kR39GotOff - kR39StrOff;
+    ph[1].p_flags  = PF_R;
+    ph[2].p_type   = PT_LOAD;  ph[2].p_vaddr = kR39PltOff;
+    ph[2].p_memsz  = kR39ImgSize - kR39PltOff;
+    ph[2].p_flags  = PF_R | PF_W;
+    ph[3].p_type   = PT_DYNAMIC; ph[3].p_vaddr = kR39DynOff;
+
+    // .dynsym: entry 0 stays null; entry 1 names the fake PLT symbol.
+    ElfW(Sym)* sym = (ElfW(Sym)*)img.at(kR39SymOff);
+    sym[1].st_name = 1;   // offset 1 in .dynstr
+
+    // .dynstr: "\0zs_test_r39_plt_sym\0"
+    snprintf(img.at(kR39StrOff), 64, "%c%s", '\0', kR39HookName);
+
+    // .rel[a].plt: one entry against the GOT slot.
+    if (rela_form) {
+        ElfW(Rela)* r = (ElfW(Rela)*)img.at(kR39PltOff);
+        r->r_offset = kR39GotOff;
+        r->r_info   = ((ElfW(Addr))1 << 32) | 1;   // ELF64_R_SYM(1)
+    } else {
+        ElfW(Rel)* r = (ElfW(Rel)*)img.at(kR39PltOff);
+        r->r_offset = kR39GotOff;
+        r->r_info   = ((ElfW(Addr))1 << 32) | 1;
+    }
+
+    // GOT slot sentinel.
+    *(void**)img.at(kR39GotOff) = (void*)0x0badf00d;
+}
+
+void r39_write_dynamic(R39Image& img, uintptr_t symtab_ptr,
+                       uintptr_t strtab_ptr, uintptr_t jmprel_ptr,
+                       size_t pltrelsz, bool rela_form) {
+    ElfW(Dyn)* d = (ElfW(Dyn)*)img.at(kR39DynOff);
+    size_t i = 0;
+    d[i].d_tag = DT_SYMTAB;   d[i++].d_un.d_ptr = symtab_ptr;
+    d[i].d_tag = DT_STRTAB;   d[i++].d_un.d_ptr = strtab_ptr;
+    d[i].d_tag = DT_JMPREL;   d[i++].d_un.d_ptr = jmprel_ptr;
+    d[i].d_tag = DT_PLTRELSZ; d[i++].d_un.d_val = pltrelsz;
+    d[i].d_tag = DT_PLTREL;   d[i++].d_un.d_val = rela_form ? DT_RELA : DT_REL;
+    d[i].d_tag = DT_NULL;
+}
+
+void r39_invoke_walker(R39Image& img) {
+    dl_phdr_info info = {};
+    const char name[] = "/system/lib64/libfake_r39.so";
+    info.dlpi_addr = (ElfW(Addr))img.base;   // the load bias
+    info.dlpi_name = name;
+    info.dlpi_phdr = (ElfW(Phdr)*)img.at(kR39PhdrOff);
+    info.dlpi_phnum = 4;
+    patch_got_all_for_phdr(&info, 0, nullptr);
+}
+} // namespace
+
+ZS_TEST(got_walker_patches_unrebased_bionic_dynamic_rela) {
+    hide_advanced_register_got_hook(kR39HookName, kR39HookFn);
+
+    R39Image img;
+    r39_prepare_image(img, /*rela_form=*/true);
+    uintptr_t B = (uintptr_t)img.base;
+    // Case 1 — bionic: RAW link-time VAs in .dynamic.
+    r39_write_dynamic(img, kR39SymOff, kR39StrOff, kR39PltOff,
+                      sizeof(ElfW(Rela)), /*rela_form=*/true);
+    r39_invoke_walker(img);
+    ZS_CHECK_EQ(*(uintptr_t*)img.at(kR39GotOff), (uintptr_t)kR39HookFn);
+
+    // Case 2 — glibc: d_ptr values already runtime-absolute.
+    *(uintptr_t*)img.at(kR39GotOff) = 0x0badf00d;   // reset sentinel
+    clear_walked_dsos();
+    r39_write_dynamic(img, B + kR39SymOff, B + kR39StrOff, B + kR39PltOff,
+                      sizeof(ElfW(Rela)), /*rela_form=*/true);
+    r39_invoke_walker(img);
+    ZS_CHECK_EQ(*(uintptr_t*)img.at(kR39GotOff), (uintptr_t)kR39HookFn);
+
+    // Case 3 — undecided convention: both candidates outside the
+    // DSO span; the walker must treat the tables as absent (skip the
+    // DSO entirely — no crash, no patch).
+    *(uintptr_t*)img.at(kR39GotOff) = 0x0badf00d;
+    clear_walked_dsos();
+    r39_write_dynamic(img, /*symtab=*/0x12345000, kR39StrOff, kR39PltOff,
+                      sizeof(ElfW(Rela)), /*rela_form=*/true);
+    r39_invoke_walker(img);
+    ZS_CHECK_EQ(*(uintptr_t*)img.at(kR39GotOff), 0x0badf00d);
+
+    // Restore every patched slot record before unmapping (the
+    // uninstall pass dereferences the recorded slot pointers).
+    hide_advanced_uninstall_got_hooks();
+    *(uintptr_t*)img.at(kR39GotOff) = 0x0badf00d;
+    munmap(img.base, img.size);
+}
+
+ZS_TEST(got_walker_patches_unrebased_bionic_dynamic_rel) {
+    // Case 4 — DT_PLTREL == DT_REL: entries are ElfW(Rel) (no
+    // r_addend; 8 bytes on ELF32, 16 on ELF64). The pre-R39 walker
+    // always used the ElfW(Rela) stride, so on 32-bit ABIs it read
+    // entries past their real ends.
+    // mmap very likely reuses the address the RELA test just unmapped
+    // — and its last case MARKED that address as walked. Start clean
+    // or the walker would skip this image as "already processed".
+    clear_walked_dsos();
+    hide_advanced_register_got_hook(kR39HookName, kR39HookFn);
+
+    R39Image img;
+    r39_prepare_image(img, /*rela_form=*/false);
+    r39_write_dynamic(img, kR39SymOff, kR39StrOff, kR39PltOff,
+                      sizeof(ElfW(Rel)), /*rela_form=*/false);
+    r39_invoke_walker(img);
+    ZS_CHECK_EQ(*(uintptr_t*)img.at(kR39GotOff), (uintptr_t)kR39HookFn);
+
+    hide_advanced_uninstall_got_hooks();
+    *(uintptr_t*)img.at(kR39GotOff) = 0x0badf00d;
+    munmap(img.base, img.size);
+}
+
+// ROUND 39 (A1, helper-level): zs_rebase_dyn_ptr resolves both
+// conventions and fails closed on the undecided one.
+ZS_TEST(rebase_dyn_ptr_resolves_both_conventions) {
+    R39Image img;
+    r39_prepare_image(img, /*rela_form=*/true);
+    uintptr_t B = (uintptr_t)img.base;
+
+    dl_phdr_info info = {};
+    const char name[] = "/system/lib64/libfake_r39b.so";
+    info.dlpi_addr = (ElfW(Addr))B;
+    info.dlpi_name = name;
+    info.dlpi_phdr = (ElfW(Phdr)*)img.at(kR39PhdrOff);
+    info.dlpi_phnum = 4;
+
+    uintptr_t lo = 0, hi = 0;
+    ZS_CHECK_EQ(zs_dso_load_span(&info, &lo, &hi), 1);
+    ZS_CHECK_EQ(lo, B);
+    ZS_CHECK_EQ(hi, B + kR39ImgSize);
+
+    // Raw link-time VA -> bias-adjusted.
+    ZS_CHECK_EQ(zs_rebase_dyn_ptr(&info, lo, hi, kR39StrOff), B + kR39StrOff);
+    // Already runtime-absolute -> unchanged.
+    ZS_CHECK_EQ(zs_rebase_dyn_ptr(&info, lo, hi, B + kR39StrOff), B + kR39StrOff);
+    // Undecidable -> 0 (absent), never a wild pointer.
+    ZS_CHECK_EQ(zs_rebase_dyn_ptr(&info, lo, hi, 0x12345000), 0);
+    // Null stays null.
+    ZS_CHECK_EQ(zs_rebase_dyn_ptr(&info, lo, hi, 0), 0);
+
+    munmap(img.base, img.size);
+}
+
 // ======================================================================
 // Round 9 tests
 // ======================================================================

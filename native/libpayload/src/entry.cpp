@@ -456,6 +456,14 @@ static void apply_module_gid_override(gid_t gid) {
 static long uid_drop_hook(void* wrapper_fp, uid_t id,
                           long (*call_real)(void*), void* real_ctx,
                           int arg_count) {
+    // ROUND 39 (C1): fail-inert — in a policy-denied environment the
+    // child pipeline must not run against the half-state that
+    // crash-looped the system_server children on the Android 7.1.1
+    // emulator. Relay the call untouched; the module stays resident
+    // and injected, the machinery stays off.
+    if (ZS_UNLIKELY(zs_module_env_denied())) {
+        return call_real(real_ctx);
+    }
     if (getpid() != g_origin_pid &&
         !g_hide_done.load(std::memory_order_acquire)) {
         // ROUND 37 (Bug 4): an ANCESTOR's dispatch latch (an app
@@ -688,6 +696,12 @@ extern "C" long zs_impl_setcontext(void* wrapper_fp, long a0, long a1,
         rv = -1;
     }
 
+    // ROUND 39 (C1): fail-inert in policy-denied environments (see
+    // module_dispatch.cpp) — the coverage/dispatch below is exactly
+    // the machinery that ran on half-state on the 7.1.1 emulator.
+    if (ZS_UNLIKELY(zs_module_env_denied())) {
+        return rv;
+    }
     // Isolated coverage: forked children only, undecidable ranges
     // only, once only. ROUND 37 (Bug 4): the dispatch-latch bounce is
     // now pid-aware — an INHERITED latch (an app zygote that
@@ -750,6 +764,13 @@ extern "C" long zs_impl_fork(void* /*wrapper_fp*/) {
     // VM exists AND we still run pre-fork — acquire the JNIEnv and
     // dispatch module onLoad there (once per process lifetime).
     if (getpid() == g_origin_pid) {
+        // ROUND 39 (C1): in a policy-denied environment the first
+        // fork's zygote-side dispatch would run against the
+        // half-initialized daemon state that crashed the children
+        // on the Android 7.1.1 emulator — skip it entirely once the
+        // gate tripped (the lazy init itself keeps running so the
+        // gate can only ever be set by a REAL EACCES probe).
+        if (!zs_module_env_denied()) {
         // ROUND 34: refresh the denylist/packages.list HERE, in the
         // long-lived zygote, pre-fork. Child-side refreshes were
         // COW-private: the 2 s throttle never elided a stat (every
@@ -766,6 +787,7 @@ extern "C" long zs_impl_fork(void* /*wrapper_fp*/) {
         // real devices (late service stage vs zygote start).
         (void)zs_module_lazy_daemon_init();
         zs_module_on_first_fork();
+        }
     }
     // Direct libc fork; ART's pthread_atfork handlers must still run.
     if (g_real_fork) return g_real_fork();
@@ -1054,6 +1076,22 @@ void zs_entry_init() {
     hide_advanced_init();
     hide_stealth_init();
 
+    // ROUND 39 (C1, hardened): the environment probe runs BEFORE any
+    // GOT hook is installed. In a policy-denied environment (the
+    // Android 7.1.1 emulator: the zygote domain is EACCES-denied the
+    // daemon/session socket), the fork-child pipeline that these
+    // hooks drive was the crash vector — children died executing
+    // de-permissioned payload pages and system_server re-entered
+    // ZygoteInit.main in a fork cascade (tombstones + kernel log
+    // verified). With the gate tripped HERE, the five privilege-drop
+    // wrappers and the fork wrapper are never installed: no module
+    // code ever runs in a forked child. The bridge injection, the
+    // magic mounts, the daemon and the module files all stay; what
+    // is lost is the in-child dispatch/hide machinery — the honest
+    // stability trade for an environment the module cannot safely
+    // operate its pipeline in.
+    zs_module_env_probe();
+
     // Load Zygisk modules (their .so paths get registered for the
     // unmap set inside zs_module_init).
     zs_module_init();
@@ -1063,6 +1101,12 @@ void zs_entry_init() {
     // entry points that detect + drive the whole pipeline. Every
     // other process forked from the zygote executes these hooks as a
     // single pid-compare + branch and nothing else.
+    if (zs_module_env_denied()) {
+        ZS_LOGW("payload: environment denied — fork-child hooks NOT "
+                "installed (fail-inert; module stays mounted and "
+                "injected)");
+        return;
+    }
     hide_advanced_register_got_hook("setresgid",
         (void*)&zs_setresgid_wrapper);
     hide_advanced_register_got_hook("setresuid",

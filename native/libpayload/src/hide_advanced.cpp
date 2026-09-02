@@ -4313,6 +4313,74 @@ static void* match_registered_hook(const char* name) {
 #  define ZS_ELF_R_SYM(info) ELF32_R_SYM(info)
 #endif
 
+// ------------------------------------------------------------------------
+// ROUND 39 (A1 + A2 — found by the Android 7.1.1 emulator run, fatal on
+// device, invisible to every host test):
+//
+// A1. The GOT walker consumed DT_SYMTAB / DT_STRTAB / DT_JMPREL
+//     d_un.d_ptr values as RUNTIME pointers. Bionic never rebases the
+//     in-memory .dynamic section — those values stay LINK-TIME virtual
+//     addresses on every Android release (verified in AOSP at
+//     android-5.0.0_r1 linker.cpp:1720 and android-7.1.1_r1
+//     linker.cpp:3567: soinfo fields are computed as
+//     "load_bias + d->d_un.d_ptr" and the section itself is only ever
+//     rewritten for the DT_DEBUG/GDB slot). glibc, the host-test world,
+//     DOES rebase those tags in memory (elf/get-dynamic-info.h
+//     ADJUST_DYN_INFO) — which is exactly why all 273 host tests stayed
+//     green while the walker segfaulted zygote64 on the emulator with
+//     symtab=0x288 / strtab=0x948 / jmprel=0x12e0 (raw file offsets as
+//     pointers; tombstone: SEGV at 0x12ec inside dl_iterate_phdr under
+//     zs_entry_init -> hide_advanced_install_got_hooks). The zygote
+//     crash-looped and the device never finished booting.
+//
+//     Fix: resolve the convention PER DSO instead of assuming one.
+//     Compute the DSO's mapped span from its PT_LOADs and accept the
+//     raw value only if it already lands inside; otherwise add the
+//     load bias and require the rebased value to land inside. If
+//     neither does, report "absent" so the DSO is skipped instead of
+//     dereferenced — a malformed table must cost stealth coverage on
+//     one DSO, never the zygote. Correct for raw bionic, rebased
+//     glibc, and dlpi_addr == 0 executables alike.
+//
+// A2. The walker always parsed PLT relocations as ElfW(Rela). On the
+//     32-bit ABIs (x86, armeabi-v7a) PLT entries are Elf32_Rel — 8
+//     bytes, no r_addend, selected by DT_PLTREL == DT_REL — so the
+//     12-byte stride read entries past their real ends, produced
+//     garbage r_offset/r_info pairs, and could patch wild addresses.
+//     Fix: honor DT_PLTREL; walk Rel and Rela tables with their own
+//     strides. (r_offset is a link-time VA in both forms and under
+//     both conventions, so the existing dlpi_addr + r_offset slot
+//     computation stays correct.)
+// ------------------------------------------------------------------------
+static int zs_dso_load_span(const struct dl_phdr_info* info,
+                             uintptr_t* lo, uintptr_t* hi) {
+    uintptr_t l = UINTPTR_MAX, h = 0;
+    for (int i = 0; i < info->dlpi_phnum; ++i) {
+        const ElfW(Phdr)& ph = info->dlpi_phdr[i];
+        if (ph.p_type != PT_LOAD || ph.p_memsz == 0) continue;
+        uintptr_t s = (uintptr_t)info->dlpi_addr + ph.p_vaddr;
+        uintptr_t e = s + ph.p_memsz;
+        if (s < l) l = s;
+        if (e > h) h = e;
+    }
+    *lo = l;
+    *hi = h;
+    return l < h;
+}
+
+// Returns 0 when the convention cannot be decided safely (caller
+// treats the table as absent and skips the DSO).
+static uintptr_t zs_rebase_dyn_ptr(const struct dl_phdr_info* info,
+                                   uintptr_t lo, uintptr_t hi,
+                                   ElfW(Addr) raw) {
+    uintptr_t v = (uintptr_t)raw;
+    if (v == 0) return 0;
+    if (v >= lo && v < hi) return v;    // already runtime-absolute (glibc)
+    uintptr_t r = (uintptr_t)info->dlpi_addr + v;
+    if (r >= lo && r < hi) return r;    // link-time VA + load bias (bionic)
+    return 0;                           // undecided: skip, never crash
+}
+
 static int patch_got_all_for_phdr(struct dl_phdr_info* info,
                                   size_t /*size*/, void* /*data*/) {
     if (!info || !info->dlpi_name || info->dlpi_name[0] == '\0') return 0;
@@ -4360,26 +4428,68 @@ static int patch_got_all_for_phdr(struct dl_phdr_info* info,
     const char*       strtab   = nullptr;
     const ElfW(Rela)* jmprel   = nullptr;
     size_t            pltrelsz = 0;
+    // ROUND 39 (A2): DT_PLTREL selects the PLT entry format — DT_RELA
+    // on the 64-bit ABIs, DT_REL on 32-bit x86 / armeabi-v7a. The
+    // default keeps the pre-R39 behavior for images that omit the tag
+    // (and for the host tests that never set it).
+    int               plt_is_rela = 1;
+
+    // ROUND 39 (A1): span for the per-DSO raw-vs-rebased decision.
+    uintptr_t span_lo = 0, span_hi = 0;
+    if (!zs_dso_load_span(info, &span_lo, &span_hi)) return 0;
 
     for (const ElfW(Dyn)* d = dyn; d->d_tag != DT_NULL; d++) {
         switch (d->d_tag) {
-            case DT_SYMTAB:   symtab   = reinterpret_cast<const ElfW(Sym)*>(d->d_un.d_ptr); break;
-            case DT_STRTAB:   strtab   = reinterpret_cast<const char*>(d->d_un.d_ptr);      break;
-            case DT_JMPREL:   jmprel   = reinterpret_cast<const ElfW(Rela)*>(d->d_un.d_ptr); break;
-            case DT_PLTRELSZ: pltrelsz = d->d_un.d_val;                                    break;
+            case DT_SYMTAB:
+                symtab = reinterpret_cast<const ElfW(Sym)*>(
+                    zs_rebase_dyn_ptr(info, span_lo, span_hi, d->d_un.d_ptr));
+                break;
+            case DT_STRTAB:
+                strtab = reinterpret_cast<const char*>(
+                    zs_rebase_dyn_ptr(info, span_lo, span_hi, d->d_un.d_ptr));
+                break;
+            case DT_JMPREL:
+                jmprel = reinterpret_cast<const ElfW(Rela)*>(
+                    zs_rebase_dyn_ptr(info, span_lo, span_hi, d->d_un.d_ptr));
+                break;
+            case DT_PLTRELSZ: pltrelsz = d->d_un.d_val; break;
+            case DT_PLTREL:   plt_is_rela = (d->d_un.d_val == DT_RELA); break;
             default: break;
         }
     }
     if (!symtab || !strtab || !jmprel || pltrelsz == 0) return 0;
 
-    size_t n = pltrelsz / sizeof(ElfW(Rela));
+    // ROUND 39 (A2): entry stride + info offset per table form. Both
+    // forms carry r_offset first and r_info at the same place RELATIVE
+    // to the entry start for their type; only ElfW(Rela) has r_addend,
+    // which the GOT patch never reads.
+    const size_t ent_size = plt_is_rela ? sizeof(ElfW(Rela))
+                                        : sizeof(ElfW(Rel));
+    size_t n = pltrelsz / ent_size;
     long pagesize = got_pagesize();
 
     for (size_t i = 0; i < n; i++) {
-        const ElfW(Rela)& r = jmprel[i];
+        // ROUND 39 (A2): read the pair through Rel or Rela layout.
+        // r_info widens exactly to ElfW(Addr) on both ELF classes
+        // (Elf64_Xword / Elf32_Word), so both forms land here.
+        ElfW(Addr) r_offset = 0;
+        ElfW(Addr) r_info = 0;
+        if (plt_is_rela) {
+            const ElfW(Rela)& r =
+                *reinterpret_cast<const ElfW(Rela)*>(
+                    reinterpret_cast<const char*>(jmprel) + i * ent_size);
+            r_offset = r.r_offset;
+            r_info   = r.r_info;
+        } else {
+            const ElfW(Rel)& r =
+                *reinterpret_cast<const ElfW(Rel)*>(
+                    reinterpret_cast<const char*>(jmprel) + i * ent_size);
+            r_offset = r.r_offset;
+            r_info   = r.r_info;
+        }
         // Round 7 (P5): ELF_R_SYM (not ELF64_R_SYM) so 32-bit ELF
         // relocations parse correctly on armeabi-v7a builds.
-        size_t sym_idx = ZS_ELF_R_SYM(r.r_info);
+        size_t sym_idx = ZS_ELF_R_SYM(r_info);
         const ElfW(Sym)& sym = symtab[sym_idx];
         const char* name = strtab + sym.st_name;
 
@@ -4387,7 +4497,7 @@ static int patch_got_all_for_phdr(struct dl_phdr_info* info,
         if (!hook) continue;
 
         void** slot = reinterpret_cast<void**>(
-            reinterpret_cast<char*>(info->dlpi_addr) + r.r_offset);
+            reinterpret_cast<char*>(info->dlpi_addr) + r_offset);
         void* current = *slot;
         if (current == hook) continue;  // already patched (re-walk)
 

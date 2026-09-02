@@ -811,3 +811,93 @@ environment means for this module, and what changed:
   `getprop ro.dalvik.vm.native.bridge` shows the loader name —
   inherent to late root; apps launched in that window can read it
   (documented, not hidden).
+
+## Round 39 — Android 7.1.1 on real hardware-grade testing (the API 25 emulator)
+
+Round 39 is the first round verified on a LIVE Android 7.1.1 system
+(the API 25 x86_64 emulator, Magisk v25.2, enforcing SELinux) rather
+than by source reading. The full chain now boots: ART loads the
+randomized-name bridge into BOTH zygotes (`-XX:NativeBridge=` in both
+pids' logs), the payload maps, the daemon runs cloaked as `subsysd`
+(PPid 1), apps launch, `sys.boot_completed=1`. Three bugs were found
+and fixed on the way; one honest compatibility gate was added.
+
+### Bug A (was FATAL, every Android release): the GOT walker read raw
+### `.dynamic` pointers
+
+`patch_got_all_for_phdr` used `DT_SYMTAB`/`DT_STRTAB`/`DT_JMPREL`
+`d_un.d_ptr` values as runtime pointers. Bionic never rebases the
+in-memory `.dynamic` — those values stay LINK-TIME virtual addresses
+on every Android release (verified at android-5.0.0_r1 and
+android-7.1.1_r1: soinfo fields are computed as
+`load_bias + d->d_un.d_ptr`, and the section is only ever rewritten
+for the DT_DEBUG slot). glibc — the host-test world — DOES rebase
+those tags in memory (`elf/get-dynamic-info.h` ADJUST_DYN_INFO),
+which is exactly why all 273 host tests stayed green while the walker
+segfaulted zygote64 on the emulator: symtab=0x288 / strtab=0x948 /
+jmprel=0x12e0 read as pointers, SEGV at 0x12ec inside
+`dl_iterate_phdr` under `zs_entry_init -> install_got_hooks`; the
+zygote crash-looped and the device never finished booting.
+
+The fix resolves the convention PER DSO: compute the DSO's mapped
+span from its PT_LOADs and accept the raw value only if it already
+lands inside; otherwise add the load bias and require the rebased
+value to land inside; if neither does, treat the table as absent and
+skip the DSO (a malformed table must cost stealth coverage on one
+DSO, never the zygote). Correct for raw bionic, rebased glibc, and
+`dlpi_addr == 0` executables alike — verified on the emulator: the
+walk now completes ("GOT walk done (6 hook(s), 19 slot(s))") and the
+uid-drop wrappers fire.
+
+### Bug B (32-bit ABIs): the walker always parsed PLT entries as
+### `ElfW(Rela)`
+
+On the 32-bit ABIs (x86, armeabi-v7a) PLT relocations are `Elf32_Rel`
+— 8 bytes, no `r_addend`, selected by `DT_PLTREL == DT_REL` — so the
+12-byte stride read entries past their real ends and produced
+garbage `r_offset`/`r_info` pairs. The walker now honors `DT_PLTREL`
+and walks Rel and Rela tables with their own strides.
+
+### Bug C (Android 7.1.1, enforcing SELinux): the fail-inert
+### environment gate
+
+With the module installed, the system_server child crash-looped:
+tombstones showed children executing de-permissioned payload pages,
+`ZygoteInit` re-entered by system-server pids (`accept()` ENOTSOCK
+deaths, cascading re-forks), the zygote restarting every ~18 s. The
+control boot with the module disabled showed zero kills — Magisk
+itself was healthy. The cause chain: on 7.1.1 the enforcing policy
+DENIES the zygote domain the module's own infrastructure
+(`avc: denied { write } ... name=s ... scontext=u:r:zygote:s0
+tcontext=system_data_file tclass=sock_file`, plus the `/data/adb`
+search denial), and the fork-child pipeline (module dispatch + hide
+machinery driven from the privilege-drop hooks) then ran against a
+half-initialized daemon/session state.
+
+EACCES — not ENOENT/ECONNREFUSED — is what distinguishes a POLICY
+fact from "daemon not up, retry later". The Round 39 gate:
+
+- `zs_module_env_probe()` runs at payload init, BEFORE any GOT hook
+  is installed: one bounded socket connect + both documented
+  session-file reads. Any EACCES trips the gate.
+- Gated environment: the five privilege-drop wrappers and the fork
+  wrapper are NEVER installed (no module code ever runs in a forked
+  child), and the lazy-init probe keeps the gate armed.
+- Not gated (policy grants access — the Android 5.0 emulator run
+  this round, daemon link proven live): nothing changes.
+
+On the 7.1.1 emulator the gated boot is fully healthy: both zygotes
+injected, the daemon cloaked, settings/systemui alive, zero zygote
+restarts. The honest residual: in a policy-denied environment the
+in-child dispatch/hide machinery is off (module files, mounts,
+injection and daemon all stay, verifiable as root — the user-facing
+contract for hostile SELinux environments is "fail-inert", not
+"fail-fatal").
+
+### The Android 5.0 re-verification note
+
+The 5.0 x86 emulator run of Round 38's artifact (build #40) had
+proven fork-hide live; that same build carries Bugs A and B. The
+Round 39 rebase-aware walker is convention-agnostic (raw vs. rebased
+resolved per DSO), so the 5.0 behavior is preserved by construction —
+the R39 synthetic-ELF host tests pin both conventions explicitly.
