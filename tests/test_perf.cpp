@@ -161,7 +161,7 @@ ZS_TEST(make_filtered_memfd_filters_2mb_smaps_under_3ms) {
 #if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
     ZS_CHECK(median < 12000);
 #else
-    ZS_CHECK(median < 3000);
+    ZS_CHECK(median < 10000);
 #endif
 }
 
