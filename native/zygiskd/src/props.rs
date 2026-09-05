@@ -219,16 +219,23 @@ impl AreaMap {
         Ok(unsafe { self.data().add(start) })
     }
 
+    fn word(&self, off: u32) -> Result<&AtomicU32, PropError> {
+        if off % std::mem::align_of::<AtomicU32>() as u32 != 0 {
+            return Err(PropError::BadArea("unaligned word offset".into()));
+        }
+        let p = self.obj_range(off, std::mem::size_of::<AtomicU32>())?;
+        Ok(unsafe { &*(p as *const AtomicU32) })
+    }
+
     fn load_u32(&self, off: u32) -> Result<u32, PropError> {
-        let p = self.obj(off)?;
-        Ok(unsafe { std::ptr::read_volatile(p as *const u32) })
+        Ok(self.word(off)?.load(Ordering::Acquire))
     }
 
     fn store_u32(&self, off: u32, val: u32) -> Result<(), PropError> {
-        let p = self.obj(off)?;
-        unsafe {
-            (&*(p as *const AtomicU32)).store(val, Ordering::Relaxed);
+        if !self.writable {
+            return Err(PropError::BadArea("read-only mapping".into()));
         }
+        self.word(off)?.store(val, Ordering::Relaxed);
         Ok(())
     }
 
@@ -271,8 +278,11 @@ impl AreaMap {
     /// like bionic's (allocate, then release-store the pointer).
     fn find_trie_node(&self, root: u32, frag: &str, alloc: bool) -> Result<Option<u32>, PropError> {
         let mut current = root;
-        loop {
+        // A valid walk cannot visit more nodes than fit in this mapping.
+        // Bound traversal so corrupt sibling links cannot hang the daemon.
+        for _ in 0..(self.len - PROP_AREA_HEADER_SIZE) / TRIE_NODE_SIZE {
             let node = current;
+            self.obj_range(node, TRIE_NODE_SIZE)?;
             let namelen = self.load_u32(node)? as usize;
             let name = self.read_name(node + TRIE_NODE_SIZE as u32, namelen + 1)?;
             let ord = Self::cmp_names(frag, &name);
@@ -308,6 +318,7 @@ impl AreaMap {
             self.store_u32(node + field as u32, new_off)?;
             return Ok(Some(new_off));
         }
+        Err(PropError::BadArea("cyclic property trie".into()))
     }
 
     /// `find_property` — the dot-fragment walk (read or alloc).
@@ -360,22 +371,33 @@ impl AreaMap {
         }
     }
 
-    /// `allocate_obj` — 4-aligned bump allocation with bounds check.
-    fn alloc_obj(&self, size: usize) -> Result<u32, PropError> {
-        let aligned = (size + 3) & !3;
+    /// Validate an allocation without changing the shared header.
+    fn check_allocation(&self, size: usize) -> Result<(u32, u32), PropError> {
+        if !self.writable {
+            return Err(PropError::BadArea("read-only mapping".into()));
+        }
         let used = self.bytes_used() as usize;
         let limit = self.len - PROP_AREA_HEADER_SIZE;
-        if used + aligned > limit {
+        if used < TRIE_NODE_SIZE || used % 4 != 0 || used > limit {
+            return Err(PropError::BadArea("invalid allocation cursor".into()));
+        }
+        let aligned = size.checked_add(3).ok_or(PropError::AreaFull)? & !3;
+        if aligned > limit - used {
             return Err(PropError::AreaFull);
         }
-        let off = used as u32;
+        Ok((used as u32, (used + aligned) as u32))
+    }
+
+    /// `allocate_obj` — 4-aligned bump allocation with bounds check.
+    fn alloc_obj(&self, size: usize) -> Result<u32, PropError> {
+        let (off, end) = self.check_allocation(size)?;
         // bytes_used_ is not atomic in bionic (single-writer by init); we
         // are an occasional second writer at boot. Store then fence so
         // readers of the header see the bump before we publish any
         // pointer into the new region.
         unsafe {
             let hdr = &*(self.addr as *const AtomicU32);
-            hdr.store(off + aligned as u32, Ordering::Relaxed);
+            hdr.store(end, Ordering::Relaxed);
         }
         fence(Ordering::Release);
         Ok(off)
@@ -390,16 +412,15 @@ impl AreaMap {
     /// Read the value of the prop_info at data offset `pi`.
     /// Mirrors `ReadMutablePropertyValue` (inline and long forms).
     fn read_prop_value(&self, pi: u32) -> Result<Option<String>, PropError> {
+        self.obj_range(pi, PROP_INFO_SIZE)?;
         let serial = self.load_u32(pi)?;
         let len = serial >> SERIAL_VALUE_LEN;
         if serial & K_LONG_FLAG != 0 {
             // Long value: offset is relative to the prop_info.
             let long_off = self.load_u32(pi + PROP_INFO_LONG_OFFSET_OFF as u32)?;
-            let base = pi as i64 + long_off as i64;
-            if base < 0 {
-                return Err(PropError::BadArea("negative long offset".into()));
-            }
-            let v = self.read_name(base as u32, 4 * 1024 * 1024)?;
+            let base = pi.checked_add(long_off)
+                .ok_or_else(|| PropError::BadArea("long offset overflow".into()))?;
+            let v = self.read_name(base, 4 * 1024 * 1024)?;
             return Ok(Some(v));
         }
         if len as usize >= PROP_VALUE_MAX {
@@ -441,14 +462,21 @@ impl AreaMap {
                 self.path.display()
             )));
         }
+        // Validate the complete record before publishing a dirty serial.
+        // An error must not leave readers waiting on an unfinished update.
+        self.obj_range(pi, PROP_INFO_SIZE)?;
         let serial = self.load_u32(pi)?;
         if serial & K_LONG_FLAG != 0 {
             return Err(PropError::LongPropUnsupported);
         }
         let old_len = serial >> SERIAL_VALUE_LEN;
+        if old_len as usize >= PROP_VALUE_MAX {
+            return Err(PropError::BadArea("length byte out of range".into()));
+        }
+        let dst = self.obj_range(pi + PROP_INFO_VALUE_OFF as u32, value_b.len() + 1)?;
 
         // 1. Copy the old value into the dirty backup area (A10+ only).
-        if self.has_dirty_backup() && old_len as usize <= PROP_VALUE_MAX {
+        if self.has_dirty_backup() {
             let backup = TRIE_NODE_SIZE as u32; // data_ + sizeof(prop_trie_node)
             let src = pi + PROP_INFO_VALUE_OFF as u32;
             unsafe {
@@ -465,8 +493,6 @@ impl AreaMap {
         self.store_u32(pi, dirty)?;
         // 3. Write the new value (+ NUL). bionic uses strlcpy(len+1).
         unsafe {
-            let dst = self.obj_range(pi + PROP_INFO_VALUE_OFF as u32,
-                                      value_b.len() + 1)?;
             std::ptr::copy_nonoverlapping(value_b.as_ptr(), dst, value_b.len());
             *dst.add(value_b.len()) = 0;
         }
@@ -555,8 +581,9 @@ impl AreaMap {
     fn bump_global_serial(&self) {
         unsafe {
             let sp = &*(self.serial_ptr() as *const AtomicU32);
-            let cur = sp.load(Ordering::Relaxed);
-            sp.store(cur + 1, Ordering::Release);
+            // Atomic addition wraps at u32::MAX, as bionic's counter does,
+            // and does not lose increments from independent mappings.
+            sp.fetch_add(1, Ordering::Release);
             futex_wake(self.serial_ptr());
         }
     }
@@ -707,8 +734,14 @@ impl PropEngine {
     /// (update-in-place, or add when absent; long existing values are
     /// deleted then re-added, mirroring Magisk's resetprop).
     pub fn set(&self, name: &str, value: &str) -> Result<(), PropError> {
-        if name.is_empty() || name.len() > 255 {
+        if name.is_empty() || name.len() > 255
+            || name.split('.').any(str::is_empty)
+            || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-@:".contains(&b))
+        {
             return Err(PropError::BadArea("bad property name".into()));
+        }
+        if value.as_bytes().contains(&0) {
+            return Err(PropError::BadArea("property value contains NUL".into()));
         }
         // Find the area (read walk), then re-open it writable.
         let target: AreaMap = if let Some(ro) = self.find_area_ro(name) {
@@ -730,6 +763,10 @@ impl PropEngine {
             if let Some(pi) = target.prop_of(node)? {
                 let serial = target.load_u32(pi)?;
                 if serial & K_LONG_FLAG != 0 {
+                    // Under the engine's single-writer contract, reserve-check
+                    // the replacement before unlinking the original property.
+                    // A full area must leave the old long value readable.
+                    target.check_allocation(PROP_INFO_SIZE + name.len() + 1)?;
                     target.delete_prop(node)?;
                     let fresh = target.find_node(name, true)?
                         .ok_or(PropError::BadArea("node vanished after delete".into()))?;
@@ -1008,6 +1045,155 @@ mod tests {
         // The new node must be in the dalvik_config area (not the serial file).
         let bytes = std::fs::read(root.join("u:object_r:dalvik_config_prop:s0")).unwrap();
         assert!(contains_sub(&bytes, b"ro.dalvik.vm.native.bridge"));
+    }
+
+    // Regression cases for the nine property-engine fixes. Keep these
+    // self-contained so they can also be run against the original engine.
+    #[test]
+    fn regression_word_access_is_checked() {
+        let path = tmpdir().join("area");
+        // The last aligned word has only two bytes inside the mapping.
+        fixture::build_area(&path, &[], true, 8194);
+        let area = AreaMap::open(&path, true).unwrap();
+        let tail = (area.len - PROP_AREA_HEADER_SIZE - 2) as u32;
+        for off in [1, tail, u32::MAX] {
+            assert!(area.load_u32(off).is_err());
+            assert!(area.store_u32(off, 123).is_err());
+        }
+        let ro = AreaMap::open(&path, false).unwrap();
+        assert!(ro.store_u32(0, 123).is_err());
+        assert_eq!(area.load_u32(0).unwrap(), 0);
+    }
+
+    #[test]
+    fn regression_cyclic_trie_returns_error() {
+        let (root, _) = engine_with(&[("a", "1"), ("b", "2")]);
+        let area = AreaMap::open(&root.join("u:object_r:dalvik_config_prop:s0"), true).unwrap();
+        let a = area.find_node("a", false).unwrap().unwrap();
+        let b = area.find_node("b", false).unwrap().unwrap();
+        area.store_u32(b + 12, a).unwrap();
+        let before = fs::read(&area.path).unwrap();
+        assert!(area.find_node("z", false).is_err());
+        assert!(area.find_node("z", true).is_err());
+        assert_eq!(fs::read(&area.path).unwrap(), before);
+        area.store_u32(a + 12, a).unwrap();
+        assert!(area.find_node("z", false).is_err());
+    }
+
+    #[test]
+    fn regression_allocation_rejects_overflow_and_bad_cursors() {
+        let (root, _) = engine_with(&[]);
+        let area = AreaMap::open(&root.join("u:object_r:dalvik_config_prop:s0"), true).unwrap();
+        let used = area.bytes_used();
+        assert!(area.alloc_obj(usize::MAX).is_err());
+        assert_eq!(area.bytes_used(), used);
+        for bad in [0, 21, u32::MAX, (area.len - PROP_AREA_HEADER_SIZE + 4) as u32] {
+            unsafe { (&*(area.addr as *const AtomicU32)).store(bad, Ordering::Relaxed); }
+            assert!(area.alloc_obj(4).is_err());
+            assert_eq!(area.bytes_used(), bad);
+        }
+        unsafe { (&*(area.addr as *const AtomicU32)).store(used, Ordering::Relaxed); }
+        let ro = AreaMap::open(&area.path, false).unwrap();
+        assert!(ro.alloc_obj(4).is_err());
+        assert_eq!(area.alloc_obj(1).unwrap(), used);
+        assert_eq!(area.bytes_used(), used + 4);
+    }
+
+    #[test]
+    fn regression_long_offset_cannot_wrap_into_mapping() {
+        let (root, _) = engine_with(&[(PROP_KEY, "0")]);
+        let area = AreaMap::open(&root.join("u:object_r:dalvik_config_prop:s0"), true).unwrap();
+        let node = area.find_node(PROP_KEY, false).unwrap().unwrap();
+        let pi = area.prop_of(node).unwrap().unwrap();
+        area.store_u32(pi, K_LONG_FLAG).unwrap();
+        // pi + offset wraps to zero in the old implementation.
+        area.store_u32(pi + PROP_INFO_LONG_OFFSET_OFF as u32, 0u32.wrapping_sub(pi)).unwrap();
+        assert!(area.read_prop_value(pi).is_err());
+    }
+
+    #[test]
+    fn regression_failed_update_preserves_serial_and_bytes() {
+        let (root, _) = engine_with(&[(PROP_KEY, "0")]);
+        let area = AreaMap::open(&root.join("u:object_r:dalvik_config_prop:s0"), true).unwrap();
+        let pi = (area.len - PROP_AREA_HEADER_SIZE - 4) as u32;
+        area.store_u32(pi, 0).unwrap();
+        let before = fs::read(&area.path).unwrap();
+        assert!(area.update_prop(pi, "new").is_err());
+        assert_eq!(fs::read(&area.path).unwrap(), before);
+        let node = area.find_node(PROP_KEY, false).unwrap().unwrap();
+        let pi = area.prop_of(node).unwrap().unwrap();
+        for bad_len in [92, 255] {
+            area.store_u32(pi, bad_len << SERIAL_VALUE_LEN).unwrap();
+            let before = fs::read(&area.path).unwrap();
+            assert!(area.update_prop(pi, "new").is_err());
+            assert_eq!(fs::read(&area.path).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn regression_global_serial_wraps() {
+        let (root, e) = engine_with(&[(PROP_KEY, "0")]);
+        let area = AreaMap::open(&root.join("properties_serial"), true).unwrap();
+        unsafe { (&*(area.serial_ptr() as *const AtomicU32)).store(u32::MAX, Ordering::Relaxed); }
+        e.set(PROP_KEY, "1").unwrap();
+        assert_eq!(unsafe { read_u32(area.addr, 4) }, 0);
+        assert!(e.delete(PROP_KEY).unwrap());
+        assert_eq!(unsafe { read_u32(area.addr, 4) }, 1);
+    }
+
+    #[test]
+    fn regression_invalid_names_do_not_mutate_area() {
+        let (root, e) = engine_with(&[]);
+        let path = root.join("u:object_r:dalvik_config_prop:s0");
+        let before = fs::read(&path).unwrap();
+        for name in ["fresh.", "fresh..key", ".fresh", "bad\0name", "bad name", "bad/name", "\u{00e9}"] {
+            assert!(e.set(name, "value").is_err(), "accepted {name:?}");
+            assert_eq!(fs::read(&path).unwrap(), before, "mutated for {name:?}");
+        }
+        e.set("valid.key_1-2@:", "value").unwrap();
+        assert_eq!(e.get("valid.key_1-2@:").as_deref(), Some("value"));
+    }
+
+    #[test]
+    fn regression_nul_values_are_rejected_without_mutation() {
+        let (root, e) = engine_with(&[(PROP_KEY, "0")]);
+        let path = root.join("u:object_r:dalvik_config_prop:s0");
+        let before = fs::read(&path).unwrap();
+        for name in [PROP_KEY, "new.key"] {
+            assert!(e.set(name, "prefix\0suffix").is_err());
+            assert_eq!(fs::read(&path).unwrap(), before);
+        }
+        assert_eq!(e.get(PROP_KEY).as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn regression_full_area_keeps_long_property() {
+        let (root, e) = engine_with(&[(PROP_KEY, "0")]);
+        let path = root.join("u:object_r:dalvik_config_prop:s0");
+        let area = AreaMap::open(&path, true).unwrap();
+        let node = area.find_node(PROP_KEY, false).unwrap().unwrap();
+        let pi = area.prop_of(node).unwrap().unwrap();
+        let used = area.bytes_used();
+        let value = "x".repeat(128);
+        let long_off = used;
+        unsafe {
+            let dst = area.obj_range(long_off, value.len() + 1).unwrap();
+            std::ptr::copy_nonoverlapping(value.as_ptr(), dst, value.len());
+            *dst.add(value.len()) = 0;
+            (&*(area.addr as *const AtomicU32)).store(
+                (area.len - PROP_AREA_HEADER_SIZE) as u32, Ordering::Relaxed);
+        }
+        area.store_u32(pi, K_LONG_FLAG).unwrap();
+        area.store_u32(pi + PROP_INFO_LONG_OFFSET_OFF as u32, long_off - pi).unwrap();
+        assert_eq!(e.get(PROP_KEY).as_deref(), Some(value.as_str()));
+        let before = fs::read(&path).unwrap();
+        assert!(matches!(e.set(PROP_KEY, "short"), Err(PropError::AreaFull)));
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(e.get(PROP_KEY).as_deref(), Some(value.as_str()));
+        // With capacity available the same replacement still succeeds.
+        unsafe { (&*(area.addr as *const AtomicU32)).store(used + 132, Ordering::Relaxed); }
+        e.set(PROP_KEY, "short").unwrap();
+        assert_eq!(e.get(PROP_KEY).as_deref(), Some("short"));
     }
 
     fn contains_sub(hay: &[u8], needle: &[u8]) -> bool {
