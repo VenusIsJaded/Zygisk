@@ -1644,6 +1644,203 @@ def test_build_ndk_discovery(mk):
                   proc.stdout + proc.stderr)
 
 
+def test_build_regressions(mk):
+    """Exercise the real build driver with fake compilers and real ELF/zip tools.
+
+    No Android NDK or Rust installation is needed. The compiler doubles only
+    produce fixtures; path handling, strip, assembly and verification are real.
+    """
+    import struct
+    import zipfile
+
+    root = os.path.join(mk.root, "build fixture")
+    os.makedirs(os.path.join(root, "scripts", "installer"))
+    os.makedirs(os.path.join(root, "native", "zygiskd"))
+    for name in ("build_module.sh", "installer/update-binary",
+                 "installer/updater-script"):
+        shutil.copy(os.path.join(REPO_ROOT, "scripts", name),
+                    os.path.join(root, "scripts", name))
+    for name in ("customize.sh", "post-fs-data.sh", "service.sh", "uninstall.sh",
+                 "zs_compat.sh", "post-mount-hook.sh", "verify.sh", "LICENSE"):
+        shutil.copy(os.path.join(REPO_ROOT, name), root)
+    ndk = os.path.join(root, "Android NDK")
+    toolbin = os.path.join(ndk, "toolchains", "llvm", "prebuilt", "linux-x86_64", "bin")
+    os.makedirs(toolbin)
+    os.makedirs(os.path.join(ndk, "build", "cmake"))
+    with open(os.path.join(ndk, "build", "cmake", "android.toolchain.cmake"), "w"):
+        pass
+    write_exec(os.path.join(toolbin, "clang"), "#!/bin/sh\nexit 99\n")
+    os.symlink(shutil.which("strip"), os.path.join(toolbin, "llvm-strip"))
+    os.symlink(shutil.which("readelf"), os.path.join(toolbin, "llvm-readelf"))
+
+    seed = os.path.join(root, "fixture.so")
+    subprocess.run(["cc", "-shared", "-fPIC", "-s", "-Wl,-z,max-page-size=16384",
+                    "-x", "c", "-", "-o", seed], input="int fixture(void){return 0;}\n",
+                   text=True, capture_output=True, check=True, timeout=30)
+    with open(seed, "rb") as fp:
+        valid_elf = fp.read()
+
+    write_exec(os.path.join(mk.bindir, "cmake"), r'''#!/usr/bin/env python3
+import json, os, shutil, sys
+args = sys.argv[1:]
+with open(os.environ["BUILD_CALLS"], "a") as fp:
+    fp.write("cmake " + json.dumps(args) + "\n")
+if args[0] == "--build":
+    out = args[1]
+    for name in ("libzygisk", "libpayload", "libzn_loader"):
+        dest = os.path.join(out, name) if os.environ.get("NESTED_OUTPUT") else out
+        os.makedirs(dest, exist_ok=True)
+        shutil.copy(os.environ["BUILD_SEED"], os.path.join(dest, name + ".so"))
+else:
+    path = next(a.split("=", 1)[1] for a in args if a.startswith("-DCMAKE_TOOLCHAIN_FILE="))
+    # CMake resolves a relative toolchain path from its build/source tree,
+    # not from the shell's cwd. Require the unambiguous absolute form.
+    if not os.path.isabs(path) or not os.path.isfile(path):
+        sys.exit("invalid CMake toolchain path: " + path)
+''')
+    write_exec(os.path.join(mk.bindir, "cargo"), r'''#!/usr/bin/env python3
+import json, os, shutil, sys
+args = sys.argv[1:]
+target = args[args.index("--target") + 1]
+prefix = "CARGO_TARGET_" + target.upper().replace("-", "_")
+# Cargo's documented precedence: encoded, generic, then target flags.
+if "CARGO_ENCODED_RUSTFLAGS" in os.environ:
+    flags = os.environ["CARGO_ENCODED_RUSTFLAGS"].split("\x1f")
+elif "RUSTFLAGS" in os.environ:
+    flags = os.environ["RUSTFLAGS"].split()
+else:
+    flags = os.environ.get(prefix + "_RUSTFLAGS", "").split()
+with open(os.environ["BUILD_CALLS"], "a") as fp:
+    fp.write("cargo " + json.dumps(flags) + "\n")
+if os.environ.get("CHECK_RUST_FLAGS"):
+    required = ["link-arg=--target=x86_64-linux-android21",
+                "link-arg=--sysroot=" + os.environ["NDK"] + "/toolchains/llvm/prebuilt/linux-x86_64/sysroot",
+                "link-arg=-Wl,-z,max-page-size=16384",
+                "link-arg=-Wl,-z,common-page-size=16384",
+                "--remap-path-prefix=" + os.environ["BUILD_REPO"] + "=.", "opt-level=2"]
+    if not all(arg in flags for arg in required):
+        sys.exit("required or caller Rust flags were lost: " + repr(flags))
+out = (args[args.index("--target-dir") + 1] if "--target-dir" in args
+       else os.environ.get("CARGO_TARGET_DIR", "target"))
+dest = os.path.join(out, target, "release")
+os.makedirs(dest, exist_ok=True)
+shutil.copy(os.environ["BUILD_SEED"], os.path.join(dest, "zygiskd"))
+''')
+    env = mk.env()
+    for key in list(env):
+        if key in ("RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "CARGO_TARGET_DIR",
+                   "OUT_ROOT", "ABIS", "API_LEVEL", "BUILD_TYPE") or key.startswith("CARGO_TARGET_"):
+            env.pop(key, None)
+    env.update(NDK=ndk, BUILD_REPO=root, BUILD_SEED=seed,
+               BUILD_CALLS=os.path.join(root, "calls.log"))
+    script = os.path.join(root, "scripts", "build_module.sh")
+    run_index = 0
+
+    def run(args=(), extra=None):
+        nonlocal run_index
+        run_index += 1
+        out = os.path.join(root, "out " + str(run_index))
+        with open(env["BUILD_CALLS"], "w"):
+            pass
+        proc = subprocess.run(["bash", script, "--abis", "x86_64", "--out", out, *args],
+                              cwd=root, env={**env, **(extra or {})},
+                              capture_output=True, text=True, timeout=30)
+        return proc, out
+
+    def passed(label, proc):
+        check(label, proc.returncode == 0, proc.stdout + proc.stderr)
+
+    # 1. Missing values must be diagnosed, not nounset crashes or swallowed options.
+    for option in ("--ndk", "--api", "--abis", "--out", "--type"):
+        for args in ((option,), (option, "--skip-zip")):
+            proc, _ = run(args)
+            check("build: missing value " + repr(args),
+                  proc.returncode == 2 and "requires a value" in proc.stderr,
+                  proc.stdout + proc.stderr)
+
+    # 2. Invalid/empty ABI lists must fail before invoking compilers or assembly.
+    for abis in ("", "   ", "mips", "x86_64 mips", "*"):
+        proc, out = run(("--abis", abis, "--skip-cpp", "--skip-rust", "--skip-zip"))
+        with open(env["BUILD_CALLS"]) as fp:
+            calls = fp.read()
+        check("build: invalid ABI list rejected " + repr(abis),
+              proc.returncode == 2 and not calls and not os.path.exists(out),
+              proc.stdout + proc.stderr)
+
+    # 3. A relative output path must still work after cd into the module tree.
+    proc, _ = run(("--out", "relative output"))
+    passed("build: relative output creates a complete archive", proc)
+    outdir = os.path.join(root, "relative output", "out")
+    archives = os.listdir(outdir) if os.path.isdir(outdir) else []
+    check("build: relative archive is at the requested location", len(archives) == 1)
+    if len(archives) == 1:
+        with zipfile.ZipFile(os.path.join(outdir, archives[0])) as archive:
+            check("build: archive contains all four ABI artifacts",
+                  all("libs/x86_64/" + f in archive.namelist() for f in
+                      ("libzygisk.so", "libpayload.so", "libzn_loader.so", "zygiskd")))
+
+    # 4. A relative NDK path must be normalized before CMake/Cargo change cwd.
+    proc, _ = run(("--ndk", "Android NDK", "--skip-rust", "--skip-zip"))
+    passed("build: relative NDK path survives cross-build configuration", proc)
+
+    # 5. Documented quick/partial builds must not try to ship incomplete zips.
+    for option, artifact in (("--skip-rust", "libzygisk.so"), ("--skip-cpp", "zygiskd")):
+        proc, out = run((option,))
+        passed("build: partial mode succeeds " + option, proc)
+        check("build: partial mode keeps the built artifact " + option,
+              os.path.isfile(os.path.join(out, "module", "libs", "x86_64", artifact)))
+        check("build: partial mode never emits an installable zip " + option,
+              not os.path.isdir(os.path.join(out, "out")))
+
+    # 6. Per-target CMake layouts must be flattened before strip is invoked.
+    proc, _ = run(("--skip-rust", "--skip-zip"), {"NESTED_OUTPUT": "1"})
+    passed("build: nested CMake artifacts are found before stripping", proc)
+
+    # 7. Cargo's target directory must agree with strip and assembly paths.
+    # Remove the default outputs so a stale successful build cannot mask this.
+    shutil.rmtree(os.path.join(root, "native", "zygiskd", "target"), ignore_errors=True)
+    for cargo_dir in (os.path.join(root, "cargo cache"), "relative cargo cache"):
+        proc, out = run(("--skip-cpp", "--skip-zip"), {"CARGO_TARGET_DIR": cargo_dir})
+        passed("build: custom Cargo output directory " + cargo_dir, proc)
+        check("build: custom Cargo output is packaged",
+              os.path.isfile(os.path.join(out, "module", "libs", "x86_64", "zygiskd")))
+
+    # 8. Global/encoded flags must not override required Android linker options.
+    for flags in ({"RUSTFLAGS": "-C opt-level=2"},
+                  {"CARGO_ENCODED_RUSTFLAGS": "-C\x1fopt-level=2"},
+                  {"CARGO_TARGET_X86_64_LINUX_ANDROID_RUSTFLAGS": "-C opt-level=2"},
+                  {"CARGO_ENCODED_RUSTFLAGS": "-C\x1fopt-level=2",
+                   "RUSTFLAGS": "-C opt-level=0"}):
+        proc, _ = run(("--skip-cpp", "--skip-zip"), {**flags, "CHECK_RUST_FLAGS": "1"})
+        passed("build: preserves required and caller flags " + next(iter(flags)), proc)
+
+    # 9. Every PT_LOAD must meet the page-size floor, not only the first one.
+    elf = bytearray(valid_elf)
+    endian = "<" if elf[5] == 1 else ">"
+    if elf[4] == 2:
+        phoff = struct.unpack_from(endian + "Q", elf, 32)[0]
+        phsize, phnum = struct.unpack_from(endian + "HH", elf, 54)
+        align_offset, align_fmt = 48, "Q"
+    else:
+        phoff = struct.unpack_from(endian + "I", elf, 28)[0]
+        phsize, phnum = struct.unpack_from(endian + "HH", elf, 42)
+        align_offset, align_fmt = 28, "I"
+    loads = [phoff + i * phsize for i in range(phnum)
+             if struct.unpack_from(endian + "I", elf, phoff + i * phsize)[0] == 1]
+    assert len(loads) > 1, "ELF fixture must have multiple load segments"
+    struct.pack_into(endian + align_fmt, elf, loads[1] + align_offset, 0x1000)
+    with open(seed, "wb") as fp:
+        fp.write(elf)
+    proc, _ = run()
+    check("build: rejects underaligned later LOAD segments",
+          proc.returncode != 0 and "alignment" in proc.stderr,
+          proc.stdout + proc.stderr)
+    with open(seed, "wb") as fp:
+        fp.write(valid_elf)
+    proc, _ = run()
+    passed("build: valid complete archive still passes all verification", proc)
+
+
 def main():
     cases = [
         ("post-fs-data: current=0 swaps (Round 29 core fix)",
@@ -1723,6 +1920,8 @@ def main():
          test_ci_script_hygiene),
         ("Build: NDK version discovery and alternate host toolchains",
          test_build_ndk_discovery),
+        ("Build: nine driver and packaging regressions",
+         test_build_regressions),
         ("Makefile: sanitizer builds cannot pass with stale binaries",
          test_sanitize_gate),
         ("Makefile: TSan failures are never reported as clean",
