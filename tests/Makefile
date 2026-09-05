@@ -111,22 +111,29 @@ race: test_race.cpp ../native/libpayload/src/hide_advanced.cpp \
 	$(MAKE) test_race
 	$(CC) -shared -fPIC -o race_fixture.so race_fixture.c
 	rm -f ./test_race_tsan
-	@if $(CXX) -std=c++17 -O1 -g -fsanitize=thread $(INCLUDES) -o \
+	@logdir=$$(mktemp -d ./.zs_tsan.XXXXXX) || exit 1; \
+	trap 'rm -rf "$$logdir"' 0; \
+	trap 'exit 1' 1 2 3 15; \
+	if $(CXX) -std=c++17 -O1 -g -fsanitize=thread $(INCLUDES) -o \
 		./test_race_tsan $< ../native/libpayload/src/hide.cpp \
-		-ldl -pthread 2>/tmp/zs_tsan_build.log; then \
+		-ldl -pthread 2>"$$logdir/build.log"; then \
 	    echo "== TSan race suite =="; \
-	    if ./test_race_tsan 2>&1 | tee /tmp/zs_tsan_out.txt | \
-	        grep -q "WARNING: ThreadSanitizer"; then \
+	    rc=0; ./test_race_tsan >"$$logdir/run.log" 2>&1 || rc=$$?; \
+	    cat "$$logdir/run.log"; \
+	    if grep -q "WARNING: ThreadSanitizer" "$$logdir/run.log"; then \
 	        echo "TSAN: DATA RACES FOUND"; \
-	        grep -c "WARNING: ThreadSanitizer" /tmp/zs_tsan_out.txt; exit 1; \
+	        grep -c "WARNING: ThreadSanitizer" "$$logdir/run.log"; exit 1; \
+	    elif [ $$rc -ne 0 ]; then \
+	        echo "TSAN: RUN FAILED (exit $$rc; NOT reported as clean)"; \
+	        exit $$rc; \
 	    else \
 	        echo "TSAN: no data races"; \
 	    fi; \
-	elif grep -q "cannot find -ltsan\|-fsanitize=thread" /tmp/zs_tsan_build.log 2>/dev/null; then \
+	elif grep -q "cannot find -ltsan\|-fsanitize=thread" "$$logdir/build.log"; then \
 	    echo "TSAN: toolchain absent — SKIP (install libtsan to enable; NOT reported as clean)"; \
 	else \
 	    echo "TSAN: BUILD FAILED (source regression, not a skip):"; \
-	    cat /tmp/zs_tsan_build.log; exit 1; \
+	    cat "$$logdir/build.log"; exit 1; \
 	fi
 	@./test_race
 
@@ -200,16 +207,20 @@ SAN_TESTS = test_hide test_hide_advanced test_hide_stealth \
 
 .PHONY: run-sanitize
 
+# Make does not track CXXFLAGS changes: force fresh instrumented builds,
+# and never execute a stale binary after a failed compile.
 run-sanitize:
 	@fail=0; \
 	for t in $(SAN_TESTS); do \
 	echo "=== $$t (ASan+UBSan) ==="; \
-	$(MAKE) $$t CXXFLAGS="$(SAN_CXXFLAGS)"; \
+	if ! $(MAKE) -B $$t CXXFLAGS="$(SAN_CXXFLAGS)"; then \
+	    fail=1; continue; \
+	fi; \
 	ASAN_OPTIONS=detect_leaks=1:abort_on_error=0 \
-	UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=0 \
+	UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
 	./$$t || fail=1; \
 	done; \
-	$(MAKE) clean >/dev/null; \
+	$(MAKE) clean >/dev/null || fail=1; \
 	exit $$fail
 
 # Round 22 — binary verification of BOTH self-unmap trampoline blobs
