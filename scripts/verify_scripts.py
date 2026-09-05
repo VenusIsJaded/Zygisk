@@ -1452,6 +1452,143 @@ def test_ci_script_hygiene(mk):  # noqa: ARG001 — signature per harness
               "directly — a lost exec bit kills CI at that line")
 
 
+def make_gate_fixture(mk, program):
+    """Run the real Makefile with tiny sources and a deterministic compiler.
+
+    This tests build/exit-status handling without depending on sanitizer
+    runtime support (TSan cannot start on some otherwise valid hosts).
+    """
+    root = os.path.join(mk.root, "make-gate")
+    testdir = os.path.join(root, "tests")
+    os.makedirs(testdir)
+    shutil.copy(os.path.join(REPO_ROOT, "tests", "Makefile"), testdir)
+    for path in ("tests/test_obfstr.cpp", "tests/test_framework.h",
+                 "tests/test_race.cpp", "tests/race_fixture.c",
+                 "native/common/obfstr.h", "native/common/log.h",
+                 "native/libpayload/src/hide_advanced.cpp",
+                 "native/libpayload/src/hide.cpp"):
+        full = os.path.join(root, path)
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, "w"):
+            pass
+    write_exec(os.path.join(testdir, "plain"),
+               '#!/bin/sh\necho plain >> "$FAKE_RUN_LOG"\n')
+    write_exec(os.path.join(testdir, "instrumented"), program)
+    write_exec(os.path.join(testdir, "compiler"), '''#!/bin/sh
+printf '%s\\n' "$*" >> "$FAKE_BUILD_LOG"
+input=plain
+case " $* " in
+  *-fsanitize=*)
+    if [ -n "$FAKE_BUILD_ERROR" ]; then
+      echo "$FAKE_BUILD_ERROR" >&2
+      exit 1
+    fi
+    input=instrumented ;;
+esac
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-o" ]; then output="$2"; break; fi
+  shift
+done
+cp "$input" "$output" && chmod +x "$output"
+''')
+    env = os.environ.copy()
+    # A parent `make verify-scripts` may export -j, -n, or command-line
+    # overrides; the isolated fixture must not inherit those settings.
+    for key in ("MAKEFLAGS", "MFLAGS", "MAKELEVEL", "MAKEOVERRIDES"):
+        env.pop(key, None)
+    env.update(FAKE_BUILD_LOG=os.path.join(testdir, "build.log"),
+               FAKE_RUN_LOG=os.path.join(testdir, "run.log"),
+               FAKE_BUILD_ERROR="")
+    return testdir, env
+
+
+def run_make_gate(testdir, env, target):
+    return subprocess.run(
+        ["make", "--no-print-directory", target, "CXX=./compiler",
+         "CC=./compiler", "SAN_TESTS=test_obfstr"],
+        cwd=testdir, env=env, capture_output=True, text=True, timeout=30)
+
+
+def test_sanitize_gate(mk):
+    testdir, env = make_gate_fixture(mk, '''#!/bin/sh
+echo instrumented >> "$FAKE_RUN_LOG"
+case "$UBSAN_OPTIONS" in
+  *halt_on_error=1*) exit 0 ;;
+  *) echo 'UBSan must fail the gate on undefined behavior' >&2; exit 1 ;;
+esac
+''')
+    # First create an up-to-date, ordinary build. Changing only compiler
+    # flags must still rebuild it when run-sanitize is requested.
+    plain = run_make_gate(testdir, env, "test_obfstr")
+    check("sanitizer fixture ordinary build succeeds", plain.returncode == 0,
+          plain.stdout + plain.stderr)
+    proc = run_make_gate(testdir, env, "run-sanitize")
+    with open(env["FAKE_BUILD_LOG"]) as fp:
+        builds = fp.read()
+    runs = ""
+    if os.path.exists(env["FAKE_RUN_LOG"]):
+        with open(env["FAKE_RUN_LOG"]) as fp:
+            runs = fp.read()
+    check("run-sanitize rebuilds with ASan and UBSan",
+          "-fsanitize=address,undefined" in builds, builds)
+    check("run-sanitize executes only the instrumented binary",
+          runs == "instrumented\n", runs)
+    check("run-sanitize enables fatal UBSan errors", proc.returncode == 0,
+          proc.stdout + proc.stderr)
+
+    # A failed rebuild must not fall back to a previously passing binary.
+    run_make_gate(testdir, env, "test_obfstr")
+    os.unlink(env["FAKE_RUN_LOG"])
+    env["FAKE_BUILD_ERROR"] = "deliberate compiler failure"
+    proc = run_make_gate(testdir, env, "run-sanitize")
+    check("run-sanitize fails on compiler errors", proc.returncode != 0,
+          proc.stdout + proc.stderr)
+    check("failed sanitizer builds never execute stale binaries",
+          not os.path.exists(env["FAKE_RUN_LOG"]))
+    check("failed sanitizer builds still clean up",
+          not os.path.exists(os.path.join(testdir, "test_obfstr")))
+
+
+def test_tsan_gate(mk):
+    testdir, env = make_gate_fixture(mk, '''#!/bin/sh
+echo instrumented >> "$FAKE_RUN_LOG"
+printf '%s\\n' "$FAKE_DIAGNOSTIC" >&2
+exit "$FAKE_STATUS"
+''')
+    cases = [
+        ("clean execution", "", "0", "", True, "TSAN: no data races"),
+        ("runtime initialization failure",
+         "FATAL: ThreadSanitizer: unexpected memory mapping", "66", "",
+         False, "RUN FAILED"),
+        ("test assertion failure", "assertion failed", "1", "",
+         False, "RUN FAILED"),
+        ("signal-style exit", "Segmentation fault", "139", "",
+         False, "RUN FAILED"),
+        ("race warning with zero exit", "WARNING: ThreadSanitizer: data race",
+         "0", "", False, "DATA RACES FOUND"),
+        ("missing toolchain", "", "0", "cannot find -ltsan",
+         True, "toolchain absent"),
+        ("compiler regression", "", "0", "error: invalid source",
+         False, "BUILD FAILED"),
+    ]
+    for name, diagnostic, status, build_error, success, message in cases:
+        env.update(FAKE_DIAGNOSTIC=diagnostic, FAKE_STATUS=status,
+                   FAKE_BUILD_ERROR=build_error)
+        proc = run_make_gate(testdir, env, "race")
+        output = proc.stdout + proc.stderr
+        check(f"TSan {name}: exit status",
+              (proc.returncode == 0) == success, output)
+        check(f"TSan {name}: diagnostic", message in output, output)
+        if name != "clean execution":
+            check(f"TSan {name}: never reported as clean",
+                  "TSAN: no data races" not in output, output)
+        if diagnostic:
+            check(f"TSan {name}: preserves runtime output",
+                  diagnostic in output, output)
+        check(f"TSan {name}: temporary logs removed",
+              not any(p.startswith(".zs_tsan.") for p in os.listdir(testdir)))
+
+
 def main():
     cases = [
         ("post-fs-data: current=0 swaps (Round 29 core fix)",
@@ -1529,6 +1666,10 @@ def main():
          test_uninstall_removes_hook),
         ("Round 33: CI script hygiene (exec bits, bash invocation)",
          test_ci_script_hygiene),
+        ("Makefile: sanitizer builds cannot pass with stale binaries",
+         test_sanitize_gate),
+        ("Makefile: TSan failures are never reported as clean",
+         test_tsan_gate),
     ]
     for title, fn in cases:
         print(f"\n== {title}")
