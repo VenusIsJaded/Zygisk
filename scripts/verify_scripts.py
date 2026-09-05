@@ -1589,6 +1589,61 @@ exit "$FAKE_STATUS"
               not any(p.startswith(".zs_tsan.") for p in os.listdir(testdir)))
 
 
+def test_build_ndk_discovery(mk):
+    """Exercise real build-script discovery without a cross-compilation toolchain."""
+    sdk = os.path.join(mk.root, "Android SDK")
+
+    def fake_ndk(path, tag="linux-x86_64"):
+        bindir = os.path.join(path, "toolchains", "llvm", "prebuilt", tag, "bin")
+        os.makedirs(bindir)
+        # Discovery only checks executability; no compiler should run here.
+        write_exec(os.path.join(bindir, "clang"), "#!/bin/sh\nexit 99\n")
+        cmake_dir = os.path.join(path, "build", "cmake")
+        os.makedirs(cmake_dir)
+        with open(os.path.join(cmake_dir, "android.toolchain.cmake"), "w"):
+            pass
+        return path
+
+    older = fake_ndk(os.path.join(sdk, "ndk", "9.0.0"))
+    newest = fake_ndk(os.path.join(sdk, "ndk", "27.3.13750724"))
+    alternate = fake_ndk(os.path.join(mk.root, "alternate NDK"), "darwin-x86_64")
+    # An unrelated prebuilt directory must not hide the usable toolchain.
+    os.makedirs(os.path.join(alternate, "toolchains", "llvm", "prebuilt", "aaa-empty"))
+    missing = os.path.join(mk.root, "missing NDK")
+    os.makedirs(missing)
+    write_exec(os.path.join(mk.bindir, "cmake"), "#!/bin/sh\nexit 99\n")
+    env = mk.env()
+    for key in ("NDK", "NDK_VERSION", "ANDROID_NDK_HOME",
+                "ANDROID_NDK_LATEST_HOME", "ANDROID_NDK_ROOT"):
+        env.pop(key, None)
+    env["ANDROID_HOME"] = sdk
+
+    cases = [
+        ("SDK newest version", {}, newest),
+        ("empty NDK_VERSION", {"NDK_VERSION": ""}, newest),
+        ("pinned NDK_VERSION", {"NDK_VERSION": "9.0.0"}, older),
+        ("explicit NDK", {"NDK": older}, older),
+        ("environment NDK override", {"ANDROID_NDK_HOME": older}, older),
+        ("alternate host toolchain", {"NDK": alternate}, alternate),
+        ("missing clang rejected", {"NDK": missing}, None),
+    ]
+    for index, (name, overrides, expected) in enumerate(cases):
+        out = os.path.join(mk.root, f"build-{index}")
+        proc = subprocess.run(
+            ["bash", os.path.join(REPO_ROOT, "scripts", "build_module.sh"),
+             "--skip-cpp", "--skip-rust", "--skip-zip", "--out", out],
+            env={**env, **overrides}, capture_output=True, text=True, timeout=30)
+        if expected is None:
+            check(f"build: {name}", proc.returncode != 0 and
+                  "ERROR: clang not found" in proc.stderr,
+                  proc.stdout + proc.stderr)
+        else:
+            check(f"build: {name}", proc.returncode == 0 and
+                  f"== NDK: {expected}" in proc.stdout.splitlines() and
+                  os.path.isfile(os.path.join(out, "module", "module.prop")),
+                  proc.stdout + proc.stderr)
+
+
 def main():
     cases = [
         ("post-fs-data: current=0 swaps (Round 29 core fix)",
@@ -1666,6 +1721,8 @@ def main():
          test_uninstall_removes_hook),
         ("Round 33: CI script hygiene (exec bits, bash invocation)",
          test_ci_script_hygiene),
+        ("Build: NDK version discovery and alternate host toolchains",
+         test_build_ndk_discovery),
         ("Makefile: sanitizer builds cannot pass with stale binaries",
          test_sanitize_gate),
         ("Makefile: TSan failures are never reported as clean",

@@ -111,7 +111,7 @@ find_ndk() {
         "${ANDROID_NDK_LATEST_HOME:-}" \
         "${ANDROID_NDK_ROOT:-}" \
         "${ANDROID_HOME:-$HOME/Android/Sdk}/ndk-bundle" \
-        "${ANDROID_HOME:-$HOME/Android/Sdk}/ndk/${NDK_VERSION:-}"
+        "${NDK_VERSION:+${ANDROID_HOME:-$HOME/Android/Sdk}/ndk/$NDK_VERSION}"
     do
         if [[ -n "$candidate" && -d "$candidate" ]]; then
             echo "$candidate"; return 0
@@ -140,7 +140,12 @@ TOOLCHAIN="$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64"
 if [[ ! -d "$TOOLCHAIN" ]]; then
     # Non-x86_64 build hosts use a different prebuilt tag (e.g. darwin-x86_64,
     # linux-aarch64). Accept whatever exists instead of hard-failing.
-    TOOLCHAIN="$(dirname "$(dirname "$(find "$NDK_PATH/toolchains/llvm/prebuilt" -maxdepth 1 -mindepth 1 -type d | head -1)")")"
+    for candidate in "$NDK_PATH"/toolchains/llvm/prebuilt/*; do
+        if [[ -x "$candidate/bin/clang" ]]; then
+            TOOLCHAIN="$candidate"
+            break
+        fi
+    done
 fi
 [[ -x "$TOOLCHAIN/bin/clang" ]] || { echo "ERROR: clang not found under $TOOLCHAIN" >&2; exit 1; }
 SYSROOT="$TOOLCHAIN/sysroot"
