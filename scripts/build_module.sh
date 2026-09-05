@@ -72,7 +72,7 @@ cd "$REPO_ROOT"
 # ---------------------------------------------------------------------------
 NDK="${NDK:-}"
 API_LEVEL="${API_LEVEL:-21}"
-ABIS="${ABIS:-arm64-v8a armeabi-v7a x86_64 x86}"
+ABIS="${ABIS-arm64-v8a armeabi-v7a x86_64 x86}"
 OUT_ROOT="${OUT_ROOT:-$REPO_ROOT/build}"
 BUILD_TYPE="${BUILD_TYPE:-Release}"
 SKIP_RUST=0
@@ -80,6 +80,13 @@ SKIP_CPP=0
 SKIP_ZIP=0
 
 while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --ndk|--api|--abis|--out|--type)
+            if [[ $# -lt 2 || "$2" == --* ]]; then
+                echo "build_module.sh: $1 requires a value" >&2
+                exit 2
+            fi ;;
+    esac
     case "$1" in
         --ndk)          NDK="$2"; shift 2;;
         --api)          API_LEVEL="$2"; shift 2;;
@@ -97,6 +104,26 @@ while [[ $# -gt 0 ]]; do
             exit 2;;
     esac
 done
+
+# Validate the whole list before any compiler runs or output is touched.
+# Use an array so whitespace is accepted but pathname expansion is not.
+read -r -a ABI_LIST <<< "${ABIS//$'\n'/ }"
+if [[ ${#ABI_LIST[@]} -eq 0 ]]; then
+    echo "build_module.sh: --abis requires at least one supported ABI" >&2
+    exit 2
+fi
+for abi in "${ABI_LIST[@]}"; do
+    case "$abi" in
+        arm64-v8a|armeabi-v7a|x86_64|x86) ;;
+        *) echo "build_module.sh: unsupported ABI: $abi" >&2; exit 2 ;;
+    esac
+done
+
+# Quick builds retain their partial module tree, but cannot produce a
+# flashable archive: the installer requires both C++ libraries and Rust.
+if [[ $SKIP_CPP -eq 1 || $SKIP_RUST -eq 1 ]]; then
+    SKIP_ZIP=1
+fi
 
 # ---------------------------------------------------------------------------
 # NDK discovery
@@ -134,6 +161,8 @@ if ! NDK_PATH="$(find_ndk)"; then
     echo "  Set NDK=/path/to/ndk (or ANDROID_NDK_HOME / ANDROID_NDK_ROOT)." >&2
     exit 1
 fi
+# Both CMake and Cargo resolve paths after changing directories.
+NDK_PATH="$(cd "$NDK_PATH" && pwd)"
 echo "== NDK: $NDK_PATH"
 
 TOOLCHAIN="$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64"
@@ -200,9 +229,6 @@ build_cpp() {
     # verify_zip step below asserts the result.
     local strip_bin="$TOOLCHAIN/bin/llvm-strip"
     [[ -x "$strip_bin" ]] || strip_bin="strip"
-    "$strip_bin" --strip-all         "$build_dir/libzygisk.so" \
-        "$build_dir/libpayload.so" \
-        "$build_dir/libzn_loader.so"
     # native/CMakeLists.txt sets CMAKE_LIBRARY_OUTPUT_DIRECTORY to the
     # build dir (flat); tolerate the classic per-target subdirectory
     # layout too for out-of-tree builds made by other tooling.
@@ -211,7 +237,6 @@ build_cpp() {
         if [[ -f "$build_dir/$out" ]]; then
             continue
         fi
-        dir="$(dirname "${out#lib}")"   # libzygisk.so -> zygisk
         for dir in "$build_dir/$(basename "$out" .so)" \
                    "$build_dir/$(echo "$out" | sed 's/^lib//; s/\.so$//')"; do
             if [[ -f "$dir/$out" ]]; then
@@ -221,6 +246,9 @@ build_cpp() {
         done
         [[ -f "$build_dir/$out" ]] || { echo "ERROR: $out missing for $abi" >&2; exit 1; }
     done
+    "$strip_bin" --strip-all "$build_dir/libzygisk.so" \
+        "$build_dir/libpayload.so" \
+        "$build_dir/libzn_loader.so"
 }
 
 # ---------------------------------------------------------------------------
@@ -260,14 +288,32 @@ build_rust() {
     # ever shipped (official NDK page-size guidance).
     local env_prefix="CARGO_TARGET_$(echo "$target" | tr 'a-z-' 'A-Z_')"
     export "${env_prefix}_LINKER=$TOOLCHAIN/bin/clang"
-    # ROUND 33 adds --remap-path-prefix (keeps the build host's
-    # absolute paths out of the daemon binary; folded into the
-    # per-target RUSTFLAGS — cargo ignores the generic RUSTFLAGS when
-    # the per-target variable is set).
-    export "${env_prefix}_RUSTFLAGS=-C link-arg=--target=${triple}${API_LEVEL} -C link-arg=--sysroot=$SYSROOT -C link-arg=-Wl,-z,max-page-size=16384 -C link-arg=-Wl,-z,common-page-size=16384 --remap-path-prefix=$REPO_ROOT=."
+    # Cargo gives encoded/global flags precedence over per-target flags.
+    # Preserve the caller's effective flags, then append required Android
+    # options using unit separators so paths containing spaces stay intact.
+    local flags_var="${env_prefix}_RUSTFLAGS"
+    local encoded_flags="${CARGO_ENCODED_RUSTFLAGS-}"
+    local caller_flags="${RUSTFLAGS-${!flags_var:-}}"
+    local -a flag_args=()
+    if [[ -z "${CARGO_ENCODED_RUSTFLAGS+x}" ]]; then
+        read -r -a flag_args <<< "${caller_flags//$'\n'/ }"
+        if [[ ${#flag_args[@]} -gt 0 ]]; then
+            printf -v encoded_flags '%s\x1f' "${flag_args[@]}"
+            encoded_flags="${encoded_flags%$'\x1f'}"
+        fi
+    fi
+    flag_args=(-C "link-arg=--target=${triple}${API_LEVEL}"
+               -C "link-arg=--sysroot=$SYSROOT"
+               -C "link-arg=-Wl,-z,max-page-size=16384"
+               -C "link-arg=-Wl,-z,common-page-size=16384"
+               "--remap-path-prefix=$REPO_ROOT=.")
+    local required_flags
+    printf -v required_flags '%s\x1f' "${flag_args[@]}"
+    encoded_flags="${encoded_flags:+$encoded_flags$'\x1f'}${required_flags%$'\x1f'}"
     (cd "$REPO_ROOT/native/zygiskd" &&
-        cargo build --release --target "$target")
-    [[ -f "$REPO_ROOT/native/zygiskd/target/$target/release/zygiskd" ]] \
+        CARGO_ENCODED_RUSTFLAGS="$encoded_flags" cargo build --release \
+            --target "$target" --target-dir "$RUST_TARGET_DIR")
+    [[ -f "$RUST_TARGET_DIR/$target/release/zygiskd" ]] \
         || { echo "ERROR: zygiskd missing for $target" >&2; exit 1; }
     # ROUND 33: strip the symbol table (the daemon lives
     # root-only-readable under /data/adb, so this is size/hygiene,
@@ -275,7 +321,7 @@ build_rust() {
     local strip_bin="$TOOLCHAIN/bin/llvm-strip"
     [[ -x "$strip_bin" ]] || strip_bin="strip"
     "$strip_bin" --strip-all \
-        "$REPO_ROOT/native/zygiskd/target/$target/release/zygiskd"
+        "$RUST_TARGET_DIR/$target/release/zygiskd"
 }
 
 # ---------------------------------------------------------------------------
@@ -311,7 +357,7 @@ EOF
 
     # Binaries per ABI.
     local abi
-    for abi in $ABIS; do
+    for abi in "${ABI_LIST[@]}"; do
         local libs_dir="$MODULE_DIR/libs/$abi"
         mkdir -p "$libs_dir"
         if [[ $SKIP_CPP -ne 1 ]]; then
@@ -322,7 +368,7 @@ EOF
         if [[ $SKIP_RUST -ne 1 ]]; then
             local target
             target="$(rust_target_for_abi "$abi")"
-            cp "$REPO_ROOT/native/zygiskd/target/$target/release/zygiskd" \
+            cp "$RUST_TARGET_DIR/$target/release/zygiskd" \
                "$libs_dir/zygiskd"
         fi
         chmod 0755 "$libs_dir/zygiskd" 2>/dev/null || true
@@ -423,7 +469,7 @@ verify_zip() {
     # SIGPIPE from head would abort the whole script.
     local expect_cls abi lib cls magic tmp_extract
     tmp_extract="$(mktemp)"
-    for abi in $ABIS; do
+    for abi in "${ABI_LIST[@]}"; do
         case "$abi" in
             arm64-v8a | x86_64) expect_cls=2 ;;
             *)                  expect_cls=1 ;;
@@ -456,7 +502,7 @@ verify_zip() {
     #    below the kernel page size — for executables exactly as for
     #    shared objects. Checked from the assembled module tree (the
     #    zip content is byte-identical to it).
-    local readelf_bin="" f align
+    local readelf_bin="" f align headers aligns
     if [[ -x "$TOOLCHAIN/bin/llvm-readelf" ]]; then
         readelf_bin="$TOOLCHAIN/bin/llvm-readelf"
     elif command -v readelf >/dev/null 2>&1; then
@@ -465,19 +511,30 @@ verify_zip() {
         echo "  NOTE: no readelf available — skipping the 16 KB alignment check"
     fi
     if [[ -n "$readelf_bin" ]]; then
-        for abi in $ABIS; do
+        for abi in "${ABI_LIST[@]}"; do
             for f in libzygisk.so libpayload.so libzn_loader.so zygiskd; do
                 # -W (wide): without it binutils readelf wraps each LOAD
                 # record across two lines and the align column lands on
                 # the second — the awk would then read an offset and
                 # false-fail. llvm-readelf is single-line either way.
-                align="$("$readelf_bin" -lW "$MODULE_DIR/libs/$abi/$f" 2>/dev/null \
-                          | grep LOAD | head -1 | awk '{print $NF}')"
-                # readelf prints 0x4000 (16384) when properly aligned.
-                if [[ -z "$align" ]] || (( align < 0x4000 )); then
-                    echo "  FAIL: libs/$abi/$f LOAD alignment $align < 0x4000 (16 KB)" >&2
+                if ! headers="$("$readelf_bin" -lW "$MODULE_DIR/libs/$abi/$f" 2>/dev/null)"; then
+                    echo "  FAIL: cannot read libs/$abi/$f program headers" >&2
                     fail=1
+                    continue
                 fi
+                aligns="$(awk '$1 == "LOAD" {print $NF}' <<< "$headers")"
+                if [[ -z "$aligns" ]]; then
+                    echo "  FAIL: libs/$abi/$f has no LOAD segments" >&2
+                    fail=1
+                    continue
+                fi
+                # Every segment must meet the floor, not only the first.
+                while IFS= read -r align; do
+                    if [[ ! "$align" =~ ^0x[0-9a-fA-F]+$ ]] || (( align < 0x4000 )); then
+                        echo "  FAIL: libs/$abi/$f LOAD alignment $align < 0x4000 (16 KB)" >&2
+                        fail=1
+                    fi
+                done <<< "$aligns"
             done
         done
     fi
@@ -488,7 +545,7 @@ verify_zip() {
     #    symbol tables inside world-readable files.
     if [[ -n "$readelf_bin" ]]; then
         local sec
-        for abi in $ABIS; do
+        for abi in "${ABI_LIST[@]}"; do
             for f in libzygisk.so libpayload.so libzn_loader.so zygiskd; do
                 [[ -f "$MODULE_DIR/libs/$abi/$f" ]] || continue
                 sec="$("$readelf_bin" -SW "$MODULE_DIR/libs/$abi/$f" 2>/dev/null \
@@ -509,7 +566,7 @@ verify_zip() {
     #    dedup is by inode — see the CMakeLists comments).
     if [[ -n "$readelf_bin" ]]; then
         local soname
-        for abi in $ABIS; do
+        for abi in "${ABI_LIST[@]}"; do
             for f in libzygisk.so libpayload.so libzn_loader.so; do
                 soname="$("$readelf_bin" -d "$MODULE_DIR/libs/$abi/$f" 2>/dev/null \
                           | grep SONAME || true)"
@@ -531,7 +588,7 @@ verify_zip() {
     [[ -x "$strings_bin" ]] || strings_bin="$(command -v strings || true)"
     if [[ -n "$strings_bin" ]]; then
         local banned hit
-        for abi in $ABIS; do
+        for abi in "${ABI_LIST[@]}"; do
             for f in libzygisk.so libpayload.so; do
                 [[ -f "$MODULE_DIR/libs/$abi/$f" ]] || continue
                 # Case-insensitive whole-token bans: any occurrence of
@@ -567,13 +624,25 @@ verify_zip() {
 # Drive the build
 # ---------------------------------------------------------------------------
 mkdir -p "$OUT_ROOT"
+OUT_ROOT="$(cd "$OUT_ROOT" && pwd)"
+MODULE_DIR="$OUT_ROOT/module"
+ZIP_DIR="$OUT_ROOT/out"
 
-for abi in $ABIS; do
+# Resolve Cargo's override relative to the crate, just as Cargo does, and
+# use that same absolute directory for compilation, stripping and assembly.
+RUST_TARGET_DIR="${CARGO_TARGET_DIR:-$REPO_ROOT/native/zygiskd/target}"
+if [[ $SKIP_RUST -ne 1 ]]; then
+    [[ "$RUST_TARGET_DIR" = /* ]] || RUST_TARGET_DIR="$REPO_ROOT/native/zygiskd/$RUST_TARGET_DIR"
+    mkdir -p "$RUST_TARGET_DIR"
+    RUST_TARGET_DIR="$(cd "$RUST_TARGET_DIR" && pwd)"
+fi
+
+for abi in "${ABI_LIST[@]}"; do
     [[ $SKIP_CPP -eq 1 ]] || build_cpp "$abi"
 done
 if [[ $SKIP_RUST -ne 1 ]]; then
     command -v cargo >/dev/null || { echo "ERROR: cargo not on PATH" >&2; exit 1; }
-    for abi in $ABIS; do
+    for abi in "${ABI_LIST[@]}"; do
         build_rust "$abi"
     done
 fi
