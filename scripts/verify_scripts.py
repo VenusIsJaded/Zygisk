@@ -2154,8 +2154,174 @@ def test_make_cleanup_regressions(mk):
                   ("race_fixture.so", "test_race_tsan", "test_race")), proc.stdout + proc.stderr)
 
 
+def test_verify_pr8_regressions(mk):
+    """Nine post-install verifier bugs; header fixtures need no Android NDK.
+
+    These are deliberately only ELF headers, not runnable binaries: the
+    device-side checker promises header sanity, not loader/provenance checks.
+    """
+    import struct
+
+    moddir = os.path.join(mk.root, "verification module with spaces")
+    os.makedirs(moddir)
+    script = os.path.join(moddir, "verify.sh")
+    shutil.copy(os.path.join(REPO_ROOT, "verify.sh"), script)
+    artifacts = ("libzygisk.so", "libpayload.so", "libzn_loader.so", "zygiskd")
+    formats = {"arm64-v8a": (2, 183, 64), "armeabi-v7a": (1, 40, 52),
+               "x86_64": (2, 62, 64), "x86": (1, 3, 52)}
+
+    def header(abi):
+        cls, machine, size = formats[abi]
+        data = bytearray(size)
+        data[:7] = b"\x7fELF" + bytes((cls, 1, 1))
+        struct.pack_into("<HHI", data, 16, 3, machine, 1)
+        struct.pack_into("<H", data, 52 if cls == 2 else 40, size)
+        return data
+
+    def put(abi, name, data):
+        folder = os.path.join(moddir, "libs", abi)
+        os.makedirs(folder, exist_ok=True)
+        with open(os.path.join(folder, name), "wb") as fp:
+            fp.write(data)
+
+    def bundle(abis=("x86_64",)):
+        shutil.rmtree(os.path.join(moddir, "libs"), ignore_errors=True)
+        for abi in abis:
+            for name in artifacts:
+                put(abi, name, header(abi))
+
+    def run(shell="sh", mode="standalone", helpers="exit", module_var="MODPATH"):
+        env = mk.env()
+        env.pop("MODPATH", None)
+        env.pop("MODDIR", None)
+        if mode == "standalone":
+            argv = [shell, script]
+        elif mode == "bare":
+            argv = [shell, "verify.sh"]
+        else:
+            env[module_var] = moddir
+            setup = 'ui_print() { printf "UI:%s\\n" "$*"; }; '
+            if helpers == "exit":
+                setup += 'abort() { exit 1; }; '
+            elif helpers != "absent":
+                setup += 'abort() { return ' + helpers + '; }; '
+            # Correct legacy argv[0] isolates format bugs from path resolution.
+            argv0 = script if mode == "legacy" else "/installer/update-binary"
+            argv = [shell, "-c", setup + '. "$1"', argv0, script]
+        return subprocess.run(argv, cwd=moddir, env=env, capture_output=True,
+                              text=True, timeout=10)
+
+    def accept(label, proc, count=4):
+        check(label, proc.returncode == 0
+              and f"Verified {count} native artifacts" in proc.stdout,
+              proc.stdout + proc.stderr)
+
+    def reject(label, proc, diagnostic):
+        check(label, proc.returncode != 0 and "Verified" not in proc.stdout
+              and diagnostic in proc.stdout + proc.stderr,
+              proc.stdout + proc.stderr)
+
+    # 1. Standalone execution must not depend on installer-only functions.
+    bundle()
+    accept("verify #1: standalone valid bundle", run("bash"))
+    bundle(())
+    reject("verify #1: standalone empty bundle has a useful error",
+           run("bash"), "No native artifacts")
+
+    # 2. A sourced script's $0 belongs to its caller, not the module.
+    bundle()
+    for variable in ("MODPATH", "MODDIR"):
+        proc = run("bash", "sourced", module_var=variable)
+        accept("verify #2: sourced module location via " + variable, proc)
+        check("verify #2: preserves installer ui_print " + variable,
+              "UI:- Verified" in proc.stdout, proc.stdout + proc.stderr)
+
+    # 3. POSIX sh does not understand bash's ANSI-C string quoting.
+    for abi in formats:
+        bundle((abi,))
+        accept("verify #3: POSIX shell accepts " + abi, run("sh", "legacy"))
+        accept("verify: standalone POSIX shell accepts " + abi, run())
+    accept("verify: bare filename invocation", run(mode="bare"))
+
+    # 4. A returning/missing abort helper must never allow success afterward.
+    for helper in ("0", "1", "absent"):
+        bundle()
+        put("x86_64", artifacts[0], b"BAD!")
+        reject("verify #4: fail closed with abort=" + helper,
+               run("bash", "legacy", helper), "not an ELF")
+
+    # 5. A nonzero global count does not imply a complete per-ABI bundle.
+    for abi in formats:
+        for missing in artifacts:
+            bundle((abi,))
+            os.unlink(os.path.join(moddir, "libs", abi, missing))
+            reject("verify #5: missing " + abi + "/" + missing,
+                   run("bash", "legacy"), "Missing native artifact")
+    bundle()
+    os.makedirs(os.path.join(moddir, "libs", "x86"))
+    reject("verify #5: empty ABI next to a complete ABI",
+           run("bash", "legacy"), "Missing native artifact")
+    bundle(formats)
+    accept("verify: all four complete ABIs", run(), 16)
+
+    # 6. The daemon is an ELF executable too, not an arbitrary existing file.
+    for data in (b"", b"#!/bin/sh\nexit 0\n", b"not an executable"):
+        bundle()
+        put("x86_64", "zygiskd", data)
+        reject("verify #6: rejects corrupt daemon " + repr(data),
+               run("bash", "legacy"), "not an ELF")
+
+    # 7. Each ABI has a fixed ELF class, for both libraries and the daemon.
+    for abi in formats:
+        for name in (artifacts[0], "zygiskd"):
+            bundle((abi,))
+            data = header(abi)
+            data[4] = 3 - data[4]
+            put(abi, name, data)
+            reject("verify #7: wrong ELF class " + abi + "/" + name,
+                   run("bash", "legacy"), "ELF class")
+
+    # 8. Same-width ARM/x86 binaries are not interchangeable. Check the
+    # high byte and the encoding too, rather than host-endian od -tu2.
+    for abi, other in (("arm64-v8a", "x86_64"), ("x86_64", "arm64-v8a"),
+                       ("armeabi-v7a", "x86"), ("x86", "armeabi-v7a")):
+        for name in (artifacts[0], "zygiskd"):
+            bundle((abi,))
+            put(abi, name, header(other))
+            reject("verify #8: wrong CPU " + abi + "/" + name,
+                   run("bash", "legacy"), "ELF machine")
+    for offset, value, diagnostic in ((19, 1, "ELF machine"),
+                                      (5, 2, "byte order")):
+        bundle()
+        data = header("x86_64")
+        data[offset] = value
+        put("x86_64", artifacts[0], data)
+        reject("verify #8: validates machine high byte/endianness " + str(offset),
+               run("bash", "legacy"), diagnostic)
+
+    # 9. Magic, class and machine can all survive a truncated download.
+    for abi in formats:
+        for length in (20, len(header(abi)) - 1):
+            for name in (artifacts[0], "zygiskd"):
+                bundle((abi,))
+                put(abi, name, header(abi)[:length])
+                reject("verify #9: truncated " + abi + "/" + name + " " + str(length),
+                       run("bash", "legacy"), "Truncated ELF header")
+
+    # Sourcing must not leak the verifier's variables, arguments or options.
+    bundle()
+    proc = subprocess.run(
+        ["sh", "-eu", "-c", 'MODPATH=$1; MODDIR=sentinel; count=sentinel; '
+         'before=$-; set -- caller args; . "$MODPATH/verify.sh"; '
+         '[ "$MODDIR/$count/$*/$-" = "sentinel/sentinel/caller args/$before" ]',
+         "installer", moddir], cwd=moddir, env=mk.env(), capture_output=True,
+        text=True, timeout=10)
+    accept("verify: sourced shell state is unchanged under errexit/nounset", proc)
+
+
 def main():
     cases = [
+        ("Verify: preserved PR #8 regressions", test_verify_pr8_regressions),
         ("Artifact verifier: seven format and invocation regressions", test_verify_artifact_regressions),
         ("Publish: five CLI and destination regressions", test_publish_regressions),
         ("Build: three NDK and API input regressions", test_build_input_regressions),
