@@ -106,6 +106,12 @@ if ! git check-ref-format "refs/heads/$BRANCH"; then
     exit 2
 fi
 
+# Reject missing local refs before changing persistent remote configuration.
+if ! git show-ref --verify --quiet "refs/heads/$BRANCH"; then
+    echo "publish.sh: local branch does not exist: $BRANCH" >&2
+    exit 1
+fi
+
 # Explicit repository/transport options must also apply to existing remotes.
 REMOTE_URL="$(git remote get-url "$REMOTE_NAME" 2>/dev/null || true)"
 if [[ -z "$REMOTE_URL" && -z "$REPO" ]]; then
@@ -136,8 +142,10 @@ if [[ -n "$REPO" ]]; then
     fi
     if [[ -z "$REMOTE_URL" ]]; then
         git remote add "$REMOTE_NAME" "$TARGET_URL"
-    elif [[ "$REMOTE_URL" != "$TARGET_URL" ]]; then
-        git remote set-url "$REMOTE_NAME" "$TARGET_URL"
+    else
+        # Without pushurl Git pushes to every configured URL. Replace the
+        # entire list, even when its first entry already equals TARGET_URL.
+        git config --replace-all "remote.$REMOTE_NAME.url" "$TARGET_URL"
     fi
     # Git gives pushurl precedence over url, including multiple destinations.
     # Explicit destination/transport selection must replace that override too.
@@ -148,10 +156,13 @@ if [[ -n "$REPO" ]]; then
 fi
 
 # Push.
-echo "publish.sh: pushing $BRANCH to $REMOTE_NAME ($REMOTE_URL)"
+# Remote URLs may contain PATs as userinfo or query parameters. Keep the
+# original URL in Git, but never echo those credentials in our diagnostics.
+DISPLAY_URL="$(printf '%s\n' "$REMOTE_URL" | sed -E 's#(://)[^/]*@#\1#; s/[?#].*$//')"
+echo "publish.sh: pushing $BRANCH to $REMOTE_NAME ($DISPLAY_URL)"
 git push -u "$REMOTE_NAME" "refs/heads/$BRANCH:refs/heads/$BRANCH"
 
 # Final status.
 echo
 echo "publish.sh: done."
-echo "publish.sh: your repo is at: $(git remote get-url "$REMOTE_NAME" | sed 's/\.git$//')"
+echo "publish.sh: your repo is at: ${DISPLAY_URL%.git}"
