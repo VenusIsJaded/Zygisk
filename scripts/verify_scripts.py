@@ -1841,8 +1841,326 @@ shutil.copy(os.environ["BUILD_SEED"], os.path.join(dest, "zygiskd"))
     passed("build: valid complete archive still passes all verification", proc)
 
 
+# Release-tooling regressions. Each numbered group covers one distinct bug.
+def test_verify_artifact_regressions(mk):
+    import struct
+
+    script = os.path.join(mk.moddir, "verify.sh")
+    shutil.copy(os.path.join(REPO_ROOT, "verify.sh"), script)
+    libs = os.path.join(mk.moddir, "libs")
+    names = ("libzygisk.so", "libpayload.so", "libzn_loader.so", "zygiskd")
+    machines = {"arm64-v8a": (2, 183), "armeabi-v7a": (1, 40),
+                "x86_64": (2, 62), "x86": (1, 3)}
+
+    def layout(abi="x86_64"):
+        shutil.rmtree(libs, ignore_errors=True)
+        dest = os.path.join(libs, abi)
+        os.makedirs(dest)
+        cls, machine = machines[abi]
+        elf = bytearray(64)
+        elf[:7] = b"\x7fELF" + bytes((cls, 1, 1))
+        struct.pack_into("<H", elf, 16, 3)
+        struct.pack_into("<H", elf, 18, machine)
+        for name in names:
+            with open(os.path.join(dest, name), "wb") as fp:
+                fp.write(elf)
+        return dest
+
+    def run(shell="bash", helpers=True, sourced=False):
+        env = mk.env()
+        env.pop("MODDIR", None)
+        env.pop("MODPATH", None)
+        if not helpers:
+            return subprocess.run([shell, script], env=env, capture_output=True,
+                                  text=True, timeout=10)
+        body = 'ui_print(){ printf "%s\\n" "$*"; }; abort(){ ui_print "$*"; exit 1; }; '
+        if sourced:
+            env["MODPATH"] = mk.moddir
+            body += '. "$1"'
+            args = [shell, "-c", body, "recovery-installer", script]
+        else:
+            # Executing through a shell with helpers mirrors Magisk's functions,
+            # while giving the verifier its original $0 (unlike sourcing).
+            with open(script) as fp:
+                body += fp.read()
+            args = [shell, "-c", body, script]
+        return subprocess.run(args, env=env, capture_output=True, text=True, timeout=10)
+
+    # 1: standalone verification must not depend on Magisk-only shell functions.
+    layout()
+    proc = run(helpers=False)
+    check("bug 01: verifier works standalone", proc.returncode == 0,
+          proc.stdout + proc.stderr)
+    shutil.rmtree(libs)
+    proc = run(helpers=False)
+    check("bug 01: standalone empty layout fails cleanly", proc.returncode != 0
+          and "not found" not in proc.stderr, proc.stdout + proc.stderr)
+
+    # 2: /system/bin/sh scripts must not need Bash's ANSI-C quoting extension.
+    layout()
+    proc = run(shell="sh")
+    check("bug 02: valid ELF accepted by POSIX sh", proc.returncode == 0,
+          proc.stdout + proc.stderr)
+
+    # 3: a present ABI must have all four artifacts, not just one file anywhere.
+    for missing in names:
+        dest = layout()
+        os.unlink(os.path.join(dest, missing))
+        proc = run()
+        check("bug 03: incomplete ABI rejected: " + missing, proc.returncode != 0,
+              proc.stdout + proc.stderr)
+    layout()
+    os.makedirs(os.path.join(libs, "x86"))
+    proc = run()
+    check("bug 03: empty secondary ABI rejected", proc.returncode != 0,
+          proc.stdout + proc.stderr)
+
+    # 4: the daemon is an ELF too, not an arbitrary file that counts as present.
+    dest = layout()
+    with open(os.path.join(dest, "zygiskd"), "wb") as fp:
+        fp.write(b"not an executable\n")
+    proc = run()
+    check("bug 04: corrupt daemon rejected", proc.returncode != 0,
+          proc.stdout + proc.stderr)
+
+    # 5: reject wrong bitness even when the ELF magic is valid.
+    dest = layout()
+    with open(os.path.join(dest, "libpayload.so"), "r+b") as fp:
+        fp.seek(4)
+        fp.write(b"\x01")
+    proc = run()
+    check("bug 05: wrong ELF class rejected", proc.returncode != 0,
+          proc.stdout + proc.stderr)
+
+    # 6: arm64 and x86_64 share ELFCLASS64, but cannot run each other's code.
+    dest = layout()
+    with open(os.path.join(dest, "libzygisk.so"), "r+b") as fp:
+        fp.seek(18)
+        fp.write(struct.pack("<H", 183))
+    proc = run()
+    check("bug 06: wrong ELF machine rejected", proc.returncode != 0,
+          proc.stdout + proc.stderr)
+    for abi in machines:
+        layout(abi)
+        proc = run()
+        check("verify: valid ABI accepted: " + abi, proc.returncode == 0,
+              proc.stdout + proc.stderr)
+
+    # 7: when sourced, $0 belongs to the installer, not to verify.sh.
+    layout()
+    proc = run(sourced=True)
+    check("bug 07: sourced verifier honors MODPATH", proc.returncode == 0,
+          proc.stdout + proc.stderr)
+
+
+def test_publish_regressions(mk):
+    import json
+
+    write_exec(os.path.join(mk.bindir, "git"), r'''#!/usr/bin/env python3
+import json, os, sys
+args = sys.argv[1:]
+with open(os.environ['PUBLISH_CALLS'], 'a') as fp:
+    fp.write(json.dumps(args) + '\n')
+state = os.environ['PUBLISH_REMOTE']
+if args[:2] == ['rev-parse', '--is-inside-work-tree']:
+    print('true')
+elif args[:2] == ['rev-parse', 'HEAD']:
+    print('0123456789abcdef')
+elif args[:1] == ['symbolic-ref']:
+    if os.environ.get('PUBLISH_DETACHED'):
+        sys.exit(1)
+    print('study-fixes')
+elif args[:2] == ['remote', 'get-url']:
+    with open(state) as fp:
+        url = fp.read()
+    if not url:
+        sys.exit(2)
+    print(url)
+elif args[:2] in (['remote', 'set-url'], ['remote', 'add']):
+    with open(state, 'w') as fp:
+        fp.write(args[-1])
+elif args[:2] == ['config', 'user.email']:
+    sys.exit(1)
+elif args[:1] != ['push']:
+    sys.exit('unexpected git command: ' + repr(args))
+''')
+    env = mk.env({"PUBLISH_CALLS": os.path.join(mk.root, "publish.log"),
+                  "PUBLISH_REMOTE": os.path.join(mk.root, "remote.url")})
+
+    def run(args=(), remote="https://github.com/example/study.git", extra=None):
+        with open(env["PUBLISH_CALLS"], "w"):
+            pass
+        with open(env["PUBLISH_REMOTE"], "w") as fp:
+            fp.write(remote)
+        proc = subprocess.run(["bash", os.path.join(REPO_ROOT, "publish.sh"), *args],
+                              env={**env, **(extra or {})}, capture_output=True,
+                              text=True, timeout=10)
+        with open(env["PUBLISH_CALLS"]) as fp:
+            calls = [json.loads(line) for line in fp]
+        with open(env["PUBLISH_REMOTE"]) as fp:
+            url = fp.read()
+        return proc, calls, url
+
+    # 8: option values cannot be missing, empty, or another switch.
+    for opt in ("--repo", "--remote", "--branch"):
+        for args in ((opt,), (opt, ""), (opt, "--ssh")):
+            proc, calls, _ = run(args)
+            check("bug 08: publish validates " + repr(args), proc.returncode == 2
+                  and "requires a value" in proc.stderr and not calls,
+                  proc.stdout + proc.stderr)
+
+    # 9: the default push should publish the branch actually being worked on.
+    proc, calls, _ = run()
+    check("bug 09: publish defaults to the current branch", proc.returncode == 0
+          and ["push", "-u", "origin", "study-fixes"] in calls, repr(calls))
+    proc, calls, _ = run(extra={"PUBLISH_DETACHED": "1"})
+    check("bug 09: detached HEAD requires an explicit branch", proc.returncode != 0
+          and not any(c[0] == "push" for c in calls), proc.stdout + proc.stderr)
+    proc, calls, _ = run(("--branch", "release"), extra={"PUBLISH_DETACHED": "1"})
+    check("publish: explicit branch works detached", proc.returncode == 0
+          and ["push", "-u", "origin", "release"] in calls, repr(calls))
+
+    # 10: --repo must not silently push to the existing, different repository.
+    proc, calls, url = run(("--repo", "owner/new-study"))
+    check("bug 10: explicit repository updates existing remote", proc.returncode == 0
+          and url == "https://github.com/owner/new-study.git", repr(calls))
+
+    # 11: explicit transport switches apply to existing GitHub remotes too.
+    for args, remote, expected in (
+        (("--ssh",), "https://github.com/example/study.git", "git@github.com:example/study.git"),
+        (("--https",), "git@github.com:example/study.git", "https://github.com/example/study.git"),
+        (("--https",), "ssh://git@github.com/example/study.git", "https://github.com/example/study.git"),
+    ):
+        proc, calls, url = run(args, remote)
+        check("bug 11: transport switch " + repr(args) + " from " + remote,
+              proc.returncode == 0 and url == expected, repr(calls))
+    proc, calls, url = run(("--ssh",), "https://example.org/team/study.git")
+    check("publish: transport conversion cannot redirect a non-GitHub remote",
+          proc.returncode != 0 and not any(c[0] == "push" for c in calls), repr(calls))
+
+    # 12: missing git user.email must not suppress the missing-remote diagnostic.
+    proc, calls, _ = run(remote="")
+    check("bug 12: missing remote diagnostic without configured email",
+          proc.returncode != 0 and "pass --repo" in proc.stderr,
+          proc.stdout + proc.stderr)
+
+
+def test_build_input_regressions(mk):
+    sdk = os.path.join(mk.root, "sdk")
+    valid = os.path.join(sdk, "ndk", "26.0")
+    toolbin = os.path.join(valid, "toolchains", "llvm", "prebuilt", "linux-x86_64", "bin")
+    os.makedirs(toolbin)
+    write_exec(os.path.join(toolbin, "clang"), "#!/bin/sh\nexit 99\n")
+    os.makedirs(os.path.join(valid, "build", "cmake"))
+    with open(os.path.join(valid, "build", "cmake", "android.toolchain.cmake"), "w"):
+        pass
+    broken = os.path.join(sdk, "ndk", "99.0")
+    os.makedirs(broken)
+    write_exec(os.path.join(mk.bindir, "cmake"), "#!/bin/sh\nexit 99\n")
+    env = mk.env()
+    for key in ("NDK", "NDK_VERSION", "ANDROID_NDK_HOME", "ANDROID_NDK_LATEST_HOME",
+                "ANDROID_NDK_ROOT", "API_LEVEL", "ABIS"):
+        env.pop(key, None)
+    env["ANDROID_HOME"] = sdk
+    index = 0
+
+    def run(args=(), extra=None):
+        nonlocal index
+        index += 1
+        out = os.path.join(mk.root, "input-build-" + str(index))
+        proc = subprocess.run(["bash", os.path.join(REPO_ROOT, "scripts", "build_module.sh"),
+                               "--skip-cpp", "--skip-rust", "--out", out, *args],
+                              env={**env, **(extra or {})}, capture_output=True,
+                              text=True, timeout=15)
+        return proc, out
+
+    # 13: an explicit missing NDK is an error, not permission to use another one.
+    proc, out = run(("--ndk", os.path.join(mk.root, "missing")),
+                    {"ANDROID_NDK_HOME": valid})
+    check("bug 13: explicit nonexistent NDK is rejected", proc.returncode != 0
+          and not os.path.exists(out), proc.stdout + proc.stderr)
+
+    # 14: automatic discovery must skip incomplete/stale NDK installations.
+    for extra in ({}, {"ANDROID_NDK_HOME": broken}, {"NDK_VERSION": "99.0"}):
+        proc, _ = run(extra=extra)
+        check("bug 14: discovery skips incomplete NDK " + repr(extra), proc.returncode == 0
+              and f"== NDK: {valid}" in proc.stdout.splitlines(), proc.stdout + proc.stderr)
+
+    # 15: invalid or unsupported API values must fail before output/compilers.
+    for api in ("", "abc", "20", "-1", "21;echo bad", "021"):
+        proc, out = run(("--ndk", valid, "--api", api))
+        check("bug 15: invalid API rejected: " + repr(api), proc.returncode == 2
+              and not os.path.exists(out), proc.stdout + proc.stderr)
+    for api in ("21", "35"):
+        proc, _ = run(("--ndk", valid, "--api", api))
+        check("build: supported API accepted: " + api, proc.returncode == 0,
+              proc.stdout + proc.stderr)
+
+
+def test_recovery_installer_regressions(mk):
+    # Rewrite only the absolute device path in a private copy; all decisions and
+    # exit handling still come from the production installer. Never mount /data.
+    with open(os.path.join(REPO_ROOT, "scripts", "installer", "update-binary")) as fp:
+        source = fp.read()
+    util = os.path.join(mk.root, "util_functions.sh")
+    script = os.path.join(mk.root, "update-binary")
+    with open(script, "w") as fp:
+        fp.write(source.replace("/data/adb/magisk/util_functions.sh", '"' + util + '"'))
+    write_exec(os.path.join(mk.bindir, "mount"), "#!/bin/sh\nexit 0\n")
+    marker = os.path.join(mk.root, "installed")
+
+    def run(version="20400", status=0):
+        if os.path.exists(marker):
+            os.unlink(marker)
+        with open(util, "w") as fp:
+            fp.write("MAGISK_VER_CODE='" + version + "'\n"
+                     + "install_module(){ touch '" + marker + "'; return " + str(status) + "; }\n")
+        return subprocess.run(["sh", script, "3", "", "module.zip"], env=mk.env(),
+                              capture_output=True, text=True, timeout=10)
+
+    # 16: preserve Magisk install_module's nonzero return code.
+    proc = run(status=42)
+    check("bug 16: recovery propagates installation failure", proc.returncode == 42,
+          proc.stdout + proc.stderr)
+    proc = run()
+    check("recovery: successful installation returns zero", proc.returncode == 0
+          and os.path.exists(marker), proc.stdout + proc.stderr)
+
+    # 17: a malformed version must not bypass the minimum-version check.
+    for version in ("garbage", "20400x", "", "20300", "999999999999999999999999999999999"):
+        proc = run(version)
+        check("bug 17: recovery rejects invalid/old version " + repr(version),
+              proc.returncode != 0 and not os.path.exists(marker), proc.stdout + proc.stderr)
+
+
+def test_make_cleanup_regressions(mk):
+    # 18: header probes must not share predictable source files across builds.
+    proc = subprocess.run(["make", "-n", "-C", os.path.join(REPO_ROOT, "tests"),
+                           "verify-public-header"], capture_output=True, text=True, timeout=10)
+    check("bug 18: public-header probes do not share /tmp source files", proc.returncode == 0
+          and "/tmp/zs_api_" not in proc.stdout, proc.stdout + proc.stderr)
+
+    # 19: clean must remove both ordinary and TSan race-suite artifacts.
+    testdir = os.path.join(mk.root, "tests")
+    os.makedirs(testdir)
+    shutil.copy(os.path.join(REPO_ROOT, "tests", "Makefile"), testdir)
+    for name in ("race_fixture.so", "test_race_tsan", "test_race"):
+        with open(os.path.join(testdir, name), "w"):
+            pass
+    proc = subprocess.run(["make", "-C", testdir, "clean"], capture_output=True,
+                          text=True, timeout=10)
+    check("bug 19: clean removes race fixtures and sanitizer binary", proc.returncode == 0
+          and all(not os.path.exists(os.path.join(testdir, name)) for name in
+                  ("race_fixture.so", "test_race_tsan", "test_race")), proc.stdout + proc.stderr)
+
+
 def main():
     cases = [
+        ("Artifact verifier: seven format and invocation regressions", test_verify_artifact_regressions),
+        ("Publish: five CLI and destination regressions", test_publish_regressions),
+        ("Build: three NDK and API input regressions", test_build_input_regressions),
+        ("Recovery: two installer failure regressions", test_recovery_installer_regressions),
+        ("Makefile: two probe and cleanup regressions", test_make_cleanup_regressions),
         ("post-fs-data: current=0 swaps (Round 29 core fix)",
          test_swap_value_zero),
         ("post-fs-data: absent prop swaps", test_swap_value_absent),

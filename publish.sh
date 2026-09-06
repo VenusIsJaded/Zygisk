@@ -49,13 +49,21 @@ cd "$REPO_ROOT"
 PROTOCOL="https"           # https or ssh
 REPO=""                    # e.g. VenusIsJaded/Zygisk
 REMOTE_NAME="origin"       # name of the git remote to use/push to
-BRANCH="main"              # the branch to push
+BRANCH=""                  # default to the current branch
+PROTOCOL_SET=0
 
 # Parse args.
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --ssh)        PROTOCOL="ssh"; shift;;
-        --https)      PROTOCOL="https"; shift;;
+        --repo|--remote|--branch)
+            if [[ $# -lt 2 || -z "$2" || "$2" == -* ]]; then
+                echo "publish.sh: $1 requires a value" >&2
+                exit 2
+            fi ;;
+    esac
+    case "$1" in
+        --ssh)        PROTOCOL="ssh"; PROTOCOL_SET=1; shift;;
+        --https)      PROTOCOL="https"; PROTOCOL_SET=1; shift;;
         --repo)       REPO="$2"; shift 2;;
         --remote)     REMOTE_NAME="$2"; shift 2;;
         --branch)     BRANCH="$2"; shift 2;;
@@ -82,24 +90,44 @@ if ! git rev-parse HEAD >/dev/null 2>&1; then
     exit 1
 fi
 
-# Determine the URL to push to.
-REMOTE_URL="$(git remote get-url "$REMOTE_NAME" 2>/dev/null || true)"
-if [[ -z "$REMOTE_URL" ]]; then
-    # No remote with this name. We need to create one.
-    if [[ -z "$REPO" ]]; then
-        # Try to guess from `git config user.email` if --repo not given.
-        GUESS_USER="$(git config user.email | cut -d@ -f1)"
-        echo "publish.sh: no remote named '$REMOTE_NAME'." >&2
-        echo "publish.sh: pass --repo USER/REPO (e.g. --repo $GUESS_USER/Zygisk)." >&2
+# A fixed main default can report success while leaving the user's changes
+# unpublished on a feature branch. Detached checkouts need an explicit choice.
+if [[ -z "$BRANCH" ]]; then
+    BRANCH="$(git symbolic-ref --quiet --short HEAD)" || {
+        echo "publish.sh: detached HEAD; pass --branch BRANCH." >&2
         exit 1
-    fi
+    }
+fi
+
+# Explicit repository/transport options must also apply to existing remotes.
+REMOTE_URL="$(git remote get-url "$REMOTE_NAME" 2>/dev/null || true)"
+if [[ -z "$REMOTE_URL" && -z "$REPO" ]]; then
+    echo "publish.sh: no remote named '$REMOTE_NAME'." >&2
+    echo "publish.sh: pass --repo USER/REPO (e.g. --repo VenusIsJaded/Zygisk)." >&2
+    exit 1
+fi
+if [[ -z "$REPO" && $PROTOCOL_SET -eq 1 ]]; then
+    case "$REMOTE_URL" in
+        https://github.com/*) REPO="${REMOTE_URL#https://github.com/}" ;;
+        git@github.com:*) REPO="${REMOTE_URL#git@github.com:}" ;;
+        ssh://git@github.com/*) REPO="${REMOTE_URL#ssh://git@github.com/}" ;;
+        *) echo "publish.sh: transport conversion requires a GitHub remote or --repo." >&2
+           exit 2 ;;
+    esac
+    REPO="${REPO%.git}"
+fi
+if [[ -n "$REPO" ]]; then
     if [[ "$PROTOCOL" == "ssh" ]]; then
-        REMOTE_URL="git@github.com:$REPO.git"
+        TARGET_URL="git@github.com:$REPO.git"
     else
-        REMOTE_URL="https://github.com/$REPO.git"
+        TARGET_URL="https://github.com/$REPO.git"
     fi
-    echo "publish.sh: adding remote $REMOTE_NAME -> $REMOTE_URL"
-    git remote add "$REMOTE_NAME" "$REMOTE_URL"
+    if [[ -z "$REMOTE_URL" ]]; then
+        git remote add "$REMOTE_NAME" "$TARGET_URL"
+    elif [[ "$REMOTE_URL" != "$TARGET_URL" ]]; then
+        git remote set-url "$REMOTE_NAME" "$TARGET_URL"
+    fi
+    REMOTE_URL="$TARGET_URL"
 fi
 
 # Push.

@@ -1,40 +1,53 @@
 #!/system/bin/sh
-# verify.sh — quick post-install sanity check.
-#
-# Confirms that the user really did build and package their own .so
-# files from the source in this repo. Fails loudly if anything is
-# missing or if any file looks suspiciously like a copy of an upstream
-# binary (we don't have a fingerprint database, but we can at least
-# check the ELF header's e_ident[EI_ABIVERSION] and the build-id to
-# make sure the file exists and is plausible).
+# verify.sh — structural checks for packaged native artifacts.
+# Accept ABI subsets, but require every present ABI to contain all four files.
+# ELF headers establish format/architecture only, not provenance or safety.
 
-MODDIR=${0%/*}
-EXPECTED_COUNT=4
+# Magisk sources scripts with MODPATH set; $0 then names the installer.
+MODDIR=${MODPATH:-${MODDIR:-$(dirname "$0")}}
+
+if ! command -v ui_print >/dev/null 2>&1; then
+  ui_print() { printf '%s\n' "$*"; }
+fi
+if ! command -v abort >/dev/null 2>&1; then
+  abort() { ui_print "$*"; exit 1; }
+fi
+
+verify_fail() {
+  abort "! $*"
+  exit 1
+}
+
+verify_elf() {
+  # od is available in Android's toybox/busybox and POSIX host shells.
+  # Check all four magic bytes, class, little-endian encoding and e_machine.
+  # No Bash-only $'...' quoting, binary shell variables, or SIGPIPE pipeline.
+  set -- $(LC_ALL=C od -An -v -tu1 -N20 "$1")
+  [ "$#" -eq 20 ] || verify_fail "$p has a truncated ELF header"
+  [ "$1 $2 $3 $4" = "127 69 76 70" ] || verify_fail "$p is not an ELF file"
+  [ "$5" = "$expected_class" ] || verify_fail "$p has the wrong ELF class for $abi"
+  [ "$6" = 1 ] || verify_fail "$p is not a little-endian ELF"
+  shift 18
+  [ "$1" = "$expected_machine" ] && [ "$2" = 0 ] ||
+    verify_fail "$p has the wrong ELF machine for $abi"
+}
 
 count=0
 for abi in arm64-v8a armeabi-v7a x86_64 x86; do
+  [ -d "$MODDIR/libs/$abi" ] || continue
+  case "$abi" in
+    arm64-v8a)   expected_class=2; expected_machine=183 ;;
+    armeabi-v7a) expected_class=1; expected_machine=40 ;;
+    x86_64)      expected_class=2; expected_machine=62 ;;
+    x86)         expected_class=1; expected_machine=3 ;;
+  esac
   for f in libzygisk.so libpayload.so libzn_loader.so zygiskd; do
     p="$MODDIR/libs/$abi/$f"
-    if [ -f "$p" ]; then
-      count=$((count + 1))
-      # ELF magic for the libraries
-      case "$f" in
-        *.so)
-          head -c 4 "$p" | grep -q $'\x7fELF' || {
-            ui_print "! $p is not an ELF file"
-            abort "! Refusing to install: corrupt artifact"
-          }
-          ;;
-      esac
-    fi
+    [ -f "$p" ] || verify_fail "Missing required artifact: $p"
+    verify_elf "$p"
+    count=$((count + 1))
   done
 done
 
-if [ "$count" -eq 0 ]; then
-  ui_print "! No native artifacts found."
-  ui_print "! You must build the .so files yourself from the source in"
-  ui_print "! this repo (see README.md) before packaging the module."
-  abort "! Refusing to install with no artifacts."
-fi
-
+[ "$count" -gt 0 ] || verify_fail "No native artifacts found; build and package them first."
 ui_print "- Verified $count native artifacts"

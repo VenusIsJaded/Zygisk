@@ -173,15 +173,10 @@ run: all verify-public-header verify-scripts verify-trampolines
 # undeclared in both languages).
 .PHONY: verify-public-header
 verify-public-header:
-	@printf '#include "zygisk_study_api.h"\nint main(void){return 0;}\n' > /tmp/zs_api_c.c
-	@if ! $(CC) -std=c99 -Wall -Wextra -I.. -fsyntax-only /tmp/zs_api_c.c; then \
-		echo "FAIL: zygisk_study_api.h does not compile standalone (C99)"; exit 1; \
-	fi
-	@printf '#include "zygisk_study_api.h"\nint main(){return 0;}\n' > /tmp/zs_api_cpp.cpp
-	@if ! $(CXX) $(CXXFLAGS) -I.. -fsyntax-only /tmp/zs_api_cpp.cpp; then \
-		echo "FAIL: zygisk_study_api.h does not compile standalone (C++)"; exit 1; \
-	fi
-	@rm -f /tmp/zs_api_c.c /tmp/zs_api_cpp.cpp
+	@printf '#include "zygisk_study_api.h"\nint main(void){return 0;}\n' | \
+		$(CC) -std=c99 -Wall -Wextra -I.. -x c -fsyntax-only -
+	@printf '#include "zygisk_study_api.h"\nint main(){return 0;}\n' | \
+		$(CXX) $(CXXFLAGS) -I.. -x c++ -fsyntax-only -
 	@echo "public API header: standalone C99 + C++17 compile OK"
 
 # Round 10: sanitized build of the logic suites (ASan + UBSan, leak
@@ -276,4 +271,4 @@ verify-scripts:
 	fi
 
 clean:
-	rm -f $(TESTS) libpayload.so libzs_test_module.so libzygisk.so
+	rm -f $(TESTS) libpayload.so libzs_test_module.so libzygisk.so race_fixture.so test_race_tsan
