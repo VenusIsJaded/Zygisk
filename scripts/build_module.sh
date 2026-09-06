@@ -82,7 +82,7 @@ SKIP_ZIP=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --ndk|--api|--abis|--out|--type)
-            if [[ $# -lt 2 || "$2" == --* ]]; then
+            if [[ $# -lt 2 || -z "$2" || "$2" == --* ]]; then
                 echo "build_module.sh: $1 requires a value" >&2
                 exit 2
             fi ;;
@@ -126,6 +126,13 @@ if [[ ! "$API_LEVEL" =~ ^[1-9][0-9]*$ ]] ||
     echo "build_module.sh: --api must be a decimal Android API level >= 21" >&2
     exit 2
 fi
+
+# Misspelled CMake configurations can silently omit configuration-specific
+# compiler flags. Only the configurations supported by this project are valid.
+case "$BUILD_TYPE" in
+    Debug|Release|RelWithDebInfo|MinSizeRel) ;;
+    *) echo "build_module.sh: unsupported build type: $BUILD_TYPE" >&2; exit 2 ;;
+esac
 
 # An explicit path is a requirement, not a discovery hint. Never silently
 # switch compilers when the caller misspells it.
@@ -205,7 +212,14 @@ fi
 SYSROOT="$TOOLCHAIN/sysroot"
 CMAKE_TOOLCHAIN_FILE="$NDK_PATH/build/cmake/android.toolchain.cmake"
 [[ -f "$CMAKE_TOOLCHAIN_FILE" ]] || { echo "ERROR: NDK CMake toolchain file missing" >&2; exit 1; }
-command -v cmake >/dev/null || { echo "ERROR: cmake not on PATH" >&2; exit 1; }
+# Check all requested toolchains before compiling anything. Rust-only builds
+# do not need the CMake executable, and missing Cargo must not waste a C++ build.
+if [[ $SKIP_CPP -ne 1 ]]; then
+    command -v cmake >/dev/null || { echo "ERROR: cmake not on PATH" >&2; exit 1; }
+fi
+if [[ $SKIP_RUST -ne 1 ]]; then
+    command -v cargo >/dev/null || { echo "ERROR: cargo not on PATH" >&2; exit 1; }
+fi
 
 # ---------------------------------------------------------------------------
 # Version metadata: per-commit for CI/local git checkouts, static fallback
@@ -413,31 +427,67 @@ EOF
     (cd "$MODULE_DIR" && find . -type f | sort)
 }
 
-make_zip() {
+make_zip() (
     command -v zip >/dev/null || { echo "ERROR: zip not on PATH" >&2; exit 1; }
     mkdir -p "$ZIP_DIR"
     local zip_name="zygisk_study-${VERSION_NAME}-${VERSION_CODE}.zip"
     local zip_path="$ZIP_DIR/$zip_name"
-    rm -f "$zip_path"
+    # Build and validate privately, on the same filesystem as the destination.
+    # Failed or interrupted builds must never publish an invalid ZIP or destroy
+    # the previous verified release. Subshell traps cannot leak into the caller.
+    local zip_work
+    zip_work="$(mktemp -d "$ZIP_DIR/.package.XXXXXX")" || exit 1
+    trap 'rm -rf "$zip_work"' EXIT
+    trap 'exit 1' HUP INT TERM
+    local candidate="$zip_work/$zip_name"
     echo "== Creating $zip_path"
-    (cd "$MODULE_DIR" && zip -r -q "$zip_path" .)
+    (cd "$MODULE_DIR" && zip -r -q "$candidate" .)
     echo "== Zip contents:"
-    unzip -l "$zip_path"
-    verify_zip "$zip_path"
+    unzip -l "$candidate"
+    verify_zip "$candidate"
+    mv -f "$candidate" "$zip_path"
     echo "== DONE: $zip_path ($(du -h "$zip_path" | cut -f1))"
-}
+)
 
 # Self-verification of the produced artifact: the module's install-time
 # contract (what customize.sh / verify.sh / the Magisk installer expect)
 # checked from the finished zip itself, so a broken package can never
 # leave a green build.
 verify_zip() {
+    (
     local zip_path="$1"
     echo "== Verifying the zip"
     local fail=0
 
     local listing
     listing="$(unzip -Z1 "$zip_path")"
+
+    # ZIP readers disagree about which duplicate wins; unzip -p concatenates
+    # them. Reject ambiguous members before examining any extracted bytes.
+    if ! awk 'seen[$0]++ { bad = 1 } END { exit bad ? 1 : 0 }' <<< "$listing"; then
+        echo "  FAIL: duplicate archive member" >&2
+        exit 1
+    fi
+    # A valid requested subset must not conceal other, unchecked ABI trees.
+    if ! awk -v abis="${ABI_LIST[*]}" '
+        BEGIN { n = split(abis, names, " "); for (i = 1; i <= n; i++) allowed[names[i]] = 1 }
+        /^libs\// && $0 != "libs/" {
+            split($0, parts, "/")
+            if (!(parts[2] in allowed)) bad = 1
+        }
+        END { exit bad ? 1 : 0 }
+    ' <<< "$listing"; then
+        echo "  FAIL: unexpected ABI entry in archive" >&2
+        exit 1
+    fi
+
+    # Keep a single private snapshot for every binary check. The staging tree
+    # can differ from the supplied ZIP and is not evidence about its contents.
+    local tmp_extract
+    tmp_extract="$(mktemp -d)" || exit 1
+    trap 'rm -rf "$tmp_extract"' EXIT
+    trap 'exit 1' HUP INT TERM
+    local MODULE_DIR="$tmp_extract"
 
     # 1. The files the installer needs. customize.sh is SOURCED by
     #    Magisk's install_module after extracting everything except
@@ -500,8 +550,6 @@ verify_zip() {
     # full magic, CPU, byte order, versions, type and complete header size.
     local abi
     if ! (
-        tmp_extract="$(mktemp -d)" || exit 1
-        trap 'rm -rf "$tmp_extract"' EXIT
         for abi in "${ABI_LIST[@]}"; do
             mkdir -p "$tmp_extract/libs/$abi" || exit 1
             for lib in libzygisk.so libpayload.so libzn_loader.so zygiskd; do
@@ -522,8 +570,8 @@ verify_zip() {
     #    libraries, Round 32 for the daemon): a 16 KB-kernel device
     #    (Android 16+, Pixel 9a onward) refuses LOAD segments aligned
     #    below the kernel page size — for executables exactly as for
-    #    shared objects. Checked from the assembled module tree (the
-    #    zip content is byte-identical to it).
+    #    shared objects. Check the private snapshot extracted from the ZIP,
+    #    not the independently mutable staging tree.
     local readelf_bin="" f align headers aligns
     if [[ -x "$TOOLCHAIN/bin/llvm-readelf" ]]; then
         readelf_bin="$TOOLCHAIN/bin/llvm-readelf"
@@ -640,13 +688,14 @@ verify_zip() {
     fi
     echo "  OK: layout, module.prop, updater-script, legacy-trap, ELF classes,"
     echo "      16 KB alignment, stripped sections, no SONAME, banned-strings all verified"
+    )
 }
 
 # ---------------------------------------------------------------------------
 # Drive the build
 # ---------------------------------------------------------------------------
 mkdir -p "$OUT_ROOT"
-OUT_ROOT="$(cd "$OUT_ROOT" && pwd)"
+OUT_ROOT="$(cd "$OUT_ROOT" && pwd -P)"
 MODULE_DIR="$OUT_ROOT/module"
 ZIP_DIR="$OUT_ROOT/out"
 
@@ -656,14 +705,24 @@ RUST_TARGET_DIR="${CARGO_TARGET_DIR:-$REPO_ROOT/native/zygiskd/target}"
 if [[ $SKIP_RUST -ne 1 ]]; then
     [[ "$RUST_TARGET_DIR" = /* ]] || RUST_TARGET_DIR="$REPO_ROOT/native/zygiskd/$RUST_TARGET_DIR"
     mkdir -p "$RUST_TARGET_DIR"
-    RUST_TARGET_DIR="$(cd "$RUST_TARGET_DIR" && pwd)"
+    RUST_TARGET_DIR="$(cd "$RUST_TARGET_DIR" && pwd -P)"
+    # assemble_module replaces MODULE_DIR recursively. A Cargo target beneath
+    # it would lose both the fresh executable and any existing cache contents.
+    module_real="$MODULE_DIR"
+    if [[ -d "$MODULE_DIR" ]]; then
+        module_real="$(cd "$MODULE_DIR" && pwd -P)"
+    fi
+    case "$RUST_TARGET_DIR/" in
+        "$module_real/"*)
+            echo "ERROR: Cargo target directory must not be inside the module staging tree" >&2
+            exit 2 ;;
+    esac
 fi
 
 for abi in "${ABI_LIST[@]}"; do
     [[ $SKIP_CPP -eq 1 ]] || build_cpp "$abi"
 done
 if [[ $SKIP_RUST -ne 1 ]]; then
-    command -v cargo >/dev/null || { echo "ERROR: cargo not on PATH" >&2; exit 1; }
     for abi in "${ABI_LIST[@]}"; do
         build_rust "$abi"
     done
