@@ -62,9 +62,10 @@
 #   ./scripts/build_module.sh --skip-rust        # C++ only (quick check)
 
 set -euo pipefail
+unset CDPATH
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 cd "$REPO_ROOT"
 
 # ---------------------------------------------------------------------------
@@ -82,7 +83,7 @@ SKIP_ZIP=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --ndk|--api|--abis|--out|--type)
-            if [[ $# -lt 2 || "$2" == --* ]]; then
+            if [[ $# -lt 2 || -z "$2" || "$2" == --* ]]; then
                 echo "build_module.sh: $1 requires a value" >&2
                 exit 2
             fi ;;
@@ -97,7 +98,7 @@ while [[ $# -gt 0 ]]; do
         --skip-cpp)     SKIP_CPP=1; shift;;
         --skip-zip)     SKIP_ZIP=1; shift;;
         -h|--help)
-            sed -n '2,60p' "$0" | sed 's/^# \{0,1\}//'
+            sed -n '2,62p' "$SCRIPT_DIR/build_module.sh" | sed 's/^# \{0,1\}//'
             exit 0;;
         *)
             echo "build_module.sh: unknown option: $1" >&2
@@ -126,6 +127,14 @@ if [[ ! "$API_LEVEL" =~ ^[1-9][0-9]*$ ]] ||
     echo "build_module.sh: --api must be a decimal Android API level >= 21" >&2
     exit 2
 fi
+
+# CMake accepts arbitrary configuration names, silently dropping the standard
+# optimization/debug flags on typos. Only expose its supported configurations.
+case "$BUILD_TYPE" in
+    Debug|Release|RelWithDebInfo|MinSizeRel) ;;
+    *) echo "build_module.sh: --type must be Debug, Release, RelWithDebInfo or MinSizeRel" >&2
+       exit 2 ;;
+esac
 
 # An explicit path is a requirement, not a discovery hint. Never silently
 # switch compilers when the caller misspells it.
@@ -187,11 +196,11 @@ if ! NDK_PATH="$(find_ndk)"; then
     exit 1
 fi
 # Both CMake and Cargo resolve paths after changing directories.
-NDK_PATH="$(cd "$NDK_PATH" && pwd)"
+NDK_PATH="$(cd -- "$NDK_PATH" && pwd)"
 echo "== NDK: $NDK_PATH"
 
 TOOLCHAIN="$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64"
-if [[ ! -d "$TOOLCHAIN" ]]; then
+if [[ ! -x "$TOOLCHAIN/bin/clang" ]]; then
     # Non-x86_64 build hosts use a different prebuilt tag (e.g. darwin-x86_64,
     # linux-aarch64). Accept whatever exists instead of hard-failing.
     for candidate in "$NDK_PATH"/toolchains/llvm/prebuilt/*; do
@@ -205,7 +214,13 @@ fi
 SYSROOT="$TOOLCHAIN/sysroot"
 CMAKE_TOOLCHAIN_FILE="$NDK_PATH/build/cmake/android.toolchain.cmake"
 [[ -f "$CMAKE_TOOLCHAIN_FILE" ]] || { echo "ERROR: NDK CMake toolchain file missing" >&2; exit 1; }
-command -v cmake >/dev/null || { echo "ERROR: cmake not on PATH" >&2; exit 1; }
+# Check prerequisites before compiling anything or creating output directories.
+if [[ $SKIP_CPP -ne 1 ]]; then
+    command -v cmake >/dev/null || { echo "ERROR: cmake not on PATH" >&2; exit 1; }
+fi
+if [[ $SKIP_RUST -ne 1 ]]; then
+    command -v cargo >/dev/null || { echo "ERROR: cargo not on PATH" >&2; exit 1; }
+fi
 
 # ---------------------------------------------------------------------------
 # Version metadata: per-commit for CI/local git checkouts, static fallback
@@ -244,7 +259,12 @@ build_cpp() {
         -DANDROID_PLATFORM="android-$API_LEVEL" \
         -DCMAKE_BUILD_TYPE="$BUILD_TYPE" \
         > /dev/null
-    cmake --build "$build_dir" -j"$(nproc)"
+    # nproc is a GNU utility, absent on macOS. Never pass a bare -j on
+    # discovery failure: make interprets it as unlimited parallelism.
+    local jobs
+    jobs="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
+    [[ "$jobs" =~ ^[1-9][0-9]*$ ]] || jobs=1
+    cmake --build "$build_dir" --config "$BUILD_TYPE" -j"$jobs"
     # ROUND 33 (stealth release): strip the shared objects. The
     # pre-Round-33 artifacts shipped a full .symtab/.strtab and (via
     # the old "-g in Release" flags) complete DWARF — over half of
@@ -259,10 +279,12 @@ build_cpp() {
     # layout too for out-of-tree builds made by other tooling.
     local out dir
     for out in libzygisk.so libpayload.so libzn_loader.so; do
-        if [[ -f "$build_dir/$out" ]]; then
-            continue
-        fi
-        for dir in "$build_dir/$(basename "$out" .so)" \
+        # Prefer actual configuration/target outputs to flattened copies from
+        # an earlier build; those copies otherwise remain stale forever.
+        for dir in "$build_dir/$BUILD_TYPE" \
+                   "$build_dir/${out%.so}/$BUILD_TYPE" \
+                   "$build_dir/$(echo "$out" | sed 's/^lib//; s/\.so$//')/$BUILD_TYPE" \
+                   "$build_dir/${out%.so}" \
                    "$build_dir/$(echo "$out" | sed 's/^lib//; s/\.so$//')"; do
             if [[ -f "$dir/$out" ]]; then
                 cp "$dir/$out" "$build_dir/$out"
@@ -414,17 +436,32 @@ EOF
 }
 
 make_zip() {
-    command -v zip >/dev/null || { echo "ERROR: zip not on PATH" >&2; exit 1; }
-    mkdir -p "$ZIP_DIR"
-    local zip_name="zygisk_study-${VERSION_NAME}-${VERSION_CODE}.zip"
-    local zip_path="$ZIP_DIR/$zip_name"
-    rm -f "$zip_path"
-    echo "== Creating $zip_path"
-    (cd "$MODULE_DIR" && zip -r -q "$zip_path" .)
-    echo "== Zip contents:"
-    unzip -l "$zip_path"
-    verify_zip "$zip_path"
-    echo "== DONE: $zip_path ($(du -h "$zip_path" | cut -f1))"
+    # Build and verify privately on the destination filesystem, then publish
+    # with one atomic rename. A failed rebuild cannot destroy a good release
+    # or leave an unverified archive at the public output path.
+    (
+        # User zip defaults such as -m (move/delete inputs) are not build options.
+        unset ZIPOPT UNZIP UNZIPOPT ZIPINFO ZIPINFOOPT
+        command -v zip >/dev/null || { echo "ERROR: zip not on PATH" >&2; exit 1; }
+        mkdir -p "$ZIP_DIR" || exit 1
+        zip_name="zygisk_study-${VERSION_NAME}-${VERSION_CODE}.zip"
+        zip_path="$ZIP_DIR/$zip_name"
+        if [[ -e "$zip_path" && ! -f "$zip_path" ]]; then
+            echo "ERROR: release ZIP destination is not a regular file: $zip_path" >&2
+            exit 1
+        fi
+        package_dir="$(mktemp -d "$ZIP_DIR/.package.XXXXXX")" || exit 1
+        trap 'rm -rf "$package_dir"' EXIT
+        trap 'exit 1' HUP INT TERM
+        candidate="$package_dir/$zip_name"
+        echo "== Creating $zip_path"
+        (cd "$MODULE_DIR" && zip -r -q "$candidate" .) || exit 1
+        echo "== Zip contents:"
+        unzip -l "$candidate" || exit 1
+        verify_zip "$candidate" || exit 1
+        mv -f "$candidate" "$zip_path" || exit 1
+        echo "== DONE: $zip_path ($(du -h "$zip_path" | cut -f1))"
+    )
 }
 
 # Self-verification of the produced artifact: the module's install-time
@@ -433,11 +470,27 @@ make_zip() {
 # leave a green build.
 verify_zip() {
     local zip_path="$1"
+    unset UNZIP UNZIPOPT ZIPINFO ZIPINFOOPT
     echo "== Verifying the zip"
     local fail=0
 
+    # Directory listings alone do not validate compressed data or CRCs.
+    if ! unzip -tq "$zip_path" >/dev/null; then
+        echo "  FAIL: archive integrity check failed" >&2
+        return 1
+    fi
     local listing
-    listing="$(unzip -Z1 "$zip_path")"
+    listing="$(unzip -Z1 "$zip_path")" || return 1
+    # Extraction tools disagree on duplicate members and path normalization.
+    # Refuse ambiguity before inspecting or extracting any installer content.
+    if ! awk 'seen[$0]++ {exit 1}' <<< "$listing"; then
+        echo "  FAIL: duplicate archive member" >&2
+        return 1
+    fi
+    if grep -Eq '(^/|(^|/)\.\.?(/|$)|//|\\)' <<< "$listing"; then
+        echo "  FAIL: unsafe or non-canonical archive member path" >&2
+        return 1
+    fi
 
     # 1. The files the installer needs. customize.sh is SOURCED by
     #    Magisk's install_module after extracting everything except
@@ -645,10 +698,18 @@ verify_zip() {
 # ---------------------------------------------------------------------------
 # Drive the build
 # ---------------------------------------------------------------------------
+# Anchor relative paths before passing them to tools, including names that
+# begin with '-' (which mkdir/cd would otherwise interpret as options).
+[[ "$OUT_ROOT" = /* ]] || OUT_ROOT="$REPO_ROOT/$OUT_ROOT"
 mkdir -p "$OUT_ROOT"
-OUT_ROOT="$(cd "$OUT_ROOT" && pwd)"
+OUT_ROOT="$(cd "$OUT_ROOT" && pwd -P)"
 MODULE_DIR="$OUT_ROOT/module"
 ZIP_DIR="$OUT_ROOT/out"
+# --out may point above the checkout. Never let staging cleanup delete source.
+if [[ "$REPO_ROOT/" == "$MODULE_DIR/"* ]]; then
+    echo "ERROR: module staging overlaps the source checkout" >&2
+    exit 2
+fi
 
 # Resolve Cargo's override relative to the crate, just as Cargo does, and
 # use that same absolute directory for compilation, stripping and assembly.
@@ -656,14 +717,18 @@ RUST_TARGET_DIR="${CARGO_TARGET_DIR:-$REPO_ROOT/native/zygiskd/target}"
 if [[ $SKIP_RUST -ne 1 ]]; then
     [[ "$RUST_TARGET_DIR" = /* ]] || RUST_TARGET_DIR="$REPO_ROOT/native/zygiskd/$RUST_TARGET_DIR"
     mkdir -p "$RUST_TARGET_DIR"
-    RUST_TARGET_DIR="$(cd "$RUST_TARGET_DIR" && pwd)"
+    RUST_TARGET_DIR="$(cd "$RUST_TARGET_DIR" && pwd -P)"
+    # Assembly recursively replaces staging; never put the Cargo cache there.
+    if [[ "$RUST_TARGET_DIR" == "$MODULE_DIR" || "$RUST_TARGET_DIR" == "$MODULE_DIR/"* ]]; then
+        echo "ERROR: Cargo target directory overlaps disposable module staging" >&2
+        exit 2
+    fi
 fi
 
 for abi in "${ABI_LIST[@]}"; do
     [[ $SKIP_CPP -eq 1 ]] || build_cpp "$abi"
 done
 if [[ $SKIP_RUST -ne 1 ]]; then
-    command -v cargo >/dev/null || { echo "ERROR: cargo not on PATH" >&2; exit 1; }
     for abi in "${ABI_LIST[@]}"; do
         build_rust "$abi"
     done
