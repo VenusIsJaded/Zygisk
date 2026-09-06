@@ -134,8 +134,34 @@ done
 ui_print "- Native artifacts present"
 
 # Set executable bits.
-chmod 0755 "$DAEMON_BIN"
-chmod 0644 "$LIBZYGISK" "$LIBPAYLOAD" "$LIBLOADER"
+chmod 0755 "$DAEMON_BIN" || { abort "! Cannot make the daemon executable."; exit 1; }
+chmod 0644 "$LIBZYGISK" "$LIBPAYLOAD" "$LIBLOADER" || {
+  abort "! Cannot set native artifact permissions."; exit 1;
+}
+
+# customize.sh runs AFTER the installer's default permission/context pass.
+# Newly created libraries and directories need explicit system_file labels;
+# chmod alone does not establish the SELinux context required by zygote.
+# https://topjohnwu.github.io/Magisk/guides.html#customization
+# Do not rely on set -e: this script is sourced into the installer's shell.
+zs_install_pair() {
+  local source_dir="$1" target_dir="$2" name
+  mkdir -p "$target_dir" || { abort "! Cannot create systemless library directory."; exit 1; }
+  for name in "$MODPATH/system" "$target_dir"; do
+    set_perm "$name" 0 0 0755 u:object_r:system_file:s0 || {
+      abort "! Cannot label systemless library directory."; exit 1;
+    }
+  done
+  cp "$source_dir/libzygisk.so" "$target_dir/$BRIDGE_NAME" && \
+    cp "$source_dir/libpayload.so" "$target_dir/$PAYLOAD_NAME" || {
+      abort "! Cannot copy the complete native library pair."; exit 1;
+    }
+  for name in "$BRIDGE_NAME" "$PAYLOAD_NAME"; do
+    set_perm "$target_dir/$name" 0 0 0644 u:object_r:system_file:s0 || {
+      abort "! Cannot label native library."; exit 1;
+    }
+  done
+}
 
 # Round 7: systemless /system layout. Magisk magic-mounts
 # $MODPATH/system over /system, so placing the two libraries here
@@ -148,7 +174,6 @@ if [ "$IS64BIT" = "true" ]; then
 else
   SYS_LIB_DIR="$MODPATH/system/lib"
 fi
-mkdir -p "$SYS_LIB_DIR"
 # ROUND 30 (STEALTH): the two libraries are installed under
 # PER-INSTALL RANDOMIZED names — lib<8-hex>.so (bridge) and
 # lib<8-hex>-p.so (payload). A fixed "libzygisk.so" / "libpayload.so"
@@ -169,10 +194,10 @@ if [ -z "$RAND_STEM" ] || [ "${#RAND_STEM}" -ne 8 ]; then
 fi
 BRIDGE_NAME="lib${RAND_STEM}.so"
 PAYLOAD_NAME="lib${RAND_STEM}-p.so"
-cp "$LIBZYGISK"  "$SYS_LIB_DIR/$BRIDGE_NAME"
-cp "$LIBPAYLOAD" "$SYS_LIB_DIR/$PAYLOAD_NAME"
-chmod 0644 "$SYS_LIB_DIR/$BRIDGE_NAME" "$SYS_LIB_DIR/$PAYLOAD_NAME"
-printf 'bridge=%s\npayload=%s\n' "$BRIDGE_NAME" "$PAYLOAD_NAME"   > "$MODPATH/.loader_names"
+zs_install_pair "$NATIVE_DIR" "$SYS_LIB_DIR"
+printf 'bridge=%s\npayload=%s\n' "$BRIDGE_NAME" "$PAYLOAD_NAME" > "$MODPATH/.loader_names" || {
+  abort "! Cannot save native library names."; exit 1;
+}
 ui_print "- Systemless bridge layout at $SYS_LIB_DIR ($BRIDGE_NAME)"
 
 # ROUND 31 (custom-ROM / dual-arch compatibility): on a 64-bit device
@@ -192,10 +217,19 @@ ui_print "- Systemless bridge layout at $SYS_LIB_DIR ($BRIDGE_NAME)"
 if [ "$IS64BIT" = "true" ]; then
   ABILIST="$(zs_getprop ro.product.cpu.abilist)"
   ZS32_SRC=""
-  case "$ABILIST" in
-    *armeabi-v7a*) ZS32_SRC="$MODPATH/libs/armeabi-v7a" ;;
-    *x86*)         ZS32_SRC="$MODPATH/libs/x86" ;;
-    *)             ZS32_SRC="" ;;
+  # Match complete comma-delimited ABI tokens and the native CPU family.
+  # x86_64 alone does not imply x86 support; translated ARM ABIs on
+  # an x64 device must never choose an ARM library for its x86 zygote.
+  # https://developer.android.com/ndk/guides/abis
+  case "$ARCH:$ABILIST" in
+    arm64:*)
+      case ",$ABILIST," in
+        *,armeabi-v7a,*) ZS32_SRC="$MODPATH/libs/armeabi-v7a" ;;
+      esac ;;
+    x64:*)
+      case ",$ABILIST," in
+        *,x86,*) ZS32_SRC="$MODPATH/libs/x86" ;;
+      esac ;;
   esac
   # ROUND 31 hardening: verify the 32-bit artifacts are actually
   # ELF32 (EI_CLASS byte 1 at offset 4). A 64-bit build dropped in
@@ -215,10 +249,7 @@ if [ "$IS64BIT" = "true" ]; then
     done
   fi
   if [ "$ZS32_OK" = "1" ]; then
-    mkdir -p "$MODPATH/system/lib"
-    cp "$ZS32_SRC/libzygisk.so"  "$MODPATH/system/lib/$BRIDGE_NAME"
-    cp "$ZS32_SRC/libpayload.so" "$MODPATH/system/lib/$PAYLOAD_NAME"
-    chmod 0644 "$MODPATH/system/lib/$BRIDGE_NAME" "$MODPATH/system/lib/$PAYLOAD_NAME"
+    zs_install_pair "$ZS32_SRC" "$MODPATH/system/lib"
     ui_print "- Dual-arch install: 32-bit bridge also placed in system/lib"
   elif [ -n "$ZS32_SRC" ]; then
     ui_print "- NOTE: device is dual-arch but no 32-bit artifacts in $ZS32_SRC"
@@ -311,7 +342,9 @@ fi
 # because the fake daemon there is started by the test harness, not
 # by service.sh. Create the expected symlink (relative, so it stays
 # valid wherever Magisk mounts the module dir).
-ln -sfn "libs/$ZS_ABI/zygiskd" "$MODPATH/zygiskd"
+ln -sfn "libs/$ZS_ABI/zygiskd" "$MODPATH/zygiskd" || {
+  abort "! Cannot create daemon launcher."; exit 1;
+}
 ui_print "- Daemon launcher: $MODPATH/zygiskd -> libs/$ZS_ABI/zygiskd"
 
 # Pick the right libzygisk.so for the system property trick (see
@@ -329,6 +362,9 @@ libloader=$LIBLOADER
 daemon=$DAEMON_BIN
 version=v0.1.0
 EOF
+if [ "$?" -ne 0 ]; then
+  abort "! Cannot save installation metadata."; exit 1;
+fi
 
 ui_print "- Zygisk Study installed"
 ui_print "- NOTE: This is an educational reimplementation."

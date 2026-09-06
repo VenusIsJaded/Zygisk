@@ -5,9 +5,10 @@
 #
 # WHY THIS EXISTS (all verified online this round, nothing guessed):
 #
-#   * Magisk mounts a module's system/ directory over /system with
-#     magic mount BEFORE post-fs-data scripts run — our loader is
-#     already visible at /system/lib[64]/ when our script starts.
+#   * Magisk runs module post-fs-data scripts BEFORE magic mount,
+#     not after it (https://topjohnwu.github.io/Magisk/guides.html#boot-scripts).
+#     A pending visibility check is normal here. Magisk mounts system/
+#     before zygote starts; service.sh checks the resulting visibility.
 #
 #   * KernelSU (current ksud, read from
 #     userspace/ksud/src/init_event.rs) runs module post-fs-data
@@ -70,27 +71,41 @@ zs_log() {
 
 # --- property write chain -------------------------------------------------
 
-# zs_prop_get NAME -> prints value (empty if absent)
+# zs_prop_get NAME -> prints value (empty if absent), nonzero if all
+# readers fail. Never leak partial stdout from a failed reader into the
+# next result. In particular, a failing daemon is not proof of absence.
 zs_prop_get() {
+  local value cand
   if command -v resetprop >/dev/null 2>&1; then
-    resetprop "$1" 2>/dev/null
-    return
+    if value="$(resetprop "$1" 2>/dev/null)"; then
+      printf '%s\n' "$value"; return 0
+    fi
   fi
-  if [ -x "$ZS_DAEMON" ]; then
-    "$ZS_DAEMON" prop get "$1" 2>/dev/null
-    return
+  for cand in /data/adb/magisk/resetprop /system/bin/resetprop; do
+    if [ -x "$cand" ] && value="$("$cand" "$1" 2>/dev/null)"; then
+      printf '%s\n' "$value"; return 0
+    fi
+  done
+  if [ -x "$ZS_DAEMON" ] && value="$("$ZS_DAEMON" prop get "$1" 2>/dev/null)"; then
+    printf '%s\n' "$value"; return 0
   fi
-  getprop "$1" 2>/dev/null
+  if value="$(getprop "$1" 2>/dev/null)"; then
+    printf '%s\n' "$value"; return 0
+  fi
+  return 1
 }
 
 # zs_prop_set NAME VALUE -> 0 on success
+# Boot scripts run while init is blocked in post-fs-data. Bypass the
+# property service (and its triggers), as required by Magisk's boot-script
+# guide: https://topjohnwu.github.io/Magisk/guides.html#boot-scripts
 zs_prop_set() {
   if command -v resetprop >/dev/null 2>&1; then
-    resetprop "$1" "$2" 2>/dev/null && return 0
+    resetprop -n "$1" "$2" 2>/dev/null && return 0
   fi
   for cand in /data/adb/magisk/resetprop /system/bin/resetprop; do
     if [ -x "$cand" ]; then
-      "$cand" "$1" "$2" 2>/dev/null && return 0
+      "$cand" -n "$1" "$2" 2>/dev/null && return 0
     fi
   done
   # Round 31: our daemon's built-in engine (props.rs) — the
@@ -130,10 +145,16 @@ zs_lib_dirs() {
   fi
 }
 
-# zs_loader_visible -> 0 if every needed dir has our bridge file
+# Both libraries are required: the bridge dlopens its sibling payload.
+# File presence is necessary, not proof that linker/SELinux will allow loading.
+zs_loader_dir_visible() {
+  [ -f "$1/$ZS_BRIDGE_NAME" ] && [ -f "$1/$ZS_PAYLOAD_NAME" ]
+}
+
+# zs_loader_visible -> 0 if every needed dir has the complete pair
 zs_loader_visible() {
   for d in $(zs_lib_dirs); do
-    [ -f "$d/$ZS_BRIDGE_NAME" ] || return 1
+    zs_loader_dir_visible "$d" || return 1
   done
   return 0
 }
@@ -198,6 +219,21 @@ zs_uninstall_record() {
   return 0
 }
 
+# Publish only a complete copy. cp can create/truncate a destination before
+# failing (ENOSPC, I/O errors); a bare -f check must never accept those bytes.
+# Keep the temporary file in the destination directory so mv is a rename.
+zs_copy_loader_file() {
+  local tmp
+  tmp="$(mktemp "$2.XXXXXX" 2>/dev/null)" || return 1
+  if cp "$1" "$tmp" 2>/dev/null && chmod 0644 "$tmp" 2>/dev/null && \
+     mv -f "$tmp" "$2" 2>/dev/null; then
+    zs_uninstall_record copy "$2"
+    return 0
+  fi
+  rm -f "$tmp" 2>/dev/null
+  return 1
+}
+
 # zs_self_mount_dir DIR -> 0 if OUR overlay over DIR is (now) active.
 # Mounts an overlayfs with lowerdir=DIR and an upper/work pair in the
 # RANDOMIZED scratch dir (see zs_ovl_root; the same approach KernelSU's
@@ -208,35 +244,42 @@ zs_self_mount_dir() {
   _dir="$1"
   _root="$(zs_ovl_root)" || return 1
   _tag="$_root$(echo "$_dir" | tr '/' '_')"
-  # already mounted?
+  # Match ownership on the SAME mount record, not another overlay's options.
+  _owned=0
   if grep -q " $_dir overlay " /proc/mounts 2>/dev/null; then
-    if grep -q "upperdir=$_tag/upper" /proc/mounts 2>/dev/null; then
-      return 0
+    if awk -v dir="$_dir" -v upper="$_tag/upper" '
+      $2 == dir && $3 == "overlay" {
+        n = split($4, opts, ",")
+        for (i = 1; i <= n; i++)
+          if (opts[i] == "upperdir=" upper) found = 1
+      }
+      END { exit !found }
+    ' /proc/mounts 2>/dev/null; then
+      zs_loader_dir_visible "$_dir" && return 0
+      _owned=1
+    else
+      # Never modify someone else's incomplete overlay here.
+      zs_loader_dir_visible "$_dir"
+      return $?
     fi
-    # someone else's overlay sits there (a metamodule mounted over
-    # the whole /system); re-check the file through it before doing
-    # anything.
-    [ -f "$_dir/$ZS_BRIDGE_NAME" ] && return 0
-    return 1
   fi
-  zs_have_overlayfs || return 1
-  mkdir -p "$_tag/upper" "$_tag/work" 2>/dev/null || return 1
-  # A file in the module dir is the upper source: copy it in AFTER the
-  # overlay is up so it lands in the upper layer.
   _src="$MODDIR/system${_dir#/system}"
-  [ -f "$_src/$ZS_BRIDGE_NAME" ] || return 1
-  mount -t overlay overlay \
-    -o "lowerdir=$_dir,upperdir=$_tag/upper,workdir=$_tag/work" \
-    "$_dir" 2>/dev/null || return 1
-  zs_uninstall_record overlay "$_dir $_tag"
-  cp "$_src/$ZS_BRIDGE_NAME" "$_dir/$ZS_BRIDGE_NAME" 2>/dev/null || return 1
-  zs_uninstall_record copy "$_dir/$ZS_BRIDGE_NAME"
-  # The payload lives beside the bridge under the same soname family.
-  if [ -f "$_src/$ZS_PAYLOAD_NAME" ]; then
-    cp "$_src/$ZS_PAYLOAD_NAME" "$_dir/$ZS_PAYLOAD_NAME" 2>/dev/null \
-      && zs_uninstall_record copy "$_dir/$ZS_PAYLOAD_NAME"
+  zs_loader_dir_visible "$_src" || return 1
+  if [ "$_owned" != "1" ]; then
+    zs_have_overlayfs || return 1
+    mkdir -p "$_tag/upper" "$_tag/work" 2>/dev/null || return 1
+    mount -t overlay overlay \
+      -o "lowerdir=$_dir,upperdir=$_tag/upper,workdir=$_tag/work" \
+      "$_dir" 2>/dev/null || return 1
+    zs_uninstall_record overlay "$_dir $_tag"
   fi
-  [ -f "$_dir/$ZS_BRIDGE_NAME" ]
+  # Also repair a partial previous attempt on our already-mounted overlay.
+  for _name in "$ZS_BRIDGE_NAME" "$ZS_PAYLOAD_NAME"; do
+    if [ ! -f "$_dir/$_name" ]; then
+      zs_copy_loader_file "$_src/$_name" "$_dir/$_name" || return 1
+    fi
+  done
+  zs_loader_dir_visible "$_dir"
 }
 
 # zs_ensure_loader_mounted -> 0 if the loader is visible by any means.
@@ -254,13 +297,12 @@ zs_ensure_loader_mounted() {
   # ROM setups and emulators). Harmless when it fails.
   for d in $(zs_lib_dirs); do
     _src="$MODDIR/system${d#/system}"
-    if [ -f "$_src/$ZS_BRIDGE_NAME" ] && [ ! -f "$d/$ZS_BRIDGE_NAME" ]; then
-      cp "$_src/$ZS_BRIDGE_NAME" "$d/$ZS_BRIDGE_NAME" 2>/dev/null \
-        && zs_uninstall_record copy "$d/$ZS_BRIDGE_NAME"
-      [ -f "$_src/$ZS_PAYLOAD_NAME" ] && \
-        cp "$_src/$ZS_PAYLOAD_NAME" "$d/$ZS_PAYLOAD_NAME" 2>/dev/null \
-        && zs_uninstall_record copy "$d/$ZS_PAYLOAD_NAME"
-    fi
+    # Retry either missing sibling after a partial previous copy.
+    for _name in "$ZS_BRIDGE_NAME" "$ZS_PAYLOAD_NAME"; do
+      if [ -f "$_src/$_name" ] && [ ! -f "$d/$_name" ]; then
+        zs_copy_loader_file "$_src/$_name" "$d/$_name" || true
+      fi
+    done
   done
   zs_loader_visible && { rm -f "$WORKDIR/.mount_pending" 2>/dev/null; return 0; }
   # Overlay self-mount per directory.

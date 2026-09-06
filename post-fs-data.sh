@@ -105,7 +105,10 @@ fi
 zs_compat_init
 
 if [ -n "$RESETPROP" ] || [ -x "$ZS_DAEMON" ]; then
-  CURRENT="$(zs_prop_get ro.dalvik.vm.native.bridge)"
+  if ! CURRENT="$(zs_prop_get ro.dalvik.vm.native.bridge)"; then
+    zs_log "native.bridge unreadable; skipping the swap this boot (fail-closed)"
+    return 0 2>/dev/null || exit 0
+  fi
   # ROUND 34 (B9 — the update-flash edge): a live value that equals
   # OUR previous install's applied name is OURS (the daemon's guard
   # had not restored stock yet, or the module was live-flashed
@@ -134,28 +137,37 @@ if [ -n "$RESETPROP" ] || [ -x "$ZS_DAEMON" ]; then
     # trigger. Verify the backup BEFORE touching the property; if it
     # cannot be written, this boot stays stock.
     if [ ! -f "$WORKDIR/.native_bridge_backup" ]; then
-      printf '%s' "$CURRENT" > "$WORKDIR/.native_bridge_backup" 2>/dev/null
-      if [ ! -f "$WORKDIR/.native_bridge_backup" ]; then
+      if ! printf '%s' "$CURRENT" > "$WORKDIR/.native_bridge_backup" 2>/dev/null; then
+        rm -f "$WORKDIR/.native_bridge_backup" 2>/dev/null
         zs_log "backup unwritable; skipping the swap this boot (fail-closed)"
         return 0 2>/dev/null || exit 0
       fi
     fi
-    zs_prop_set ro.dalvik.vm.native.bridge "$BRIDGE_LIB"
+    if ! zs_prop_set ro.dalvik.vm.native.bridge "$BRIDGE_LIB"; then
+      zs_log "native.bridge write failed; not arming the property guard"
+      return 0 2>/dev/null || exit 0
+    fi
     # Round 30: record the value we just installed so the daemon's
     # property guard can (a) restore the stock value once the zygote
     # has consumed it and (b) re-apply this exact value after a
     # zygote crash-restart. Written ONLY on a successful swap — its
     # absence (or a mismatch with the live value) means the guard
     # stays inert.
-    if [ "$(zs_prop_get ro.dalvik.vm.native.bridge)" = "$BRIDGE_LIB" ]; then
-      printf '%s' "$BRIDGE_LIB" > "$WORKDIR/.native_bridge_applied" 2>/dev/null
+    if ! APPLIED="$(zs_prop_get ro.dalvik.vm.native.bridge)" || [ "$APPLIED" != "$BRIDGE_LIB" ]; then
+      zs_log "native.bridge readback failed; rolling back the unconfirmed swap"
+      zs_rollback_bridge
+      return 0 2>/dev/null || exit 0
+    fi
+    if ! printf '%s' "$BRIDGE_LIB" > "$WORKDIR/.native_bridge_applied" 2>/dev/null; then
+      zs_log "native.bridge marker unwritable; rolling back the swap"
+      zs_rollback_bridge
+      return 0 2>/dev/null || exit 0
     fi
     zs_log "native.bridge swapped (was: ${CURRENT:-<absent>}; name withheld)"
     # ROUND 31 (KernelSU / APatch / metamodule-less environments):
-    # on Magisk the root manager has ALREADY magic-mounted
-    # $MODPATH/system over /system, so the loader is visible right
-    # now. On KernelSU (ksud runs module post-fs-data scripts BEFORE
-    # the metamodule mount, verified from init_event.rs) it is NOT —
+    # Magisk runs this script BEFORE magic mount, and KernelSU
+    # runs it BEFORE the metamodule mount. The systemless loader
+    # normally is NOT visible at this stage on either manager —
     # and without any metamodule it never will be by itself. Mark the
     # mount as pending; the post-mount.d hook (KernelSU/APatch run it
     # AFTER their metamodule mounting, still before zygote) and
@@ -163,7 +175,13 @@ if [ -n "$RESETPROP" ] || [ -x "$ZS_DAEMON" ]; then
     if zs_loader_visible; then
       rm -f "$WORKDIR/.mount_pending" 2>/dev/null
     else
-      : > "$WORKDIR/.mount_pending" 2>/dev/null
+      # Use a regular builtin, not ':' (a special builtin): a redirection
+      # failure on ':' can terminate a POSIX shell before rollback runs.
+      if ! printf '%s' '' > "$WORKDIR/.mount_pending" 2>/dev/null; then
+        zs_log "mount-pending marker unwritable; rolling back the swap"
+        zs_rollback_bridge
+        return 0 2>/dev/null || exit 0
+      fi
       zs_log "loader not visible at /system yet; mount check deferred"
     fi
   else

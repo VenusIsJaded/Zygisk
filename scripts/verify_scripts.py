@@ -56,8 +56,15 @@ if [ "$#" -eq 1 ]; then
   fi
   exit 0
 fi
+printf '%s\\n' "$*" >> "$LOG.raw"
+if [ "$ZS_REQUIRE_NO_SERVICE" = "1" ] && [ "$1" != "-n" ] && [ "$1" != "--delete" ]; then
+  echo "property service blocked during post-fs-data" >&2
+  exit 1
+fi
+# Preserve raw argv for the boot-stage regression; legacy checks below
+# intentionally compare normalized NAME VALUE operations.
+if [ "$1" = "-n" ]; then shift; fi
 printf '%s\\n' "$*" >> "$LOG"
-# SET updates the state a subsequent GET returns.
 if [ "$1" = "--delete" ]; then
   [ -n "$ZS_FAKE_DELETE_FAIL" ] && exit 1
   : > "$STATE"
@@ -135,6 +142,17 @@ class FakeMagisk:
         write_exec(os.path.join(self.bindir, "resetprop"), FAKE_RESETPROP)
         write_exec(os.path.join(self.bindir, "log"), FAKE_LOG)
         write_exec(os.path.join(self.bindir, "getprop"), FAKE_GETPROP)
+        # Model the documented installer helper, not host SELinux/root.
+        # Record all arguments so tests can assert context + ownership.
+        write_exec(os.path.join(self.bindir, "set_perm"), '''#!/bin/sh
+printf '%s\\n' "$*" >> "${MODPATH:?}/permissions.log"
+[ "$5" = u:object_r:system_file:s0 ] || exit 1
+[ "$2:$3" = 0:0 ] || exit 1
+case "$1" in
+  *"${ZS_FAIL_PERM:-__never__}"*) exit 1 ;;
+esac
+chmod "$4" "$1"
+''')
         self.resetprop_log = os.path.join(self.root, "resetprop.log")
         self.stub_daemon_log = os.path.join(self.root, "stub_daemon.log")
         self.prop_value = "0"
@@ -145,6 +163,7 @@ class FakeMagisk:
         env = dict(os.environ)
         env["PATH"] = self.bindir + os.pathsep + env.get("PATH", "")
         env["ZS_TEST_ROOT"] = self.sysroot
+        env["ZS_TEST_ADB_ROOT"] = self.root
         env["ZS_FAKE_RESETPROP_LOG"] = self.resetprop_log
         env["ZS_FAKE_PROP_VALUE"] = self.prop_value
         env["ZS_FAKE_PROP_STATE"] = self.prop_state
@@ -199,7 +218,12 @@ def installed_layout(mk, abi="arm64-v8a", with_symlink=True):
 
 def test_swap_value_zero(mk):
     mk.prop_value = "0"
-    proc = mk.run_script("post-fs-data.sh")
+    proc = mk.run_script("post-fs-data.sh", {"ZS_REQUIRE_NO_SERVICE": "1"})
+    with open(mk.resetprop_log + ".raw") as fp:
+        raw_calls = fp.read().splitlines()
+    check("post-fs-data bypasses the blocked property service",
+          "-n ro.dalvik.vm.native.bridge libzygisk.so" in raw_calls,
+          repr(raw_calls))
     check("post-fs-data with current=0 exits 0", proc.returncode == 0,
           proc.stderr[-200:])
     calls = mk.resetprop_calls()
@@ -487,6 +511,7 @@ def test_customize_no_getprop_on_path(mk):
         ["sh", "-c",
          "ui_print() { echo \"$*\"; }\n"
          "abort() { echo \"ABORT:$*\"; exit 1; }\n"
+         f"set_perm() {{ '{mk.bindir}/set_perm' \"$@\"; }}\n"
          f". {os.path.join(mk.moddir, 'customize.sh')}\n"],
         env={"PATH": "/usr/bin:/bin",
              "MODPATH": modpath,
@@ -535,6 +560,7 @@ def test_customize_buildprop_fallback(mk):
         ["sh", "-c",
          "ui_print() { echo \"$*\"; }\n"
          "abort() { echo \"ABORT:$*\"; exit 1; }\n"
+         f"set_perm() {{ '{mk.bindir}/set_perm' \"$@\"; }}\n"
          f". {os.path.join(mk.moddir, 'customize.sh')}\n"],
         env={"PATH": "/usr/bin:/bin",
              "MODPATH": modpath,
@@ -1244,13 +1270,13 @@ def test_service_late_resolution(mk):
         os.path.join(mk.workdir, ".mount_pending")))
 
 
-def _run_customize(mk, modpath, extra_env=None, abilist=None, bridge="0"):
+def _run_customize(mk, modpath, extra_env=None, abilist=None, bridge="0", arch="arm64"):
     """Shared customize.sh runner with a remapped /data/adb."""
     env = mk.env(extra_env or {})
     env["MODPATH"] = str(modpath)
     # ROUND 32: the REAL installer value (Magisk/KSU/APatch
     # api_level_arch_detect), not the NDK-style ABI name.
-    env["ARCH"] = "arm64"
+    env["ARCH"] = arch
     env["IS64BIT"] = "true"
     env["API"] = "30"
     env["ZS_TEST_ADB_ROOT"] = str(mk.root)  # remap /data/adb
@@ -1359,6 +1385,45 @@ def test_customize_dual_arch(mk):
               os.path.join(modpath3, "system", "lib")),
           proc3.stdout[-200:])
     mk3.cleanup()
+
+    # Complete ABI tokens, constrained to the native CPU family. Give
+    # every package all four ABIs so wrong selections cannot hide behind
+    # missing files; distinct contents prove which ISA was copied.
+    for arch, abilist, expected in (
+        ("x64", "x86_64", None),
+        ("x64", "x86_64,x86", "x86"),
+        ("x64", "x86_64,armeabi-v7a,x86", "x86"),
+        ("x64", "x86_64,armeabi-v7a", None),
+        ("arm64", "arm64-v8a", None),
+        ("arm64", "arm64-v8a,armeabi-v7a,armeabi", "armeabi-v7a"),
+        ("arm64", "arm64-v8a,x86", None),
+    ):
+        fixture = FakeMagisk()
+        try:
+            mod = os.path.join(fixture.root, "abi_module")
+            _populate_modpath(mod, ("arm64-v8a", "armeabi-v7a", "x86_64", "x86"))
+            for abi in ("armeabi-v7a", "x86"):
+                for lib in ("libzygisk.so", "libpayload.so"):
+                    with open(os.path.join(mod, "libs", abi, lib), "ab") as fp:
+                        fp.write(abi.encode())
+            result = _run_customize(fixture, mod, abilist=abilist, arch=arch)
+            check(f"ABI matrix {arch}/{abilist} installs", result.returncode == 0,
+                  result.stderr[-200:])
+            libdir = os.path.join(mod, "system", "lib")
+            if expected is None:
+                check(f"ABI matrix {arch}/{abilist} skips foreign or absent ISA",
+                      not os.path.exists(libdir))
+            else:
+                with open(os.path.join(mod, ".loader_names")) as fp:
+                    names = dict(line.strip().split("=", 1) for line in fp)
+                for key, lib in (("bridge", "libzygisk.so"), ("payload", "libpayload.so")):
+                    with open(os.path.join(libdir, names[key]), "rb") as fp:
+                        actual = fp.read()
+                    with open(os.path.join(mod, "libs", expected, lib), "rb") as fp:
+                        check(f"ABI matrix {arch}/{abilist} selects {expected} {key}",
+                              actual == fp.read())
+        finally:
+            fixture.cleanup()
 
 
 def test_customize_root_manager_envs(mk):
@@ -4074,8 +4139,529 @@ def test_pr13_symbol_and_segment_regressions(mk):
                   proc.stdout + proc.stderr)
 
 
+def test_android_syscall_abi_matrix(mk):
+    """Compile production helpers under synthetic NDK macro sets, never
+    executing foreign syscalls. This checks dispatch/arguments, not a device
+    struct layout; the Android cross-build supplies the real Bionic headers.
+    """
+    from pathlib import Path
+    root = Path(REPO_ROOT)
+    source = (root / "native/libpayload/src/hide_advanced.cpp").read_text()
+    helpers = source[source.index("static inline int zs_raw_fstatat("):
+                     source.index("static inline int zs_raw_access(")]
+    entry = (root / "native/libpayload/src/entry.cpp").read_text()
+    uid_macros = entry[entry.index("#ifdef SYS_setresgid32"):
+                       entry.index("namespace zygisk_study {")]
+    compiler = shutil.which("g++")
+    check("Android syscall regression compiler available", compiler is not None)
+    if not compiler:
+        return
+    preamble = r'''
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <cerrno>
+#include <cassert>
+#undef __ANDROID__
+#undef __LP64__
+#undef SYS_fstatat64
+#undef SYS_fstatat
+#undef SYS_newfstatat
+#undef SYS_stat
+#undef SYS_lstat
+// Legacy numbers deliberately coexist: selecting either must fail the test.
+#define SYS_stat 901
+#define SYS_lstat 902
+struct Call { long number; int fd; const char* path; struct stat* st; int flags; };
+static Call last;
+static bool fail_call;
+static long capture(long number, int fd, const char* path, struct stat* st, int flags) {
+    last = {number, fd, path, st, flags};
+    if (fail_call) { errno = EACCES; return -1; }
+    return 0;
+}
+#define syscall capture
+'''
+    for name, defines, expected in (
+        ("android-arm32", "#define __ANDROID__ 1\n#define SYS_fstatat64 327\n", 327),
+        ("android-x86", "#define __ANDROID__ 1\n#define SYS_fstatat64 300\n", 300),
+        ("android-arm64", "#define __ANDROID__ 1\n#define __LP64__ 1\n#define SYS_newfstatat 79\n", 79),
+        ("android-x86_64", "#define __ANDROID__ 1\n#define __LP64__ 1\n#define SYS_newfstatat 262\n", 262),
+    ):
+        lp32 = name in ("android-arm32", "android-x86")
+        ids = ""
+        for index, call in enumerate(("setresgid", "setresuid", "setgid", "setuid"), 1):
+            ids += f"#undef SYS_{call}\n#undef SYS_{call}32\n#define SYS_{call} {index}\n"
+            if lp32:
+                ids += f"#define SYS_{call}32 {index + 100}\n"
+        assertions = "\n".join(
+            f"static_assert(ZS_SYS_{call} == {index + (100 if lp32 else 0)}, \"UID syscall ABI\");"
+            for index, call in enumerate(("setresgid", "setresuid", "setgid", "setuid"), 1))
+        program = preamble + defines + ids + uid_macros + assertions + helpers + r'''
+int main() {
+    struct stat st{};
+    const char* path = "relative-link";
+    assert(zs_raw_stat(path, &st) == 0);
+    assert(last.number == EXPECTED && last.fd == AT_FDCWD && last.flags == 0);
+    assert(last.path == path && last.st == &st);
+    assert(zs_raw_lstat(path, &st) == 0);
+    assert(last.number == EXPECTED && last.flags == AT_SYMLINK_NOFOLLOW);
+    assert(last.fd == AT_FDCWD && last.path == path && last.st == &st);
+    assert(zs_raw_fstatat(17, path, &st, AT_EMPTY_PATH) == 0);
+    assert(last.number == EXPECTED && last.fd == 17 && last.flags == AT_EMPTY_PATH);
+    fail_call = true;
+    errno = 0;
+    assert(zs_raw_stat(path, &st) == -1 && errno == EACCES);
+}
+'''.replace("EXPECTED", str(expected))
+        binary = str(Path(mk.root) / name)
+        compiled = subprocess.run([compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror",
+                                   "-x", "c++", "-", "-o", binary], input=program,
+                                  capture_output=True, text=True, timeout=60)
+        check(f"{name}: production syscall helpers compile", compiled.returncode == 0,
+              compiled.stderr)
+        if compiled.returncode == 0:
+            ran = subprocess.run([binary], capture_output=True, text=True, timeout=10)
+            check(f"{name}: stat and UID ABI dispatch + errno", ran.returncode == 0,
+                  ran.stderr)
+    # The public hook must actually delegate to the tested helper.
+    # Skip the forward declarations near the top of the translation unit.
+    # The end marker must also be searched AFTER the definition's start.
+    start = source.index('extern "C" int zygisk_study_hook_fstatat(',
+                         source.index('static inline int zs_raw_fstatat('))
+    hook = source[start:source.index('extern "C" int zygisk_study_hook_statx(', start)]
+    check("fstatat hook uses ABI-aware fallback", "zs_raw_fstatat(dirfd, path, st, flags)" in hook)
+    check("legacy 32-bit raw fstat never receives a public struct stat",
+          "#if defined(SYS_fstat) && defined(__LP64__)" in source)
+
+
+def test_android_access_contracts(mk):
+    """Run the actual hook bodies with captured syscalls, including old headers.
+    This is deterministic on hosts without faccessat2 or Android's libc.
+    """
+    from pathlib import Path
+    source = (Path(REPO_ROOT) / "native/libpayload/src/hide_advanced.cpp").read_text()
+    start = source.index('extern "C" int zygisk_study_hook_faccessat(',
+                         source.index('static inline int zs_raw_access('))
+    bodies = source[start:source.index('extern "C" int zygisk_study_hook_fstatat(', start)]
+    preamble = r'''
+#include <cerrno>
+#include <cassert>
+#include <fcntl.h>
+#include <unistd.h>
+#define ZS_LIKELY(x) (x)
+#define SYS_faccessat 1001
+static bool active;
+static int hide_advanced_is_active() { return active; }
+static int path_is_hidden(const char*) { return 0; }
+using Access = int (*)(int, const char*, int, int);
+static Access g_real_faccessat, g_real_faccessat2;
+static int calls, argc, seen_fd, seen_mode, seen_flags, fail_errno;
+static long seen_number;
+static const char* seen_path;
+static long capture(long n, int fd, const char* p, int mode) {
+    ++calls; argc = 3; seen_number = n; seen_fd = fd; seen_path = p; seen_mode = mode;
+    if (fail_errno) { errno = fail_errno; return -1; }
+    return 0;
+}
+static long capture(long n, int fd, const char* p, int mode, int flags) {
+    long rc = capture(n, fd, p, mode); argc = 4; seen_flags = flags; return rc;
+}
+static int libc_access(int, const char*, int, int) { return 42; }
+#define syscall capture
+'''
+    program = r'''
+int main() {
+    const char* path = "relative-link";
+    for (bool enabled : {false, true}) {
+        active = enabled;
+        g_real_faccessat = nullptr; g_real_faccessat2 = nullptr;
+        calls = 0; fail_errno = 0;
+        assert(zygisk_study_hook_faccessat(17, path, R_OK, 0) == 0);
+        assert(calls == 1 && argc == 3 && seen_number == SYS_faccessat);
+        assert(seen_fd == 17 && seen_path == path && seen_mode == R_OK);
+        for (int flag : {AT_EACCESS, AT_SYMLINK_NOFOLLOW, AT_EMPTY_PATH, 0x40000000}) {
+            calls = 0; errno = 0;
+            assert(zygisk_study_hook_faccessat(17, path, F_OK, flag) == -1);
+            assert(errno == EINVAL && calls == 0);
+        }
+        // A resolved libc wrapper remains authoritative (including on hosts).
+        g_real_faccessat = libc_access;
+        assert(zygisk_study_hook_faccessat(17, path, R_OK, 0) == 42);
+        // But it must NEVER service faccessat2, even for zero flags.
+        for (int flag : {0, AT_EACCESS, AT_SYMLINK_NOFOLLOW, AT_EMPTY_PATH}) {
+            calls = 0; errno = 0;
+#ifdef SYS_faccessat2
+            assert(zygisk_study_hook_faccessat2(17, path, R_OK, flag) == 0);
+            assert(calls == 1 && argc == 4 && seen_number == SYS_faccessat2);
+            assert(seen_fd == 17 && seen_path == path && seen_mode == R_OK && seen_flags == flag);
+            for (int error : {ENOSYS, EACCES, EINVAL}) {
+                fail_errno = error; errno = 0;
+                assert(zygisk_study_hook_faccessat2(17, path, R_OK, flag) == -1);
+                assert(errno == error);
+            }
+            fail_errno = 0;
+#else
+            assert(zygisk_study_hook_faccessat2(17, path, R_OK, flag) == -1);
+            assert(errno == ENOSYS && calls == 0);
+#endif
+        }
+        g_real_faccessat2 = libc_access;
+        assert(zygisk_study_hook_faccessat2(17, path, R_OK, 0) == 42);
+    }
+}
+'''
+    for modern in (False, True):
+        binary = str(Path(mk.root) / ("access-modern" if modern else "access-legacy"))
+        code = '#include <initializer_list>\n' + preamble
+        if modern:
+            code += '#define SYS_faccessat2 1002\n'
+        proc = subprocess.run(["g++", "-std=c++17", "-x", "c++", "-", "-o", binary],
+                              input=code + bodies + program, capture_output=True, text=True, timeout=60)
+        check(f"access contract compiles (modern headers={modern})", proc.returncode == 0, proc.stderr)
+        if proc.returncode == 0:
+            proc = subprocess.run([binary], capture_output=True, text=True, timeout=10)
+            check(f"access flags, dispatch and errno (modern headers={modern})",
+                  proc.returncode == 0, proc.stderr)
+
+
+def test_bridge_pin_without_nodelete(mk):
+    """Exercise bridge refcounts without glibc's NODELETE masking the defect.
+    An unpinned negative control must unload. Neither case loads a payload.
+    """
+    from pathlib import Path
+    root = Path(REPO_ROOT)
+    source = (root / "native/libzygisk/src/entry.cpp").read_text()
+    consumer = r'''
+#include <dlfcn.h>
+#include <cassert>
+#include <cstdlib>
+int main(int argc, char** argv) {
+    assert(argc == 3);
+    void* h = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
+    assert(h && dlsym(h, "NativeBridgeItf"));
+    assert(dlclose(h) == 0);
+    void* retained = dlopen(argv[1], RTLD_NOLOAD | RTLD_NOW);
+    assert((retained != nullptr) == (atoi(argv[2]) != 0));
+    if (retained) assert(dlclose(retained) == 0);
+}
+'''
+    binary = str(Path(mk.root) / "bridge-consumer")
+    proc = subprocess.run(["g++", "-x", "c++", "-", "-o", binary, "-ldl"],
+                          input=consumer, capture_output=True, text=True, timeout=60)
+    check("no-NODELETE bridge consumer compiles", proc.returncode == 0, proc.stderr)
+    if proc.returncode != 0:
+        return
+    for pinned in (True, False):
+        library = str(Path(mk.root) / ("bridge-pinned.so" if pinned else "bridge-unpinned.so"))
+        code = source if pinned else source.replace('if (!pin_bridge()) {', 'if (false) {', 1)
+        proc = subprocess.run(["g++", "-std=c++17", "-fPIC", "-shared", "-fno-gnu-unique",
+                               "-I" + str(root / "native/common"), "-x", "c++", "-",
+                               "-o", library, "-ldl"], input=code,
+                              capture_output=True, text=True, timeout=60)
+        check(f"bridge compiles without NODELETE (pin={pinned})", proc.returncode == 0, proc.stderr)
+        if proc.returncode == 0:
+            env = dict(os.environ)
+            env.pop("LD_LIBRARY_PATH", None)
+            proc = subprocess.run([binary, library, str(int(pinned))], cwd=mk.root,
+                                  env=env, capture_output=True, text=True, timeout=10)
+            check(f"bridge lifetime after ART-style dlclose (pin={pinned})",
+                  proc.returncode == 0, proc.stderr)
+
+
+def test_property_read_and_swap_failures(_mk):
+    """Exercise real boot scripts with failing tools, never Android properties."""
+    for scenario in ("all-readers-fail", "daemon-fallback", "getprop-fallback",
+                     "write-fails", "readback-fails", "readback-mismatch",
+                     "backup-fails", "marker-fails", "pending-marker-fails"):
+        mk = FakeMagisk()
+        try:
+            os.makedirs(mk.workdir, exist_ok=True)
+            # Failed readers may print plausible output before reporting error.
+            # No such output can authorize a swap or contaminate the next reader.
+            resetprop = FAKE_RESETPROP.replace(
+                'if [ "$#" -eq 1 ]; then',
+                '''if [ "$#" -eq 1 ]; then
+  case "$ZS_READ_SCENARIO" in
+    all-readers-fail|daemon-fallback|getprop-fallback)
+      printf 'partial-output'; exit 1 ;;
+    readback-fails)
+      if [ -f "$STATE" ]; then printf 'libzygisk.so'; exit 1; fi ;;
+    readback-mismatch)
+      if [ -f "$STATE" ]; then printf '0'; exit 0; fi ;;
+  esac''', 1).replace(
+                'elif [ "$#" -ge 2 ]; then',
+                '''elif [ "$#" -ge 2 ]; then
+  [ "$ZS_READ_SCENARIO" = write-fails ] && exit 1''', 1)
+            write_exec(os.path.join(mk.bindir, "resetprop"), resetprop)
+            write_exec(os.path.join(mk.bindir, "getprop"), '''#!/bin/sh
+if [ "$ZS_READ_SCENARIO" = getprop-fallback ]; then
+  printf 'libhoudini.so'; exit 0
+fi
+printf 'partial-output'; exit 1
+''')
+            write_exec(os.path.join(mk.moddir, "zygiskd"), '''#!/bin/sh
+if [ "$1 $2" = 'prop get' ] && [ "$ZS_READ_SCENARIO" = daemon-fallback ]; then
+  printf 'libndk_translation.so'; exit 0
+fi
+printf 'partial-output'; exit 1
+''')
+            if scenario in ("backup-fails", "marker-fails", "pending-marker-fails"):
+                # A directory produces deterministic redirection failure even
+                # when this suite is run as root (chmod alone would not).
+                name = {"backup-fails": ".native_bridge_backup",
+                        "marker-fails": ".native_bridge_applied",
+                        "pending-marker-fails": ".mount_pending"}[scenario]
+                os.mkdir(os.path.join(mk.workdir, name))
+            proc = mk.run_script("post-fs-data.sh", {"ZS_READ_SCENARIO": scenario})
+            calls = mk.resetprop_calls()
+            applied = os.path.join(mk.workdir, ".native_bridge_applied")
+            check(f"{scenario}: boot script exits cleanly", proc.returncode == 0,
+                  proc.stderr[-300:])
+            check(f"{scenario}: guard never armed", not os.path.isfile(applied))
+            pending = os.path.join(mk.workdir, ".mount_pending")
+            check(f"{scenario}: no successful mount-pending state",
+                  os.path.isdir(pending) if scenario == "pending-marker-fails"
+                  else not os.path.exists(pending))
+            if scenario in ("all-readers-fail", "daemon-fallback", "getprop-fallback",
+                            "backup-fails"):
+                check(f"{scenario}: no property mutation", calls == [], repr(calls))
+            if scenario in ("all-readers-fail", "daemon-fallback", "getprop-fallback"):
+                check(f"{scenario}: no bogus stock backup", mk.backup_value() is None)
+                # Test the helper result as well as the fail-closed caller.
+                result = subprocess.run(
+                    ["sh", "-c", '. "$1/zs_compat.sh"; ZS_DAEMON="$1/zygiskd"; '
+                     'zs_prop_get ro.dalvik.vm.native.bridge', "sh", mk.moddir],
+                    env=mk.env({"ZS_READ_SCENARIO": scenario}),
+                    capture_output=True, text=True, timeout=10)
+                expected = {"daemon-fallback": "libndk_translation.so\n",
+                            "getprop-fallback": "libhoudini.so\n"}.get(scenario, "")
+                check(f"{scenario}: reader status and output preserved",
+                      result.stdout == expected and
+                      ((result.returncode != 0) == (scenario == "all-readers-fail")),
+                      repr((result.returncode, result.stdout)))
+            if scenario in ("readback-fails", "readback-mismatch", "marker-fails",
+                            "pending-marker-fails"):
+                check(f"{scenario}: rollback attempted after swap",
+                      calls == ["ro.dalvik.vm.native.bridge libzygisk.so",
+                                "ro.dalvik.vm.native.bridge 0"], repr(calls))
+                with open(mk.prop_state) as fp:
+                    check(f"{scenario}: stock value restored", fp.read().strip() == "0")
+        finally:
+            mk.cleanup()
+
+
+def test_loader_mount_failures(mk):
+    """Real shell functions with redirected paths and fake mount/copy failures.
+
+    No host mounts are performed. Both dash and BusyBox ash execute the same
+    production bodies; only the system/mount-table paths are redirected.
+    """
+    from pathlib import Path
+    import shlex
+
+    root = Path(mk.root)
+    system = root / "system"
+    mounts = root / "mounts"
+    compat = (Path(REPO_ROOT) / "zs_compat.sh").read_text()
+    compat = compat.replace("/system/lib", str(system / "lib"))
+    compat = compat.replace("#/system}", "#" + str(system) + "}")
+    compat = compat.replace("/proc/mounts", str(mounts))
+    source = root / "compat-remapped.sh"
+    source.write_text(compat)
+    shells = [["sh"]]
+    if shutil.which("busybox"):
+        shells.append(["busybox", "ash"])
+    else:
+        skip("BusyBox loader regression", "busybox not installed")
+    body = r'''
+set -e
+. "$COMPAT"
+ZS_BRIDGE_NAME=libtest.so
+ZS_PAYLOAD_NAME=libtest-p.so
+ZS_IS64=1
+ZS_IS32=0
+ZS_OVL_ROOT="$WORKDIR/overlay"
+mkdir -p "$WORKDIR" "$MODDIR/system/lib64" "$MODDIR/system/lib" \
+         "$SYSTEM/lib64" "$SYSTEM/lib"
+for dir in lib lib64; do
+  printf 'complete bridge bytes' > "$MODDIR/system/$dir/$ZS_BRIDGE_NAME"
+  printf 'complete payload bytes' > "$MODDIR/system/$dir/$ZS_PAYLOAD_NAME"
+done
+: > "$MOUNTS"
+: > "$WORKDIR/.mount_pending"
+zs_have_overlayfs() { [ "$OVERLAY" = 1 ]; }
+mount() {
+  printf 'mount\n' >> "$WORKDIR/mount_calls"
+  printf 'overlay %s overlay rw,%s 0 0\n' "$6" "$5" >> "$MOUNTS"
+}
+cp() {
+  if [ "$FAIL_COPY" = "${1##*/}" ]; then
+    printf truncated > "$2"
+    return 1
+  fi
+  command cp "$@"
+}
+mv() {
+  [ "$FAIL_RENAME" != 1 ] || return 1
+  command mv "$@"
+}
+case "$CASE" in
+  visible*)
+    command cp "$MODDIR/system/lib64/"* "$SYSTEM/lib64/"
+    command cp "$MODDIR/system/lib/"* "$SYSTEM/lib/"
+    case "$CASE" in
+      visible32) ZS_IS64=0; ZS_IS32=1; rm -f "$SYSTEM/lib64/"* ;;
+      visible64) rm -f "$SYSTEM/lib/"* ;;
+      visible_dual) ZS_IS32=1 ;;
+      visible_missing_bridge) rm "$SYSTEM/lib64/$ZS_BRIDGE_NAME" ;;
+      visible_missing_payload) rm "$SYSTEM/lib64/$ZS_PAYLOAD_NAME" ;;
+      visible_missing_secondary) ZS_IS32=1; rm "$SYSTEM/lib/$ZS_PAYLOAD_NAME" ;;
+    esac
+    case "$CASE" in
+      visible_missing*) ! zs_loader_visible ;;
+      *) zs_loader_visible ;;
+    esac ;;
+  copy_failure|rename_failure)
+    OVERLAY=0
+    if [ "$CASE" = copy_failure ]; then FAIL_COPY="$ZS_PAYLOAD_NAME";
+    else FAIL_RENAME=1; fi
+    ! zs_ensure_loader_mounted
+    test -f "$WORKDIR/.mount_pending"
+    test ! -e "$SYSTEM/lib64/$ZS_PAYLOAD_NAME"
+    test -z "$(find "$SYSTEM" -name '*.so.*' -print)"
+    FAIL_COPY=; FAIL_RENAME=0
+    zs_ensure_loader_mounted
+    test ! -e "$WORKDIR/.mount_pending"
+    cmp "$MODDIR/system/lib64/$ZS_PAYLOAD_NAME" "$SYSTEM/lib64/$ZS_PAYLOAD_NAME" ;;
+  direct_bridge_missing|direct_payload_missing)
+    OVERLAY=0
+    if [ "$CASE" = direct_bridge_missing ]; then name="$ZS_PAYLOAD_NAME";
+    else name="$ZS_BRIDGE_NAME"; fi
+    command cp "$MODDIR/system/lib64/$name" "$SYSTEM/lib64/$name"
+    zs_ensure_loader_mounted
+    test ! -e "$WORKDIR/.mount_pending"
+    cmp "$MODDIR/system/lib64/$ZS_BRIDGE_NAME" "$SYSTEM/lib64/$ZS_BRIDGE_NAME"
+    cmp "$MODDIR/system/lib64/$ZS_PAYLOAD_NAME" "$SYSTEM/lib64/$ZS_PAYLOAD_NAME" ;;
+  overlay*)
+    OVERLAY=1
+    if [ "$CASE" = overlay_foreign ]; then
+      tag="$ZS_OVL_ROOT$(echo "$SYSTEM/lib64" | tr '/' '_')"
+      printf 'overlay %s overlay rw,upperdir=/foreign 0 0\n' "$SYSTEM/lib64" > "$MOUNTS"
+      printf 'overlay /unrelated overlay rw,upperdir=%s/upper 0 0\n' "$tag" >> "$MOUNTS"
+      ! zs_self_mount_dir "$SYSTEM/lib64"
+      test ! -e "$SYSTEM/lib64/$ZS_BRIDGE_NAME"
+      test ! -e "$WORKDIR/mount_calls"
+    elif [ "$CASE" = overlay_missing_source ]; then
+      rm "$MODDIR/system/lib64/$ZS_PAYLOAD_NAME"
+      ! zs_self_mount_dir "$SYSTEM/lib64"
+      test ! -e "$WORKDIR/mount_calls"
+    else
+      FAIL_COPY="$ZS_PAYLOAD_NAME"
+      ! zs_self_mount_dir "$SYSTEM/lib64"
+      test -f "$SYSTEM/lib64/$ZS_BRIDGE_NAME"
+      test ! -e "$SYSTEM/lib64/$ZS_PAYLOAD_NAME"
+      test -z "$(find "$SYSTEM" -name '*.so.*' -print)"
+      FAIL_COPY=
+      zs_self_mount_dir "$SYSTEM/lib64"
+      test "$(wc -l < "$WORKDIR/mount_calls")" -eq 1
+      cmp "$MODDIR/system/lib64/$ZS_PAYLOAD_NAME" "$SYSTEM/lib64/$ZS_PAYLOAD_NAME"
+      zs_self_mount_dir "$SYSTEM/lib64"
+      test "$(wc -l < "$WORKDIR/mount_calls")" -eq 1
+    fi ;;
+esac
+'''
+    cases = ("visible32", "visible64", "visible_dual", "visible_missing_bridge",
+             "visible_missing_payload", "visible_missing_secondary", "copy_failure",
+             "rename_failure", "direct_bridge_missing", "direct_payload_missing",
+             "overlay_retry", "overlay_foreign", "overlay_missing_source")
+    for shell in shells:
+        for case in cases:
+            for directory in (system, Path(mk.workdir), Path(mk.moddir) / "system"):
+                shutil.rmtree(directory, ignore_errors=True)
+            env = mk.env({"COMPAT": str(source), "SYSTEM": str(system),
+                          "MOUNTS": str(mounts), "MODDIR": mk.moddir,
+                          "WORKDIR": mk.workdir, "CASE": case,
+                          "OVERLAY": "0", "FAIL_COPY": "", "FAIL_RENAME": "0"})
+            proc = subprocess.run(shell + ["-c", body], env=env,
+                                  capture_output=True, text=True, timeout=20)
+            check(f"loader {shlex.join(shell)}: {case}", proc.returncode == 0,
+                  proc.stdout + proc.stderr)
+
+
+def test_customize_install_failures(mk):
+    """Installer success requires complete, labeled files and metadata.
+
+    These are shell contract tests, NOT an Android SELinux policy test.
+    Deliberately leave errexit off, matching the root-manager installer.
+    """
+    import shlex
+    from pathlib import Path
+
+    for api in range(21, 37):
+        proc, mod = run_customize(mk, api=str(api))
+        check(f"installer API {api}: complete installation succeeds",
+              proc.returncode == 0, proc.stdout + proc.stderr)
+        if proc.returncode == 0:
+            mod = Path(mod)
+            names = dict(line.split("=", 1) for line in
+                         (mod / ".loader_names").read_text().splitlines())
+            calls = (mod / "permissions.log").read_text().splitlines()
+            for target, mode in ((mod / "system", "0755"),
+                                 (mod / "system/lib64", "0755"),
+                                 (mod / "system/lib64" / names["bridge"], "0644"),
+                                 (mod / "system/lib64" / names["payload"], "0644")):
+                check(f"installer API {api}: explicit label for {target.name}",
+                      f"{target} 0 0 {mode} u:object_r:system_file:s0" in calls)
+
+    failures_to_inject = (
+        ("cp", "/arm64-v8a/libzygisk.so", "primary bridge copy"),
+        ("cp", "/arm64-v8a/libpayload.so", "primary payload copy"),
+        ("cp", "/armeabi-v7a/libzygisk.so", "secondary bridge copy"),
+        ("cp", "/armeabi-v7a/libpayload.so", "secondary payload copy"),
+        ("chmod", "/arm64-v8a/zygiskd", "daemon executable permission"),
+        ("ln", "zygiskd", "daemon launcher"),
+        ("perm", "/system/lib64", "primary directory label"),
+        ("perm", "-p.so", "payload label"),
+        ("perm", "/system/lib/", "secondary library label"),
+        ("metadata", ".loader_names", "library name metadata"),
+        ("metadata", ".zygisk_study_info", "installation metadata"),
+    )
+    for tool, match, label in failures_to_inject:
+        fixture = FakeMagisk()
+        try:
+            mod = Path(fixture.root) / "install"
+            _populate_modpath(mod, ("arm64-v8a", "armeabi-v7a"))
+            env = {}
+            if tool == "perm":
+                env["ZS_FAIL_PERM"] = match
+            elif tool == "metadata":
+                (mod / match).mkdir()  # redirection must fail, not report success
+            else:
+                real = shlex.quote(shutil.which(tool))
+                write_exec(Path(fixture.bindir) / tool,
+                           '#!/bin/sh\ncase "$*" in\n'
+                           + f'  *"{match}"*) exit 1 ;;\nesac\n'
+                           + f'exec {real} "$@"\n')
+            proc = _run_customize(fixture, mod, env,
+                                  abilist="arm64-v8a,armeabi-v7a")
+            check(f"installer refuses {label} failure",
+                  proc.returncode != 0 and "ABORT:" in proc.stdout
+                  and "Zygisk Study installed" not in proc.stdout,
+                  proc.stdout + proc.stderr)
+        finally:
+            fixture.cleanup()
+
+
 def main():
     cases = [
+        ("PR #14: installer labels and fatal write failures", test_customize_install_failures),
+        ("PR #14: complete loader pairs and atomic copy failures", test_loader_mount_failures),
+        ("PR #14: property read and swap failures", test_property_read_and_swap_failures),
+        ("PR #14: Android access contracts", test_android_access_contracts),
+        ("PR #14: Lollipop bridge pin without NODELETE", test_bridge_pin_without_nodelete),
+        ("PR #14: Android syscall ABI matrix", test_android_syscall_abi_matrix),
         ("PR #13: 41 symbol/segment defects across four ABIs", test_pr13_symbol_and_segment_regressions),
         ("PR #13: 44 additional release regressions", test_pr13_additional_forty_four),
         ("Nineteen release, recovery and publishing regressions", test_release_and_recovery_nineteen),

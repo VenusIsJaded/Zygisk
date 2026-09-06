@@ -61,7 +61,7 @@
 //     below).
 //
 //   - initialize()'s signature is the real one:
-//     bool initialize(const NativeBridgeCallbacks* cb,
+//     bool initialize(const NativeBridgeRuntimeCallbacks* cb,
 //                     const char* app_cache_dir, const char* isa).
 //
 //   - The payload path respects the process word size (32-bit zygote
@@ -168,7 +168,7 @@ enum JNICallType {
 struct NativeBridgeCallbacks {
     uint32_t version;
     // v1:
-    bool (*initialize)(const struct NativeBridgeCallbacks* callbacks,
+    bool (*initialize)(const struct NativeBridgeRuntimeCallbacks* callbacks,
                        const char* app_cache_dir, const char* isa);
     void* (*loadLibrary)(const char* libpath, int flag);
     void* (*getTrampoline)(void* handle, const char* name,
@@ -197,7 +197,7 @@ struct NativeBridgeCallbacks {
     void* (*loadLibraryExt)(const char* libpath, int flag,
                             struct native_bridge_namespace_t* ns);
     struct native_bridge_namespace_t* (*getVendorNamespace)();
-    // v5 (verified from android-13.0.0_r1 and 16.0.0_r1/main):
+    // v5 (present since android-10.0.0_r1):
     struct native_bridge_namespace_t* (*getExportedNamespace)(
         const char* name);
     // v6:
@@ -213,10 +213,6 @@ struct NativeBridgeCallbacks {
     // v8:
     bool (*isNativeBridgeFunctionPointer)(const void* method);
 };
-
-// Symbols we look up in the *real* native bridge (if present).
-typedef bool (*InitializeFn)(const struct NativeBridgeCallbacks*,
-                             const char*, const char*);
 
 // Path to the payload, by word size. The daemon bind-mounts both
 // libraries into the systemless /system tree. ROUND 33: the literals
@@ -287,6 +283,9 @@ static void derive_payload_path(char* out, size_t cap) {
     copy_legacy_payload_path(out, cap);
 }
 
+// Retained for process lifetime: Android 5.0/5.1 ignore DF_1_NODELETE.
+// ART may still dlclose its own handle after the bridge's code was unmapped.
+static void* g_bridge_pin = nullptr;
 static void* g_real_native_bridge = nullptr;
 static const struct NativeBridgeCallbacks* g_real_table = nullptr;
 static void* g_payload            = nullptr;
@@ -433,11 +432,30 @@ static void try_load_payload() {
 // the table itself, below).
 static void select_table_version();
 
+// Lollipop's soinfo_unload calls DT_FINI as soon as ref_count reaches 1;
+// 5.1's DT_FLAGS_1 parser supports NOW/GLOBAL only. A link-time NODELETE
+// flag is therefore insufficient on API 21/22. Pin the already-linked
+// bridge in its constructor, before loading code that can unmap it.
+// https://android.googlesource.com/platform/bionic/+/android-5.1.1_r1/linker/linker.cpp
+static bool pin_bridge() {
+    if (g_bridge_pin) return true;
+    Dl_info info{};
+    if (!dladdr((const void*)&libzygisk_ctor, &info) || !info.dli_fname)
+        return false;
+    g_bridge_pin = dlopen(info.dli_fname, RTLD_NOLOAD | RTLD_LAZY);
+    return g_bridge_pin != nullptr;
+}
+
 static void bootstrap() {
     if (g_initialized) return;
     g_initialized = 1;
     ZS_LOGI("libzygisk: bootstrap (pid %d)", (int)getpid());
     select_table_version();
+    if (!pin_bridge()) {
+        // No hook/self-unmap pipeline is safe without a retained bridge.
+        ZS_LOGW("libzygisk: cannot pin bridge; skipping payload initialization");
+        return;
+    }
     try_load_real_native_bridge();
     try_load_payload();
 }
@@ -453,7 +471,10 @@ static void libzygisk_ctor() {
     bootstrap();
 }
 
-static bool native_bridge_initialize(const struct NativeBridgeCallbacks* cb,
+// AOSP passes the runtime callback table, NOT the bridge table itself.
+// The pointer width matches either way, but the function types do not:
+// keep the exact contract for typed indirect calls (including CFI).
+static bool native_bridge_initialize(const struct NativeBridgeRuntimeCallbacks* cb,
                                      const char* app_cache_dir,
                                      const char* isa) {
     (void)cb;
@@ -479,7 +500,7 @@ static bool native_bridge_is_compatible(uint32_t bridge_version) {
     // forward) — the full 20-slot AOSP table through
     // isNativeBridgeFunctionPointer (verified byte-identical at
     // android-16.0.0_r1 and refs/heads/main = Android 17 dev; the
-    // v5/v6 slots exist since 13.0.0_r1, v7/v8 are new in 16).
+    // v5 arrived in Android 10, v6 in 11, v7 in 15, and v8 in 16).
     // Versions above 8 would need slots we do not have — answer false
     // so the runtime logs-and-skips the feature instead of calling a
     // slot past our table.
@@ -645,7 +666,7 @@ static void native_bridge_pre_zygote_fork() {
     // else: nothing to prepare — forks are transparent to us.
 }
 
-// v7 slots (CRITICAL_NATIVE_SUPPORT_VERSION = 7, added in 16; both
+// v7 slots (CRITICAL_NATIVE_SUPPORT_VERSION = 7, added in 15; both
 // verified from the 16/main loader source). The loader itself falls
 // back to the plain getTrampoline when the bridge predates v7 — our
 // no-bridge path mirrors exactly that fallback.

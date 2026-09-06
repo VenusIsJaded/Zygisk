@@ -3050,50 +3050,38 @@ static int path_is_hidden(const char* path) {
     return 0;
 }
 
-// ROUND 32 (found by actually cross-compiling against the NDK — the
-// first time this tree was ever built for Android): the legacy
-// stat/lstat/access syscall NUMBERS do not exist on every architecture.
-// Verified from the kernel UAPI headers shipped in the NDK sysroot:
-//   aarch64 (asm-generic/unistd.h): NO __NR_stat / __NR_lstat /
-//     __NR_access — only newfstatat(79), fstat, faccessat(48),
-//     statx(291), faccessat2(439).
-//   arm32 / i686 / x86_64: all three legacy numbers exist.
-// The #ifdef ladder keeps the legacy syscall where it exists (identical
-// behavior to every previous round on host and 32-bit/x86_64) and uses
-// the equivalent new-style syscall on aarch64 — newfstatat with
-// AT_FDCWD (and AT_SYMLINK_NOFOLLOW for lstat) is the exact stat/lstat
-// semantic; faccessat with AT_FDCWD is the exact access semantic.
-// The whole fallback only runs if the dlsym of the libc wrapper failed,
-// which does not happen on any real Android — but if it ever did, the
-// raw-syscall path now compiles and works on every ABI we ship.
-static inline int zs_raw_stat(const char* path, struct stat* st) {
-#if defined(SYS_stat)
-    return (int)syscall(SYS_stat, path, st);
+// Bionic's public struct stat uses the stat64 kernel layout on ARM32
+// and x86, NOT the legacy SYS_stat/SYS_lstat layout. Match its syscall
+// selection at both android-5.0.0_r1 and android-16.0.0_r1:
+// https://android.googlesource.com/platform/bionic/+/android-16.0.0_r1/libc/SYSCALLS.TXT
+// Do not infer layout compatibility merely from a syscall macro existing.
+static inline int zs_raw_fstatat(int dirfd, const char* path,
+                                 struct stat* st, int flags) {
+#if defined(__ANDROID__) && !defined(__LP64__)
+    return (int)syscall(SYS_fstatat64, dirfd, path, st, flags);
 #elif defined(SYS_newfstatat)
-    return (int)syscall(SYS_newfstatat, AT_FDCWD, path, st, 0);
+    return (int)syscall(SYS_newfstatat, dirfd, path, st, flags);
+#elif defined(SYS_fstatat)
+    return (int)syscall(SYS_fstatat, dirfd, path, st, flags);
 #else
     errno = ENOSYS;
     return -1;
 #endif
 }
 
+static inline int zs_raw_stat(const char* path, struct stat* st) {
+    return zs_raw_fstatat(AT_FDCWD, path, st, 0);
+}
+
 static inline int zs_raw_lstat(const char* path, struct stat* st) {
-#if defined(SYS_lstat)
-    return (int)syscall(SYS_lstat, path, st);
-#elif defined(SYS_newfstatat)
-    return (int)syscall(SYS_newfstatat, AT_FDCWD, path, st,
-                        AT_SYMLINK_NOFOLLOW);
-#else
-    errno = ENOSYS;
-    return -1;
-#endif
+    return zs_raw_fstatat(AT_FDCWD, path, st, AT_SYMLINK_NOFOLLOW);
 }
 
 static inline int zs_raw_access(const char* path, int mode) {
 #if defined(SYS_access)
     return (int)syscall(SYS_access, path, mode);
 #elif defined(SYS_faccessat)
-    return (int)syscall(SYS_faccessat, AT_FDCWD, path, mode, 0);
+    return (int)syscall(SYS_faccessat, AT_FDCWD, path, mode);
 #else
     errno = ENOSYS;
     return -1;
@@ -3148,9 +3136,13 @@ extern "C" int zygisk_study_hook_faccessat(int dirfd, const char* path,
                                            int mode, int flags) {
     if (ZS_LIKELY(!hide_advanced_is_active()) ||
         !(path && path[0] == '/' && path_is_hidden(path))) {
-        return g_real_faccessat
-            ? g_real_faccessat(dirfd, path, mode, flags)
-            : (int)syscall(SYS_faccessat, dirfd, path, mode, flags);
+        if (g_real_faccessat) return g_real_faccessat(dirfd, path, mode, flags);
+        // The legacy kernel syscall has only THREE arguments: passing
+        // flags as a fourth silently ignores them. Bionic rejects flags
+        // rather than emulating AT_EACCESS / AT_SYMLINK_NOFOLLOW.
+        // platform/bionic libc/bionic/faccessat.cpp (Android 8 and 16).
+        if (flags != 0) { errno = EINVAL; return -1; }
+        return (int)syscall(SYS_faccessat, dirfd, path, mode);
     }
     errno = ENOENT;
     return -1;
@@ -3161,11 +3153,13 @@ extern "C" int zygisk_study_hook_faccessat2(int dirfd, const char* path,
     if (ZS_LIKELY(!hide_advanced_is_active()) ||
         !(path && path[0] == '/' && path_is_hidden(path))) {
         if (g_real_faccessat2) return g_real_faccessat2(dirfd, path, mode, flags);
-        if (g_real_faccessat)  return g_real_faccessat(dirfd, path, mode, flags);
 #ifdef SYS_faccessat2
+        // Linux 5.8+: preserve the four-argument contract and propagate
+        // ENOSYS on older kernels. Bionic faccessat is not a substitute.
         return (int)syscall(SYS_faccessat2, dirfd, path, mode, flags);
 #else
-        return (int)syscall(SYS_faccessat, dirfd, path, mode, flags);
+        errno = ENOSYS;
+        return -1;
 #endif
     }
     errno = ENOENT;
@@ -3177,14 +3171,7 @@ extern "C" int zygisk_study_hook_fstatat(int dirfd, const char* path,
     if (ZS_LIKELY(!hide_advanced_is_active()) ||
         !(path && path[0] == '/' && path_is_hidden(path))) {
         if (g_real_fstatat) return g_real_fstatat(dirfd, path, st, flags);
-#if defined(SYS_fstatat)
-        return (int)syscall(SYS_fstatat, dirfd, path, st, flags);
-#elif defined(SYS_newfstatat)
-        return (int)syscall(SYS_newfstatat, dirfd, path, st, flags);
-#else
-        errno = ENOSYS;
-        return -1;
-#endif
+        return zs_raw_fstatat(dirfd, path, st, flags);
     }
     errno = ENOENT;
     return -1;
@@ -3988,10 +3975,12 @@ extern "C" long zygisk_study_hook_syscall(long number, ...) {
         }
     }
 #endif
-#ifdef SYS_fstat
+#if defined(SYS_fstat) && defined(__LP64__)
     if (number == (long)SYS_fstat && hide_advanced_is_active()) {
-        // x86_64-only raw path (aarch64 has no SYS_fstat — its fstat
-        // is fstatat AT_EMPTY_PATH, covered by the statx hook).
+        // ARM64 and x86_64 have a native-layout fstat syscall. Never
+        // write a public struct stat into an ARM32/x86 legacy fstat
+        // buffer: that kernel structure is smaller and laid out
+        // differently. Forward those calls unchanged below.
         struct stat* st = (struct stat*)a[1];
         if (fd_stat_as_procfs((int)a[0], st)) return 0;
     }

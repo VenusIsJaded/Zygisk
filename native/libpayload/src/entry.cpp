@@ -83,6 +83,31 @@
 
 #include "zygisk.hpp"
 
+// Android's 32-bit ARM/x86 syscall tables retain the old 16-bit UID/GID
+// calls under the unsuffixed names. Match bionic's SYSCALLS.TXT: use the
+// *32 variants when present, including for Android multi-user IDs > 65535.
+// https://android.googlesource.com/platform/bionic/+/android-16.0.0_r1/libc/SYSCALLS.TXT
+#ifdef SYS_setresgid32
+#  define ZS_SYS_setresgid SYS_setresgid32
+#else
+#  define ZS_SYS_setresgid SYS_setresgid
+#endif
+#ifdef SYS_setresuid32
+#  define ZS_SYS_setresuid SYS_setresuid32
+#else
+#  define ZS_SYS_setresuid SYS_setresuid
+#endif
+#ifdef SYS_setgid32
+#  define ZS_SYS_setgid SYS_setgid32
+#else
+#  define ZS_SYS_setgid SYS_setgid
+#endif
+#ifdef SYS_setuid32
+#  define ZS_SYS_setuid SYS_setuid32
+#else
+#  define ZS_SYS_setuid SYS_setuid
+#endif
+
 namespace zygisk_study {
 
 // ------------------------------------------------------------------------
@@ -351,7 +376,7 @@ static long call_real_setresgid(void* ctx) {
         return s->setresgid((gid_t)c->a, (gid_t)c->b, (gid_t)c->c);
 #endif
     return g_real_setresgid ? g_real_setresgid((gid_t)c->a, (gid_t)c->b, (gid_t)c->c)
-                            : syscall(SYS_setresgid, c->a, c->b, c->c);
+                            : syscall(ZS_SYS_setresgid, c->a, c->b, c->c);
 }
 static long call_real_setresuid(void* ctx) {
     RealCtx3* c = (RealCtx3*)ctx;
@@ -360,7 +385,7 @@ static long call_real_setresuid(void* ctx) {
         return s->setresuid((uid_t)c->a, (uid_t)c->b, (uid_t)c->c);
 #endif
     return g_real_setresuid ? g_real_setresuid((uid_t)c->a, (uid_t)c->b, (uid_t)c->c)
-                            : syscall(SYS_setresuid, c->a, c->b, c->c);
+                            : syscall(ZS_SYS_setresuid, c->a, c->b, c->c);
 }
 static long call_real_setgid(void* ctx) {
     RealCtx1* c = (RealCtx1*)ctx;
@@ -369,7 +394,7 @@ static long call_real_setgid(void* ctx) {
         return s->setgid((gid_t)c->a);
 #endif
     return g_real_setgid ? g_real_setgid((gid_t)c->a)
-                         : syscall(SYS_setgid, c->a);
+                         : syscall(ZS_SYS_setgid, c->a);
 }
 static long call_real_setuid(void* ctx) {
     RealCtx1* c = (RealCtx1*)ctx;
@@ -378,7 +403,7 @@ static long call_real_setuid(void* ctx) {
         return s->setuid((uid_t)c->a);
 #endif
     return g_real_setuid ? g_real_setuid((uid_t)c->a)
-                         : syscall(SYS_setuid, c->a);
+                         : syscall(ZS_SYS_setuid, c->a);
 }
 
 // The shared body of the GID-drop hooks (setresgid/setgid — the first
@@ -429,7 +454,7 @@ static void apply_module_gid_override(gid_t gid) {
                     (unsigned)gid, strerror(errno));
         }
     } else {
-        if (syscall(SYS_setresgid, gid, gid, gid) != 0) {
+        if (syscall(ZS_SYS_setresgid, gid, gid, gid) != 0) {
             ZS_LOGW("payload: module gid override to %u failed: %s",
                     (unsigned)gid, strerror(errno));
         }
