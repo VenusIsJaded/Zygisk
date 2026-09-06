@@ -135,6 +135,10 @@ case "$BUILD_TYPE" in
     *) echo "build_module.sh: --type must be Debug, Release, RelWithDebInfo or MinSizeRel" >&2
        exit 2 ;;
 esac
+# Cargo calls its unoptimized configuration "debug"; all other CMake
+# configurations continue to use the optimized release profile.
+RUST_PROFILE=release
+[[ "$BUILD_TYPE" != Debug ]] || RUST_PROFILE=debug
 
 # An explicit path is a requirement, not a discovery hint. Never silently
 # switch compilers when the caller misspells it.
@@ -152,10 +156,18 @@ fi
 # ---------------------------------------------------------------------------
 # NDK discovery
 # ---------------------------------------------------------------------------
+# Discovery and final toolchain selection must agree on the host OS. Otherwise
+# an incompatible preferred NDK masks a usable later environment/SDK candidate.
+case "$(uname -s)" in
+    Linux) HOST_OS=linux ;;
+    Darwin) HOST_OS=darwin ;;
+    *) echo "ERROR: unsupported NDK build host" >&2; exit 1 ;;
+esac
+
 is_ndk() {
     [[ -f "$1/build/cmake/android.toolchain.cmake" ]] || return 1
     local prebuilt
-    for prebuilt in "$1"/toolchains/llvm/prebuilt/*; do
+    for prebuilt in "$1"/toolchains/llvm/prebuilt/"$HOST_OS"-*; do
         [[ -x "$prebuilt/bin/clang" ]] && return 0
     done
     return 1
@@ -199,11 +211,11 @@ fi
 NDK_PATH="$(cd -- "$NDK_PATH" && pwd)"
 echo "== NDK: $NDK_PATH"
 
-TOOLCHAIN="$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64"
+TOOLCHAIN="$NDK_PATH/toolchains/llvm/prebuilt/$HOST_OS-x86_64"
 if [[ ! -x "$TOOLCHAIN/bin/clang" ]]; then
-    # Non-x86_64 build hosts use a different prebuilt tag (e.g. darwin-x86_64,
-    # linux-aarch64). Accept whatever exists instead of hard-failing.
-    for candidate in "$NDK_PATH"/toolchains/llvm/prebuilt/*; do
+    # Alternate CPU tags are usable only on the same operating system. An
+    # executable bit on a Linux binary does not make it runnable on macOS.
+    for candidate in "$NDK_PATH"/toolchains/llvm/prebuilt/"$HOST_OS"-*; do
         if [[ -x "$candidate/bin/clang" ]]; then
             TOOLCHAIN="$candidate"
             break
@@ -357,10 +369,12 @@ build_rust() {
     local required_flags
     printf -v required_flags '%s\x1f' "${flag_args[@]}"
     encoded_flags="${encoded_flags:+$encoded_flags$'\x1f'}${required_flags%$'\x1f'}"
+    local -a profile_args=()
+    [[ "$RUST_PROFILE" != release ]] || profile_args=(--release)
     (cd "$REPO_ROOT/native/zygiskd" &&
-        CARGO_ENCODED_RUSTFLAGS="$encoded_flags" cargo build --release \
+        CARGO_ENCODED_RUSTFLAGS="$encoded_flags" cargo build "${profile_args[@]}" \
             --target "$target" --target-dir "$RUST_TARGET_DIR")
-    [[ -f "$RUST_TARGET_DIR/$target/release/zygiskd" ]] \
+    [[ -f "$RUST_TARGET_DIR/$target/$RUST_PROFILE/zygiskd" ]] \
         || { echo "ERROR: zygiskd missing for $target" >&2; exit 1; }
     # ROUND 33: strip the symbol table (the daemon lives
     # root-only-readable under /data/adb, so this is size/hygiene,
@@ -368,7 +382,7 @@ build_rust() {
     local strip_bin="$TOOLCHAIN/bin/llvm-strip"
     [[ -x "$strip_bin" ]] || strip_bin="strip"
     "$strip_bin" --strip-all \
-        "$RUST_TARGET_DIR/$target/release/zygiskd"
+        "$RUST_TARGET_DIR/$target/$RUST_PROFILE/zygiskd"
 }
 
 # ---------------------------------------------------------------------------
@@ -415,7 +429,7 @@ EOF
         if [[ $SKIP_RUST -ne 1 ]]; then
             local target
             target="$(rust_target_for_abi "$abi")"
-            cp "$RUST_TARGET_DIR/$target/release/zygiskd" \
+            cp "$RUST_TARGET_DIR/$target/$RUST_PROFILE/zygiskd" \
                "$libs_dir/zygiskd"
         fi
         chmod 0755 "$libs_dir/zygiskd" 2>/dev/null || true
@@ -469,6 +483,9 @@ make_zip() {
 # checked from the finished zip itself, so a broken package can never
 # leave a green build.
 verify_zip() {
+    # Keep the extracted snapshot and cleanup trap local to this invocation.
+    # Every subsequent ELF check must inspect the ZIP, never mutable staging.
+    (
     local zip_path="$1"
     unset UNZIP UNZIPOPT ZIPINFO ZIPINFOOPT
     echo "== Verifying the zip"
@@ -489,6 +506,33 @@ verify_zip() {
     fi
     if grep -Eq '(^/|(^|/)\.\.?(/|$)|//|\\)' <<< "$listing"; then
         echo "  FAIL: unsafe or non-canonical archive member path" >&2
+        return 1
+    fi
+
+    # Do not silently ignore additional ABIs: they are extracted by the
+    # installer too, but would otherwise escape the fixed-path ELF checks.
+    local entry archive_abi
+    while IFS= read -r entry; do
+        case "$entry" in
+            libs/) continue ;;
+            libs/*)
+                archive_abi="${entry#libs/}"
+                archive_abi="${archive_abi%%/*}"
+                case " ${ABI_LIST[*]} " in
+                    *" $archive_abi "*) ;;
+                    *) echo "  FAIL: unrequested archive ABI: $archive_abi" >&2
+                       return 1 ;;
+                esac ;;
+        esac
+    done <<< "$listing"
+
+    # unzip -p prints symlink target text, not the file an installer would
+    # extract. Our generated packages contain regular files/directories only;
+    # reject links anywhere rather than verifying a different install layout.
+    local attributes
+    attributes="$(unzip -Z -l "$zip_path")" || return 1
+    if grep -q '^l' <<< "$attributes"; then
+        echo "  FAIL: symlink archive member" >&2
         return 1
     fi
 
@@ -532,8 +576,10 @@ verify_zip() {
 
     # 3. updater-script carries the conventional marker.
     local us
-    us="$(unzip -p "$zip_path" META-INF/com/google/android/updater-script | tr -d '\r\n')"
-    if [[ "$us" != "#MAGISK" ]]; then
+    us="$(unzip -p "$zip_path" META-INF/com/google/android/updater-script)" || return 1
+    # Command substitution removes the final LF; permit a CRLF terminator
+    # without deleting embedded newlines/CRs and joining a broken marker.
+    if [[ "$us" != "#MAGISK" && "$us" != $'#MAGISK\r' ]]; then
         echo "  FAIL: updater-script is not the #MAGISK marker" >&2
         fail=1
     fi
@@ -551,10 +597,12 @@ verify_zip() {
     # Extract only fixed expected paths; never run scripts from an input ZIP.
     # The shared POSIX checker covers all four artifacts, both ELF classes,
     # full magic, CPU, byte order, versions, type and complete header size.
-    local abi
+    local abi tmp_extract MODULE_DIR
+    tmp_extract="$(mktemp -d)" || return 1
+    trap 'rm -rf "$tmp_extract"' EXIT
+    trap 'exit 1' HUP INT TERM
+    MODULE_DIR="$tmp_extract"
     if ! (
-        tmp_extract="$(mktemp -d)" || exit 1
-        trap 'rm -rf "$tmp_extract"' EXIT
         for abi in "${ABI_LIST[@]}"; do
             mkdir -p "$tmp_extract/libs/$abi" || exit 1
             for lib in libzygisk.so libpayload.so libzn_loader.so zygiskd; do
@@ -575,8 +623,7 @@ verify_zip() {
     #    libraries, Round 32 for the daemon): a 16 KB-kernel device
     #    (Android 16+, Pixel 9a onward) refuses LOAD segments aligned
     #    below the kernel page size — for executables exactly as for
-    #    shared objects. Checked from the assembled module tree (the
-    #    zip content is byte-identical to it).
+    #    shared objects. Checked from the private extracted ZIP snapshot.
     local readelf_bin="" f align headers aligns
     if [[ -x "$TOOLCHAIN/bin/llvm-readelf" ]]; then
         readelf_bin="$TOOLCHAIN/bin/llvm-readelf"
@@ -693,6 +740,7 @@ verify_zip() {
     fi
     echo "  OK: layout, module.prop, updater-script, legacy-trap, ELF classes,"
     echo "      16 KB alignment, stripped sections, no SONAME, banned-strings all verified"
+    )
 }
 
 # ---------------------------------------------------------------------------

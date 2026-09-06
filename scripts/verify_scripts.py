@@ -1594,7 +1594,10 @@ def test_build_ndk_discovery(mk):
 
     older = fake_ndk(os.path.join(sdk, "ndk", "9.0.0"))
     newest = fake_ndk(os.path.join(sdk, "ndk", "27.3.13750724"))
-    alternate = fake_ndk(os.path.join(mk.root, "alternate NDK"), "darwin-x86_64")
+    # Keep the host deterministic, even when this suite runs on macOS.
+    write_exec(os.path.join(mk.bindir, "uname"), "#!/bin/sh\necho Linux\n")
+    alternate = fake_ndk(os.path.join(mk.root, "alternate NDK"), "linux-aarch64")
+    foreign = fake_ndk(os.path.join(sdk, "ndk", "99.0.0"), "darwin-x86_64")
     # An unrelated prebuilt directory must not hide the usable toolchain.
     os.makedirs(os.path.join(alternate, "toolchains", "llvm", "prebuilt", "aaa-empty"))
     missing = os.path.join(mk.root, "missing NDK")
@@ -1612,7 +1615,13 @@ def test_build_ndk_discovery(mk):
         ("pinned NDK_VERSION", {"NDK_VERSION": "9.0.0"}, older),
         ("explicit NDK", {"NDK": older}, older),
         ("environment NDK override", {"ANDROID_NDK_HOME": older}, older),
-        ("alternate host toolchain", {"NDK": alternate}, alternate),
+        ("alternate same-OS toolchain", {"NDK": alternate}, alternate),
+        ("foreign preferred NDK falls through to SDK", {"ANDROID_NDK_HOME": foreign}, newest),
+        ("foreign preferred NDK falls through to next environment candidate",
+         {"ANDROID_NDK_HOME": foreign, "ANDROID_NDK_LATEST_HOME": older}, older),
+        ("foreign latest NDK falls through to classic environment candidate",
+         {"ANDROID_NDK_LATEST_HOME": foreign, "ANDROID_NDK_ROOT": older}, older),
+        ("explicit foreign NDK fails instead of silently switching", {"NDK": foreign}, None),
         ("missing clang rejected", {"NDK": missing}, None),
     ]
     for index, (name, overrides, expected) in enumerate(cases):
@@ -2613,7 +2622,7 @@ fi
     tools = os.path.join(root, "tools")
     os.makedirs(tools)
     for name in ("bash", "dirname", "mkdir", "cp", "chmod", "rm", "sed", "git",
-                 "cat", "find", "sort", "basename", "getconf", "tr"):
+                 "cat", "find", "sort", "basename", "getconf", "tr", "uname"):
         source = shutil.which(name)
         if source:
             os.symlink(source, os.path.join(tools, name))
@@ -3309,8 +3318,258 @@ def test_final_nine_regressions(mk):
               proc.returncode != 0 and "python3" in proc.stdout, proc.stdout + proc.stderr)
 
 
+def test_assertion_and_build_regressions(mk):
+    """Assertion/build regressions, including PR #12's three additional fixes."""
+    import json
+    import shlex
+    import struct
+    import zipfile
+    from pathlib import Path
+
+    root = Path(mk.root)
+    compiler = shlex.split(os.environ.get("CXX", "c++"))
+
+    def cpp(label, body):
+        source = root / "assertion.cpp"
+        binary = root / "assertion"
+        source.write_text('#include "test_framework.h"\n' + body)
+        proc = subprocess.run([*compiler, "-std=c++17", "-Wall", "-Wextra",
+                               "-I" + str(Path(REPO_ROOT) / "tests"), str(source),
+                               "-o", str(binary)], capture_output=True, text=True, timeout=60)
+        if proc.returncode == 0:
+            proc = subprocess.run([str(binary)], capture_output=True, text=True, timeout=10)
+        check(label, proc.returncode == 0, proc.stdout + proc.stderr)
+
+    cpp("audit 01: equality supports strings and pointers", r'''
+int main() {
+    std::string a = "same", b = "same";
+    ZS_CHECK_EQ(a, b);
+    int value = 1;
+    ZS_CHECK_EQ(&value, &value);
+    try { ZS_CHECK_EQ(a, std::string("different")); }
+    catch (const zstest::CheckFailed& e) {
+        return e.msg.find("same") != std::string::npos ? 0 : 1;
+    }
+    return 2;
+}
+''')
+    cpp("audit 02: comparison does not copy noncopyable operands", r'''
+struct Value {
+    int n;
+    explicit Value(int value) : n(value) {}
+    Value(const Value&) = delete;
+    bool operator!=(const Value& other) const { return n != other.n; }
+};
+int main() { Value a(1), b(2); ZS_CHECK_NE(a, b); }
+''')
+    cpp("audit 03: assertion macros do not capture caller variable names", r'''
+int main() {
+    int _a = 1, _b = 2;
+    ZS_CHECK_NE(_a, _b);
+    ZS_CHECK_EQ(_a, 1);
+    std::string _h = "hello", _n = "ell";
+    ZS_CHECK_STR_CONTAINS(_h, _n);
+    ZS_CHECK_STR_ABSENT(_h, "absent");
+    ZS_CHECK_STR_EQ(_h, "hello");
+    int calls = 0;
+    ZS_CHECK_EQ(++calls, 1);
+    return calls != 1;
+}
+''')
+    cpp("audit 04: null strings report assertion failures without undefined behavior", r'''
+int main() {
+    const char* missing = nullptr;
+    int failures = 0;
+    auto expect = [&](auto fn) {
+        try { fn(); }
+        catch (const zstest::CheckFailed& e) {
+            if (e.msg.find("assertion.cpp:") != std::string::npos) ++failures;
+        }
+        catch (...) {}
+    };
+    expect([&] { ZS_CHECK_STR_EQ(missing, ""); });
+    expect([&] { ZS_CHECK_STR_EQ("", missing); });
+    expect([&] { ZS_CHECK_STR_CONTAINS(missing, ""); });
+    expect([&] { ZS_CHECK_STR_CONTAINS("", missing); });
+    expect([&] { ZS_CHECK_STR_ABSENT(missing, ""); });
+    expect([&] { ZS_CHECK_STR_ABSENT("", missing); });
+    return failures == 6 ? 0 : 1;
+}
+''')
+
+    cpp("audit 10: pointer diagnostics never read character buffers", r'''
+#include <sys/mman.h>
+#include <unistd.h>
+int main() {
+    const long page = sysconf(_SC_PAGESIZE);
+    if (page <= 0) return 2;
+    void* mapping = mmap(nullptr, 2 * page, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mapping == MAP_FAILED) return 3;
+    char* buffer = static_cast<char*>(mapping);
+    if (mprotect(buffer + page, page, PROT_NONE) != 0) {
+        munmap(mapping, 2 * page);
+        return 4;
+    }
+    buffer[page - 1] = 'x'; // A valid single character, not a C string.
+    int failures = 0;
+    auto expect = [&](auto pointer) {
+        decltype(pointer) missing = nullptr;
+        for (bool reverse : {false, true}) {
+            try {
+                if (reverse) { ZS_CHECK_EQ(missing, pointer); }
+                else { ZS_CHECK_EQ(pointer, missing); }
+            } catch (const zstest::CheckFailed& e) {
+                if (e.msg.find("assertion.cpp:") != std::string::npos &&
+                    e.msg.find(" != ") != std::string::npos) ++failures;
+            }
+        }
+    };
+    expect(buffer + page);
+    expect(static_cast<const char*>(buffer + page));
+    expect(reinterpret_cast<signed char*>(buffer + page));
+    expect(reinterpret_cast<unsigned char*>(buffer + page));
+    expect(static_cast<volatile char*>(buffer + page));
+    expect(buffer + page - 1);
+    munmap(mapping, 2 * page);
+    return failures == 12 ? 0 : 1;
+}
+''')
+
+    checkout = root / "checkout"
+    (checkout / "scripts/installer").mkdir(parents=True)
+    (checkout / "native/zygiskd").mkdir(parents=True)
+    for name in ("build_module.sh", "installer/update-binary", "installer/updater-script"):
+        shutil.copy(Path(REPO_ROOT) / "scripts" / name, checkout / "scripts" / name)
+    for name in ("customize.sh", "post-fs-data.sh", "service.sh", "uninstall.sh",
+                 "zs_compat.sh", "post-mount-hook.sh", "verify.sh", "LICENSE"):
+        shutil.copy(Path(REPO_ROOT) / name, checkout / name)
+    ndk = root / "ndk"
+    (ndk / "build/cmake").mkdir(parents=True)
+    (ndk / "build/cmake/android.toolchain.cmake").touch()
+    for tag in ("linux-x86_64", "darwin-x86_64"):
+        tools = ndk / "toolchains/llvm/prebuilt" / tag / "bin"
+        tools.mkdir(parents=True)
+        for tool in ("clang", "llvm-strip"):
+            write_exec(tools / tool, "#!/bin/sh\nexit 0\n")
+    log = root / "cargo.json"
+    write_exec(Path(mk.bindir) / "cargo", '''#!/usr/bin/env python3
+import json, os, pathlib, sys
+args = sys.argv[1:]
+target = args[args.index('--target') + 1]
+profile = 'release' if '--release' in args else 'debug'
+out = pathlib.Path(args[args.index('--target-dir') + 1]) / target / profile / 'zygiskd'
+out.parent.mkdir(parents=True, exist_ok=True)
+out.write_text(profile)
+key = 'CARGO_TARGET_' + target.upper().replace('-', '_') + '_LINKER'
+pathlib.Path(os.environ['AUDIT_CARGO_LOG']).write_text(json.dumps([os.environ[key], profile]))
+''')
+    uname = shutil.which("uname")
+    write_exec(Path(mk.bindir) / "uname", '#!/bin/sh\n'
+               'if [ "$1" = -s ]; then echo "$AUDIT_HOST"; else exec '
+               + shlex.quote(uname) + ' "$@"; fi\n')
+    env = mk.env({"AUDIT_CARGO_LOG": str(log), "NDK": str(ndk),
+                  "CARGO_TARGET_DIR": str(root / "cargo-target")})
+    for number, host, build_type, expected_profile in (
+            (5, "Darwin", "Release", "release"),
+            (6, "Linux", "Debug", "debug")):
+        out = root / ("out-" + str(number))
+        proc = subprocess.run(["bash", str(checkout / "scripts/build_module.sh"),
+                               "--abis", "x86_64", "--skip-cpp", "--out", str(out),
+                               "--type", build_type], env={**env, "AUDIT_HOST": host},
+                              capture_output=True, text=True, timeout=30)
+        selected = json.loads(log.read_text()) if log.exists() else []
+        expected_tag = "darwin-x86_64" if host == "Darwin" else "linux-x86_64"
+        check(f"audit {number:02d}: host toolchain / Rust profile {host}/{build_type}",
+              proc.returncode == 0 and len(selected) == 2
+              and expected_tag in selected[0] and selected[1] == expected_profile
+              and (out / "module/libs/x86_64/zygiskd").read_text() == expected_profile,
+              repr(selected) + proc.stdout + proc.stderr)
+        log.unlink(missing_ok=True)
+    (Path(mk.bindir) / "uname").unlink()
+
+    # Inspect the real archive verifier with deterministic ELF program headers.
+    # A valid staging copy must not mask different bytes inside the ZIP.
+    tools = ndk / "bin"
+    tools.mkdir()
+    write_exec(tools / "llvm-readelf", '''#!/usr/bin/env python3
+import pathlib, sys
+if sys.argv[1] == '-lW':
+    alignment = '0x1000' if pathlib.Path(sys.argv[-1]).read_bytes().endswith(b'bad-alignment') else '0x4000'
+    print('LOAD 0x000000 0x000000 0x000000 0x001000 0x001000 R E ' + alignment)
+''')
+    write_exec(tools / "llvm-strings", "#!/bin/sh\nexit 0\n")
+    data = bytearray(64)
+    data[:7] = b"\x7fELF\x02\x01\x01"
+    struct.pack_into("<HHI", data, 16, 3, 62, 1)
+    struct.pack_into("<H", data, 52, 64)
+    names = ("libzygisk.so", "libpayload.so", "libzn_loader.so", "zygiskd")
+    staging = root / "staging"
+    (staging / "libs/x86_64").mkdir(parents=True)
+    for name in names:
+        (staging / "libs/x86_64" / name).write_bytes(data)
+    source = (Path(REPO_ROOT) / "scripts/build_module.sh").read_text()
+    function = source.split("verify_zip() {", 1)[1].split("\n}\n", 1)[0]
+    runner = ('set -euo pipefail\nABI_LIST=(x86_64)\nverify_zip() {' + function
+              + '\n}\nverify_zip "$1" || exit 1\n')
+    env = mk.env({"REPO_ROOT": REPO_ROOT, "MODULE_DIR": str(staging), "TOOLCHAIN": str(ndk)})
+    fixture = root / "fixture.zip"
+
+    def archive(extra=None, marker="#MAGISK\n", corrupt=False, symlink=None):
+        def member(name):
+            if name != symlink:
+                return name
+            info = zipfile.ZipInfo(name)
+            info.create_system = 3
+            info.external_attr = (stat.S_IFLNK | 0o777) << 16
+            return info
+
+        with zipfile.ZipFile(fixture, "w") as z:
+            for name in ("customize.sh post-fs-data.sh service.sh uninstall.sh zs_compat.sh "
+                         "post-mount-hook.sh verify.sh LICENSE "
+                         "META-INF/com/google/android/update-binary").split():
+                z.writestr(member(name), "fixture")
+            z.writestr("module.prop", "id=zygisk_study\nname=Study\nversion=1\n"
+                       "versionCode=1\nauthor=Test\ndescription=Fixture\n")
+            z.writestr("META-INF/com/google/android/updater-script", marker)
+            for name in names:
+                z.writestr(member("libs/x86_64/" + name),
+                           data + (b"bad-alignment" if corrupt and name == "libpayload.so" else b""))
+            if extra:
+                z.writestr(member(extra), "unexpected ABI")
+        return subprocess.run(["bash", "-c", runner, "verify", str(fixture)], env=env,
+                              capture_output=True, text=True, timeout=30)
+
+    proc = archive()
+    check("audit archive control: valid package is accepted", proc.returncode == 0,
+          proc.stdout + proc.stderr)
+    for extra in ("libs/riscv64/zygiskd", "libs/x86/zygiskd"):
+        proc = archive(extra=extra)
+        check("audit 07: unrequested/unverified ABI rejected: " + extra,
+              proc.returncode != 0, proc.stdout + proc.stderr)
+    for marker in ("#MAG\nISK\n", "#MA\rGISK\n"):
+        proc = archive(marker=marker)
+        check("audit 08: split recovery marker is not silently concatenated",
+              proc.returncode != 0, proc.stdout + proc.stderr)
+    proc = archive(corrupt=True)
+    check("audit 09: archived ELF alignment is checked, not the staging copy",
+          proc.returncode != 0, proc.stdout + proc.stderr)
+    for symlink in ("customize.sh", "META-INF/com/google/android/update-binary",
+                    "libs/x86_64/libpayload.so", "optional-link"):
+        proc = archive(symlink=symlink,
+                       extra=symlink if symlink == "optional-link" else None)
+        check("audit 12: symlink archive member rejected: " + symlink,
+              proc.returncode != 0 and "symlink archive member" in proc.stderr,
+              proc.stdout + proc.stderr)
+    # NDK discovery regressions (audit 11) live in test_build_ndk_discovery.
+    proc = archive()
+    check("audit archive control: regular members remain valid after link rejection",
+          proc.returncode == 0, proc.stdout + proc.stderr)
+
+
 def main():
     cases = [
+        ("PR #12 assertion and build regressions", test_assertion_and_build_regressions),
         ("PR #11 final audit: nine further regressions", test_final_nine_regressions),
         ("PR #11 completion: nine NEW regressions", test_pr11_completion_regressions),
         ("PR #11: nine additional tooling regressions", test_nine_followup_regressions),
