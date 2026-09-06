@@ -35,6 +35,7 @@ Exits 0 when every check passes, 1 on any failure, 77 when no Rust
 toolchain is available (same skip convention as verify_trampolines).
 """
 
+import json
 import os
 import shutil
 import signal
@@ -69,15 +70,30 @@ def cargo_build():
         sys.exit(77)
     env = dict(os.environ)
     env["PATH"] = os.path.expanduser("~/.cargo/bin:") + env.get("PATH", "")
-    r = subprocess.run(["cargo", "build"], cwd=DAEMON_DIR, env=env,
-                       capture_output=True, text=True)
+    r = subprocess.run(["cargo", "build", "--message-format=json"],
+                       cwd=DAEMON_DIR, env=env, capture_output=True, text=True)
     if r.returncode != 0:
         print(r.stderr)
         print("cargo build failed")
         sys.exit(1)
-    binp = os.path.join(DAEMON_DIR, "target", "debug", "zygiskd")
-    if not os.path.exists(binp):
-        print("built binary not found:", binp)
+    # Cargo owns output-path resolution (including target-dir and config
+    # overrides). Use this build's artifact, never a possibly stale default.
+    binp = None
+    for line in r.stdout.splitlines():
+        try:
+            message = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(message, dict):
+            continue
+        target = message.get("target", {})
+        if (message.get("reason") == "compiler-artifact"
+                and target.get("name") == "zygiskd"
+                and "bin" in target.get("kind", [])
+                and message.get("executable")):
+            binp = message["executable"]
+    if not binp or not os.path.isfile(binp) or not os.access(binp, os.X_OK):
+        print("built executable not reported by Cargo or not executable:", binp)
         sys.exit(1)
     return binp, env
 
@@ -149,7 +165,14 @@ def ask(sock_path, verb):
     s = connect(sock_path)
     try:
         s.sendall(verb)
-        return s.recv(4096)
+        # These one-shot protocol verbs finish by closing the connection.
+        # SOCK_STREAM preserves byte order, not write/message boundaries.
+        chunks = []
+        while True:
+            chunk = s.recv(4096)
+            if not chunk:
+                return b"".join(chunks)
+            chunks.append(chunk)
     finally:
         s.close()
 
