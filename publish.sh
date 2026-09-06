@@ -80,6 +80,16 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# Hooks and wrapper scripts can inherit another checkout's Git context.
+# Changing directory does not override these variables: refuse rather than
+# silently pushing a different repository or changing its remote settings.
+for git_context in GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_NAMESPACE; do
+    if [[ -n "${!git_context:-}" ]]; then
+        echo "publish.sh: unset $git_context before publishing this checkout." >&2
+        exit 2
+    fi
+done
+
 # Sanity: are we in a git repo?
 if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     echo "publish.sh: not in a git repo. Run from the project root." >&2

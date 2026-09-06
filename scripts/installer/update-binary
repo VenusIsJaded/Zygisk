@@ -42,10 +42,26 @@ ui_print() {
   fi
 }
 
+# Validate the recovery protocol before any mount or installer side effect.
+# An empty fd is allowed: ui_print falls back to stdout outside recovery.
+if [ "$#" -ne 3 ] || [ -z "$3" ]; then
+  printf '%s\n' 'Usage: update-binary API OUTFD ZIPFILE' >&2
+  exit 1
+fi
 OUTFD=$2
 ZIPFILE=$3
+# Magisk utilities may change directory while being sourced.
+case "$ZIPFILE" in
+  /*) ;;
+  *) ZIPFILE="$(pwd -P)/$ZIPFILE" ;;
+esac
+export OUTFD ZIPFILE
 
 mount /data 2>/dev/null
+if [ ! -f "$ZIPFILE" ] || [ ! -r "$ZIPFILE" ]; then
+  ui_print " Module ZIP is missing or unreadable. "
+  exit 1
+fi
 
 if [ ! -f /data/adb/magisk/util_functions.sh ]; then
   ui_print "*******************************"
@@ -55,7 +71,10 @@ if [ ! -f /data/adb/magisk/util_functions.sh ]; then
   exit 1
 fi
 
-. /data/adb/magisk/util_functions.sh
+if ! . /data/adb/magisk/util_functions.sh; then
+  ui_print " Failed to load Magisk installation utilities. "
+  exit 1
+fi
 
 # Do not let test(1)'s "integer expression expected" error bypass the gate.
 # Bound the digit count before arithmetic to avoid overflow on 32-bit shells.
