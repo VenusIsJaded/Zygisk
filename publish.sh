@@ -93,10 +93,17 @@ fi
 # A fixed main default can report success while leaving the user's changes
 # unpublished on a feature branch. Detached checkouts need an explicit choice.
 if [[ -z "$BRANCH" ]]; then
-    BRANCH="$(git symbolic-ref --quiet --short HEAD)" || {
+    BRANCH="$(git symbolic-ref --quiet HEAD)" || {
         echo "publish.sh: detached HEAD; pass --branch BRANCH." >&2
         exit 1
     }
+fi
+
+# Fully qualify both ends: an explicit branch can share its name with a tag.
+BRANCH="${BRANCH#refs/heads/}"
+if ! git check-ref-format "refs/heads/$BRANCH"; then
+    echo "publish.sh: invalid branch name: $BRANCH" >&2
+    exit 2
 fi
 
 # Explicit repository/transport options must also apply to existing remotes.
@@ -117,6 +124,11 @@ if [[ -z "$REPO" && $PROTOCOL_SET -eq 1 ]]; then
     REPO="${REPO%.git}"
 fi
 if [[ -n "$REPO" ]]; then
+    REPO="${REPO%.git}"
+    if [[ ! "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+        echo "publish.sh: --repo must be OWNER/REPO (optional .git suffix)." >&2
+        exit 2
+    fi
     if [[ "$PROTOCOL" == "ssh" ]]; then
         TARGET_URL="git@github.com:$REPO.git"
     else
@@ -127,12 +139,17 @@ if [[ -n "$REPO" ]]; then
     elif [[ "$REMOTE_URL" != "$TARGET_URL" ]]; then
         git remote set-url "$REMOTE_NAME" "$TARGET_URL"
     fi
+    # Git gives pushurl precedence over url, including multiple destinations.
+    # Explicit destination/transport selection must replace that override too.
+    if git config --get-all "remote.$REMOTE_NAME.pushurl" >/dev/null; then
+        git config --unset-all "remote.$REMOTE_NAME.pushurl"
+    fi
     REMOTE_URL="$TARGET_URL"
 fi
 
 # Push.
 echo "publish.sh: pushing $BRANCH to $REMOTE_NAME ($REMOTE_URL)"
-git push -u "$REMOTE_NAME" "$BRANCH"
+git push -u "$REMOTE_NAME" "refs/heads/$BRANCH:refs/heads/$BRANCH"
 
 # Final status.
 echo

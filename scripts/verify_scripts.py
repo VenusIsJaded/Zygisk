@@ -1861,6 +1861,8 @@ def test_verify_artifact_regressions(mk):
         elf[:7] = b"\x7fELF" + bytes((cls, 1, 1))
         struct.pack_into("<H", elf, 16, 3)
         struct.pack_into("<H", elf, 18, machine)
+        struct.pack_into("<I", elf, 20, 1)
+        struct.pack_into("<H", elf, 52 if cls == 2 else 40, 64 if cls == 2 else 52)
         for name in names:
             with open(os.path.join(dest, name), "wb") as fp:
                 fp.write(elf)
@@ -1979,7 +1981,9 @@ elif args[:2] == ['remote', 'get-url']:
 elif args[:2] in (['remote', 'set-url'], ['remote', 'add']):
     with open(state, 'w') as fp:
         fp.write(args[-1])
-elif args[:2] == ['config', 'user.email']:
+elif args[:1] == ['check-ref-format']:
+    pass
+elif args[:2] in (['config', 'user.email'], ['config', '--get-all']):
     sys.exit(1)
 elif args[:1] != ['push']:
     sys.exit('unexpected git command: ' + repr(args))
@@ -2012,13 +2016,13 @@ elif args[:1] != ['push']:
     # 9: the default push should publish the branch actually being worked on.
     proc, calls, _ = run()
     check("bug 09: publish defaults to the current branch", proc.returncode == 0
-          and ["push", "-u", "origin", "study-fixes"] in calls, repr(calls))
+          and ["push", "-u", "origin", "refs/heads/study-fixes:refs/heads/study-fixes"] in calls, repr(calls))
     proc, calls, _ = run(extra={"PUBLISH_DETACHED": "1"})
     check("bug 09: detached HEAD requires an explicit branch", proc.returncode != 0
           and not any(c[0] == "push" for c in calls), proc.stdout + proc.stderr)
     proc, calls, _ = run(("--branch", "release"), extra={"PUBLISH_DETACHED": "1"})
     check("publish: explicit branch works detached", proc.returncode == 0
-          and ["push", "-u", "origin", "release"] in calls, repr(calls))
+          and ["push", "-u", "origin", "refs/heads/release:refs/heads/release"] in calls, repr(calls))
 
     # 10: --repo must not silently push to the existing, different repository.
     proc, calls, url = run(("--repo", "owner/new-study"))
@@ -2319,8 +2323,203 @@ def test_verify_pr8_regressions(mk):
     accept("verify: sourced shell state is unchanged under errexit/nounset", proc)
 
 
+
+def test_nineteen_validation_regressions(mk):
+    """Nineteen independently reproduced failures relative to main at aa34cfe.
+
+    Only host fixtures are used; no Android execution or network pushes.
+    Archive tests invoke the real verification function with deterministic
+    readelf output, keeping structural checks independent of toolchain support.
+    """
+    import struct
+    import zipfile
+
+    names = ("libzygisk.so", "libpayload.so", "libzn_loader.so", "zygiskd")
+    script = os.path.join(REPO_ROOT, "verify.sh")
+    libs = os.path.join(mk.moddir, "libs")
+
+    def header(cls=2, machine=62):
+        data = bytearray(64 if cls == 2 else 52)
+        data[:7] = b"\x7fELF" + bytes((cls, 1, 1))
+        struct.pack_into("<HHI", data, 16, 3, machine, 1)
+        struct.pack_into("<H", data, 52 if cls == 2 else 40, len(data))
+        return data
+
+    def bundle(cls=2, machine=62, abi="x86_64"):
+        shutil.rmtree(libs, ignore_errors=True)
+        os.makedirs(os.path.join(libs, abi))
+        for name in names:
+            with open(os.path.join(libs, abi, name), "wb") as fp:
+                fp.write(header(cls, machine))
+        return os.path.join(libs, abi, names[0])
+
+    def verify(setup="", tail="", extra=None):
+        return subprocess.run(
+            ["sh", "-c", setup + '. "$1"' + tail, "installer", script],
+            env=mk.env({"MODPATH": mk.moddir, **(extra or {})}),
+            capture_output=True, text=True, timeout=10)
+
+    def result(number, label, proc, ok):
+        check(f"nineteen {number:02d}: {label}", ok, proc.stdout + proc.stderr)
+
+    bundle()
+    proc = verify('count=original; abi=original; ',
+                  '; [ "$count/$abi" = original/original ]')
+    result(1, "sourcing preserves caller variables", proc, proc.returncode == 0)
+    proc = verify('IFS=:; ')
+    result(2, "caller IFS does not corrupt byte parsing", proc, proc.returncode == 0)
+
+    for cls, machine, abi in ((2, 62, "x86_64"), (1, 3, "x86")):
+        path = bundle(cls, machine, abi)
+        with open(path, "wb") as fp:
+            fp.write(header(cls, machine)[:-1])
+        proc = verify()
+        result(3, "rejects truncated " + abi + " headers", proc, proc.returncode != 0)
+
+    bundle()
+    # A broken reader can emit plausible bytes before reporting I/O failure.
+    fake_od = os.path.join(mk.bindir, "od")
+    import shlex
+    write_exec(fake_od, '#!/bin/sh\n' + shlex.quote(shutil.which("od")) +
+               ' "$@"\nexit 1\n')
+    proc = verify()
+    result(4, "reader failure cannot pass on partial output", proc, proc.returncode != 0)
+    os.unlink(fake_od)
+
+    bundle()
+    with open(os.path.join(libs, "x86"), "w") as fp:
+        fp.write("not a directory")
+    proc = verify()
+    result(5, "malformed secondary ABI entry is not skipped", proc, proc.returncode != 0)
+    bundle()
+    os.makedirs(os.path.join(libs, "x86_typo"))
+    proc = verify()
+    result(6, "unknown ABI directory is not silently ignored", proc, proc.returncode != 0)
+
+    for number, offset, value, label in (
+            (7, 6, b"\x00", "ELF identification version"),
+            (8, 20, b"\x00\x00\x00\x00", "ELF header version"),
+            (9, 16, b"\x01\x00", "relocatable object masquerading as library"),
+            (10, 52, b"\x00\x00", "declared ELF header size")):
+        path = bundle()
+        with open(path, "r+b") as fp:
+            fp.seek(offset)
+            fp.write(value)
+        proc = verify()
+        result(number, "rejects " + label, proc, proc.returncode != 0)
+    # Positive controls: ELF32, ELF64 and a non-PIE executable daemon.
+    for cls, machine, abi in ((1, 40, "armeabi-v7a"), (2, 183, "arm64-v8a")):
+        bundle(cls, machine, abi)
+        daemon = os.path.join(libs, abi, "zygiskd")
+        with open(daemon, "r+b") as fp:
+            fp.seek(16)
+            fp.write(b"\x02\x00")
+        proc = verify()
+        check("nineteen control: valid " + abi + " executable", proc.returncode == 0,
+              proc.stdout + proc.stderr)
+
+    # The staged tree remains valid while the ZIP is independently mutated.
+    bundle()
+    toolchain = os.path.join(mk.root, "archive tools")
+    os.makedirs(os.path.join(toolchain, "bin"))
+    write_exec(os.path.join(toolchain, "bin", "llvm-readelf"),
+               '#!/bin/sh\ncase "$1" in -lW) echo " LOAD 0 0 0 0 0 R 0x4000";; esac\n')
+    write_exec(os.path.join(toolchain, "bin", "llvm-strings"), '#!/bin/sh\nexit 0\n')
+    with open(os.path.join(REPO_ROOT, "scripts", "build_module.sh")) as fp:
+        build = fp.read()
+    function = build[build.index("verify_zip() {"):build.index("# Drive the build")]
+    prop = ("id=zygisk_study\nname=Study\nversion=1\nversionCode=1\n"
+            "author=Study\ndescription=Educational\n")
+    base = {f: b"fixture" for f in (
+        "customize.sh", "post-fs-data.sh", "service.sh", "uninstall.sh", "verify.sh",
+        "zs_compat.sh", "post-mount-hook.sh", "LICENSE",
+        "META-INF/com/google/android/update-binary")}
+    base.update({"module.prop": prop.encode(),
+                 "META-INF/com/google/android/updater-script": b"#MAGISK\n"})
+    base.update({"libs/x86_64/" + name: bytes(header()) for name in names})
+
+    def archive_run(entries):
+        archive = os.path.join(mk.root, "module.zip")
+        with zipfile.ZipFile(archive, "w") as zf:
+            for name, data in entries.items():
+                zf.writestr(name, data)
+        return subprocess.run(
+            ["bash", "-c", 'set -euo pipefail; ABI_LIST=(x86_64); ' +
+             function + '\nverify_zip "$1"', "verify-archive", archive],
+            env=mk.env({"REPO_ROOT": REPO_ROOT, "MODULE_DIR": mk.moddir,
+                        "TOOLCHAIN": toolchain}), capture_output=True, text=True, timeout=20)
+
+    proc = archive_run(base)
+    check("nineteen control: valid archive", proc.returncode == 0, proc.stdout + proc.stderr)
+    mutations = []
+    entries = dict(base)
+    del entries["verify.sh"]
+    mutations.append((11, "missing packaged verifier", entries))
+    entries = dict(base)
+    entries["customizeXsh"] = entries.pop("customize.sh")
+    mutations.append((12, "regex lookalike required filename", entries))
+    entries = dict(base)
+    entries["libs/x86_64/libpayload.so"] = bytes(header(2, 183))
+    mutations.append((13, "same-width wrong CPU in archive", entries))
+    entries = dict(base)
+    entries["libs/x86_64/zygiskd"] = b"not an ELF executable"
+    mutations.append((14, "corrupt daemon in archive", entries))
+    entries = dict(base)
+    entries["module.prop"] = prop.replace("name=Study", "name=").encode()
+    mutations.append((15, "empty required metadata", entries))
+    entries = dict(base)
+    entries["module.prop"] = (prop + "id=another_module\n").encode()
+    mutations.append((16, "conflicting duplicate metadata", entries))
+    for number, label, entries in mutations:
+        proc = archive_run(entries)
+        result(number, "rejects " + label, proc, proc.returncode != 0)
+
+    # Real local Git repositories exercise ref ambiguity and pushurl semantics.
+    repo = os.path.join(mk.root, "publish repo")
+    remote = os.path.join(mk.root, "remote.git")
+    os.makedirs(repo)
+    real_git = shutil.which("git")
+    def git(*args):
+        return subprocess.run([real_git, *args], cwd=repo, capture_output=True,
+                              text=True, check=True, timeout=10)
+    git("init", "-q")
+    git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit",
+        "--allow-empty", "-qm", "fixture")
+    git("checkout", "-qb", "topic")
+    git("tag", "topic")
+    git("init", "--bare", "-q", remote)
+    git("remote", "add", "origin", remote)
+    publisher = os.path.join(repo, "publish.sh")
+    shutil.copy(os.path.join(REPO_ROOT, "publish.sh"), publisher)
+    def publish(*args, extra=None):
+        return subprocess.run(["bash", publisher, *args], cwd=repo,
+                              env=mk.env(extra), capture_output=True, text=True, timeout=15)
+    proc = publish("--branch", "topic")
+    result(17, "branch/tag name collision publishes the branch", proc, proc.returncode == 0)
+    if proc.returncode == 0:
+        check("nineteen control: destination branch exists",
+              bool(git("--git-dir=" + remote, "rev-parse", "refs/heads/topic").stdout.strip()))
+
+    # Block actual network pushes; ask real Git which URL it would use instead.
+    import shlex
+    write_exec(os.path.join(mk.bindir, "git"), '#!/bin/sh\nif [ "$1" = push ]; then\n'
+               '  ' + shlex.quote(real_git) + ' remote get-url --push --all origin\n'
+               '  exit 0\nfi\nexec ' + shlex.quote(real_git) + ' "$@"\n')
+    git("config", "remote.origin.pushurl", "https://github.com/wrong/destination.git")
+    proc = publish("--repo", "study/intended")
+    result(18, "explicit destination cannot be overridden by pushurl", proc,
+           proc.returncode == 0 and "wrong/destination" not in proc.stdout
+           and "https://github.com/study/intended.git" in proc.stdout)
+    if "pushurl" in git("config", "--get-regexp", "remote.origin").stdout:
+        git("config", "--unset-all", "remote.origin.pushurl")
+    proc = publish("--repo", "study/intended.git")
+    result(19, "repository suffix is not duplicated", proc,
+           proc.returncode == 0 and ".git.git" not in proc.stdout)
+
+
 def main():
     cases = [
+        ("Nineteen: verification and publishing regressions", test_nineteen_validation_regressions),
         ("Verify: preserved PR #8 regressions", test_verify_pr8_regressions),
         ("Artifact verifier: seven format and invocation regressions", test_verify_artifact_regressions),
         ("Publish: five CLI and destination regressions", test_publish_regressions),

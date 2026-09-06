@@ -55,11 +55,35 @@ zs_verify_elf() {
   if [ "$6" != 1 ]; then
     zs_verify_fail "! Unsupported ELF byte order: $p"
   fi
+  [ "$7" = 1 ] || zs_verify_fail "! Unsupported ELF identification version: $p"
+  # Libraries must be ET_DYN. The daemon may be PIE (ET_DYN) or ET_EXEC.
+  if [ "${18}" != 0 ] || { [ "${17}" != 3 ] &&
+       { [ "$f" != zygiskd ] || [ "${17}" != 2 ]; }; }; then
+    zs_verify_fail "! Unsupported ELF object type: $p"
+  fi
   shift 18
   if [ "$1" != "$elf_machine" ] || [ "$2" != 0 ]; then
     zs_verify_fail "! Wrong ELF machine for $abi: $p"
   fi
+  shift 2
+  [ "$1 $2 $3 $4" = "1 0 0 0" ] ||
+    zs_verify_fail "! Unsupported ELF header version: $p"
+  if [ "$elf_class" = 2 ]; then shift 32; else shift 20; fi
+  [ "$1" = "$header_size" ] && [ "$2" = 0 ] ||
+    zs_verify_fail "! Invalid declared ELF header size: $p"
 }
+
+# A valid subset must not conceal misspelled/unsupported ABI entries.
+# Enable expansion locally even when the sourcing shell has noglob enabled.
+set +f
+for zs_entry in "$MODDIR"/libs/* "$MODDIR"/libs/.[!.]* "$MODDIR"/libs/..?*; do
+  [ -e "$zs_entry" ] || [ -L "$zs_entry" ] || continue
+  case "${zs_entry##*/}" in
+    arm64-v8a|armeabi-v7a|x86_64|x86) ;;
+    *) zs_verify_fail "! Unsupported ABI entry: $zs_entry" ;;
+  esac
+done
+set -f
 
 count=0
 for abi in arm64-v8a armeabi-v7a x86_64 x86; do
