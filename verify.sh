@@ -1,53 +1,87 @@
 #!/system/bin/sh
-# verify.sh — structural checks for packaged native artifacts.
-# Accept ABI subsets, but require every present ABI to contain all four files.
-# ELF headers establish format/architecture only, not provenance or safety.
+# verify.sh — quick post-install sanity check.
+# Run with sh, or source with MODPATH (installer) / MODDIR set.
+# Checks bundle completeness and ELF headers, not provenance, build IDs,
+# or whether a binary will actually load on a device.
 
-# Magisk sources scripts with MODPATH set; $0 then names the installer.
-MODDIR=${MODPATH:-${MODDIR:-$(dirname "$0")}}
-
-if ! command -v ui_print >/dev/null 2>&1; then
-  ui_print() { printf '%s\n' "$*"; }
+# Keep helpers, variables, shell options and positional arguments out of
+# the installer shell when this script is sourced.
+(
+set -f
+IFS=$(printf '\n\t ')
+MODDIR=${MODPATH:-${MODDIR:-}}
+if [ -z "$MODDIR" ]; then
+  case "$0" in
+    */*) MODDIR=${0%/*} ;;
+    *) MODDIR=. ;;
+  esac
 fi
-if ! command -v abort >/dev/null 2>&1; then
-  abort() { ui_print "$*"; exit 1; }
-fi
 
-verify_fail() {
-  abort "! $*"
+zs_verify_print() {
+  if command -v ui_print >/dev/null 2>&1; then
+    ui_print "$@"
+  else
+    printf '%s\n' "$*"
+  fi
+}
+
+zs_verify_fail() {
+  zs_verify_print "$*"
+  if command -v abort >/dev/null 2>&1; then
+    abort "$*" || :
+  fi
+  # Some installer/test abort helpers return instead of exiting.
   exit 1
 }
 
-verify_elf() {
-  # od is available in Android's toybox/busybox and POSIX host shells.
-  # Check all four magic bytes, class, little-endian encoding and e_machine.
-  # No Bash-only $'...' quoting, binary shell variables, or SIGPIPE pipeline.
-  set -- $(LC_ALL=C od -An -v -tu1 -N20 "$1")
-  [ "$#" -eq 20 ] || verify_fail "$p has a truncated ELF header"
-  [ "$1 $2 $3 $4" = "127 69 76 70" ] || verify_fail "$p is not an ELF file"
-  [ "$5" = "$expected_class" ] || verify_fail "$p has the wrong ELF class for $abi"
-  [ "$6" = 1 ] || verify_fail "$p is not a little-endian ELF"
+zs_verify_elf() {
+  # Read bytes numerically: no bash-only $'...' quoting, binary shell
+  # strings, host-endian integer decoding or external readelf required.
+  if ! zs_header=$(od -An -v -tu1 -N64 < "$1"); then
+    zs_verify_fail "! Cannot read ELF header: $1"
+  fi
+  set -- $zs_header
+  if [ "$#" -lt 4 ] || [ "$1 $2 $3 $4" != "127 69 76 70" ]; then
+    zs_verify_fail "! $p is not an ELF file"
+  fi
+  if [ "$#" -lt 5 ] || [ "$5" != "$elf_class" ]; then
+    zs_verify_fail "! Wrong ELF class for $abi: $p"
+  fi
+  if [ "$#" -lt "$header_size" ]; then
+    zs_verify_fail "! Truncated ELF header: $p"
+  fi
+  # All four supported Android ABIs are little-endian. Compare both
+  # e_machine bytes, so same-width ARM/x86 mixups cannot pass.
+  if [ "$6" != 1 ]; then
+    zs_verify_fail "! Unsupported ELF byte order: $p"
+  fi
   shift 18
-  [ "$1" = "$expected_machine" ] && [ "$2" = 0 ] ||
-    verify_fail "$p has the wrong ELF machine for $abi"
+  if [ "$1" != "$elf_machine" ] || [ "$2" != 0 ]; then
+    zs_verify_fail "! Wrong ELF machine for $abi: $p"
+  fi
 }
 
 count=0
 for abi in arm64-v8a armeabi-v7a x86_64 x86; do
-  [ -d "$MODDIR/libs/$abi" ] || continue
+  # Subset builds are supported, but every present ABI must be complete.
+  [ -e "$MODDIR/libs/$abi" ] || [ -L "$MODDIR/libs/$abi" ] || continue
   case "$abi" in
-    arm64-v8a)   expected_class=2; expected_machine=183 ;;
-    armeabi-v7a) expected_class=1; expected_machine=40 ;;
-    x86_64)      expected_class=2; expected_machine=62 ;;
-    x86)         expected_class=1; expected_machine=3 ;;
+    arm64-v8a)   elf_class=2; header_size=64; elf_machine=183 ;;
+    armeabi-v7a) elf_class=1; header_size=52; elf_machine=40 ;;
+    x86_64)      elf_class=2; header_size=64; elf_machine=62 ;;
+    x86)         elf_class=1; header_size=52; elf_machine=3 ;;
   esac
   for f in libzygisk.so libpayload.so libzn_loader.so zygiskd; do
     p="$MODDIR/libs/$abi/$f"
-    [ -f "$p" ] || verify_fail "Missing required artifact: $p"
-    verify_elf "$p"
+    [ -f "$p" ] || zs_verify_fail "! Missing native artifact: $p"
+    zs_verify_elf "$p"
     count=$((count + 1))
   done
 done
 
-[ "$count" -gt 0 ] || verify_fail "No native artifacts found; build and package them first."
-ui_print "- Verified $count native artifacts"
+if [ "$count" -eq 0 ]; then
+  zs_verify_fail "! No native artifacts found. Build the binaries from source before packaging the module (see README.md)."
+fi
+
+zs_verify_print "- Verified $count native artifacts"
+)
