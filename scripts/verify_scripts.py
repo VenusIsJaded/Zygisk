@@ -2033,10 +2033,10 @@ elif args[:2] == ['remote', 'get-url']:
     if not url:
         sys.exit(2)
     print(url)
-elif args[:2] in (['remote', 'set-url'], ['remote', 'add']):
+elif args[:2] in (['remote', 'set-url'], ['remote', 'add'], ['config', '--replace-all']):
     with open(state, 'w') as fp:
         fp.write(args[-1])
-elif args[:1] == ['check-ref-format']:
+elif args[:1] in (['check-ref-format'], ['show-ref']):
     pass
 elif args[:2] in (['config', 'user.email'], ['config', '--get-all']):
     sys.exit(1)
@@ -2167,6 +2167,9 @@ def test_recovery_installer_regressions(mk):
         fp.write(source.replace("/data/adb/magisk/util_functions.sh", '"' + util + '"'))
     write_exec(os.path.join(mk.bindir, "mount"), "#!/bin/sh\nexit 0\n")
     marker = os.path.join(mk.root, "installed")
+    archive = os.path.join(mk.root, "module.zip")
+    with open(archive, "w"):
+        pass
 
     def run(version="20400", status=0):
         if os.path.exists(marker):
@@ -2174,7 +2177,7 @@ def test_recovery_installer_regressions(mk):
         with open(util, "w") as fp:
             fp.write("MAGISK_VER_CODE='" + version + "'\n"
                      + "install_module(){ touch '" + marker + "'; return " + str(status) + "; }\n")
-        return subprocess.run(["sh", script, "3", "", "module.zip"], env=mk.env(),
+        return subprocess.run(["sh", script, "3", "1", archive], env=mk.env(),
                               capture_output=True, text=True, timeout=10)
 
     # 16: preserve Magisk install_module's nonzero return code.
