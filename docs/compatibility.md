@@ -201,6 +201,12 @@ Zygisk alternative — the recovery procedure is the same.
 
 ## Android version support (Round 28)
 
+**Validation scope (PR #14):** "Supported" below describes the intended
+source-level contract, not successful Android execution. Host regressions
+and four-ABI NDK builds do not certify boot safety, SELinux/linker behavior,
+or compatibility with every Android/OEM release. No device or emulator
+validation has been performed for this PR.
+
 The loader's Android surface was verified against AOSP sources at
 android-4.3_r1, android-4.3.1_r1, android-4.4.2_r1,
 android-5.0.0_r1, android-5.1.1_r37, android-6.0.0_r1,
@@ -219,7 +225,7 @@ the bridge interface is byte-identical to 16's). Note: since Android
 | 7.0 / 7.1 / 7.1.2 | Supported | nativebridge VersionCheck + isCompatibleWith(2) call; zygote setresgid→setresuid order; the /dev/__properties__/ directory + trie format; kernel floors (memfd fallback for 3.4/3.10) |
 | 8.0 / 8.1 | Supported | LoadNativeBridge isCompatibleWith(3) call; the 15-slot table; same property format; 3.18/4.4 kernels have memfd |
 | 9 – 15 | Supported (as before) | Rounds 7–24 research (9/13/15/main); Round 25 pinned the 9.x bridge lifecycle to the same constructor contract |
-| 16 / 17-dev | Supported (Round 27) | art/libnativebridge at android-16.0.0_r1 == refs/heads/main (byte-identical, diff-verified): the 20-slot table (13.0 added v5 getExportedNamespace + v6 preZygoteFork; 16/main add v7 getTrampolineWithJNICallType + getTrampolineForFunctionPointer and v8 isNativeBridgeFunctionPointer; the v3 initAnonymousNamespace slot was renamed unused_initAnonymousNamespace — same position, ABI-stable); LoadNativeBridge asks isCompatibleWith(3) — accepts our table; every v5..v8 entry point is isCompatibleWith-guarded (RUNTIME_NAMESPACE=5, PRE_ZYGOTE_FORK=6, CRITICAL_NATIVE=7, IDENTIFY_NATIVELY_BRIDGED=8) and our table implements every slot so the guards pass; `InitNonZygoteOrPostFork(kUnload)` → dlclose lifecycle unchanged; Zygote.cpp drop order setresgid → **SetUpSeccompFilter + SetSchedulerPolicy BETWEEN the drops** → setresuid (16/main) — verified harmless: the hide pipeline runs at the gid-drop hook, before the app seccomp filter exists; 16 KB-kernel devices (Pixel 9a+) require `-Wl,-z,max-page-size=16384` ELF alignment — now set on all three CMake targets |
+| 16 / 17-dev | Supported (Round 27) | art/libnativebridge at android-16.0.0_r1 == refs/heads/main (byte-identical, diff-verified): the 20-slot table (Android 10 added v5 getExportedNamespace, 11 added v6 preZygoteFork, 15 added v7 getTrampolineWithJNICallType + getTrampolineForFunctionPointer, and 16 added v8 isNativeBridgeFunctionPointer; the v3 initAnonymousNamespace slot was renamed unused_initAnonymousNamespace — same position, ABI-stable); LoadNativeBridge asks isCompatibleWith(3) — accepts our table; every v5..v8 entry point is isCompatibleWith-guarded (RUNTIME_NAMESPACE=5, PRE_ZYGOTE_FORK=6, CRITICAL_NATIVE=7, IDENTIFY_NATIVELY_BRIDGED=8) and our table implements every slot so the guards pass; `InitNonZygoteOrPostFork(kUnload)` → dlclose lifecycle unchanged; Zygote.cpp drop order setresgid → **SetUpSeccompFilter + SetSchedulerPolicy BETWEEN the drops** → setresuid (16/main) — verified harmless: the hide pipeline runs at the gid-drop hook, before the app seccomp filter exists; 16 KB-kernel devices (Pixel 9a+) require `-Wl,-z,max-page-size=16384` ELF alignment — now set on all three CMake targets |
 
 Key version-specific mechanisms and where they are handled:
 
@@ -230,8 +236,10 @@ Key version-specific mechanisms and where they are handled:
   from each version's own `ZygoteHooks_nativePostForkChild` +
   `Runtime::DidForkFromZygote`/`InitNonZygoteOrPostFork`;
   same-arch children even `dlclose` the bridge, which the
-  payload's self-pin neutralizes — on 5.x the pin is the ONLY
-  protection, since the L linker ignores DF_1_NODELETE).
+  bridge's retained `RTLD_NOLOAD` reference prevents an unload after
+  self-unmapping. The payload retains its own reference separately.
+  On 5.x these pins are required because the L linker ignores
+  DF_1_NODELETE. If bridge pinning fails, payload initialization is skipped).
 - **NativeBridgeCallbacks**: the exact 20-slot AOSP table (16 ==
   17-dev) with every slot implemented — 6.0+ call
   `isCompatibleWith` during LoadNativeBridge and a NULL slot is a
@@ -495,9 +503,11 @@ installer survives contact with the boot chain. Custom-ROM users
 run three root managers (Magisk, KernelSU, APatch — plus forks), and
 this round read all three from their own sources:
 
-* **Magisk** mounts a module's `system/` over `/system` with magic
-  mount before post-fs-data scripts run, and ships a `resetprop`
-  binary. Everything the old rounds relied on.
+* **Magisk** runs module post-fs-data scripts **before** magic-mounting
+  `system/` over `/system`, not afterward. This corrects the earlier
+  mount-order claim: loader visibility is normally pending during the
+  script. Its blocking boot stage requires `resetprop -n` to bypass the
+  property service ([official boot-script guide](https://topjohnwu.github.io/Magisk/guides.html#boot-scripts)).
 * **KernelSU** (ksud `init_event.rs`, read this round): module
   post-fs-data scripts run BEFORE the metamodule that mounts module
   system/ dirs — and per the official module guide, "KernelSU uses a
@@ -547,17 +557,20 @@ So the module now carries its own compatibility chain:
   bionic-shaped fixture area read back by a THIRD independent trie
   implementation (Python).
 * **A loader-mount fallback chain** (zs_compat.sh +
-  post-mount-hook.sh): post-fs-data checks whether the bridge is
-  visible at /system/lib[64]; on KernelSU it is not yet (scripts run
-  before metamodule mounting), so a pending flag is set and the
+  post-mount-hook.sh): post-fs-data checks whether both the bridge and
+  its sibling payload are visible in every required /system/lib[64]
+  directory. On Magisk and KernelSU they normally are not yet (scripts
+  precede module mounts), so a pending flag is set. Failure to save that
+  flag attempts stock rollback and disarms the property guard. The
   /data/adb/post-mount.d hook — installed by customize.sh, run by
   KernelSU/APatch AFTER their metamodule mounting and before zygote
   — resolves it: metamodule mount (already visible), a direct copy
   (RW /system, rare), or OUR OWN overlayfs over the lib dir (the
   same approach KernelSU's official meta-overlayfs metamodule uses,
   with a /proc/filesystems capability check). If nothing works, the
-  property swap is rolled back and the guard stands down: the boot
-  never references a file ART cannot load. service.sh is the
+  property rollback is attempted and the guard stands down. File presence
+  is only a prerequisite, not proof of SELinux/linker loadability, and a
+  failed property writer can also prevent rollback. service.sh is the
   last-resort retry point (a late resolution arms the module for the
   next zygote generation).
 * **Conflict detection** (customize.sh): Magisk's own Zygisk
@@ -571,10 +584,47 @@ So the module now carries its own compatibility chain:
   also runs a 32-bit zygote (most pre-2018 SoCs — common on
   LineageOS-class ROMs), the 32-bit zygote resolves the SAME soname
   through /system/lib, so the 32-bit pair is installed beside the
-  64-bit one when the device's abilist includes the 32-bit ABI —
-  gated on the artifacts actually being ELF32 (EI_CLASS byte
+  64-bit one when the device's abilist includes a whole 32-bit ABI token
+  from the same native CPU family. `x86_64` alone does not imply `x86`,
+  and translated ARM ABIs cannot select ARM code for an x86 zygote.
+  Installation is also gated on the artifacts actually being ELF32 (EI_CLASS byte
   checked; a 64-bit binary in the 32-bit slot is refused with the
   reason logged).
+
+### PR #14 compatibility corrections and regression coverage
+
+- NativeBridge `initialize` takes `NativeBridgeRuntimeCallbacks*`, not
+  `NativeBridgeCallbacks*`. The independent host consumer uses the same
+  AOSP contract. Header references: [Android 10](https://android.googlesource.com/platform/system/core/+/android-10.0.0_r1/libnativebridge/include/nativebridge/native_bridge.h),
+  [11](https://android.googlesource.com/platform/art/+/android-11.0.0_r1/libnativebridge/include/nativebridge/native_bridge.h),
+  [15](https://android.googlesource.com/platform/art/+/android-15.0.0_r1/libnativebridge/include/nativebridge/native_bridge.h),
+  [16](https://android.googlesource.com/platform/art/+/android-16.0.0_r1/libnativebridge/include/nativebridge/native_bridge.h).
+- ARM32/x86 fallback syscalls use the full-width UID/GID variants and
+  Bionic-compatible `fstatat64` metadata layout. Legacy raw `fstat` buffers
+  are not overwritten with a larger public `struct stat`.
+  [Bionic syscall definitions](https://android.googlesource.com/platform/bionic/+/android-16.0.0_r1/libc/SYSCALLS.TXT).
+- Legacy `faccessat` has three kernel arguments; its fallback rejects
+  nonzero flags. `faccessat2` uses its own four-argument syscall, preserving
+  `ENOSYS` instead of silently delegating to incompatible libc semantics.
+  [Bionic faccessat](https://android.googlesource.com/platform/bionic/+/android-16.0.0_r1/libc/bionic/faccessat.cpp).
+- Property readers discard failed partial output and try fallbacks. An
+  unreadable property cannot authorize a swap. Backup, write, readback,
+  applied-marker and pending-marker failures have executable regressions;
+  rollback is best-effort when a swap has already happened.
+- Loader fallback copies stage and rename each file so an interrupted
+  copy cannot publish a truncated library. Retries repair missing siblings,
+  including on an already-owned overlay; ownership is checked on one mount
+  record. These host fixtures do not perform real mounts.
+- The installer checks library copies, metadata, launcher and permissions.
+  Newly created systemless files/directories receive explicit root ownership
+  and `system_file` contexts via `set_perm`, because customization runs after
+  the default permission pass ([Magisk installer contract](https://topjohnwu.github.io/Magisk/guides.html#customization)).
+- `scripts/verify_scripts.py` covers those failure paths, native-family ABI
+  selection, API 21–36 installer inputs, captured four-ABI syscall dispatch,
+  access errno/flags, and bridge lifetime without NODELETE (with an unpinned
+  negative control). Synthetic ABI and API-input tests are not Android
+  execution or SELinux-policy tests. CI separately runs host C++/Rust tests,
+  daemon E2E and the four-ABI Android NDK build/package gate.
 
 ### Round 31 residuals (honest scope)
 

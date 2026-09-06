@@ -60,6 +60,7 @@
 #include "test_framework.h"
 
 #include <dlfcn.h>
+#include <signal.h>
 #include <unistd.h>
 #include <string>
 #include <stddef.h>
@@ -70,15 +71,16 @@
 // refs/heads/main; 13.0.0_r1 reads the first 17 slots; 8.1/9.0 the
 // first 15; 7.x the first 8; 5.x the five v1 slots). Mirrors the
 // definition in native/libzygisk/src/entry.cpp.
+struct NativeBridgeRuntimeCallbacks;
 struct NativeBridgeRuntimeValues;
 struct native_bridge_namespace_t;
-typedef bool (*NativeBridgeSignalHandlerFn)(int, void*, void*);
+typedef bool (*NativeBridgeSignalHandlerFn)(int, siginfo_t*, void*);
 // AOSP art/libnativebridge (16 == main): enum JNICallType {
 //   kJNICallTypeRegular = 1, kJNICallTypeCriticalNative = 2 };
 // ABI: passed as a 32-bit value in w1/x1 — int is ABI-identical.
 struct NativeBridgeCallbacks {
     uint32_t version;
-    bool (*initialize)(const struct NativeBridgeCallbacks*, const char*,
+    bool (*initialize)(const struct NativeBridgeRuntimeCallbacks*, const char*,
                        const char*);
     void* (*loadLibrary)(const char*, int);
     void* (*getTrampoline)(void*, const char*, const char*, uint32_t);
