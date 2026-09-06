@@ -57,7 +57,14 @@ fi
 
 . /data/adb/magisk/util_functions.sh
 
-if [ -z "$MAGISK_VER_CODE" ] || [ "$MAGISK_VER_CODE" -lt 20400 ]; then
+# Do not let test(1)'s "integer expression expected" error bypass the gate.
+# Bound the digit count before arithmetic to avoid overflow on 32-bit shells.
+case "${MAGISK_VER_CODE:-}" in
+  ''|*[!0-9]*)
+    ui_print " Invalid Magisk version code; refusing installation. "
+    exit 1 ;;
+esac
+if [ "${#MAGISK_VER_CODE}" -gt 9 ] || [ "$MAGISK_VER_CODE" -lt 20400 ]; then
   ui_print "*******************************"
   ui_print " Please update Magisk to v20.4+! "
   ui_print "*******************************"
@@ -65,4 +72,4 @@ if [ -z "$MAGISK_VER_CODE" ] || [ "$MAGISK_VER_CODE" -lt 20400 ]; then
 fi
 
 install_module
-exit 0
+exit $?

@@ -119,6 +119,21 @@ for abi in "${ABI_LIST[@]}"; do
     esac
 done
 
+# CMake may silently clamp old API levels, while Cargo uses the raw value.
+# Reject unsupported/malformed input before either tool or output is touched.
+if [[ ! "$API_LEVEL" =~ ^[1-9][0-9]*$ ]] ||
+   { [[ ${#API_LEVEL} -lt 3 ]] && (( API_LEVEL < 21 )); }; then
+    echo "build_module.sh: --api must be a decimal Android API level >= 21" >&2
+    exit 2
+fi
+
+# An explicit path is a requirement, not a discovery hint. Never silently
+# switch compilers when the caller misspells it.
+if [[ -n "$NDK" && ! -d "$NDK" ]]; then
+    echo "ERROR: explicit NDK directory does not exist: $NDK" >&2
+    exit 1
+fi
+
 # Quick builds retain their partial module tree, but cannot produce a
 # flashable archive: the installer requires both C++ libraries and Rust.
 if [[ $SKIP_CPP -eq 1 || $SKIP_RUST -eq 1 ]]; then
@@ -128,6 +143,15 @@ fi
 # ---------------------------------------------------------------------------
 # NDK discovery
 # ---------------------------------------------------------------------------
+is_ndk() {
+    [[ -f "$1/build/cmake/android.toolchain.cmake" ]] || return 1
+    local prebuilt
+    for prebuilt in "$1"/toolchains/llvm/prebuilt/*; do
+        [[ -x "$prebuilt/bin/clang" ]] && return 0
+    done
+    return 1
+}
+
 find_ndk() {
     if [[ -n "$NDK" && -d "$NDK" ]]; then
         echo "$NDK"; return 0
@@ -140,7 +164,7 @@ find_ndk() {
         "${ANDROID_HOME:-$HOME/Android/Sdk}/ndk-bundle" \
         "${NDK_VERSION:+${ANDROID_HOME:-$HOME/Android/Sdk}/ndk/$NDK_VERSION}"
     do
-        if [[ -n "$candidate" && -d "$candidate" ]]; then
+        if [[ -n "$candidate" ]] && is_ndk "$candidate"; then
             echo "$candidate"; return 0
         fi
     done
@@ -148,10 +172,11 @@ find_ndk() {
     # directory names like 27.3.13750724).
     local sdk_ndk="${ANDROID_HOME:-$HOME/Android/Sdk}/ndk"
     if [[ -d "$sdk_ndk" ]]; then
-        candidate="$(ls -1 "$sdk_ndk" 2>/dev/null | sort -V | tail -1)"
-        if [[ -n "$candidate" && -d "$sdk_ndk/$candidate" ]]; then
-            echo "$sdk_ndk/$candidate"; return 0
-        fi
+        while IFS= read -r candidate; do
+            if is_ndk "$sdk_ndk/$candidate"; then
+                echo "$sdk_ndk/$candidate"; return 0
+            fi
+        done < <(ls -1 "$sdk_ndk" 2>/dev/null | sort -Vr)
     fi
     return 1
 }
