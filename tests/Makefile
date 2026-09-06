@@ -30,6 +30,10 @@ else
 TRAMPOLINE_SRC =
 endif
 
+# A compiler/linker may write its output before failing. Never let a later
+# invocation treat that truncated target as an up-to-date successful build.
+.DELETE_ON_ERROR:
+
 .PHONY: all run clean
 
 all: $(TESTS) libpayload.so
@@ -129,7 +133,7 @@ race: test_race.cpp ../native/libpayload/src/hide_advanced.cpp \
 	    else \
 	        echo "TSAN: no data races"; \
 	    fi; \
-	elif grep -q "cannot find -ltsan\|-fsanitize=thread" "$$logdir/build.log"; then \
+	elif grep -Eq "cannot find -ltsan|unrecognized (command-line )?option .*fsanitize=thread|unsupported (argument|option) .*thread" "$$logdir/build.log"; then \
 	    echo "TSAN: toolchain absent — SKIP (install libtsan to enable; NOT reported as clean)"; \
 	else \
 	    echo "TSAN: BUILD FAILED (source regression, not a skip):"; \
@@ -151,6 +155,12 @@ test_zn_loader: test_zn_loader.cpp ../native/libzn_loader/src/entry.cpp \
 	../zygisk_study_api.h ../native/common/log.h test_framework.h
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -o $@ $< \
 	../native/libzn_loader/src/entry.cpp -ldl -pthread
+
+# Many host suites include production .cpp files directly, and shared libraries
+# compile multiple translation units in one command. Track their common/public
+# headers conservatively so incremental runs cannot exercise stale code.
+HOST_HEADERS := $(wildcard ../native/common/*.h ../native/libpayload/src/*.h ../*.h ../*.hpp)
+$(TESTS) libpayload.so libzygisk.so libzs_test_module.so: $(HOST_HEADERS)
 
 # ROUND 34: verify-trampolines is now a HARD dependency of `run` —
 # the arm64 arg-register bug (base/size loaded into x23/x24 instead
@@ -238,7 +248,7 @@ verify-daemon:
 	fi; \
 	exit $$rc; \
 	else \
-	echo "python3 unavailable; skipping"; \
+	echo "python3 unavailable; verification cannot run"; exit 77; \
 	fi
 
 .PHONY: verify-trampolines
@@ -253,7 +263,7 @@ verify-trampolines:
 	fi; \
 	exit $$rc; \
 	else \
-	echo "python3 unavailable; skipping"; \
+	echo "python3 unavailable; verification cannot run"; exit 77; \
 	fi
 
 # Round 29 - the module's shell scripts run for real against a fake
@@ -267,7 +277,7 @@ verify-scripts:
 	rc=$$?; \
 	exit $$rc; \
 	else \
-	echo "python3 unavailable; skipping"; \
+	echo "python3 unavailable; verification cannot run"; exit 77; \
 	fi
 
 clean:

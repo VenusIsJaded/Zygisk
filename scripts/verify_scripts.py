@@ -49,7 +49,7 @@ FAKE_RESETPROP = """#!/bin/sh
 LOG="${ZS_FAKE_RESETPROP_LOG:?}"
 STATE="${ZS_FAKE_PROP_STATE:?}"
 if [ "$#" -eq 1 ]; then
-  if [ -s "$STATE" ]; then
+  if [ -f "$STATE" ]; then
     cat "$STATE"
   else
     printf '%s\\n' "$ZS_FAKE_PROP_VALUE"
@@ -59,8 +59,8 @@ fi
 printf '%s\\n' "$*" >> "$LOG"
 # SET updates the state a subsequent GET returns.
 if [ "$1" = "--delete" ]; then
-  : > "$STATE"
   [ -n "$ZS_FAKE_DELETE_FAIL" ] && exit 1
+  : > "$STATE"
 elif [ "$#" -ge 2 ]; then
   printf '%s\\n' "$2" > "$STATE"
 fi
@@ -77,7 +77,7 @@ FAKE_GETPROP = """#!/bin/sh
 # customize.sh detections use it. Values come from ZS_FAKE_GETPROP_*.
 case "$1" in
   ro.dalvik.vm.native.bridge)
-    if [ -n "${ZS_FAKE_PROP_STATE:-}" ] && [ -s "$ZS_FAKE_PROP_STATE" ]; then
+    if [ -n "${ZS_FAKE_PROP_STATE:-}" ] && [ -f "$ZS_FAKE_PROP_STATE" ]; then
       cat "$ZS_FAKE_PROP_STATE"; exit 0
     fi
     printf '%s\\n' "${ZS_FAKE_GETPROP_BRIDGE:-0}"; exit 0 ;;
@@ -1050,31 +1050,19 @@ def find_real_daemon():
     global REAL_DAEMON, REAL_DAEMON_ABSENT_TOOLCHAIN
     if REAL_DAEMON is not None:
         return REAL_DAEMON
-    import shutil as _sh
-    # BUG (found R34): os.path.expanduser() returns a non-empty path
-    # even when the file does not exist, so `which() or expanduser()`
-    # could NEVER evaluate falsy — a host without Rust fell into the
-    # subprocess below, died with FileNotFoundError, and was reported
-    # as "cargo build failed" (a FAIL). Existence must be tested.
-    cargo = _sh.which("cargo")
-    if not cargo:
-        cand = os.path.expanduser("~/.cargo/bin/cargo")
-        if os.path.exists(cand):
-            cargo = cand
-    if not cargo:
-        REAL_DAEMON = ""
-        REAL_DAEMON_ABSENT_TOOLCHAIN = True
-        return ""
+    # Share toolchain selection and output lookup with the daemon harness;
+    # otherwise CARGO_TARGET_DIR or a configured Android target selects a
+    # missing/stale binary only in this second, release-profile harness.
+    from verify_daemon import cargo_build
     REAL_DAEMON_ABSENT_TOOLCHAIN = False
-    zygd = os.path.join(REPO_ROOT, "native", "zygiskd")
     try:
-        subprocess.run([cargo, "build", "--release"], cwd=zygd,
-                       capture_output=True, timeout=600, check=True)
-    except Exception:
+        REAL_DAEMON, _ = cargo_build(release=True)
+    except SystemExit as exc:
         REAL_DAEMON = ""
-        return ""
-    binp = os.path.join(zygd, "target", "release", "zygiskd")
-    REAL_DAEMON = binp if os.path.exists(binp) else ""
+        REAL_DAEMON_ABSENT_TOOLCHAIN = exc.code == 77
+    except (OSError, subprocess.SubprocessError) as exc:
+        print("daemon build failed:", exc)
+        REAL_DAEMON = ""
     return REAL_DAEMON
 
 
@@ -1966,7 +1954,7 @@ with open(os.environ['PUBLISH_CALLS'], 'a') as fp:
 state = os.environ['PUBLISH_REMOTE']
 if args[:2] == ['rev-parse', '--is-inside-work-tree']:
     print('true')
-elif args[:2] == ['rev-parse', 'HEAD']:
+elif args[:2] in (['rev-parse', 'HEAD'], ['rev-parse', '--verify']):
     print('0123456789abcdef')
 elif args[:1] == ['symbolic-ref']:
     if os.environ.get('PUBLISH_DETACHED'):
@@ -1978,12 +1966,12 @@ elif args[:2] == ['remote', 'get-url']:
     if not url:
         sys.exit(2)
     print(url)
-elif args[:2] in (['remote', 'set-url'], ['remote', 'add']):
+elif args[:2] in (['remote', 'set-url'], ['remote', 'add'], ['config', '--replace-all']):
     with open(state, 'w') as fp:
         fp.write(args[-1])
 elif args[:1] == ['check-ref-format']:
     pass
-elif args[:2] in (['config', 'user.email'], ['config', '--get-all']):
+elif args[:2] in (['config', 'user.email'], ['config', '--get-all'], ['config', '--local'], ['config', '--bool']):
     sys.exit(1)
 elif args[:1] != ['push']:
     sys.exit('unexpected git command: ' + repr(args))
@@ -2016,13 +2004,13 @@ elif args[:1] != ['push']:
     # 9: the default push should publish the branch actually being worked on.
     proc, calls, _ = run()
     check("bug 09: publish defaults to the current branch", proc.returncode == 0
-          and ["push", "-u", "origin", "refs/heads/study-fixes:refs/heads/study-fixes"] in calls, repr(calls))
+          and ["push", "--no-follow-tags", "-u", "origin", "refs/heads/study-fixes:refs/heads/study-fixes"] in calls, repr(calls))
     proc, calls, _ = run(extra={"PUBLISH_DETACHED": "1"})
     check("bug 09: detached HEAD requires an explicit branch", proc.returncode != 0
           and not any(c[0] == "push" for c in calls), proc.stdout + proc.stderr)
     proc, calls, _ = run(("--branch", "release"), extra={"PUBLISH_DETACHED": "1"})
     check("publish: explicit branch works detached", proc.returncode == 0
-          and ["push", "-u", "origin", "refs/heads/release:refs/heads/release"] in calls, repr(calls))
+          and ["push", "--no-follow-tags", "-u", "origin", "refs/heads/release:refs/heads/release"] in calls, repr(calls))
 
     # 10: --repo must not silently push to the existing, different repository.
     proc, calls, url = run(("--repo", "owner/new-study"))
@@ -2517,8 +2505,818 @@ def test_nineteen_validation_regressions(mk):
            proc.returncode == 0 and ".git.git" not in proc.stdout)
 
 
+def test_build_lifecycle_regressions(mk):
+    """Nine build-driver failures, using compiler doubles and real shell tools."""
+    root = os.path.join(mk.root, "build lifecycle")
+    os.makedirs(os.path.join(root, "scripts", "installer"))
+    os.makedirs(os.path.join(root, "native", "zygiskd"))
+    for name in ("build_module.sh", "installer/update-binary", "installer/updater-script"):
+        shutil.copy(os.path.join(REPO_ROOT, "scripts", name),
+                    os.path.join(root, "scripts", name))
+    for name in ("customize.sh", "post-fs-data.sh", "service.sh", "uninstall.sh",
+                 "zs_compat.sh", "post-mount-hook.sh", "verify.sh", "LICENSE"):
+        shutil.copy(os.path.join(REPO_ROOT, name), root)
+    ndk = os.path.join(root, "ndk")
+    toolbin = os.path.join(ndk, "toolchains/llvm/prebuilt/linux-x86_64/bin")
+    os.makedirs(toolbin)
+    os.makedirs(os.path.join(ndk, "build/cmake"))
+    with open(os.path.join(ndk, "build/cmake/android.toolchain.cmake"), "w"):
+        pass
+    for tool in ("clang", "llvm-strip"):
+        write_exec(os.path.join(toolbin, tool), "#!/bin/sh\nexit 0\n")
+    write_exec(os.path.join(mk.bindir, "cmake"), r'''#!/bin/sh
+printf '%s\n' "$*" >> "$CALLS"
+if [ "$1" = --build ]; then
+  dest=$2
+  case "$LAYOUT" in
+    config) dest="$dest/Debug" ;;
+    nested) dest="$dest/libpayload" ;;
+  esac
+  mkdir -p "$dest"
+  for name in libzygisk.so libpayload.so libzn_loader.so; do
+    printf 'fresh\n' > "$dest/$name"
+  done
+fi
+''')
+    script = os.path.join(root, "scripts/build_module.sh")
+    env = mk.env({"NDK": ndk, "CALLS": os.path.join(root, "calls"), "LAYOUT": "flat"})
+    for key in ("CARGO_TARGET_DIR", "OUT_ROOT", "ABIS", "API_LEVEL", "BUILD_TYPE"):
+        env.pop(key, None)
+    index = 0
+
+    def run(args=(), extra=None):
+        nonlocal index
+        index += 1
+        out = os.path.join(root, "out" + str(index))
+        with open(env["CALLS"], "w"):
+            pass
+        proc = subprocess.run(["bash", script, "--abis", "x86_64", "--out", out,
+                               "--skip-rust", "--skip-zip", *args],
+                              env={**env, **(extra or {})}, capture_output=True,
+                              text=True, timeout=15)
+        with open(env["CALLS"]) as fp:
+            calls = fp.read()
+        return proc, out, calls
+
+    # 01: empty path options must not fall back to discovery or the repository.
+    for option in ("--ndk", "--out"):
+        proc, _, calls = run((option, ""))
+        check("lifecycle 01: reject empty " + option,
+              proc.returncode == 2 and not calls, proc.stdout + proc.stderr)
+
+    # 02: CMake silently accepts misspelled types with no optimization flags.
+    for value in ("", "Releaze", "../outside"):
+        proc, _, calls = run(("--type", value))
+        check("lifecycle 02: reject invalid build type " + repr(value),
+              proc.returncode == 2 and not calls, proc.stdout + proc.stderr)
+
+    proc, _, calls = run(("--type", "Release"))
+    check("lifecycle 03: select configuration when building multi-config generators",
+          proc.returncode == 0 and "--config Release" in calls, proc.stdout + proc.stderr)
+
+    proc, _, _ = run(("--type", "Debug"), {"LAYOUT": "config"})
+    check("lifecycle 04: collect configuration-specific CMake outputs",
+          proc.returncode == 0, proc.stdout + proc.stderr)
+
+    out = os.path.join(root, "stale")
+    flat = os.path.join(out, "cpp/x86_64")
+    os.makedirs(flat)
+    for name in ("libzygisk.so", "libpayload.so", "libzn_loader.so"):
+        with open(os.path.join(flat, name), "w") as fp:
+            fp.write("stale\n")
+    # Classic per-target directories, including a stale flattened copy.
+    with open(os.path.join(mk.bindir, "cmake")) as fp:
+        cmake = fp.read()
+    write_exec(os.path.join(mk.bindir, "cmake"), cmake.replace(
+        "printf 'fresh\\n' > \"$dest/$name\"",
+        'mkdir -p "$2/${name%.so}"\nprintf \'fresh\\n\' > "$2/${name%.so}/$name"'))
+    proc, _, _ = run(("--out", out), {"LAYOUT": "nested"})
+    path = os.path.join(out, "module/libs/x86_64/libpayload.so")
+    with open(path) as fp:
+        contents = fp.read()
+    check("lifecycle 05: refreshed nested artifacts replace stale flattened copies",
+          proc.returncode == 0 and contents == "fresh\n", proc.stdout + proc.stderr)
+    write_exec(os.path.join(mk.bindir, "cmake"), cmake)
+
+    # 06: a present but incomplete preferred toolchain must not mask a usable one.
+    alternate = os.path.join(ndk, "toolchains/llvm/prebuilt/linux-aarch64/bin")
+    os.makedirs(alternate)
+    for tool in ("clang", "llvm-strip"):
+        shutil.copy(os.path.join(toolbin, tool), alternate)
+    os.unlink(os.path.join(toolbin, "clang"))
+    proc, _, _ = run()
+    check("lifecycle 06: incomplete preferred prebuilt does not block fallback",
+          proc.returncode == 0, proc.stdout + proc.stderr)
+    shutil.copy(os.path.join(alternate, "clang"), toolbin)
+
+    # 07/08: a controlled PATH proves missing dependencies cannot be masked by CI.
+    tools = os.path.join(root, "tools")
+    os.makedirs(tools)
+    for name in ("bash", "dirname", "mkdir", "cp", "chmod", "rm", "sed", "git",
+                 "cat", "find", "sort", "basename", "getconf", "tr"):
+        source = shutil.which(name)
+        if source:
+            os.symlink(source, os.path.join(tools, name))
+    os.symlink(os.path.join(mk.bindir, "cmake"), os.path.join(tools, "cmake"))
+    proc, _, calls = run(extra={"PATH": tools})
+    check("lifecycle 07: missing nproc uses a bounded portable job count",
+          proc.returncode == 0 and "not found" not in proc.stderr
+          and not any(line.endswith(" -j") for line in calls.splitlines()),
+          proc.stdout + proc.stderr + calls)
+    with open(env["CALLS"], "w"):
+        pass
+    proc = subprocess.run([shutil.which("bash"), script, "--abis", "x86_64",
+                           "--out", os.path.join(root, "missing-cargo"), "--skip-zip"],
+                          env={**env, "PATH": tools}, capture_output=True, text=True, timeout=15)
+    with open(env["CALLS"]) as fp:
+        calls = fp.read()
+    check("lifecycle 08: missing Cargo fails before C++ compilation",
+          proc.returncode != 0 and not calls, proc.stdout + proc.stderr + calls)
+
+    # 09: a failed rebuild must preserve the last verified archive byte-for-byte.
+    with open(script) as fp:
+        source = fp.read()
+    function = source[source.index("make_zip() {"):source.index("# Self-verification")]
+    zipdir = os.path.join(root, "archives")
+    os.makedirs(zipdir)
+    archive = os.path.join(zipdir, "zygisk_study-vtest-1.zip")
+    with open(archive, "wb") as fp:
+        fp.write(b"previous verified release")
+    proc = subprocess.run(
+        ["bash", "-c", 'set -euo pipefail; ' + function +
+         '\nverify_zip(){ return 1; }; make_zip'],
+        env=mk.env({"ZIP_DIR": zipdir, "MODULE_DIR": mk.moddir,
+                    "VERSION_NAME": "vtest", "VERSION_CODE": "1"}),
+        capture_output=True, text=True, timeout=15)
+    with open(archive, "rb") as fp:
+        contents = fp.read()
+    check("lifecycle 09: failed verification preserves the published archive",
+          proc.returncode != 0 and contents == b"previous verified release",
+          proc.stdout + proc.stderr)
+
+
+def test_publish_preflight_regressions(mk):
+    """Three publishing preflight errors; all Git operations stay local."""
+    repo = os.path.join(mk.root, "publisher")
+    os.makedirs(repo)
+    real_git = shutil.which("git")
+
+    def git(*args):
+        return subprocess.run([real_git, *args], cwd=repo, check=True,
+                              text=True, capture_output=True, timeout=10)
+
+    git("init", "-q")
+    git("-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+        "commit", "--allow-empty", "-qm", "fixture")
+    git("remote", "add", "origin", "https://github.com/study/original.git")
+    script = os.path.join(repo, "publish.sh")
+    shutil.copy(os.path.join(REPO_ROOT, "publish.sh"), script)
+    import shlex
+    write_exec(os.path.join(mk.bindir, "git"), '#!/bin/sh\n'
+               'if [ "$1" = push ]; then echo attempted >> "$PUSH_LOG"; exit 0; fi\n'
+               'exec ' + shlex.quote(real_git) + ' "$@"\n')
+    log = os.path.join(repo, "push.log")
+    for number, label, args in (
+            (10, "missing source branch", ("--branch", "missing", "--repo", "study/new")),
+            (12, "repository path traversal", ("--repo", "../other"))):
+        before = git("config", "--local", "--list").stdout
+        proc = subprocess.run(["bash", script, *args], env=mk.env({"PUSH_LOG": log}),
+                              capture_output=True, text=True, timeout=10)
+        after = git("config", "--local", "--list").stdout
+        check(f"lifecycle {number:02d}: {label} rejected before mutation/push",
+              proc.returncode != 0 and before == after and not os.path.exists(log),
+              proc.stdout + proc.stderr)
+        if os.path.exists(log):
+            os.unlink(log)
+        git("remote", "set-url", "origin", "https://github.com/study/original.git")
+
+    # A repository named original.git has a clone URL ending in .git.git.
+    git("remote", "set-url", "origin", "https://github.com/study/original.git.git")
+    proc = subprocess.run(["bash", script, "--ssh"], env=mk.env({"PUSH_LOG": log}),
+                          capture_output=True, text=True, timeout=10)
+    check("lifecycle 11: transport conversion removes exactly one clone suffix",
+          proc.returncode == 0 and git("remote", "get-url", "origin").stdout.strip()
+          == "git@github.com:study/original.git.git", proc.stdout + proc.stderr)
+
+
+def test_daemon_harness_regressions(mk):
+    """Seven harness failures, using controlled processes/sockets, not Android."""
+    import importlib.util
+    from unittest.mock import Mock, patch
+
+    spec = importlib.util.spec_from_file_location(
+        "verify_daemon", os.path.join(REPO_ROOT, "scripts/verify_daemon.py"))
+    daemon = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(daemon)
+    cargo_dir = os.path.join(mk.root, "cargo outputs")
+    host = "x86_64-unknown-linux-gnu"
+    os.makedirs(os.path.join(cargo_dir, host, "debug"))
+    binary = os.path.join(cargo_dir, host, "debug/zygiskd")
+    with open(binary, "w"):
+        pass
+    completed = subprocess.CompletedProcess([], 0, "host: " + host + "\n", "")
+    with patch.dict(os.environ, {"CARGO_TARGET_DIR": cargo_dir}), \
+            patch.object(daemon.shutil, "which", return_value="/selected/cargo"), \
+            patch.object(daemon.subprocess, "run", return_value=completed):
+        try:
+            found, _ = daemon.cargo_build()
+        except SystemExit:
+            found = None
+        check("lifecycle 13: daemon verifier honors Cargo target directory", found == binary)
+
+    with patch.object(daemon.shutil, "which", return_value="/selected/cargo"), \
+            patch.object(daemon.os.path, "exists", return_value=True), \
+            patch.object(daemon.subprocess, "run", return_value=completed) as run:
+        before = os.environ.get("PATH", "")
+        daemon.cargo_build()
+        argv, kwargs = run.call_args
+        check("lifecycle 14: selected Cargo is not shadowed by HOME toolchain",
+              argv[0][0] == "/selected/cargo" and kwargs["env"]["PATH"] == before)
+
+    sock = Mock()
+    sock.connect.side_effect = OSError("connection refused")
+    with patch.object(daemon.socket, "socket", return_value=sock):
+        try:
+            daemon.connect("fixture.sock")
+        except OSError:
+            pass
+    check("lifecycle 15: connection failures close their socket", sock.close.called)
+
+    sock = Mock()
+    sock.recv.side_effect = [b"a" * 4096, b"b" * 12, b""]
+    with patch.object(daemon, "connect", return_value=sock):
+        reply = daemon.ask("fixture.sock", b"L")
+    check("lifecycle 16: stream replies are read through EOF",
+          reply == b"a" * 4096 + b"b" * 12 and sock.close.called)
+
+    tree = Mock(root=mk.root, workdir=mk.workdir,
+                session_file=os.path.join(mk.root, "session"))
+    proc = Mock()
+    proc.poll.return_value = None
+    with patch.object(daemon.subprocess, "Popen", return_value=proc), \
+            patch.object(daemon.os.path, "exists", return_value=True), \
+            patch.object(daemon, "read_session_path", side_effect=[OSError(), "socket", "socket", "socket"]), \
+            patch.object(daemon, "connect", side_effect=[OSError(), OSError(), Mock()]) as connect, \
+            patch.object(daemon.time, "sleep"):
+        daemon.start_daemon("binary", tree, {})
+    check("lifecycle 17: session publication waits for a usable socket",
+          connect.call_count == 3)
+
+    proc = Mock()
+    proc.poll.return_value = None
+    with patch.object(daemon.subprocess, "Popen", return_value=proc), \
+            patch.object(daemon.os.path, "exists", return_value=False), \
+            patch.object(daemon.time, "time", side_effect=[0, 6]), \
+            patch.object(daemon.time, "monotonic", side_effect=[0, 6]):
+        try:
+            daemon.start_daemon("binary", tree, {})
+        except (SystemExit, RuntimeError):
+            pass
+    check("lifecycle 18: startup timeout reaps the child", proc.wait.called)
+
+    with patch.object(daemon, "cargo_build", return_value=("binary", {})), \
+            patch.object(daemon.tempfile, "mkdtemp", return_value=mk.root), \
+            patch.object(daemon, "Tree", return_value=tree), \
+            patch.object(daemon, "start_daemon", side_effect=RuntimeError("startup failed")), \
+            patch.object(daemon.shutil, "rmtree") as cleanup:
+        try:
+            daemon.main()
+        except (RuntimeError, SystemExit):
+            pass
+    check("lifecycle 19: startup failure still cleans the temporary tree", cleanup.called)
+
+
+def test_nine_followup_regressions(mk):
+    """Nine additional PR #11 bugs; fixtures never contact a remote service."""
+    import importlib.util
+    import shlex
+    from pathlib import Path
+    from unittest.mock import patch
+
+    # 1/2: use real Git configuration; intercept only the network-facing push.
+    repo = Path(mk.root) / "publish-extra"
+    repo.mkdir()
+    real_git = shutil.which("git")
+
+    def git(*args):
+        return subprocess.run([real_git, *args], cwd=repo, check=True,
+                              capture_output=True, text=True, timeout=10)
+
+    git("init", "-q")
+    git("-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+        "commit", "--allow-empty", "-qm", "fixture")
+    shutil.copy(os.path.join(REPO_ROOT, "publish.sh"), repo)
+    git("remote", "add", "origin", "https://github.com/study/old.git")
+    git("config", "--add", "remote.origin.url", "https://github.com/study/other.git")
+    log = repo / "push.log"
+    write_exec(os.path.join(mk.bindir, "git"), '#!/bin/sh\n'
+               'if [ "$1" = push ]; then echo push >> "$PUSH_LOG"; exit 0; fi\n'
+               'exec ' + shlex.quote(real_git) + ' "$@"\n')
+    env = mk.env({"PUSH_LOG": str(log)})
+    proc = subprocess.run(["bash", str(repo / "publish.sh"), "--repo", "study/new"],
+                          env=env, capture_output=True, text=True, timeout=10)
+    destinations = git("remote", "get-url", "--push", "--all", "origin").stdout.splitlines()
+    check("additional 01: explicit publishing destination replaces ALL URLs",
+          proc.returncode == 0 and destinations == ["https://github.com/study/new.git"],
+          repr(destinations) + proc.stderr)
+    log.unlink(missing_ok=True)
+    # Isolate the mirror failure from the independent multi-URL failure.
+    git("config", "--replace-all", "remote.origin.url", "https://github.com/study/new.git")
+    git("config", "remote.origin.mirror", "true")
+    before = git("config", "--local", "--list").stdout
+    proc = subprocess.run(["bash", str(repo / "publish.sh"), "--repo", "study/repoint"],
+                          env=env, capture_output=True, text=True, timeout=10)
+    check("additional 02: mirror remote rejected before mutation or push",
+          proc.returncode != 0 and not log.exists()
+          and before == git("config", "--local", "--list").stdout, proc.stderr)
+
+    # 3: both scripts change cwd before reading their help from argv[0].
+    for script in ("publish.sh", "scripts/build_module.sh"):
+        proc = subprocess.run(["bash", "../" + script, "--help"],
+                              cwd=os.path.join(REPO_ROOT, "tests"),
+                              capture_output=True, text=True, timeout=10)
+        check("additional 03: relative invocation help: " + script,
+              proc.returncode == 0 and "USAGE:" in proc.stdout, proc.stderr)
+
+    # 4: a single-leading-dash output directory is a valid path, not mkdir flags.
+    root = Path(mk.root) / "build-extra"
+    (root / "scripts/installer").mkdir(parents=True)
+    for name in ("build_module.sh", "installer/update-binary", "installer/updater-script"):
+        shutil.copy(Path(REPO_ROOT) / "scripts" / name, root / "scripts" / name)
+    for name in ("customize.sh", "post-fs-data.sh", "service.sh", "uninstall.sh",
+                 "zs_compat.sh", "post-mount-hook.sh", "verify.sh", "LICENSE"):
+        shutil.copy(Path(REPO_ROOT) / name, root / name)
+    ndk = root / "ndk"
+    toolbin = ndk / "toolchains/llvm/prebuilt/linux-x86_64/bin"
+    toolbin.mkdir(parents=True)
+    (ndk / "build/cmake").mkdir(parents=True)
+    (ndk / "build/cmake/android.toolchain.cmake").touch()
+    write_exec(toolbin / "clang", "#!/bin/sh\nexit 0\n")
+    proc = subprocess.run(["bash", str(root / "scripts/build_module.sh"),
+                           "--ndk", str(ndk), "--out", "-output", "--abis", "x86_64",
+                           "--skip-cpp", "--skip-rust"], cwd=root, env=mk.env(),
+                          capture_output=True, text=True, timeout=10)
+    check("additional 04: leading-dash output path is treated as a directory",
+          proc.returncode == 0 and (root / "-output/module/module.prop").is_file(),
+          proc.stderr)
+
+    # 5/6: Cargo doubles emulate real output layouts, including a cross default.
+    spec = importlib.util.spec_from_file_location(
+        "verify_daemon", os.path.join(REPO_ROOT, "scripts/verify_daemon.py"))
+    daemon = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(daemon)
+    crate = root / "native/zygiskd"
+    crate.mkdir(parents=True)
+    write_exec(os.path.join(mk.bindir, "rustc"),
+               "#!/bin/sh\nprintf 'rustc fixture\nhost: x86_64-unknown-linux-gnu\n'\n")
+    write_exec(os.path.join(mk.bindir, "cargo"), '''#!/usr/bin/env python3
+import os, pathlib, sys
+args = sys.argv[1:]
+target = args[args.index('--target') + 1] if '--target' in args else os.getenv('CARGO_BUILD_TARGET', '')
+out = args[args.index('--target-dir') + 1] if '--target-dir' in args else os.getenv('CARGO_TARGET_DIR', 'target')
+profile = 'release' if '--release' in args else 'debug'
+path = pathlib.Path(out) / target / profile / 'zygiskd'
+path.parent.mkdir(parents=True, exist_ok=True)
+path.write_text('native' if target in ('', 'x86_64-unknown-linux-gnu') else 'cross')
+path.chmod(0o755)
+''')
+    for target_dir in (str(root / "cargo cache"), "relative cache"):
+        with patch.dict(os.environ, mk.env({"CARGO_TARGET_DIR": target_dir}), clear=True), \
+                patch.dict(sys.modules, {"verify_daemon": daemon}), \
+                patch.object(daemon, "DAEMON_DIR", str(crate)), \
+                patch.dict(globals(), REPO_ROOT=str(root), REAL_DAEMON=None,
+                           REAL_DAEMON_ABSENT_TOOLCHAIN=None):
+            found = find_real_daemon()
+        expected = os.path.abspath(os.path.join(crate, target_dir))
+        check("additional 05: property harness honors Cargo output " + target_dir,
+              bool(found) and os.path.commonpath([found, expected]) == expected,
+              repr(found))
+    stale = crate / "target/debug/zygiskd"
+    stale.parent.mkdir(parents=True)
+    stale.write_text("stale host binary")
+    with patch.dict(os.environ, mk.env({"CARGO_BUILD_TARGET": "aarch64-linux-android",
+                                       "CARGO_TARGET_DIR": str(crate / "target")}), clear=True), \
+            patch.object(daemon, "DAEMON_DIR", str(crate)):
+        try:
+            found, _ = daemon.cargo_build()
+        except SystemExit:
+            found = ""
+    check("additional 06: daemon E2E builds the host despite cross-target defaults",
+          bool(found) and Path(found).read_text() == "native", repr(found))
+
+    # 7: an empty or deleted property must not resurrect the initial value.
+    for operation in (("property", ""), ("--delete", "property")):
+        subprocess.run([os.path.join(mk.bindir, "resetprop"), *operation],
+                       env=mk.env(), check=True, timeout=10)
+        for reader, key in (("resetprop", "property"), ("getprop", "ro.dalvik.vm.native.bridge")):
+            proc = subprocess.run([os.path.join(mk.bindir, reader), key], env=mk.env(),
+                                  capture_output=True, text=True, timeout=10)
+            check("additional 07: fake property reads preserve empty/deleted state "
+                  + repr(operation) + " via " + reader,
+                  proc.returncode == 0 and not proc.stdout.strip(), repr(proc.stdout))
+
+    # 8/9: lightweight Make fixtures reproduce stale and partially-written builds.
+    make_root = Path(mk.root) / "make-extra"
+    tests = make_root / "tests"
+    tests.mkdir(parents=True)
+    shutil.copy(Path(REPO_ROOT) / "tests/Makefile", tests)
+    for subtree in ("tests", "native/common", "native/libpayload/src"):
+        for source in (Path(REPO_ROOT) / subtree).iterdir():
+            if source.suffix in (".h", ".cpp", ".S"):
+                dest = make_root / subtree / source.name
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.touch()
+                os.utime(dest, (100, 100))
+    binary = tests / "test_hide"
+    binary.touch()
+    os.utime(binary, (200, 200))
+    os.utime(make_root / "native/libpayload/src/hide.h", (300, 300))
+    proc = subprocess.run(["make", "-n", "test_hide"], cwd=tests,
+                          capture_output=True, text=True, timeout=10)
+    check("additional 08: included header changes trigger recompilation",
+          proc.returncode == 0 and "-o test_hide" in proc.stdout, proc.stdout + proc.stderr)
+    compiler = tests / "failing-cxx"
+    write_exec(compiler, '''#!/bin/sh
+while [ "$1" != -o ]; do shift; done
+shift
+printf 'partial executable' > "$1"
+exit 1
+''')
+    args = ["make", "test_obfstr", "CXX=" + str(compiler)]
+    first = subprocess.run(args, cwd=tests, capture_output=True, text=True, timeout=10)
+    second = subprocess.run(args, cwd=tests, capture_output=True, text=True, timeout=10)
+    check("additional 09: failed compilers cannot leave up-to-date partial binaries",
+          first.returncode != 0 and second.returncode != 0
+          and not (tests / "test_obfstr").exists(), second.stdout + second.stderr)
+
+
+def test_pr11_completion_regressions(mk):
+    """Nine new follow-up bugs, separate from the nine already in PR #11."""
+    import importlib.util
+    import shlex
+    import zipfile
+    from pathlib import Path
+    from unittest.mock import Mock, patch
+
+    root = Path(mk.root)
+    repo = root / "publisher"
+    repo.mkdir()
+    real_git = shutil.which("git")
+    env = mk.env({"GIT_CONFIG_GLOBAL": str(root / "global.gitconfig"),
+                  "GIT_CONFIG_NOSYSTEM": "1"})
+    # Prevent the user's Git identity or config overrides leaking into fixtures.
+    for key in list(env):
+        if key.startswith("GIT_CONFIG_KEY_") or key.startswith("GIT_CONFIG_VALUE_"):
+            env.pop(key)
+    env.pop("GIT_CONFIG_COUNT", None)
+    (root / "global.gitconfig").touch()
+
+    def git(*args):
+        return subprocess.run([real_git, *args], cwd=repo, env=env,
+                              check=True, capture_output=True, text=True, timeout=10)
+
+    git("init", "-q", "-b", "main")
+    git("config", "user.name", "Test")
+    git("config", "user.email", "test@example.invalid")
+    git("commit", "--allow-empty", "-qm", "fixture")
+    shutil.copy(Path(REPO_ROOT) / "publish.sh", repo)
+    (repo / "scripts").mkdir()
+    shutil.copy(Path(REPO_ROOT) / "scripts/build_module.sh", repo / "scripts")
+
+    # 1: cd prints its destination when CDPATH is used, corrupting $(cd && pwd).
+    for script in ("publisher/publish.sh", "publisher/scripts/build_module.sh"):
+        proc = subprocess.run(["bash", script, "--help"], cwd=root,
+                              env={**env, "CDPATH": str(root)},
+                              capture_output=True, text=True, timeout=10)
+        check("completion 01: CDPATH cannot corrupt script roots: " + script,
+              proc.returncode == 0 and "USAGE:" in proc.stdout, proc.stderr)
+
+    log = root / "push.log"
+    write_exec(Path(mk.bindir) / "git", '#!/bin/sh\n'
+               'if [ "$1" = push ]; then echo push >> "$PUSH_LOG"; exit 0; fi\n'
+               'exec ' + shlex.quote(real_git) + ' "$@"\n')
+    env["PUSH_LOG"] = str(log)
+
+    def publish(*args):
+        return subprocess.run(["bash", str(repo / "publish.sh"), *args], env=env,
+                              capture_output=True, text=True, timeout=10)
+
+    # 2: converting transport must use the fork's push URL, not upstream fetch.
+    git("remote", "add", "origin", "https://github.com/upstream/study.git")
+    git("config", "remote.origin.pushurl", "https://github.com/fork/study.git")
+    proc = publish("--ssh")
+    dest = git("remote", "get-url", "--push", "origin").stdout.strip()
+    check("completion 02: transport conversion preserves the push repository",
+          proc.returncode == 0 and dest == "git@github.com:fork/study.git", dest + proc.stderr)
+
+    # 3: an explicit branch-only push must not publish annotated release tags.
+    git("remote", "remove", "origin")
+    bare = root / "destination.git"
+    git("init", "--bare", "-q", str(bare))
+    git("remote", "add", "origin", str(bare))
+    git("config", "push.followTags", "true")
+    git("tag", "-am", "local release", "v-local")
+    (Path(mk.bindir) / "git").unlink()  # Real local push, never a network request.
+    proc = publish()
+    tags = git("--git-dir=" + str(bare), "tag", "--list").stdout.strip()
+    check("completion 03: branch-only publishing does not follow release tags",
+          proc.returncode == 0 and not tags, repr(tags) + proc.stderr)
+    git("config", "--unset", "push.followTags")
+
+    # 4: inherited push URLs cannot be removed by a local git config --unset.
+    write_exec(Path(mk.bindir) / "git", '#!/bin/sh\n'
+               'if [ "$1" = push ]; then echo push >> "$PUSH_LOG"; exit 0; fi\n'
+               'exec ' + shlex.quote(real_git) + ' "$@"\n')
+    log.unlink(missing_ok=True)
+    git("config", "--global", "remote.origin.pushurl", "https://github.com/other/study.git")
+    before = git("config", "--local", "--list").stdout
+    proc = publish("--repo", "requested/study")
+    check("completion 04: inherited push overrides fail before mutating local config",
+          proc.returncode != 0 and not log.exists()
+          and before == git("config", "--local", "--list").stdout, proc.stderr)
+    git("config", "--global", "--unset", "remote.origin.pushurl")
+    (Path(mk.bindir) / "git").unlink()
+
+    # 5: assembly deletes module/ recursively; Cargo outputs inside it are unsafe.
+    ndk = repo / "ndk"
+    toolbin = ndk / "toolchains/llvm/prebuilt/linux-x86_64/bin"
+    toolbin.mkdir(parents=True)
+    (ndk / "build/cmake").mkdir(parents=True)
+    (ndk / "build/cmake/android.toolchain.cmake").touch()
+    write_exec(toolbin / "clang", "#!/bin/sh\nexit 0\n")
+    marker = root / "cargo-ran"
+    write_exec(Path(mk.bindir) / "cargo", '#!/bin/sh\ntouch "$CARGO_MARKER"\nexit 1\n')
+    (repo / "native/zygiskd").mkdir(parents=True)
+    unsafe = repo / "output/module/cargo"
+    unsafe.mkdir(parents=True)
+    sentinel = unsafe / "previous-build"
+    sentinel.write_text("keep")
+    proc = subprocess.run(["bash", str(repo / "scripts/build_module.sh"),
+                           "--ndk", str(ndk), "--out", str(repo / "output"),
+                           "--abis", "x86_64", "--skip-cpp"], cwd=repo,
+                          env={**env, "CARGO_TARGET_DIR": str(unsafe),
+                               "CARGO_MARKER": str(marker)},
+                          capture_output=True, text=True, timeout=10)
+    check("completion 05: reject Cargo cache inside disposable module staging",
+          proc.returncode != 0 and not marker.exists() and sentinel.read_text() == "keep",
+          proc.stderr)
+
+    # 6: all archived entries need CRC verification, including scripts/LICENSE.
+    verifier = root / "zip-verifier"
+    verifier.mkdir()
+    write_exec(verifier / "verify.sh", "#!/bin/sh\nexit 0\n")
+    source = (Path(REPO_ROOT) / "scripts/build_module.sh").read_text()
+    function = source.split("verify_zip() {", 1)[1].split("\n}\n", 1)[0]
+    archive = verifier / "fixture.zip"
+    required = ("customize.sh post-fs-data.sh service.sh uninstall.sh zs_compat.sh "
+                "post-mount-hook.sh verify.sh LICENSE META-INF/com/google/android/update-binary").split()
+    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_STORED) as z:
+        for name in required:
+            z.writestr(name, "fixture content")
+        z.writestr("module.prop", "id=zygisk_study\nname=Study\nversion=1\n"
+                   "versionCode=1\nauthor=Test\ndescription=Fixture\n")
+        z.writestr("META-INF/com/google/android/updater-script", "#MAGISK\n")
+    runner = ('set -euo pipefail\nABI_LIST=()\nREPO_ROOT=' + shlex.quote(str(verifier))
+              + '\nTOOLCHAIN=' + shlex.quote(str(ndk)) + '\nMODULE_DIR=' + shlex.quote(str(verifier))
+              + '\nverify_zip() {' + function + '\n}\nverify_zip "$1" || exit 1\n')
+    valid = subprocess.run(["bash", "-c", runner, "verify", str(archive)], env=env,
+                           capture_output=True, text=True, timeout=10)
+    with zipfile.ZipFile(archive) as z:
+        info = z.getinfo("LICENSE")
+        offset = info.header_offset + 30 + len(info.filename.encode()) + len(info.extra)
+    content = bytearray(archive.read_bytes())
+    content[offset] ^= 1  # Keep the central directory/listing intact; corrupt data only.
+    archive.write_bytes(content)
+    corrupt = subprocess.run(["bash", "-c", runner, "verify", str(archive)], env=env,
+                             capture_output=True, text=True, timeout=10)
+    check("completion 06: archive CRC errors in non-ELF files are rejected",
+          valid.returncode == 0 and corrupt.returncode != 0, corrupt.stdout + corrupt.stderr)
+
+    # 7: merely mentioning -fsanitize=thread is not proof of a missing toolchain.
+    testdir, make_env = make_gate_fixture(mk, "#!/bin/sh\nexit 0\n")
+    make_env["FAKE_BUILD_ERROR"] = "error: static assertion failed: -fsanitize=thread regression"
+    proc = run_make_gate(testdir, make_env, "race")
+    check("completion 07: sanitizer source errors cannot masquerade as toolchain skips",
+          proc.returncode != 0 and "SKIP" not in proc.stdout, proc.stdout + proc.stderr)
+
+    spec = importlib.util.spec_from_file_location(
+        "completion_daemon", Path(REPO_ROOT) / "scripts/verify_daemon.py")
+    daemon = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(daemon)
+    crate = root / "crate"
+    crate.mkdir()
+    # 8: CARGO_BUILD_RUSTC is Cargo's supported compiler selector too.
+    compiler = root / "selected-rustc"
+    write_exec(compiler, "#!/bin/sh\nprintf 'host: selected-host-target\\n'\n")
+    write_exec(Path(mk.bindir) / "rustc", "#!/bin/sh\nprintf 'host: wrong-host-target\\n'\n")
+    write_exec(Path(mk.bindir) / "cargo", '''#!/usr/bin/env python3
+import pathlib, sys
+args = sys.argv[1:]
+target = args[args.index('--target') + 1]
+out = pathlib.Path(args[args.index('--target-dir') + 1]) / target / 'debug' / 'zygiskd'
+out.parent.mkdir(parents=True, exist_ok=True)
+out.write_text(target)
+out.chmod(0o755)
+''')
+    cargo_env = {**env, "CARGO_BUILD_RUSTC": str(compiler), "CARGO_TARGET_DIR": str(crate / "target")}
+    cargo_env.pop("RUSTC", None)
+    with patch.dict(os.environ, cargo_env, clear=True), patch.object(daemon, "DAEMON_DIR", str(crate)):
+        binary, _ = daemon.cargo_build()
+    check("completion 08: host harness honors CARGO_BUILD_RUSTC",
+          Path(binary).read_text() == "selected-host-target", binary)
+
+    # 9: a live previous daemon's socket is not evidence that a new child is ready.
+    tree = daemon.Tree(str(root / "daemon-tree"))
+    Path(tree.session_file).write_text("old-socket")
+    child = Mock()
+    child.poll.return_value = None
+    connection = Mock()
+    times = iter((0, 0, 6))  # One probe, then expire the startup deadline.
+    with patch.object(daemon.subprocess, "Popen", return_value=child), \
+            patch.object(daemon, "connect", return_value=connection), \
+            patch.object(daemon.time, "monotonic", side_effect=lambda: next(times)), \
+            patch.object(daemon.time, "sleep"), patch.object(daemon, "stop_daemon") as stop:
+        try:
+            daemon.start_daemon("fixture-daemon", tree, {})
+            rejected = False
+        except RuntimeError:
+            rejected = True
+        check("completion 09: stale live session cannot satisfy startup readiness",
+              rejected and stop.call_count == 1)
+
+
+def test_final_nine_regressions(mk):
+    """Nine distinct bugs found after the existing completion regressions."""
+    import importlib.util
+    import shlex
+    import warnings
+    import zipfile
+    from pathlib import Path
+    from unittest.mock import Mock, patch
+
+    root = Path(mk.root)
+    real_git = shutil.which("git")
+    env = mk.env({"GIT_CONFIG_GLOBAL": str(root / "gitconfig"),
+                  "GIT_CONFIG_NOSYSTEM": "1"})
+    for key in list(env):
+        if key.startswith("GIT_CONFIG_") and key not in ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM"):
+            env.pop(key)
+    repo = root / "publisher"
+    repo.mkdir()
+
+    def git(*args):
+        return subprocess.run([real_git, *args], cwd=repo, env=env, check=True,
+                              capture_output=True, text=True, timeout=10)
+
+    git("init", "-q", "-b", "main")
+    git("-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+        "commit", "--allow-empty", "-qm", "fixture")
+    git("remote", "add", "origin", "https://github.com/local/study.git")
+    git("config", "--global", "remote.origin.url", "https://github.com/other/study.git")
+    shutil.copy(Path(REPO_ROOT) / "publish.sh", repo)
+    log = root / "push.log"
+    write_exec(Path(mk.bindir) / "git", '#!/bin/sh\n'
+               'if [ "$1" = push ]; then echo push >> "$PUSH_LOG"; exit 0; fi\n'
+               'exec ' + shlex.quote(real_git) + ' "$@"\n')
+    before = git("config", "--local", "--list").stdout
+    proc = subprocess.run(["bash", str(repo / "publish.sh"), "--repo", "requested/study"],
+                          env={**env, "PUSH_LOG": str(log)}, capture_output=True, text=True, timeout=10)
+    check("final 01: inherited fetch URLs cannot silently add push destinations",
+          proc.returncode != 0 and not log.exists()
+          and git("config", "--local", "--list").stdout == before, proc.stderr)
+    (Path(mk.bindir) / "git").unlink()
+
+    source = (Path(REPO_ROOT) / "scripts/build_module.sh").read_text()
+    make_zip = source[source.index("make_zip() {"):source.index("# Self-verification")]
+    staging = root / "staging"
+    staging.mkdir()
+    (staging / "payload").write_text("preserve staging")
+    zipdir = root / "archives"
+    zipdir.mkdir()
+    zip_env = {**env, "MODULE_DIR": str(staging), "ZIP_DIR": str(zipdir),
+               "VERSION_NAME": "fixture", "VERSION_CODE": "1"}
+    runner = 'set -euo pipefail\n' + make_zip + '\nverify_zip(){ return 0; }; make_zip\n'
+    proc = subprocess.run(["bash", "-c", runner], env={**zip_env, "ZIPOPT": "-m"},
+                          capture_output=True, text=True, timeout=10)
+    check("final 02: inherited ZIPOPT cannot delete the staging tree",
+          proc.returncode == 0 and (staging / "payload").is_file(), proc.stdout + proc.stderr)
+    # Recreate the tree on the unfixed implementation so this remains independent.
+    staging.mkdir(exist_ok=True)
+    (staging / "payload").write_text("preserve staging")
+    archive = zipdir / "zygisk_study-fixture-1.zip"
+    archive.unlink(missing_ok=True)
+    archive.mkdir()
+    proc = subprocess.run(["bash", "-c", runner], env=zip_env,
+                          capture_output=True, text=True, timeout=10)
+    check("final 03: publishing refuses a directory at the release ZIP path",
+          proc.returncode != 0 and not list(archive.iterdir()), proc.stdout + proc.stderr)
+
+    # A legitimate checkout named module under --out would otherwise be rm -rf'd.
+    output = root / "build-root"
+    checkout = output / "module"
+    (checkout / "scripts").mkdir(parents=True)
+    shutil.copy(Path(REPO_ROOT) / "scripts/build_module.sh", checkout / "scripts")
+    sentinel = checkout / "source-sentinel"
+    sentinel.write_text("source, not staging")
+    ndk = root / "ndk"
+    toolbin = ndk / "toolchains/llvm/prebuilt/linux-x86_64/bin"
+    toolbin.mkdir(parents=True)
+    (ndk / "build/cmake").mkdir(parents=True)
+    (ndk / "build/cmake/android.toolchain.cmake").touch()
+    write_exec(toolbin / "clang", "#!/bin/sh\nexit 0\n")
+    proc = subprocess.run(["bash", str(checkout / "scripts/build_module.sh"),
+                           "--out", str(output), "--ndk", str(ndk),
+                           "--skip-cpp", "--skip-rust"], env=env,
+                          capture_output=True, text=True, timeout=10)
+    check("final 04: assembly cannot recursively delete its own checkout",
+          proc.returncode != 0 and sentinel.is_file(), proc.stderr)
+
+    verifier = root / "verifier"
+    verifier.mkdir()
+    write_exec(verifier / "verify.sh", "#!/bin/sh\nexit 0\n")
+    function = source.split("verify_zip() {", 1)[1].split("\n}\n", 1)[0]
+    runner = ('set -euo pipefail\nABI_LIST=()\nREPO_ROOT=' + shlex.quote(str(verifier))
+              + '\nTOOLCHAIN=' + shlex.quote(str(ndk)) + '\nMODULE_DIR=' + shlex.quote(str(verifier))
+              + '\nverify_zip() {' + function + '\n}\nverify_zip "$1" || exit 1\n')
+    fixture = verifier / "fixture.zip"
+    required = ("customize.sh post-fs-data.sh service.sh uninstall.sh zs_compat.sh "
+                "post-mount-hook.sh verify.sh LICENSE META-INF/com/google/android/update-binary").split()
+
+    def verify(extra=None):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)  # Deliberate duplicate ZIP member.
+            with zipfile.ZipFile(fixture, "w") as z:
+                for name in required:
+                    z.writestr(name, "fixture content")
+                z.writestr("module.prop", "id=zygisk_study\nname=Study\nversion=1\n"
+                           "versionCode=1\nauthor=Test\ndescription=Fixture\n")
+                z.writestr("META-INF/com/google/android/updater-script", "#MAGISK\n")
+                if extra:
+                    z.writestr(extra, "unexpected content")
+        return subprocess.run(["bash", "-c", runner, "verify", str(fixture)], env=env,
+                              capture_output=True, text=True, timeout=10)
+
+    valid = verify()
+    check("final archive control: valid ZIP still verifies", valid.returncode == 0, valid.stderr)
+    proc = verify("customize.sh")
+    check("final 05: duplicate archive members cannot pass verification",
+          proc.returncode != 0, proc.stdout + proc.stderr)
+    for name in ("../outside", "/absolute", "libs/../../outside", "./customize.sh"):
+        proc = verify(name)
+        check("final 06: unsafe or aliased archive paths rejected: " + name,
+              proc.returncode != 0, proc.stdout + proc.stderr)
+
+    spec = importlib.util.spec_from_file_location(
+        "final_daemon", Path(REPO_ROOT) / "scripts/verify_daemon.py")
+    daemon = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(daemon)
+    sock = Mock()
+    sock.recv.side_effect = [b"a", b"b", b""]
+    # Time advances while the peer keeps sending, so a per-recv timeout never fires.
+    with patch.object(daemon, "connect", return_value=sock), \
+            patch.object(daemon.time, "monotonic", side_effect=[0, 0, 1, 6, 7, 8]):
+        try:
+            daemon.ask("fixture.sock", b"L")
+            expired = False
+        except TimeoutError:
+            expired = True
+    check("final 07: trickling replies cannot extend the total response deadline",
+          expired and sock.close.called)
+    sock = Mock()
+    sock.recv.side_effect = [b"a" * 4096] * 4 + [b""]
+    with patch.object(daemon, "connect", return_value=sock), \
+            patch.object(daemon, "MAX_RESPONSE_BYTES", 8192, create=True):
+        try:
+            daemon.ask("fixture.sock", b"L")
+            bounded = False
+        except ValueError:
+            bounded = True
+    check("final 08: oversized replies are bounded and close their socket",
+          bounded and sock.close.called)
+
+    testdir = root / "missing-python"
+    testdir.mkdir()
+    shutil.copy(Path(REPO_ROOT) / "tests/Makefile", testdir)
+    tools = testdir / "tools"
+    tools.mkdir()
+    make_env = {**env, "PATH": str(tools)}
+    for key in ("MAKEFLAGS", "MFLAGS", "MAKELEVEL", "MAKEOVERRIDES"):
+        make_env.pop(key, None)
+    for target in ("verify-scripts", "verify-trampolines", "verify-daemon"):
+        proc = subprocess.run([shutil.which("make"), target], cwd=testdir, env=make_env,
+                              capture_output=True, text=True, timeout=10)
+        check("final 09: missing Python cannot report a successful gate: " + target,
+              proc.returncode != 0 and "python3" in proc.stdout, proc.stdout + proc.stderr)
+
+
 def main():
     cases = [
+        ("PR #11 final audit: nine further regressions", test_final_nine_regressions),
+        ("PR #11 completion: nine NEW regressions", test_pr11_completion_regressions),
+        ("PR #11: nine additional tooling regressions", test_nine_followup_regressions),
+        ("Build lifecycle: nine configuration and release regressions", test_build_lifecycle_regressions),
+        ("Publish preflight: three non-mutating failure regressions", test_publish_preflight_regressions),
+        ("Daemon harness: seven resource and protocol regressions", test_daemon_harness_regressions),
         ("Nineteen: verification and publishing regressions", test_nineteen_validation_regressions),
         ("Verify: preserved PR #8 regressions", test_verify_pr8_regressions),
         ("Artifact verifier: seven format and invocation regressions", test_verify_artifact_regressions),

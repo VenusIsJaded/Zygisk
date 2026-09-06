@@ -51,6 +51,8 @@ DAEMON_DIR = os.path.join(REPO_ROOT, "native", "zygiskd")
 PROP_MAGIC = b"PROP"          # bytes 8..12  of the area image
 PROP_VERSION = bytes.fromhex("abd06efc")  # bytes 12..16 (0xfc6ed0ab LE)
 CLOAK_NAME = b"subsysd"
+MAX_RESPONSE_BYTES = 16 * 1024 * 1024
+RESPONSE_TIMEOUT = 5.0
 
 failures = []
 
@@ -62,20 +64,45 @@ def check(name, ok, detail=""):
         failures.append(f"{name}: {detail}")
 
 
-def cargo_build():
-    if shutil.which("cargo") is None and not os.path.exists(
-            os.path.expanduser("~/.cargo/bin/cargo")):
-        print("NOTE: no Rust toolchain (cargo) — daemon E2E skipped.")
-        sys.exit(77)
+def cargo_build(release=False):
+    # Respect the caller's selected toolchain; HOME is only a fallback, not
+    # permission to shadow a Cargo wrapper or pinned executable already on PATH.
+    cargo = shutil.which("cargo")
+    if cargo is None:
+        fallback = os.path.expanduser("~/.cargo/bin/cargo")
+        if os.path.isfile(fallback) and os.access(fallback, os.X_OK):
+            cargo = fallback
+        else:
+            print("NOTE: no Rust toolchain (cargo) — daemon E2E skipped.")
+            sys.exit(77)
     env = dict(os.environ)
-    env["PATH"] = os.path.expanduser("~/.cargo/bin:") + env.get("PATH", "")
-    r = subprocess.run(["cargo", "build"], cwd=DAEMON_DIR, env=env,
-                       capture_output=True, text=True)
+    target_dir = env.get("CARGO_TARGET_DIR") or os.path.join(DAEMON_DIR, "target")
+    target_dir = os.path.abspath(os.path.join(DAEMON_DIR, target_dir))
+    # These tests EXECUTE the output on the host. An Android default in
+    # CARGO_BUILD_TARGET or .cargo/config.toml must not select a cross binary
+    # (or cause us to run an old host binary left in target/debug).
+    rustc = env.get("RUSTC") or env.get("CARGO_BUILD_RUSTC") or shutil.which("rustc")
+    if not rustc:
+        rustc = os.path.join(os.path.dirname(cargo), "rustc")
+    env["RUSTC"] = rustc
+    version = subprocess.run([rustc, "-vV"], cwd=DAEMON_DIR, env=env,
+                             capture_output=True, text=True, timeout=30)
+    host = next((line.split(":", 1)[1].strip() for line in version.stdout.splitlines()
+                 if line.startswith("host:")), "")
+    if version.returncode != 0 or not host or len(host.split()) != 1:
+        print("cannot determine the Rust host target:", version.stderr)
+        sys.exit(1)
+    # Use the same directory/target/profile for Cargo and binary lookup.
+    args = [cargo, "build", "--target", host, "--target-dir", target_dir]
+    if release:
+        args.append("--release")
+    r = subprocess.run(args, cwd=DAEMON_DIR, env=env,
+                       capture_output=True, text=True, timeout=600)
     if r.returncode != 0:
         print(r.stderr)
         print("cargo build failed")
         sys.exit(1)
-    binp = os.path.join(DAEMON_DIR, "target", "debug", "zygiskd")
+    binp = os.path.join(target_dir, host, "release" if release else "debug", "zygiskd")
     if not os.path.exists(binp):
         print("built binary not found:", binp)
         sys.exit(1)
@@ -110,27 +137,51 @@ class Tree:
         return os.path.join(self.workdir, "denylist")
 
 
+def stop_daemon(proc):
+    """Terminate and reap a child, including the forced-kill fallback."""
+    if proc.poll() is None:
+        proc.terminate()
+    try:
+        proc.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+
+
 def start_daemon(binary, tree, env):
     e = dict(env)
     e["ZS_TEST_ROOT"] = tree.root
+    try:
+        previous_session = read_session_path(tree)
+    except OSError:
+        previous_session = None
     proc = subprocess.Popen(
         [binary, "--workdir", tree.workdir],
         env=e, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    # Wait for the session file (written before bind).
-    deadline = time.time() + 5
-    while time.time() < deadline:
-        if os.path.exists(tree.session_file):
-            break
-        if proc.poll() is not None:
-            print("daemon exited early with", proc.returncode)
-            sys.exit(1)
-        time.sleep(0.05)
-    else:
-        print("session file never appeared")
-        proc.kill()
-        sys.exit(1)
-    time.sleep(0.1)
-    return proc
+    # Publishing the session file precedes bind/listen and an old file can
+    # survive a restart. Probe the socket rather than relying on a fixed sleep.
+    try:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                raise RuntimeError(f"daemon exited early with {proc.returncode}")
+            try:
+                if os.path.exists(tree.session_file):
+                    session = read_session_path(tree)
+                    if session == previous_session:
+                        time.sleep(0.05)
+                        continue
+                    sock = connect(session)
+                    sock.close()
+                    return proc
+            except OSError:
+                pass  # Session publication/bind is still in progress.
+            time.sleep(0.05)
+        raise RuntimeError("daemon socket did not become ready")
+    except BaseException:
+        # start_daemon owns the child until it successfully returns it.
+        stop_daemon(proc)
+        raise
 
 
 def read_session_path(tree):
@@ -140,16 +191,37 @@ def read_session_path(tree):
 
 def connect(sock_path):
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    s.settimeout(5)
-    s.connect(sock_path)
-    return s
+    try:
+        s.settimeout(5)
+        s.connect(sock_path)
+        return s
+    except BaseException:
+        s.close()
+        raise
 
 
 def ask(sock_path, verb):
     s = connect(sock_path)
     try:
+        deadline = time.monotonic() + RESPONSE_TIMEOUT
         s.sendall(verb)
-        return s.recv(4096)
+        # SOCK_STREAM does not preserve message boundaries. Half-close the
+        # request (also allowing companion echo to finish), then read to EOF.
+        s.shutdown(socket.SHUT_WR)
+        chunks = []
+        total = 0
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("daemon response deadline exceeded")
+            s.settimeout(remaining)
+            chunk = s.recv(4096)
+            if not chunk:
+                return b"".join(chunks)
+            total += len(chunk)
+            if total > MAX_RESPONSE_BYTES:
+                raise ValueError("daemon response exceeds size limit")
+            chunks.append(chunk)
     finally:
         s.close()
 
@@ -182,20 +254,19 @@ def main():
     env["ZS_TEST_SWEEP_MS"] = "150"
 
     tmp = tempfile.mkdtemp(prefix="zygiskd_e2e_")
-    tree = Tree(tmp)
-    print(f"== tree at {tmp} ==")
-
-    print("== starting daemon ==")
-    proc = start_daemon(binary, tree, env)
+    proc = None
     try:
+        tree = Tree(tmp)
+        print(f"== tree at {tmp} ==")
+        print("== starting daemon ==")
+        proc = start_daemon(binary, tree, env)
         run_checks(binary, tree, env, proc)
     finally:
-        proc.send_signal(signal.SIGTERM)
         try:
-            proc.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-        shutil.rmtree(tmp, ignore_errors=True)
+            if proc is not None:
+                stop_daemon(proc)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
     if failures:
         print(f"\nDAEMON E2E: {len(failures)} FAILURES")
