@@ -442,10 +442,10 @@ verify_zip() {
     # 1. The files the installer needs. customize.sh is SOURCED by
     #    Magisk's install_module after extracting everything except
     #    META-INF; the boot scripts must be at the zip root.
-    local required="module.prop customize.sh post-fs-data.sh service.sh uninstall.sh zs_compat.sh post-mount-hook.sh LICENSE META-INF/com/google/android/update-binary META-INF/com/google/android/updater-script"
+    local required="module.prop customize.sh post-fs-data.sh service.sh uninstall.sh zs_compat.sh post-mount-hook.sh verify.sh LICENSE META-INF/com/google/android/update-binary META-INF/com/google/android/updater-script"
     local f
     for f in $required; do
-        if ! grep -qx "$f" <<< "$listing"; then
+        if ! grep -Fxq -- "$f" <<< "$listing"; then
             echo "  FAIL: missing required file: $f" >&2
             fail=1
         fi
@@ -455,14 +455,24 @@ verify_zip() {
     #    version, versionCode[=integer], author, description).
     local prop
     prop="$(unzip -p "$zip_path" module.prop)"
-    local vcode
-    vcode="$(grep '^versionCode=' <<< "$prop" | cut -d= -f2-)"
-    if ! grep -q '^id=zygisk_study$' <<< "$prop" \
-       || ! grep -q '^name=' <<< "$prop" \
-       || ! grep -q '^version=' <<< "$prop" \
-       || ! grep -q '^author=' <<< "$prop" \
-       || ! grep -q '^description=' <<< "$prop" \
-       || [[ -z "$vcode" || ! "$vcode" =~ ^[0-9]+$ ]]; then
+    # Read values after the first '='; reject ambiguity rather than letting
+    # different property consumers disagree about the effective module ID.
+    if ! awk '
+        BEGIN { split("id name version versionCode author description", keys)
+                for (i in keys) required[keys[i]] = 1 }
+        /^[^#][^=]*=/ {
+            key = substr($0, 1, index($0, "=") - 1)
+            value = substr($0, index($0, "=") + 1)
+            if (key in required) {
+                seen[key]++
+                if (value !~ /[^[:space:]]/) bad = 1
+                if (key == "id" && value != "zygisk_study") bad = 1
+                if (key == "versionCode" && value !~ /^[0-9]+$/) bad = 1
+            }
+        }
+        END { for (key in required) if (seen[key] != 1) bad = 1
+              exit bad ? 1 : 0 }
+    ' <<< "$prop"; then
         echo "  FAIL: module.prop does not satisfy the strict format" >&2
         fail=1
     fi
@@ -479,47 +489,34 @@ verify_zip() {
     #    a zip containing install.sh as a PRE-modern module and runs the
     #    legacy installer path instead (verified from
     #    scripts/util_functions.sh).
-    if grep -qx "install.sh" <<< "$listing"; then
+    if grep -Fxq -- "install.sh" <<< "$listing"; then
         echo "  FAIL: root install.sh would trigger Magisk's legacy installer path" >&2
         fail=1
     fi
 
-    # 5. Every packaged library has the right ELF class for its ABI
-    #    directory (the EI_CLASS byte at offset 4; the same check
-    #    customize.sh runs on the 32-bit pair at install time).
-    #      arm64-v8a, x86_64  -> 2 (ELF64)
-    #      armeabi-v7a, x86   -> 1 (ELF32)
-    # NOTE: the byte is read from an extracted temp file rather than a
-    # `unzip -p | head -c 5` pipe — under `set -o pipefail` the early
-    # SIGPIPE from head would abort the whole script.
-    local expect_cls abi lib cls magic tmp_extract
-    tmp_extract="$(mktemp)"
-    for abi in "${ABI_LIST[@]}"; do
-        case "$abi" in
-            arm64-v8a | x86_64) expect_cls=2 ;;
-            *)                  expect_cls=1 ;;
-        esac
-        for lib in libzygisk.so libpayload.so libzn_loader.so; do
-            if ! grep -qx "libs/$abi/$lib" <<< "$listing"; then
-                echo "  FAIL: libs/$abi/$lib missing from the zip" >&2
-                fail=1
-                continue
-            fi
-            unzip -p "$zip_path" "libs/$abi/$lib" > "$tmp_extract"
-            magic="$(od -An -tu1 -N5 "$tmp_extract" | tr -s ' ' | sed 's/^ //')"
-            cls="$(awk '{print $5}' <<< "$magic")"
-            if [[ "$(awk '{print $1}' <<< "$magic")" != "127" || "$cls" != "$expect_cls" ]]; then
-                echo "  FAIL: libs/$abi/$lib: magic/class mismatch (got '$magic', want e_ident[0]=127 class=$expect_cls)" >&2
-                fail=1
-            fi
+    # 5. Verify actual archived bytes, not just the staging tree or EI_CLASS.
+    # Extract only fixed expected paths; never run scripts from an input ZIP.
+    # The shared POSIX checker covers all four artifacts, both ELF classes,
+    # full magic, CPU, byte order, versions, type and complete header size.
+    local abi
+    if ! (
+        tmp_extract="$(mktemp -d)" || exit 1
+        trap 'rm -rf "$tmp_extract"' EXIT
+        for abi in "${ABI_LIST[@]}"; do
+            mkdir -p "$tmp_extract/libs/$abi" || exit 1
+            for lib in libzygisk.so libpayload.so libzn_loader.so zygiskd; do
+                if ! grep -Fxq -- "libs/$abi/$lib" <<< "$listing"; then
+                    echo "  FAIL: libs/$abi/$lib missing from the zip" >&2
+                    exit 1
+                fi
+                unzip -p "$zip_path" "libs/$abi/$lib" > "$tmp_extract/libs/$abi/$lib" || exit 1
+            done
         done
-        # zygiskd must exist and be a valid executable for the ABI.
-        if ! grep -qx "libs/$abi/zygiskd" <<< "$listing"; then
-            echo "  FAIL: libs/$abi/zygiskd missing from the zip" >&2
-            fail=1
-        fi
-    done
-    rm -f "$tmp_extract"
+        MODPATH="$tmp_extract" sh "$REPO_ROOT/verify.sh"
+    ); then
+        echo "  FAIL: archived native artifacts did not pass verification" >&2
+        fail=1
+    fi
 
     # 6. 16 KB page alignment on EVERY packaged ELF (Round 27 for the
     #    libraries, Round 32 for the daemon): a 16 KB-kernel device
