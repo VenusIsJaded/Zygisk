@@ -1840,6 +1840,61 @@ shutil.copy(os.environ["BUILD_SEED"], os.path.join(dest, "zygiskd"))
     proc, _ = run()
     passed("build: valid complete archive still passes all verification", proc)
 
+    # Current nineteen-bug pass: build driver regressions 09--14.
+    for option in ("--ndk", "--api", "--abis", "--out", "--type"):
+        proc, out = run((option, ""))
+        check("study 09: rejects empty " + option, proc.returncode == 2
+              and "requires a value" in proc.stderr and not os.path.exists(out),
+              proc.stdout + proc.stderr)
+    for kind in ("Relese", "", "Release;Debug"):
+        proc, out = run(("--type", kind))
+        check("study 10: rejects invalid build configuration " + repr(kind),
+              proc.returncode == 2 and not os.path.exists(out), proc.stdout + proc.stderr)
+    # Hide just one executable from command -v without depending on host PATH.
+    for number, tool, args in ((11, "cmake", ("--skip-cpp",)),
+                               (12, "cargo", ())):
+        override = '() { if [[ "$*" == "-v ' + tool + '" ]]; then return 1; fi; builtin command "$@"; }'
+        proc, _ = run(args, {"BASH_FUNC_command%%": override})
+        with open(env["BUILD_CALLS"]) as fp:
+            calls = fp.read()
+        check(f"study {number:02d}: {tool} availability checked for the requested build",
+              proc.returncode == 0 if number == 11 else
+              proc.returncode != 0 and not calls and "cargo not on PATH" in proc.stderr,
+              proc.stdout + proc.stderr + calls)
+
+    stable_out = os.path.join(root, "transactional output")
+    proc, _ = run(("--out", stable_out))
+    passed("study 13 control: initial archive", proc)
+    archive_dir = os.path.join(stable_out, "out")
+    saved = {name: open(os.path.join(archive_dir, name), "rb").read()
+             for name in os.listdir(archive_dir)}
+    # Force verification failure, then verify the previous release survives.
+    with open(seed, "wb") as fp:
+        fp.write(elf)
+    proc, _ = run(("--out", stable_out))
+    current = {name: open(os.path.join(archive_dir, name), "rb").read()
+               for name in os.listdir(archive_dir)}
+    check("study 13: failed replacement preserves the last verified archive",
+          proc.returncode != 0 and current == saved, proc.stdout + proc.stderr)
+    proc, failed_out = run()
+    check("study 13: failed first build leaves no release archive", proc.returncode != 0
+          and not os.listdir(os.path.join(failed_out, "out")), proc.stdout + proc.stderr)
+    with open(seed, "wb") as fp:
+        fp.write(valid_elf)
+
+    overlap_out = os.path.join(root, "overlapping output")
+    cargo_dir = os.path.join(overlap_out, "module", "cargo")
+    os.makedirs(cargo_dir)
+    sentinel = os.path.join(cargo_dir, "keep")
+    with open(sentinel, "w") as fp:
+        fp.write("previous cargo cache")
+    proc, _ = run(("--out", overlap_out, "--skip-cpp"), {"CARGO_TARGET_DIR": cargo_dir})
+    with open(env["BUILD_CALLS"]) as fp:
+        calls = fp.read()
+    check("study 14: staging cannot delete Cargo's target directory",
+          proc.returncode != 0 and os.path.isfile(sentinel) and not calls,
+          proc.stdout + proc.stderr)
+
 
 # Release-tooling regressions. Each numbered group covers one distinct bug.
 def test_verify_artifact_regressions(mk):
@@ -2517,8 +2572,224 @@ def test_nineteen_validation_regressions(mk):
            proc.returncode == 0 and ".git.git" not in proc.stdout)
 
 
+def test_study_recovery_regressions(mk):
+    """Regression IDs 01--05: validate the recovery handoff before side effects."""
+    import shlex
+    with open(os.path.join(REPO_ROOT, "scripts/installer/update-binary")) as fp:
+        source = fp.read()
+    util = os.path.join(mk.root, "util_functions.sh")
+    script = os.path.join(mk.root, "update-binary")
+    with open(script, "w") as fp:
+        fp.write(source.replace("/data/adb/magisk/util_functions.sh", shlex.quote(util)))
+    mounted = os.path.join(mk.root, "mounted")
+    installed = os.path.join(mk.root, "installed")
+    exported = os.path.join(mk.root, "exported")
+    archive = os.path.join(mk.root, "module with spaces.zip")
+    with open(archive, "w") as fp:
+        fp.write("fixture")
+    write_exec(os.path.join(mk.bindir, "mount"),
+               "#!/bin/sh\ntouch " + shlex.quote(mounted) + "\n")
+    def run(args=None, source_status=0):
+        for path in (mounted, installed, exported):
+            if os.path.exists(path):
+                os.unlink(path)
+        with open(util, "w") as fp:
+            fp.write("MAGISK_VER_CODE=20400\ninstall_module() {\n"
+                     "touch " + shlex.quote(installed) + "\n"
+                     "sh -c 'printf \"%s\\n%s\\n\" \"$OUTFD\" \"$ZIPFILE\"' > "
+                     + shlex.quote(exported) + "\n}\nreturn " + str(source_status) + "\n")
+        env = mk.env()
+        env.pop("OUTFD", None)
+        env.pop("ZIPFILE", None)
+        return subprocess.run(["sh", script, *(args if args is not None else
+                                              ("3", "1", archive))], env=env,
+                              capture_output=True, text=True, timeout=10)
+    for args in ((), ("3",), ("3", "1"), ("3", "1", archive, "extra")):
+        proc = run(args)
+        check("study 01: recovery rejects wrong argument count " + repr(args),
+              proc.returncode != 0 and not os.path.exists(mounted)
+              and not os.path.exists(installed), proc.stdout + proc.stderr)
+    for fd in ("", "../status", "-1", "one"):
+        proc = run(("3", fd, archive))
+        check("study 02: recovery rejects invalid output descriptor " + repr(fd),
+              proc.returncode != 0 and not os.path.exists(mounted)
+              and not os.path.exists(installed), proc.stdout + proc.stderr)
+    for path in ("", archive + ".missing", mk.root):
+        proc = run(("3", "1", path))
+        check("study 03: recovery rejects missing/non-file archive " + repr(path),
+              proc.returncode != 0 and not os.path.exists(mounted)
+              and not os.path.exists(installed), proc.stdout + proc.stderr)
+    proc = run()
+    content = open(exported).read() if os.path.exists(exported) else ""
+    check("study 04: handoff variables reach installer subprocesses",
+          proc.returncode == 0 and content == "1\n" + archive + "\n",
+          proc.stdout + proc.stderr + repr(content))
+    proc = run(source_status=42)
+    check("study 05: failed utility initialization cannot install",
+          proc.returncode != 0 and not os.path.exists(installed), proc.stdout + proc.stderr)
+
+
+def test_study_publish_regressions(mk):
+    """Regression IDs 06--08 use real Git configuration, never network pushes."""
+    import shlex
+    repo = os.path.join(mk.root, "repository")
+    os.makedirs(repo)
+    real_git = shutil.which("git")
+    def git(*args):
+        return subprocess.run([real_git, *args], cwd=repo, capture_output=True,
+                              text=True, check=True, timeout=10)
+    git("init", "-q")
+    git("-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+        "commit", "--allow-empty", "-qm", "fixture")
+    git("checkout", "-qb", "topic")
+    git("remote", "add", "origin", "https://github.com/study/original.git")
+    publisher = os.path.join(repo, "publish.sh")
+    shutil.copy(os.path.join(REPO_ROOT, "publish.sh"), publisher)
+    log = os.path.join(mk.root, "push.log")
+    write_exec(os.path.join(mk.bindir, "git"), '#!/bin/sh\nif [ "$1" = push ]; then\n'
+               + shlex.quote(real_git) + ' remote get-url --push --all origin > '
+               + shlex.quote(log) + '\nexit 0\nfi\nexec ' + shlex.quote(real_git) + ' "$@"\n')
+    def run(*args):
+        if os.path.exists(log):
+            os.unlink(log)
+        return subprocess.run(["bash", publisher, *args], cwd=repo, env=mk.env(),
+                              capture_output=True, text=True, timeout=10)
+    before = git("config", "--local", "--list").stdout
+    proc = run("--branch", "missing", "--repo", "study/other")
+    after = git("config", "--local", "--list").stdout
+    check("study 06: nonexistent branch fails without remote mutation or push",
+          proc.returncode != 0 and before == after and not os.path.exists(log),
+          proc.stdout + proc.stderr)
+    git("config", "--add", "remote.origin.url", "https://github.com/study/unwanted.git")
+    proc = run("--repo", "study/intended")
+    urls = open(log).read().splitlines() if os.path.exists(log) else []
+    check("study 07: explicit repository overrides every inherited push destination",
+          proc.returncode == 0 and urls == ["https://github.com/study/intended.git"],
+          proc.stdout + proc.stderr + repr(urls))
+    git("config", "--replace-all", "remote.origin.url",
+        "https://fixture-secret@github.com/study/private.git?access_token=fixture-query")
+    proc = run()
+    check("study 08: publishing diagnostics do not disclose URL credentials",
+          proc.returncode == 0 and "fixture-secret" not in proc.stdout + proc.stderr
+          and "fixture-query" not in proc.stdout + proc.stderr, proc.stdout + proc.stderr)
+
+
+def test_study_archive_regressions(mk):
+    """Regression IDs 15--17: verify the actual archive, including its namespace."""
+    import struct
+    import warnings
+    import zipfile
+    names = ("libzygisk.so", "libpayload.so", "libzn_loader.so", "zygiskd")
+    seed = os.path.join(mk.root, "seed.so")
+    subprocess.run(["cc", "-shared", "-fPIC", "-s", "-Wl,-z,max-page-size=16384",
+                    "-x", "c", "-", "-o", seed], input="int fixture(void){return 0;}\n",
+                   capture_output=True, text=True, check=True, timeout=30)
+    valid = open(seed, "rb").read()
+    tools = os.path.join(mk.root, "toolchain", "bin")
+    os.makedirs(tools)
+    os.symlink(shutil.which("readelf"), os.path.join(tools, "llvm-readelf"))
+    os.symlink(shutil.which("strings"), os.path.join(tools, "llvm-strings"))
+    libs = os.path.join(mk.moddir, "libs", "x86_64")
+    os.makedirs(libs)
+    for name in names:
+        with open(os.path.join(libs, name), "wb") as fp:
+            fp.write(valid)
+    entries = {name: b"fixture" for name in (
+        "customize.sh", "post-fs-data.sh", "service.sh", "uninstall.sh", "zs_compat.sh",
+        "post-mount-hook.sh", "verify.sh", "LICENSE", "META-INF/com/google/android/update-binary")}
+    entries["module.prop"] = (b"id=zygisk_study\nname=Study\nversion=1\nversionCode=1\n"
+                              b"author=Study\ndescription=Educational\n")
+    entries["META-INF/com/google/android/updater-script"] = b"#MAGISK\n"
+    entries.update({"libs/x86_64/" + name: valid for name in names})
+    with open(os.path.join(REPO_ROOT, "scripts/build_module.sh")) as fp:
+        source = fp.read()
+    function = source[source.index("verify_zip() {"):source.index("# Drive the build")]
+    def run(extra=(), replace=None):
+        archive = os.path.join(mk.root, "module.zip")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            with zipfile.ZipFile(archive, "w") as zf:
+                for name, data in {**entries, **(replace or {})}.items():
+                    zf.writestr(name, data)
+                for name, data in extra:
+                    zf.writestr(name, data)
+        return subprocess.run(["bash", "-c", "set -euo pipefail; ABI_LIST=(x86_64); "
+                               + function + '\nverify_zip "$1"', "verify", archive],
+                              env=mk.env({"REPO_ROOT": REPO_ROOT, "MODULE_DIR": mk.moddir,
+                                          "TOOLCHAIN": os.path.dirname(tools)}),
+                              capture_output=True, text=True, timeout=20)
+    proc = run()
+    check("study archive control: valid archive", proc.returncode == 0, proc.stdout + proc.stderr)
+    bad = bytearray(valid)
+    cls64 = bad[4] == 2
+    phoff = struct.unpack_from("<Q" if cls64 else "<I", bad, 32 if cls64 else 28)[0]
+    phsize, phnum = struct.unpack_from("<HH", bad, 54 if cls64 else 42)
+    for i in range(phnum):
+        offset = phoff + i * phsize
+        if struct.unpack_from("<I", bad, offset)[0] == 1:
+            struct.pack_into("<Q" if cls64 else "<I", bad, offset + (48 if cls64 else 28), 0x1000)
+    proc = run(replace={"libs/x86_64/libpayload.so": bytes(bad)})
+    check("study 15: alignment is checked from archived bytes, not staging",
+          proc.returncode != 0 and "alignment" in proc.stderr, proc.stdout + proc.stderr)
+    for entry in ("libs/mips/", "libs/.hidden/", "libs/x86/zygiskd"):
+        proc = run(extra=((entry, b"unexpected"),))
+        check("study 16: unexpected archived ABI rejected: " + entry,
+              proc.returncode != 0, proc.stdout + proc.stderr)
+    for entry in ("libs/x86_64/libpayload.so", "customize.sh"):
+        proc = run(extra=((entry, b"untrusted duplicate"),))
+        check("study 17: duplicate archive member rejected: " + entry,
+              proc.returncode != 0, proc.stdout + proc.stderr)
+
+
+def test_study_daemon_harness_regressions(mk):
+    """Regression IDs 18--19: Cargo output discovery and stream framing."""
+    import importlib.util
+    import json
+    from unittest import mock
+    spec = importlib.util.spec_from_file_location("daemon_checks", os.path.join(REPO_ROOT, "scripts/verify_daemon.py"))
+    daemon = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(daemon)
+    binary = os.path.join(mk.root, "custom-target", "debug", "zygiskd")
+    os.makedirs(os.path.dirname(binary))
+    write_exec(binary, "#!/bin/sh\nexit 0\n")
+    artifact = {"reason": "compiler-artifact", "target": {"name": "zygiskd", "kind": ["bin"]},
+                "executable": binary}
+    built = subprocess.CompletedProcess(["cargo", "build"], 0, json.dumps(artifact) + "\n", "")
+    with mock.patch.object(daemon.shutil, "which", return_value="/fixture/cargo"), \
+         mock.patch.object(daemon.subprocess, "run", return_value=built) as invoked:
+        try:
+            result, _ = daemon.cargo_build()
+        except SystemExit:
+            result = None
+        check("study 18: daemon harness uses Cargo's reported executable", result == binary)
+        args = invoked.call_args.args[0]
+        check("study 18: Cargo emits machine-readable artifact messages",
+              "--message-format=json" in args, repr(args))
+    # A stale default target binary must never mask a missing Cargo artifact.
+    with mock.patch.object(daemon.shutil, "which", return_value="/fixture/cargo"), \
+         mock.patch.object(daemon.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")), \
+         mock.patch.object(daemon.os.path, "exists", return_value=True):
+        try:
+            daemon.cargo_build()
+            refused = False
+        except SystemExit as error:
+            refused = error.code == 1
+        check("study 18: absent build artifact cannot run a stale default binary", refused)
+    stream = mock.Mock()
+    stream.recv.side_effect = [b"test", b"mod/zygisk/", b"x86_64/library.so\n", b""]
+    with mock.patch.object(daemon, "connect", return_value=stream):
+        reply = daemon.ask("fixture", b"L")
+    check("study 19: socket reply survives arbitrary stream fragmentation",
+          reply == b"testmod/zygisk/x86_64/library.so\n", repr(reply))
+    check("study 19 control: socket closed after complete reply", stream.close.call_count == 1)
+
+
 def main():
     cases = [
+        ("Study: recovery regressions 01--05", test_study_recovery_regressions),
+        ("Study: publishing regressions 06--08", test_study_publish_regressions),
+        ("Study: archive regressions 15--17", test_study_archive_regressions),
+        ("Study: daemon harness regressions 18--19", test_study_daemon_harness_regressions),
         ("Nineteen: verification and publishing regressions", test_nineteen_validation_regressions),
         ("Verify: preserved PR #8 regressions", test_verify_pr8_regressions),
         ("Artifact verifier: seven format and invocation regressions", test_verify_artifact_regressions),
