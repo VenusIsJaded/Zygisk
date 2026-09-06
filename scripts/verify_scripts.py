@@ -2116,7 +2116,10 @@ def test_recovery_installer_regressions(mk):
         with open(util, "w") as fp:
             fp.write("MAGISK_VER_CODE='" + version + "'\n"
                      + "install_module(){ touch '" + marker + "'; return " + str(status) + "; }\n")
-        return subprocess.run(["sh", script, "3", "", "module.zip"], env=mk.env(),
+        archive = os.path.join(mk.root, "module.zip")
+        with open(archive, "wb") as fp:
+            fp.write(b"fixture")
+        return subprocess.run(["sh", script, "3", "", archive], env=mk.env(),
                               capture_output=True, text=True, timeout=10)
 
     # 16: preserve Magisk install_module's nonzero return code.
@@ -2433,7 +2436,7 @@ def test_nineteen_validation_regressions(mk):
         "META-INF/com/google/android/update-binary")}
     base.update({"module.prop": prop.encode(),
                  "META-INF/com/google/android/updater-script": b"#MAGISK\n"})
-    base.update({"libs/x86_64/" + name: bytes(header()) for name in names})
+    base.update({"libs/x86_64/" + name: bytes(release_elf_fixture()) for name in names})
 
     def archive_run(entries):
         archive = os.path.join(mk.root, "module.zip")
@@ -3499,10 +3502,7 @@ if sys.argv[1] == '-lW':
     print('LOAD 0x000000 0x000000 0x000000 0x001000 0x001000 R E ' + alignment)
 ''')
     write_exec(tools / "llvm-strings", "#!/bin/sh\nexit 0\n")
-    data = bytearray(64)
-    data[:7] = b"\x7fELF\x02\x01\x01"
-    struct.pack_into("<HHI", data, 16, 3, 62, 1)
-    struct.pack_into("<H", data, 52, 64)
+    data = release_elf_fixture()
     names = ("libzygisk.so", "libpayload.so", "libzn_loader.so", "zygiskd")
     staging = root / "staging"
     (staging / "libs/x86_64").mkdir(parents=True)
@@ -3567,8 +3567,518 @@ if sys.argv[1] == '-lW':
           proc.returncode == 0, proc.stdout + proc.stderr)
 
 
+def release_elf_fixture(cls=2, machine=62):
+    """Small structural ELF control, not executable code or a loadability claim.
+
+    Older archive tests mocked inspection tools and used only an ELF header.
+    Give those controls real LOAD/dynamic tables so they still reach the
+    particular tool/ZIP failure they are meant to test.
+    """
+    import struct
+    data = bytearray(512)
+    data[:7] = b"\x7fELF" + bytes((cls, 1, 1))
+    struct.pack_into("<HHI", data, 16, 3, machine, 1)
+    wide = cls == 2
+    ehsize, phsize, word = (64, 56, 8) if wide else (52, 32, 4)
+    struct.pack_into("<Q" if wide else "<I", data, 32 if wide else 28, ehsize)
+    struct.pack_into("<HHH", data, 52 if wide else 40, ehsize, phsize, 2)
+    if wide:
+        struct.pack_into("<IIQQQQQQ", data, ehsize, 1, 5, 0, 0, 0, len(data), len(data), 0x4000)
+        struct.pack_into("<IIQQQQQQ", data, ehsize + phsize, 2, 4, 256, 256, 256, 96, 96, 8)
+    else:
+        struct.pack_into("<IIIIIIII", data, ehsize, 1, 0, 0, 0, len(data), len(data), 5, 0x4000)
+        struct.pack_into("<IIIIIIII", data, ehsize + phsize, 2, 256, 256, 256, 48, 48, 4, 4)
+    for i, (tag, value) in enumerate(((5, 480), (10, 1), (6, 384),
+                                     (11, 24 if wide else 16), (4, 416), (0, 0))):
+        struct.pack_into("<QQ" if wide else "<II", data, 256 + i * word * 2, tag, value)
+    struct.pack_into("<IIII", data, 416, 1, 1, 0, 0)  # one empty SysV bucket
+    return data
+
+
+def test_release_and_recovery_nineteen(mk):
+    """Nineteen release/installer/publisher failures, using only local fixtures."""
+    import shlex
+    import struct
+    import zipfile
+    from pathlib import Path
+
+    root = Path(mk.root)
+    source = (Path(REPO_ROOT) / "scripts/build_module.sh").read_text()
+    function = source.split("verify_zip() {", 1)[1].split("\n}\n", 1)[0]
+    toolchain = root / "toolchain"
+    tools = toolchain / "bin"
+    tools.mkdir(parents=True)
+    readelf = tools / "llvm-readelf"
+    strings = tools / "llvm-strings"
+    write_exec(readelf, '''#!/bin/sh
+case "$1" in
+  -lW) printf 'LOAD 0x0 0x0 0x0 0x40 0x40 R E %s\\n' "${AUDIT_ALIGN:-0x4000}" ;;
+  -SW) [ "${AUDIT_ERROR:-}" != sections ] || exit 1 ;;
+  -d) [ "${AUDIT_ERROR:-}" != dynamic ] || exit 1 ;;
+esac
+exit 0
+''')
+    write_exec(strings, '#!/bin/sh\n[ "${AUDIT_ERROR:-}" != strings ]\n')
+    data = release_elf_fixture()
+    names = ("libzygisk.so", "libpayload.so", "libzn_loader.so", "zygiskd")
+    scripts = ("customize.sh post-fs-data.sh service.sh uninstall.sh zs_compat.sh "
+               "post-mount-hook.sh verify.sh LICENSE "
+               "META-INF/com/google/android/update-binary").split()
+    prop = b"id=zygisk_study\nname=Study\nversion=1\nversionCode=1\nauthor=Test\ndescription=Fixture\n"
+    archive = root / "fixture.zip"
+    runner = ('set -euo pipefail\nABI_LIST=(x86_64)\n'
+              # A missing fallback is simulated without hiding awk/unzip/sh.
+              'command(){ if [ "$1" = -v ] && [ "$2" = "${AUDIT_MISSING:-}" ]; '
+              'then return 1; fi; builtin command "$@"; }\n'
+              'verify_zip() {' + function + '\n}\nverify_zip "$1" || exit 1\n')
+    env = mk.env({"REPO_ROOT": REPO_ROOT, "TOOLCHAIN": str(toolchain),
+                  "MODULE_DIR": str(root)})
+
+    def verify(extra=None, props=prop, empty=None, error="", align="0x4000", missing=""):
+        with zipfile.ZipFile(archive, "w") as z:
+            for name in scripts:
+                z.writestr(name, b"" if name == empty else b"fixture\n")
+            z.writestr("module.prop", props)
+            z.writestr("META-INF/com/google/android/updater-script", "#MAGISK\n")
+            for name in names:
+                z.writestr("libs/x86_64/" + name, data)
+            if extra is not None:
+                z.writestr(extra, "extra")
+        disabled = tools / ("llvm-" + missing)
+        if missing:
+            disabled.rename(str(disabled) + ".disabled")
+        try:
+            return subprocess.run(["bash", "-c", runner, "audit", str(archive)],
+                                  env={**env, "AUDIT_ERROR": error, "AUDIT_ALIGN": align,
+                                       "AUDIT_MISSING": missing},
+                                  capture_output=True, text=True, timeout=15)
+        finally:
+            if missing:
+                Path(str(disabled) + ".disabled").rename(disabled)
+
+    def reject(number, label, proc, condition=True):
+        check(f"release19 {number:02d}: {label}", proc.returncode != 0 and condition,
+              proc.stdout + proc.stderr)
+
+    proc = verify()
+    check("release19 archive control: valid input", proc.returncode == 0, proc.stderr)
+    reject(1, "missing readelf cannot verify a release", verify(missing="readelf"))
+    reject(2, "section inspection failures propagate", verify(error="sections"))
+    reject(3, "dynamic inspection failures propagate", verify(error="dynamic"))
+    reject(4, "missing strings cannot verify a release", verify(missing="strings"))
+    reject(5, "string inspection failures propagate", verify(error="strings"))
+    reject(6, "LOAD alignment must be a power of two", verify(align="0x6000"))
+    reject(7, "LOAD alignment cannot wrap shell arithmetic", verify(align="0x10000000000004000"))
+    reject(8, "a regular file cannot also be an archive parent", verify(extra="LICENSE/child"))
+    info = zipfile.ZipInfo("optional-fifo")
+    info.create_system = 3
+    info.external_attr = (stat.S_IFIFO | 0o600) << 16
+    reject(9, "special archive members are refused", verify(extra=info))
+    reject(10, "control characters cannot alias archive names", verify(extra="optional\tname"))
+    reject(11, "empty required boot scripts are refused", verify(empty="service.sh"))
+    reject(12, "versionCode must fit Android's signed int", verify(props=prop.replace(
+        b"versionCode=1", b"versionCode=2147483648")))
+    reject(13, "NUL bytes cannot disappear from module metadata", verify(props=prop.replace(
+        b"id=zygisk_study", b"id=zygisk_\x00study")))
+    # Boundaries and canonical directory entries remain accepted.
+    for value in (b"0", b"2147483647"):
+        proc = verify(props=prop.replace(b"versionCode=1", b"versionCode=" + value), extra="extras/")
+        check("release19 archive control: version boundary " + value.decode(),
+              proc.returncode == 0, proc.stdout + proc.stderr)
+
+    # Recovery uses a private util file and a no-op mount; no device paths run.
+    util = root / "util_functions.sh"
+    installer = root / "update-binary"
+    original = (Path(REPO_ROOT) / "scripts/installer/update-binary").read_text()
+    installer.write_text(original.replace("/data/adb/magisk/util_functions.sh", shlex.quote(str(util))))
+    mount_log = root / "mount.log"
+    write_exec(Path(mk.bindir) / "mount", '#!/bin/sh\nprintf mount >> "$AUDIT_MOUNT_LOG"\n')
+    marker = root / "installed"
+    zipfile_path = root / "module.zip"
+    zipfile_path.write_bytes(b"fixture")
+    elsewhere = root / "elsewhere"
+    elsewhere.mkdir()
+    recovery_env = mk.env({"AUDIT_MOUNT_LOG": str(mount_log), "AUDIT_MARKER": str(marker),
+                           "AUDIT_ELSEWHERE": str(elsewhere)})
+    recovery_env.pop("ZIPFILE", None)
+    recovery_env.pop("OUTFD", None)
+
+    def recover(body, args=None):
+        marker.unlink(missing_ok=True)
+        mount_log.unlink(missing_ok=True)
+        util.write_text("MAGISK_VER_CODE=20400\n" + body)
+        return subprocess.run(["sh", str(installer), *(args if args is not None else
+                              ["3", "1", str(zipfile_path)])], cwd=root, env=recovery_env,
+                              capture_output=True, text=True, timeout=10)
+
+    body = 'install_module(){ touch "$AUDIT_MARKER"; }\n'
+    proc = recover(body + 'false\n')
+    reject(14, "failed Magisk utility loading stops installation", proc, not marker.exists())
+    proc = recover('install_module(){ sh -c \'[ -n "$ZIPFILE" ] && [ "$OUTFD" = 1 ]\'; }\n')
+    check("release19 15: recovery exports ZIPFILE and OUTFD", proc.returncode == 0, proc.stderr)
+    proc = recover(body, ["3"])
+    reject(16, "missing recovery arguments fail before mount/install", proc,
+           not marker.exists() and not mount_log.exists())
+    proc = recover('cd "$AUDIT_ELSEWHERE"\ninstall_module(){ [ -f "$ZIPFILE" ]; }\n',
+                   ["3", "1", "module.zip"])
+    check("release19 17: relative ZIP path survives utility directory changes",
+          proc.returncode == 0, proc.stdout + proc.stderr)
+    proc = recover(body, ["3", "1", str(root / "missing.zip")])
+    reject(18, "missing ZIP fails before installation", proc, not marker.exists())
+    proc = recover(body)
+    check("release19 recovery control: valid invocation installs", proc.returncode == 0
+          and marker.exists(), proc.stdout + proc.stderr)
+
+    # No network pushes: the conflicting Git context points at a local fixture.
+    git = shutil.which("git")
+    repo = root / "publisher"
+    foreign = root / "foreign"
+    repo.mkdir()
+    foreign.mkdir()
+    git_env = mk.env({"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"})
+    for key in list(git_env):
+        if key.startswith("GIT_") and key not in ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM"):
+            git_env.pop(key)
+    for path in (repo, foreign):
+        subprocess.run([git, "init", "-q", "-b", "main", str(path)], env=git_env, check=True)
+        subprocess.run([git, "-C", str(path), "-c", "user.name=Test", "-c",
+                        "user.email=test@example.invalid", "commit", "--allow-empty", "-qm", "fixture"],
+                       env=git_env, check=True)
+        subprocess.run([git, "-C", str(path), "remote", "add", "origin", "https://github.com/test/study.git"],
+                       env=git_env, check=True)
+    publisher = repo / "publish.sh"
+    shutil.copy(Path(REPO_ROOT) / "publish.sh", publisher)
+    push_log = root / "push.log"
+    write_exec(Path(mk.bindir) / "git", '#!/bin/sh\n'
+               'if [ "$1" = push ]; then echo push >> "$AUDIT_PUSH_LOG"; exit 0; fi\n'
+               'exec ' + shlex.quote(git) + ' "$@"\n')
+    proc = subprocess.run(["bash", str(publisher)],
+                          env={**git_env, "GIT_DIR": str(foreign / ".git"),
+                               "GIT_WORK_TREE": str(foreign), "AUDIT_PUSH_LOG": str(push_log)},
+                          capture_output=True, text=True, timeout=10)
+    reject(19, "foreign Git environment cannot publish a different checkout", proc,
+           not push_log.exists())
+
+
+def test_pr13_additional_forty_four(mk):
+    """44 separately corrupted release fixtures; real readelf, strings and unzip.
+
+    Never execute an archived script or ELF. The healthy control is compiled on
+    the host; mutations retain CRC-correct ZIPs to reach the release checks.
+    """
+    import struct
+    import zipfile
+    from pathlib import Path
+
+    root = Path(mk.root)
+    seed = root / "seed.so"
+    subprocess.run(["cc", "-shared", "-fPIC", "-s", "-Wl,-z,max-page-size=16384",
+                    "-x", "c", "-", "-o", str(seed)],
+                   input='#include <stdio.h>\nint fixture(void){return puts("fixture");}\n',
+                   text=True, capture_output=True, check=True, timeout=30)
+    original = seed.read_bytes()
+    assert original[4:6] == b"\x02\x01", "these mutation offsets require ELF64 LE"
+    phoff = struct.unpack_from("<Q", original, 32)[0]
+    phsize, phnum = struct.unpack_from("<HH", original, 54)
+    ph = [phoff + i * phsize for i in range(phnum)]
+    loads = [p for p in ph if struct.unpack_from("<I", original, p)[0] == 1]
+    dynamic = next(p for p in ph if struct.unpack_from("<I", original, p)[0] == 2)
+    stack = next(p for p in ph if struct.unpack_from("<I", original, p)[0] == 0x6474e551)
+    dynoff, dynsize = (struct.unpack_from("<Q", original, dynamic + n)[0] for n in (8, 32))
+    tags = {}
+    for p in range(dynoff, dynoff + dynsize, 16):
+        tag, value = struct.unpack_from("<QQ", original, p)
+        if tag == 0:
+            break
+        tags[tag] = (p, value)
+    def file_offset(address):
+        for p in loads:
+            offset, vaddr, _, filesz = struct.unpack_from("<QQQQ", original, p + 8)
+            if vaddr <= address < vaddr + filesz:
+                return offset + address - vaddr
+        raise AssertionError("fixture address is not file-backed")
+
+    source = (Path(REPO_ROOT) / "scripts/build_module.sh").read_text()
+    function = source.split("verify_zip() {", 1)[1].split("\n}\n", 1)[0]
+    runner = ('set -euo pipefail\nABI_LIST=(x86_64)\nverify_zip() {' + function
+              + '\n}\nverify_zip "$1" || exit 1\n')
+    archive = root / "release.zip"
+    prop = b"id=zygisk_study\nname=Study\nversion=1\nversionCode=1\nauthor=Test\ndescription=Fixture\n"
+    shell_names = ("customize.sh post-fs-data.sh service.sh uninstall.sh zs_compat.sh "
+                   "post-mount-hook.sh verify.sh META-INF/com/google/android/update-binary").split()
+    base = {name: b"#!/system/bin/sh\n:\n" for name in shell_names}
+    base.update({"module.prop": prop, "LICENSE": b"fixture license\n",
+                 "META-INF/com/google/android/updater-script": b"#MAGISK\n"})
+    for name in ("libzygisk.so", "libpayload.so", "libzn_loader.so", "zygiskd"):
+        base["libs/x86_64/" + name] = original
+    def run(elf=None, entries=None, extra=None, compression=zipfile.ZIP_STORED):
+        contents = dict(base)
+        if elf is not None:
+            contents["libs/x86_64/libzn_loader.so"] = elf
+        contents.update(entries or {})
+        with zipfile.ZipFile(archive, "w", compression=compression) as z:
+            for name, data in contents.items():
+                z.writestr(name, data)
+            if extra is not None:
+                z.writestr(*extra)
+        return subprocess.run(["bash", "-c", runner, "release44", str(archive)],
+                              env=mk.env({"REPO_ROOT": REPO_ROOT, "TOOLCHAIN": str(root),
+                                          "MODULE_DIR": str(root)}),
+                              capture_output=True, text=True, timeout=20)
+    control = run()
+    check("PR13 +44 control: real stripped host ELF verifies", control.returncode == 0,
+          control.stdout + control.stderr)
+    def reject(number, label, **kwargs):
+        proc = run(**kwargs)
+        check(f"PR13 +44 {number:02d}: {label}", proc.returncode != 0,
+              proc.stdout + proc.stderr)
+    def patch(*changes):
+        data = bytearray(original)
+        for offset, fmt, value in changes:
+            struct.pack_into("<" + fmt, data, offset, value)
+        return data
+    def tag_value(tag, value):
+        return patch((tags[tag][0] + 8, "Q", value))
+
+    reject(1, "LOAD file range cannot extend past EOF", elf=patch((loads[-1] + 32, "Q", len(original))))
+    reject(2, "LOAD file size cannot exceed memory size", elf=patch((loads[-1] + 40, "Q", 1)))
+    reject(3, "LOAD virtual address range cannot overflow", elf=patch((loads[-1] + 16, "Q", 2**64 - 1)))
+    reject(4, "LOAD file and virtual page offsets must agree", elf=patch((loads[-1] + 16, "Q", 0x8001)))
+    reject(5, "LOAD virtual memory ranges cannot overlap", elf=patch((loads[-1] + 16, "Q", 0)))
+    data = bytearray(original)
+    a, b = loads[:2]
+    data[a:a + phsize], data[b:b + phsize] = data[b:b + phsize], data[a:a + phsize]
+    reject(6, "LOAD records must be in ascending virtual order", elf=data)
+    reject(7, "release ELF must not request an executable stack", elf=patch((stack + 4, "I", 7)))
+    reject(8, "release LOAD cannot be simultaneously writable and executable", elf=patch((loads[1] + 4, "I", 7)))
+    reject(9, "a shared library must contain a dynamic segment", elf=patch((dynamic, "I", 0)))
+    reject(10, "dynamic file range must be within the artifact", elf=patch((dynamic + 32, "Q", len(original))))
+    reject(11, "dynamic segment virtual range must be mapped", elf=patch((dynamic + 16, "Q", 0x10000000)))
+    reject(12, "dynamic segment size must contain whole entries", elf=patch((dynamic + 32, "Q", dynsize - 1)))
+    data = bytearray(original)
+    for p in range(dynoff, dynoff + dynsize, 16):
+        if struct.unpack_from("<Q", data, p)[0] == 0:
+            struct.pack_into("<QQ", data, p, 21, 0)
+    reject(13, "dynamic table must terminate with DT_NULL", elf=data)
+    reject(14, "singleton dynamic tags cannot conflict", elf=patch((tags[12][0], "Q", 5)))
+    reject(15, "DT_STRTAB is required", elf=patch((tags[5][0], "Q", 21)))
+    reject(16, "DT_STRSZ is required", elf=patch((tags[10][0], "Q", 21)))
+    reject(17, "dynamic string table must be mapped", elf=tag_value(5, 0x10000000))
+    reject(18, "dynamic string table must be completely file-backed", elf=tag_value(10, len(original)))
+    reject(19, "DT_NEEDED offsets must be inside the string table", elf=tag_value(1, tags[10][1]))
+    data = bytearray(original)
+    strings_offset = file_offset(tags[5][1])
+    start, end = strings_offset + tags[1][1], strings_offset + tags[10][1]
+    data[start:end] = b"x" * (end - start)
+    reject(20, "DT_NEEDED names must have a NUL terminator", elf=data)
+    reject(21, "DT_NEEDED cannot name an empty library", elf=tag_value(1, 0))
+    data = bytearray(original)
+    data[start] = ord("/")
+    reject(22, "DT_NEEDED cannot bake in a filesystem path", elf=data)
+    reject(23, "DT_SYMENT must match the ELF symbol width", elf=tag_value(11, 1))
+    reject(24, "DT_SYMTAB must point at file-backed memory", elf=tag_value(6, 0x10000000))
+    reject(25, "DT_RELAENT must match the ELF relocation width", elf=tag_value(9, 1))
+    reject(26, "DT_RELASZ must contain whole relocations", elf=tag_value(8, tags[8][1] - 1))
+    reject(27, "dynamic relocations must be fully file-backed", elf=tag_value(7, 0x10000000))
+    reject(28, "DT_INIT must point into an executable segment", elf=tag_value(12, 0x10000000))
+    reject(29, "initializer array size must contain whole pointers", elf=tag_value(27, 1))
+    reject(30, "initializer array must be completely file-backed", elf=tag_value(25, 0x10000000))
+    reject(31, "DT_TEXTREL is rejected for Android API 23+", elf=patch((tags[12][0], "Q", 22)))
+    reject(32, "DF_TEXTREL cannot bypass text-relocation rejection", elf=patch((tags[12][0], "Q", 30), (tags[12][0] + 8, "Q", 4)))
+    marker = "META-INF/com/google/android/updater-script"
+    reject(33, "NUL cannot disappear from the Magisk marker", entries={marker: b"#MAG\x00ISK\n"})
+    reject(34, "blank lines cannot disappear from the Magisk marker", entries={marker: b"#MAGISK\n\n"})
+    reject(35, "shell files cannot contain binary NUL bytes", entries={"service.sh": b"#!/system/bin/sh\n:\x00\n"})
+    reject(36, "CRLF scripts cannot ship broken Android shebangs", entries={"service.sh": b"#!/system/bin/sh\r\n:\r\n"})
+    reject(37, "installer shell syntax errors fail before publication", entries={"customize.sh": b"if then\n"})
+    reject(38, "control bytes cannot corrupt module metadata", entries={"module.prop": prop.replace(b"name=Study", b"name=Study\r")})
+    info = zipfile.ZipInfo("extras/")
+    info.create_system = 3
+    info.external_attr = (stat.S_IFREG | 0o644) << 16
+    reject(39, "ZIP directory names cannot claim regular-file attributes", extra=(info, b""))
+    reject(40, "recovery-incompatible bzip2 ZIP compression is refused", compression=zipfile.ZIP_BZIP2)
+    reject(41, "release cannot accidentally ship the disable marker", extra=("disable", b""))
+    reject(42, "release cannot accidentally ship the remove marker", extra=("remove", b""))
+    reject(43, "release cannot disable its required system mount", extra=("skip_mount", b""))
+    reject(44, "per-install loader state cannot be reused in a release", extra=(".loader_names", b"bridge=libold.so\n"))
+    control = run(compression=zipfile.ZIP_DEFLATED)
+    check("PR13 +44 control: recovery-compatible deflate remains supported",
+          control.returncode == 0, control.stdout + control.stderr)
+    control = run(entries={marker: b"#MAGISK\r\n", "service.sh": b":"})
+    check("PR13 +44 control: CRLF marker and shell without final newline are valid",
+          control.returncode == 0, control.stdout + control.stderr)
+    # Exercise both parser widths and all CPU metadata, without requiring a
+    # cross compiler locally. CI additionally verifies all four real NDK builds.
+    parser = source.split("<<'PY_VERIFY_RELEASE'\n", 1)[1].split("\nPY_VERIFY_RELEASE", 1)[0]
+    namespace = {}
+    exec(parser.split("\ntry:\n    verify_archive", 1)[0], namespace)
+    for cls, machine, abi in ((1, 3, "x86"), (1, 40, "armeabi-v7a"),
+                              (2, 62, "x86_64"), (2, 183, "arm64-v8a")):
+        namespace["verify_elf"](release_elf_fixture(cls, machine))
+        check("PR13 +44 control: structural " + abi + " ELF accepted", True)
+
+
+def test_pr13_symbol_and_segment_regressions(mk):
+    """41 new validation defects, each reproduced for four ABIs (164 cases).
+
+    Count validation defects, NOT their ABI repetitions. Fixtures are structural
+    data, never executed. Every mutation is checked through the complete ZIP
+    gate and must fail for its specific diagnostic, not some unrelated check.
+    """
+    import struct
+    import zipfile
+    from pathlib import Path
+
+    root = Path(mk.root)
+    source = (Path(REPO_ROOT) / "scripts/build_module.sh").read_text()
+    function = source.split("verify_zip() {", 1)[1].split("\n}\n", 1)[0]
+    runner = ('set -euo pipefail\nABI_LIST=("$2")\nverify_zip() {' + function
+              + '\n}\nverify_zip "$1" || exit 1\n')
+    archive = root / "symbols.zip"
+    env = mk.env({"REPO_ROOT": REPO_ROOT, "TOOLCHAIN": str(root), "MODULE_DIR": str(root)})
+    base = {name: b"#!/system/bin/sh\n:\n" for name in (
+        "customize.sh post-fs-data.sh service.sh uninstall.sh zs_compat.sh "
+        "post-mount-hook.sh verify.sh META-INF/com/google/android/update-binary").split()}
+    base.update({"LICENSE": b"fixture\n", "module.prop":
+                 b"id=zygisk_study\nname=Study\nversion=1\nversionCode=1\nauthor=Test\ndescription=Fixture\n",
+                 "META-INF/com/google/android/updater-script": b"#MAGISK\n"})
+
+    def verify(data, abi, control):
+        with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as z:
+            for name, contents in base.items():
+                z.writestr(name, contents)
+            for name in ("libzygisk.so", "libpayload.so", "libzn_loader.so", "zygiskd"):
+                z.writestr("libs/" + abi + "/" + name,
+                           data if name == "libzn_loader.so" else control)
+        return subprocess.run(["bash", "-c", runner, "symbol-regressions", str(archive), abi],
+                              env=env, capture_output=True, text=True, timeout=20)
+
+    for cls, machine, abi in ((1, 3, "x86"), (1, 40, "armeabi-v7a"),
+                              (2, 62, "x86_64"), (2, 183, "arm64-v8a")):
+        wide = cls == 2
+        word, ehsize, phsize, symsize = (8, 64, 56, 24) if wide else (4, 52, 32, 16)
+        uint = "Q" if wide else "I"
+        original = bytearray(2048)
+        original[:7] = b"\x7fELF" + bytes((cls, 1, 1))
+        struct.pack_into("<HHI", original, 16, 3, machine, 1)
+        struct.pack_into("<" + uint, original, 32 if wide else 28, ehsize)
+        struct.pack_into("<HHH", original, 52 if wide else 40, ehsize, phsize, 6)
+        interpreter = b"/system/bin/linker" + (b"64" if wide else b"") + b"\0"
+        segments = (
+            (1, 5, 0, 0, len(original), 4096, 0x4000),
+            (2, 4, 512, 512, 8 * word * 2, 8 * word * 2, word),
+            (7, 4, 1728, 1728, 4, 8, 4),
+            (3, 4, 1664, 1664, len(interpreter), len(interpreter), 1),
+            (6, 4, ehsize, ehsize, 6 * phsize, 6 * phsize, word),
+            (0x6474e552, 4, 1728, 1728, 16, 16, 1),
+        )
+        for i, (kind, flags, off, addr, filesz, memsz, align) in enumerate(segments):
+            values = ((kind, flags, off, addr, addr, filesz, memsz, align) if wide else
+                      (kind, off, addr, addr, filesz, memsz, flags, align))
+            struct.pack_into("<IIQQQQQQ" if wide else "<IIIIIIII", original,
+                             ehsize + i * phsize, *values)
+        tags = {tag: 512 + i * word * 2 for i, tag in enumerate((5, 10, 6, 11, 4, 0x6ffffef5, 21, 0))}
+        for tag, value in ((5, 1600), (10, 9), (6, 1280), (11, symsize),
+                           (4, 1024), (0x6ffffef5, 1104), (21, 0), (0, 0)):
+            struct.pack_into("<" + uint * 2, original, tags[tag], tag, value)
+        struct.pack_into("<IIIIII", original, 1024, 1, 3, 1, 0, 2, 0)
+        struct.pack_into("<IIII", original, 1104, 1, 1, 1, 5)
+        struct.pack_into("<" + uint, original, 1120, (1 << (word * 8)) - 1)
+        bucket = 1120 + word
+        chain = bucket + 4
+        struct.pack_into("<III", original, bucket, 1, 0x1234, 0x5679)
+        struct.pack_into("<I", original, 1280 + symsize, 1)
+        struct.pack_into("<I", original, 1280 + 2 * symsize, 5)
+        original[1600:1609] = b"\0foo\0bar\0"
+        original[1664:1664 + len(interpreter)] = interpreter
+        # Fields within a program header differ between ELF32 and ELF64.
+        fields = ({"offset": 8, "address": 16, "filesz": 32, "memsz": 40, "align": 48} if wide else
+                  {"offset": 4, "address": 8, "filesz": 16, "memsz": 20, "align": 28})
+
+        def patch(*changes):
+            data = bytearray(original)
+            for off, fmt, value in changes:
+                struct.pack_into("<" + fmt, data, off, value)
+            return data
+
+        def tag_value(tag, value):
+            return (tags[tag] + word, uint, value)
+
+        def field(segment, name, value):
+            return (ehsize + segment * phsize + fields[name], uint, value)
+
+        def kind(segment, value):
+            return (ehsize + segment * phsize, "I", value)
+
+        cases = [
+            ("missing symbol hash", "missing symbol hash", patch((tags[4], uint, 21), (tags[0x6ffffef5], uint, 21))),
+            ("unmapped SysV hash header", "SysV hash header", patch(tag_value(4, 4096))),
+            ("zero SysV buckets", "SysV bucket count", patch((1024, "I", 0))),
+            ("zero SysV symbol count", "SysV symbol count", patch((1028, "I", 0))),
+            ("truncated SysV hash arrays", "SysV hash arrays", patch((1024, "I", 512))),
+            ("SysV bucket index out of bounds", "SysV bucket index", patch((1032, "I", 3))),
+            ("SysV chain index out of bounds", "SysV chain index", patch((1040, "I", 3))),
+            ("cyclic SysV lookup chain", "SysV hash cycle", patch((1040, "I", 1))),
+            ("unmapped GNU hash header", "GNU hash header", patch(tag_value(0x6ffffef5, 4096))),
+            ("zero GNU buckets", "GNU bucket count", patch((1104, "I", 0))),
+            ("zero GNU bloom words", "GNU bloom size", patch((1112, "I", 0))),
+            ("non-power-of-two GNU bloom", "GNU bloom size", patch((1112, "I", 3))),
+            ("undefined GNU bloom shift", "GNU bloom shift", patch((1116, "I", 32))),
+            ("truncated GNU bloom and buckets", "GNU hash prefix", patch((1112, "I", 1024))),
+            ("GNU bucket before symbol offset", "GNU bucket index", patch((1108, "I", 2))),
+            ("unmapped GNU lookup chain", "GNU hash chain", patch((bucket, "I", 10000))),
+            ("disagreeing SysV and GNU symbol counts", "symbol counts disagree", patch((1028, "I", 4))),
+            ("truncated full dynamic symbol table", "dynamic symbol table extent", patch(tag_value(6, len(original) - symsize))),
+            ("nonzero reserved null symbol", "reserved null symbol", patch((1280, "I", 1))),
+            ("symbol name offset outside string table", "symbol name offset", patch((1280 + symsize, "I", 9))),
+            ("missing initial string-table NUL", "string table must start", patch((1600, "B", 120))),
+            ("missing final string-table NUL", "string table must end", patch((1608, "B", 120))),
+            ("duplicate DT_HASH", "duplicate singleton", patch((tags[21], uint, 4), tag_value(21, 1024))),
+            ("duplicate DT_GNU_HASH", "duplicate singleton", patch((tags[21], uint, 0x6ffffef5), tag_value(21, 1104))),
+            ("dynamic file size exceeds memory size", "dynamic filesz exceeds memsz", patch(field(1, "memsz", 1))),
+            ("TLS file size exceeds memory size", "TLS filesz exceeds memsz", patch(field(2, "memsz", 1))),
+            ("TLS initialization extends past EOF", "TLS file range", patch(field(2, "offset", len(original)))),
+            ("TLS file and virtual addresses disagree", "TLS file/virtual", patch(field(2, "address", 1732))),
+            ("invalid TLS alignment", "TLS alignment", patch(field(2, "align", 3))),
+            ("TLS virtual range overflow", "TLS address overflow", patch(field(2, "address", (1 << (word * 8)) - 4))),
+            ("duplicate TLS segment", "duplicate TLS", patch(kind(5, 7))),
+            ("interpreter bytes extend past EOF", "interpreter file range", patch(field(3, "offset", len(original)))),
+            ("unterminated interpreter", "interpreter terminator", patch((1664 + len(interpreter) - 1, "B", 120))),
+            ("embedded interpreter NUL", "interpreter embedded NUL", patch((1665, "B", 0))),
+            ("relative interpreter path", "interpreter must be absolute", patch((1664, "B", 120))),
+            ("duplicate interpreter segment", "duplicate interpreter", patch(kind(5, 3))),
+            ("duplicate PHDR segment", "duplicate PHDR", patch(kind(5, 6))),
+            ("PHDR does not describe the program table", "PHDR table range", patch(field(4, "filesz", phsize))),
+            ("PHDR file and virtual addresses disagree", "PHDR file/virtual", patch(field(4, "address", ehsize + 4))),
+            ("RELRO covers unmapped memory", "RELRO memory range", patch(field(5, "address", 8192))),
+            ("entry point is not executable file-backed code", "entry point", patch((24, uint, 8192))),
+        ]
+        assert len(cases) == 41
+        control = verify(original, abi, original)
+        check("PR13 +41 control: complete " + abi + " archive", control.returncode == 0,
+              control.stdout + control.stderr)
+        for number, (label, diagnostic, data) in enumerate(cases, 1):
+            proc = verify(data, abi, original)
+            check(f"PR13 +41 {number:02d} [{abi}]: {label}",
+                  proc.returncode != 0 and diagnostic in proc.stderr, proc.stdout + proc.stderr)
+        # Single-hash binaries and the GNU table's legitimate empty-bucket form
+        # are supported too. No section headers are present in any fixture.
+        for label, data in (
+                ("SysV only", patch((tags[0x6ffffef5], uint, 21))),
+                ("GNU only", patch((tags[4], uint, 21))),
+                ("empty GNU bucket", patch((bucket, "I", 0), (1108, "I", 3))),
+                ("zero-filled TLS", patch(field(2, "filesz", 0))),
+                ("Thumb entry" if machine == 40 else "valid entry", patch((24, uint, 1025 if machine == 40 else 1024)))):
+            proc = verify(data, abi, original)
+            check("PR13 +41 control: " + abi + " " + label, proc.returncode == 0,
+                  proc.stdout + proc.stderr)
+
+
 def main():
     cases = [
+        ("PR #13: 41 symbol/segment defects across four ABIs", test_pr13_symbol_and_segment_regressions),
+        ("PR #13: 44 additional release regressions", test_pr13_additional_forty_four),
+        ("Nineteen release, recovery and publishing regressions", test_release_and_recovery_nineteen),
         ("PR #12 assertion and build regressions", test_assertion_and_build_regressions),
         ("PR #11 final audit: nine further regressions", test_final_nine_regressions),
         ("PR #11 completion: nine NEW regressions", test_pr11_completion_regressions),

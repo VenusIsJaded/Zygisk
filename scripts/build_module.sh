@@ -488,8 +488,303 @@ verify_zip() {
     (
     local zip_path="$1"
     unset UNZIP UNZIPOPT ZIPINFO ZIPINFOOPT
+    export LC_ALL=C
     echo "== Verifying the zip"
     local fail=0
+
+    # readelf can exit successfully even while describing an unloadable ELF.
+    # Validate byte ranges and loader contracts ourselves, without executing any
+    # archived code. Python's ZIP reader also preserves bytes that shell command
+    # substitution discards and exposes compression and file-kind metadata.
+    if ! python3 - "$zip_path" "${ABI_LIST[@]}" <<'PY_VERIFY_RELEASE'
+import stat
+import struct
+import subprocess
+import sys
+import zipfile
+
+
+def require(ok, message):
+    if not ok:
+        raise ValueError(message)
+
+
+def verify_elf(data):
+    require(len(data) >= 52 and data[:4] == b"\x7fELF", "missing ELF header")
+    require(data[4] in (1, 2) and data[5:7] == b"\x01\x01", "unsupported ELF encoding")
+    wide = data[4] == 2
+    word, ehsize, phsize = (8, 64, 56) if wide else (4, 52, 32)
+    require(len(data) >= ehsize, "truncated ELF header")
+    phoff = struct.unpack_from("<Q" if wide else "<I", data, 32 if wide else 28)[0]
+    declared, count = struct.unpack_from("<HH", data, 54 if wide else 42)
+    require(declared == phsize and count > 0 and phoff >= ehsize
+            and phoff + count * phsize <= len(data), "invalid program-header table")
+    segments = []
+    for i in range(count):
+        values = struct.unpack_from("<IIQQQQQQ" if wide else "<IIIIIIII", data, phoff + i * phsize)
+        if wide:
+            kind, flags, offset, address, _, filesz, memsz, align = values
+        else:
+            kind, offset, address, _, filesz, memsz, flags, align = values
+        segments.append((kind, flags, offset, address, filesz, memsz, align))
+    loads = [s for s in segments if s[0] == 1]
+    require(loads, "missing LOAD segment")
+    previous_end = 0
+    for _, flags, offset, address, filesz, memsz, align in loads:
+        require(offset + filesz <= len(data), "LOAD file range exceeds EOF")
+        require(filesz <= memsz, "LOAD filesz exceeds memsz")
+        require(address + memsz < 1 << (word * 8), "LOAD address overflow")
+        require(align >= 0x4000 and align & (align - 1) == 0,
+                "invalid LOAD alignment (requires power of two >= 16 KB)")
+        require(offset % align == address % align, "LOAD page offsets disagree")
+        require(address >= previous_end, "overlapping or out-of-order LOAD segments")
+        previous_end = address + memsz
+        require(flags & 3 != 3, "writable executable LOAD segment")
+    require(not any(s[0] == 0x6474e551 and s[1] & 1 for s in segments), "executable stack")
+
+    def mapped(address, size, context="dynamic address range"):
+        for _, _, offset, base, filesz, _, _ in loads:
+            if base <= address and address + size <= base + filesz:
+                return offset + address - base
+        raise ValueError(context + " is not file-backed")
+
+    # Segment metadata is consumed independently of section headers by the
+    # kernel/linker. A valid LOAD table does not make these ranges valid.
+    def unique_segment(kind, label):
+        matches = [s for s in segments if s[0] == kind]
+        require(len(matches) <= 1, "duplicate " + label + " segment")
+        return matches[0] if matches else None
+
+    tls = unique_segment(7, "TLS")
+    if tls:
+        _, _, offset, address, filesz, memsz, align = tls
+        require(filesz <= memsz, "TLS filesz exceeds memsz")
+        require(address + memsz < 1 << (word * 8), "TLS address overflow")
+        require(offset + filesz <= len(data), "TLS file range exceeds EOF")
+        require(align in (0, 1) or align & (align - 1) == 0, "invalid TLS alignment")
+        # A pure .tbss template has no initialization bytes to map. Its memory
+        # size describes per-thread storage, not an ordinary LOAD allocation.
+        if filesz:
+            require(mapped(address, filesz, "TLS file/virtual range") == offset,
+                    "TLS file/virtual ranges disagree")
+
+    interp = unique_segment(3, "interpreter")
+    if interp:
+        _, _, offset, _, filesz, _, _ = interp
+        require(filesz >= 2 and offset + filesz <= len(data), "invalid interpreter file range")
+        name = data[offset:offset + filesz]
+        require(name[-1:] == b"\0", "missing interpreter terminator")
+        require(b"\0" not in name[:-1], "interpreter embedded NUL")
+        require(name.startswith(b"/"), "interpreter must be absolute")
+
+    phdr = unique_segment(6, "PHDR")
+    if phdr:
+        _, _, offset, address, filesz, memsz, _ = phdr
+        require(offset == phoff and filesz == memsz == count * phsize, "invalid PHDR table range")
+        require(mapped(address, filesz, "PHDR file/virtual range") == offset,
+                "PHDR file/virtual ranges disagree")
+
+    for _, _, _, address, _, memsz, _ in (s for s in segments if s[0] == 0x6474e552):
+        # RELRO may cover several adjacent LOAD records; do not assume it is
+        # contained in just one. Check the unrounded range before page protection.
+        cursor = address
+        end = address + memsz
+        for _, _, _, base, _, load_memsz, _ in loads:
+            if base <= cursor < base + load_memsz:
+                cursor = min(end, base + load_memsz)
+            if cursor == end:
+                break
+        require(cursor == end, "unmapped RELRO memory range")
+
+    entry = struct.unpack_from("<Q" if wide else "<I", data, 24)[0]
+    if entry:
+        address = entry & ~1 if data[18:20] == b"\x28\0" else entry
+        require(any(s[1] & 1 and s[3] <= address < s[3] + s[4] for s in loads),
+                "entry point is not executable file-backed code")
+
+    dynamics = [s for s in segments if s[0] == 2]
+    require(len(dynamics) == 1, "exactly one dynamic segment required")
+    _, _, offset, address, size, memsz, _ = dynamics[0]
+    entry_size = word * 2
+    require(size <= memsz, "dynamic filesz exceeds memsz")
+    require(size > 0 and offset + size <= len(data), "dynamic segment exceeds EOF")
+    require(mapped(address, size) == offset, "dynamic segment file/virtual ranges disagree")
+    require(size % entry_size == 0, "partial dynamic entry")
+    tags = {}
+    needed = []
+    terminated = False
+    # Only tags with singleton semantics that we consume are constrained here;
+    # DT_NEEDED and unrelated vendor-specific/repeatable tags remain legal.
+    singletons = {2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 17, 18, 19, 20, 22, 23,
+                  25, 26, 27, 28, 30, 32, 33, 35, 36, 37, 0x6ffffef5}
+    for pos in range(offset, offset + size, entry_size):
+        tag, value = struct.unpack_from("<QQ" if wide else "<II", data, pos)
+        if tag == 0:
+            terminated = True
+            break
+        if tag == 1:
+            needed.append(value)
+        if tag in singletons:
+            require(tag not in tags, "duplicate singleton dynamic tag")
+        tags[tag] = value
+    require(terminated, "missing DT_NULL terminator")
+    require(22 not in tags and not tags.get(30, 0) & 4, "Android-incompatible text relocations")
+    require(5 in tags and 10 in tags and tags[10] > 0, "missing dynamic string table")
+    strings = mapped(tags[5], tags[10])
+    for index in needed:
+        require(index < tags[10], "DT_NEEDED offset exceeds string table")
+        end = data.find(b"\0", strings + index, strings + tags[10])
+        require(end >= 0, "unterminated DT_NEEDED name")
+        name = data[strings + index:end]
+        require(name and b"/" not in name, "empty or path-dependent DT_NEEDED name")
+    symbol_size = 24 if wide else 16
+    require(tags.get(11) == symbol_size and 6 in tags, "invalid dynamic symbol entry size/table")
+    mapped(tags[6], symbol_size)
+    require(data[strings] == 0, "dynamic string table must start with NUL")
+    require(data[strings + tags[10] - 1] == 0, "dynamic string table must end with NUL")
+
+    # DT_SYMTAB has no byte-size tag. Derive its extent from the hash tables
+    # used for runtime lookup, not optional/strippable section headers. Bounds
+    # are checked before allocating arrays or traversing attacker-sized chains.
+    gnu_hash = 0x6ffffef5
+    require(4 in tags or gnu_hash in tags, "missing symbol hash table")
+    sysv_count = None
+    if 4 in tags:
+        header = mapped(tags[4], 8, "SysV hash header")
+        buckets_count, sysv_count = struct.unpack_from("<II", data, header)
+        require(buckets_count > 0, "invalid SysV bucket count")
+        require(sysv_count > 0, "invalid SysV symbol count")
+        table = mapped(tags[4], (2 + buckets_count + sysv_count) * 4, "SysV hash arrays")
+        buckets = struct.unpack_from("<" + "I" * buckets_count, data, table + 8)
+        chains = struct.unpack_from("<" + "I" * sysv_count, data, table + 8 + buckets_count * 4)
+        require(all(index < sysv_count for index in buckets), "invalid SysV bucket index")
+        require(all(index < sysv_count for index in chains), "invalid SysV chain index")
+        # Visit each node once, even if many buckets share a suffix. Checking
+        # chains by restarting every bucket can become quadratic on bad input.
+        state = bytearray(sysv_count)
+        state[0] = 2
+        for start in range(1, sysv_count):
+            index = start
+            path = []
+            while state[index] == 0:
+                state[index] = 1
+                path.append(index)
+                index = chains[index]
+            require(state[index] != 1, "SysV hash cycle")
+            for index in path:
+                state[index] = 2
+
+    gnu_count = None
+    gnu_complete = False
+    if gnu_hash in tags:
+        header = mapped(tags[gnu_hash], 16, "GNU hash header")
+        buckets_count, first_symbol, bloom_count, shift = struct.unpack_from("<IIII", data, header)
+        require(buckets_count > 0, "invalid GNU bucket count")
+        require(bloom_count > 0 and bloom_count & (bloom_count - 1) == 0, "invalid GNU bloom size")
+        require(shift < 32, "invalid GNU bloom shift")
+        prefix_size = 16 + bloom_count * word + buckets_count * 4
+        prefix = mapped(tags[gnu_hash], prefix_size, "GNU hash prefix")
+        buckets = struct.unpack_from("<" + "I" * buckets_count, data, prefix + 16 + bloom_count * word)
+        require(all(index == 0 or index >= first_symbol for index in buckets), "invalid GNU bucket index")
+        last_bucket = max(buckets)
+        gnu_count = first_symbol
+        if last_bucket:
+            # All earlier chains are file-backed and eventually terminate if
+            # the chain starting at the greatest bucket index does. This also
+            # avoids repeatedly walking shared/overlapping bucket suffixes.
+            chain_address = tags[gnu_hash] + prefix_size + (last_bucket - first_symbol) * 4
+            position = mapped(chain_address, 4, "GNU hash chain")
+            available = next(s[3] + s[4] - chain_address for s in loads
+                             if s[3] <= chain_address < s[3] + s[4])
+            for i in range(available // 4):
+                value = struct.unpack_from("<I", data, position + i * 4)[0]
+                if value & 1:
+                    gnu_count = last_bucket + i + 1
+                    gnu_complete = True
+                    break
+            require(gnu_complete, "unterminated GNU hash chain")
+        if sysv_count is not None:
+            # An empty GNU hash provides only a lower bound: some linkers
+            # retain unhashable undefined symbols beyond its symbol offset.
+            require(sysv_count == gnu_count if gnu_complete else sysv_count >= gnu_count,
+                    "SysV and GNU symbol counts disagree")
+
+    symbol_count = sysv_count if sysv_count is not None else max(1, gnu_count)
+    symbols = mapped(tags[6], symbol_count * symbol_size, "dynamic symbol table extent")
+    require(not any(data[symbols:symbols + symbol_size]), "nonzero reserved null symbol")
+    for index in range(1, symbol_count):
+        name = struct.unpack_from("<I", data, symbols + index * symbol_size)[0]
+        require(name < tags[10], "dynamic symbol name offset exceeds string table")
+    # The final NUL check above ensures every in-range name is terminated.
+
+    # Conventional REL/RELA and RELR tables. Android packed relocations use a
+    # different encoding and are deliberately not interpreted as fixed records.
+    for address_tag, size_tag, entry_tag, expected in (
+            (7, 8, 9, word * 3), (17, 18, 19, word * 2), (36, 35, 37, word)):
+        if any(tag in tags for tag in (address_tag, size_tag, entry_tag)):
+            require(address_tag in tags and size_tag in tags and tags.get(entry_tag) == expected,
+                    "invalid relocation table/entry size")
+            require(tags[size_tag] % expected == 0, "partial relocation entry")
+            mapped(tags[address_tag], tags[size_tag])
+    if 23 in tags or 2 in tags:
+        require(23 in tags and 2 in tags and tags.get(20) in (7, 17), "invalid PLT relocation table")
+        expected = word * (3 if tags[20] == 7 else 2)
+        require(tags[2] % expected == 0, "partial PLT relocation entry")
+        mapped(tags[23], tags[2])
+    for tag in (12, 13):
+        if tags.get(tag, 0):
+            # ARM32 function pointers may carry the Thumb instruction-set bit.
+            address = tags[tag] & ~1 if data[18:20] == b"\x28\0" else tags[tag]
+            require(any(s[1] & 1 and s[3] <= address < s[3] + s[4] for s in loads),
+                    "initializer/finalizer is not executable file-backed code")
+    for address_tag, size_tag in ((25, 27), (26, 28), (32, 33)):
+        if address_tag in tags or size_tag in tags:
+            require(address_tag in tags and size_tag in tags and tags[size_tag] % word == 0,
+                    "invalid initializer/finalizer array size")
+            mapped(tags[address_tag], tags[size_tag])
+
+
+def verify_archive(path, abis):
+    with zipfile.ZipFile(path) as archive:
+        for info in archive.infolist():
+            require(info.compress_type in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED),
+                    "compression not supported by Android recovery")
+            kind = stat.S_IFMT(info.external_attr >> 16) if info.create_system == 3 else 0
+            require(kind != stat.S_IFLNK, "symlink archive member")
+            require(kind == 0 or (kind == stat.S_IFDIR if info.is_dir() else kind == stat.S_IFREG),
+                    "archive file-kind/name mismatch")
+            require(info.filename not in ("disable", "remove", "skip_mount", ".loader_names"),
+                    "per-install state must not be shipped: " + info.filename)
+        marker = archive.read("META-INF/com/google/android/updater-script")
+        require(marker in (b"#MAGISK", b"#MAGISK\n", b"#MAGISK\r\n"), "invalid Magisk marker bytes")
+        prop = archive.read("module.prop")
+        require(not any(c < 32 and c != 10 or c == 127 for c in prop), "control bytes in module.prop")
+        scripts = ("customize.sh post-fs-data.sh service.sh uninstall.sh zs_compat.sh "
+                   "post-mount-hook.sh verify.sh META-INF/com/google/android/update-binary").split()
+        for name in scripts:
+            text = archive.read(name)
+            require(b"\0" not in text and b"\r" not in text, "binary/CRLF shell file: " + name)
+            syntax = subprocess.run(["sh", "-n"], input=text, capture_output=True, timeout=15)
+            require(syntax.returncode == 0, "shell syntax error: " + name)
+        for abi in abis:
+            for name in ("libzygisk.so", "libpayload.so", "libzn_loader.so", "zygiskd"):
+                path = "libs/" + abi + "/" + name
+                try:
+                    verify_elf(archive.read(path))
+                except ValueError as error:
+                    raise ValueError(path + ": " + str(error)) from error
+
+
+try:
+    verify_archive(sys.argv[1], sys.argv[2:])
+except (OSError, ValueError, KeyError, RuntimeError, struct.error,
+        zipfile.BadZipFile, subprocess.SubprocessError) as error:
+    print("  FAIL: release structure: " + str(error), file=sys.stderr)
+    sys.exit(1)
+PY_VERIFY_RELEASE
+    then
+        return 1
+    fi
 
     # Directory listings alone do not validate compressed data or CRCs.
     if ! unzip -tq "$zip_path" >/dev/null; then
@@ -506,6 +801,30 @@ verify_zip() {
     fi
     if grep -Eq '(^/|(^|/)\.\.?(/|$)|//|\\)' <<< "$listing"; then
         echo "  FAIL: unsafe or non-canonical archive member path" >&2
+        return 1
+    fi
+
+    # Control bytes are not portable archive names (Info-ZIP may display
+    # them as caret escapes). Reject those escapes too: the listing must
+    # describe exactly the names an installer will extract.
+    if grep -Eq '[[:cntrl:]]|\^' <<< "$listing"; then
+        echo "  FAIL: control or escaped characters in archive member path" >&2
+        return 1
+    fi
+    # A ZIP can store both 'file' and 'file/child'. Listing either entry
+    # succeeds, but extraction cannot materialize both on a filesystem.
+    if ! awk '
+        { name = $0; dir = sub(/\/$/, "", name)
+          if (name in kinds && kinds[name] != dir) bad = 1
+          kinds[name] = dir }
+        END { for (name in kinds) {
+                  parent = name
+                  while (sub(/\/[^/]+$/, "", parent))
+                      if (parent in kinds && !kinds[parent]) bad = 1
+              }
+              exit bad ? 1 : 0 }
+    ' <<< "$listing"; then
+        echo "  FAIL: conflicting file/directory archive paths" >&2
         return 1
     fi
 
@@ -535,6 +854,10 @@ verify_zip() {
         echo "  FAIL: symlink archive member" >&2
         return 1
     fi
+    if grep -Eq '^[bcps]' <<< "$attributes"; then
+        echo "  FAIL: special-file archive member" >&2
+        return 1
+    fi
 
     # 1. The files the installer needs. customize.sh is SOURCED by
     #    Magisk's install_module after extracting everything except
@@ -545,13 +868,24 @@ verify_zip() {
         if ! grep -Fxq -- "$f" <<< "$listing"; then
             echo "  FAIL: missing required file: $f" >&2
             fail=1
+        elif ! bytes="$(unzip -p "$zip_path" "$f" | wc -c)" || [[ "$bytes" -eq 0 ]]; then
+            echo "  FAIL: empty or unreadable required file: $f" >&2
+            fail=1
         fi
     done
 
     # 2. module.prop sanity: the documented strict format (id, name,
     #    version, versionCode[=integer], author, description).
     local prop
-    prop="$(unzip -p "$zip_path" module.prop)"
+    # Bash removes NUL bytes in command substitutions, potentially turning
+    # corrupt metadata into an apparently valid but different module ID.
+    if ! unzip -p "$zip_path" module.prop | od -An -v -tu1 | awk '
+        { for (i = 1; i <= NF; i++) if ($i == 0) exit 1 }
+    '; then
+        echo "  FAIL: binary or unreadable module.prop" >&2
+        return 1
+    fi
+    prop="$(unzip -p "$zip_path" module.prop)" || return 1
     # Read values after the first '='; reject ambiguity rather than letting
     # different property consumers disagree about the effective module ID.
     if ! awk '
@@ -564,7 +898,8 @@ verify_zip() {
                 seen[key]++
                 if (value !~ /[^[:space:]]/) bad = 1
                 if (key == "id" && value != "zygisk_study") bad = 1
-                if (key == "versionCode" && value !~ /^[0-9]+$/) bad = 1
+                if (key == "versionCode" &&
+                    (value !~ /^[0-9]+$/ || value + 0 > 2147483647)) bad = 1
             }
         }
         END { for (key in required) if (seen[key] != 1) bad = 1
@@ -630,7 +965,8 @@ verify_zip() {
     elif command -v readelf >/dev/null 2>&1; then
         readelf_bin="readelf"
     else
-        echo "  NOTE: no readelf available — skipping the 16 KB alignment check"
+        echo "  FAIL: readelf is required to verify native artifacts" >&2
+        return 1
     fi
     if [[ -n "$readelf_bin" ]]; then
         for abi in "${ABI_LIST[@]}"; do
@@ -652,8 +988,12 @@ verify_zip() {
                 fi
                 # Every segment must meet the floor, not only the first.
                 while IFS= read -r align; do
-                    if [[ ! "$align" =~ ^0x[0-9a-fA-F]+$ ]] || (( align < 0x4000 )); then
-                        echo "  FAIL: libs/$abi/$f LOAD alignment $align < 0x4000 (16 KB)" >&2
+                    # At most 15 hex digits keeps the value in signed shell
+                    # arithmetic on our 64-bit build hosts. Real NDK alignment
+                    # values are tiny; overflow must never wrap into a pass.
+                    if [[ ! "$align" =~ ^0x[0-9a-fA-F]{1,15}$ ]] ||
+                       (( align < 0x4000 || (align & (align - 1)) != 0 )); then
+                        echo "  FAIL: libs/$abi/$f invalid LOAD alignment $align (requires power of two >= 16 KB)" >&2
                         fail=1
                     fi
                 done <<< "$aligns"
@@ -670,9 +1010,12 @@ verify_zip() {
         for abi in "${ABI_LIST[@]}"; do
             for f in libzygisk.so libpayload.so libzn_loader.so zygiskd; do
                 [[ -f "$MODULE_DIR/libs/$abi/$f" ]] || continue
-                sec="$("$readelf_bin" -SW "$MODULE_DIR/libs/$abi/$f" 2>/dev/null \
-                       | grep -E '\.(symtab|strtab)\b|\.debug_' \
-                       | awk '{print $2}' || true)"
+                if ! sec="$("$readelf_bin" -SW "$MODULE_DIR/libs/$abi/$f" 2>/dev/null)"; then
+                    echo "  FAIL: cannot read libs/$abi/$f section headers" >&2
+                    fail=1
+                    continue
+                fi
+                sec="$(grep -E '\.(symtab|strtab)\b|\.debug_' <<< "$sec" || true)"
                 if [[ -n "$sec" ]]; then
                     echo "  FAIL: libs/$abi/$f still carries $sec (not stripped)" >&2
                     fail=1
@@ -690,8 +1033,12 @@ verify_zip() {
         local soname
         for abi in "${ABI_LIST[@]}"; do
             for f in libzygisk.so libpayload.so libzn_loader.so; do
-                soname="$("$readelf_bin" -d "$MODULE_DIR/libs/$abi/$f" 2>/dev/null \
-                          | grep SONAME || true)"
+                if ! soname="$("$readelf_bin" -d "$MODULE_DIR/libs/$abi/$f" 2>/dev/null)"; then
+                    echo "  FAIL: cannot read libs/$abi/$f dynamic table" >&2
+                    fail=1
+                    continue
+                fi
+                soname="$(grep SONAME <<< "$soname" || true)"
                 if [[ -n "$soname" ]]; then
                     echo "  FAIL: libs/$abi/$f carries a SONAME: $soname" >&2
                     fail=1
@@ -709,7 +1056,7 @@ verify_zip() {
     local strings_bin="$TOOLCHAIN/bin/llvm-strings"
     [[ -x "$strings_bin" ]] || strings_bin="$(command -v strings || true)"
     if [[ -n "$strings_bin" ]]; then
-        local banned hit
+        local banned hit string_output
         for abi in "${ABI_LIST[@]}"; do
             for f in libzygisk.so libpayload.so; do
                 [[ -f "$MODULE_DIR/libs/$abi/$f" ]] || continue
@@ -718,11 +1065,18 @@ verify_zip() {
                 # generic strings that remain (libc.so NEEDED entries,
                 # the AOSP-mandated NativeBridgeItf export, the
                 # compiler .comment) are allowed by construction.
+                # Run the producer once and check its status separately from
+                # grep's ordinary no-match exit code. A broken inspection tool
+                # must not be interpreted as a clean artifact.
+                if ! string_output="$("$strings_bin" -a "$MODULE_DIR/libs/$abi/$f" 2>/dev/null)"; then
+                    echo "  FAIL: cannot inspect strings in libs/$abi/$f" >&2
+                    fail=1
+                    continue
+                fi
                 for banned in zygisk zygiskd zygisk_study ZygiskStudy \
                               libpayload libzn_loader session.sock \
                               denylist ro.zygisk_study; do
-                    hit="$("$strings_bin" -a "$MODULE_DIR/libs/$abi/$f" 2>/dev/null \
-                           | grep -i -m1 "$banned" || true)"
+                    hit="$(grep -i -m1 "$banned" <<< "$string_output" || true)"
                     if [[ -n "$hit" ]]; then
                         echo "  FAIL: libs/$abi/$f leaks banned string '$banned': $hit" >&2
                         fail=1
@@ -731,7 +1085,8 @@ verify_zip() {
             done
         done
     else
-        echo "  NOTE: no strings tool available — skipping the banned-string scan"
+        echo "  FAIL: strings is required to verify native artifacts" >&2
+        return 1
     fi
 
     if [[ $fail -ne 0 ]]; then
