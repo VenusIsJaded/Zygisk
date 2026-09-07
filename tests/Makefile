@@ -168,7 +168,7 @@ $(TESTS) libpayload.so libzygisk.so libzs_test_module.so: $(HOST_HEADERS)
 # this verification existed but nothing in CI invoked it. Its
 # arg-register and scrub gates are the only automated check of the
 # arm64 blob's syscall ABI (the host executes only the x86_64 blob).
-run: all verify-public-header verify-scripts verify-trampolines
+run: all verify-public-header verify-scripts verify-trampolines verify-webui
 	@fail=0; \
 	for t in $(TESTS); do \
 	echo "=== $$t ==="; \
@@ -282,3 +282,8 @@ verify-scripts:
 
 clean:
 	rm -f $(TESTS) libpayload.so libzs_test_module.so libzygisk.so race_fixture.so test_race_tsan
+
+# Dependency-free parser, root-bridge, collector and packaging regressions.
+.PHONY: verify-webui
+verify-webui:
+	node --test test_webui.cjs

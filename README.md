@@ -129,6 +129,39 @@ zygisk_study/
     └── compatibility.md      # Magisk vs KernelSU integration
 ```
 
+## Module dashboard (WebUI)
+
+Release ZIPs include an offline, read-only dashboard under `webroot/`. Open
+**WebUI** for Zygisk Study in KernelSU, or a compatible APatch/Magisk WebUI
+host exposing the KernelSU-style `ksu.exec` bridge. Standard Magisk Manager
+has no built-in WebUI. Use an up-to-date Android System WebView; the native
+loader's Android 5.0 floor is not a promise of support for that OS's original
+WebView. Ordinary browsers show explicitly labeled **sample data**, never
+real device results. If device collection fails, the UI shows an error, not
+a simulated success.
+
+- **Modules:** disk inventory, ABI/layout notices, disable/remove markers,
+  search, filters, and details. Discovery does not establish successful loading.
+  The current study daemon does not honor disable/remove markers and expects
+  `zygisk/<abi>/libzygisk-module.so`, not the standard upstream layout.
+- **Diagnostics:** observed startup prerequisites plus an explicitly unverified
+  native-function checklist. No injection, callback execution, property writes,
+  daemon commands, reboot, or module toggling is performed.
+- **Logs:** on-demand, tag-filtered last 150 lines. `.debug` enables shell logs
+  only; native logs require a Debug build. Empty logs are not proof of health.
+- **Export:** local JSON, with logs excluded by default. Review module names,
+  device details, and optional logs before sharing. No telemetry or network
+  requests are made by the dashboard.
+
+The root command is fixed to the installed collector path. Metadata is
+base64-framed (not sourced as shell), validated, and HTML-escaped. A collection
+error retains the previous snapshot with a visible stale-data warning.
+
+Run `make -C tests verify-webui` with Node.js 18+ and Python 3 for the
+parser/bridge, fake-device collector, and release packaging tests; these also
+run in the full `make -C tests run` CI gate. Host tests do **not** replace a
+rooted-device test: native loading and callbacks remain unverified.
+
 ## How to build (when you want your own `.so` files)
 
 The one-command path (Round 32) — builds all four ABIs and assembles

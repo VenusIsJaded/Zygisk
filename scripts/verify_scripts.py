@@ -1725,6 +1725,7 @@ def test_build_regressions(mk):
     for name in ("customize.sh", "post-fs-data.sh", "service.sh", "uninstall.sh",
                  "zs_compat.sh", "post-mount-hook.sh", "verify.sh", "LICENSE"):
         shutil.copy(os.path.join(REPO_ROOT, name), root)
+    shutil.copytree(os.path.join(REPO_ROOT, "webroot"), os.path.join(root, "webroot"))
     ndk = os.path.join(root, "Android NDK")
     toolbin = os.path.join(ndk, "toolchains", "llvm", "prebuilt", "linux-x86_64", "bin")
     os.makedirs(toolbin)
@@ -2498,6 +2499,7 @@ def test_nineteen_validation_regressions(mk):
     base = {f: b"fixture" for f in (
         "customize.sh", "post-fs-data.sh", "service.sh", "uninstall.sh", "verify.sh",
         "zs_compat.sh", "post-mount-hook.sh", "LICENSE",
+        "webroot/index.html", "webroot/app.js", "webroot/styles.css", "webroot/diagnostics.sh",
         "META-INF/com/google/android/update-binary")}
     base.update({"module.prop": prop.encode(),
                  "META-INF/com/google/android/updater-script": b"#MAGISK\n"})
@@ -2593,6 +2595,7 @@ def test_build_lifecycle_regressions(mk):
     for name in ("customize.sh", "post-fs-data.sh", "service.sh", "uninstall.sh",
                  "zs_compat.sh", "post-mount-hook.sh", "verify.sh", "LICENSE"):
         shutil.copy(os.path.join(REPO_ROOT, name), root)
+    shutil.copytree(os.path.join(REPO_ROOT, "webroot"), os.path.join(root, "webroot"))
     ndk = os.path.join(root, "ndk")
     toolbin = os.path.join(ndk, "toolchains/llvm/prebuilt/linux-x86_64/bin")
     os.makedirs(toolbin)
@@ -2923,6 +2926,7 @@ def test_nine_followup_regressions(mk):
     for name in ("customize.sh", "post-fs-data.sh", "service.sh", "uninstall.sh",
                  "zs_compat.sh", "post-mount-hook.sh", "verify.sh", "LICENSE"):
         shutil.copy(Path(REPO_ROOT) / name, root / name)
+    shutil.copytree(Path(REPO_ROOT) / "webroot", root / "webroot")
     ndk = root / "ndk"
     toolbin = ndk / "toolchains/llvm/prebuilt/linux-x86_64/bin"
     toolbin.mkdir(parents=True)
@@ -3146,7 +3150,7 @@ def test_pr11_completion_regressions(mk):
     function = source.split("verify_zip() {", 1)[1].split("\n}\n", 1)[0]
     archive = verifier / "fixture.zip"
     required = ("customize.sh post-fs-data.sh service.sh uninstall.sh zs_compat.sh "
-                "post-mount-hook.sh verify.sh LICENSE META-INF/com/google/android/update-binary").split()
+                "webroot/index.html webroot/app.js webroot/styles.css webroot/diagnostics.sh post-mount-hook.sh verify.sh LICENSE META-INF/com/google/android/update-binary").split()
     with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_STORED) as z:
         for name in required:
             z.writestr(name, "fixture content")
@@ -3317,7 +3321,7 @@ def test_final_nine_regressions(mk):
               + '\nverify_zip() {' + function + '\n}\nverify_zip "$1" || exit 1\n')
     fixture = verifier / "fixture.zip"
     required = ("customize.sh post-fs-data.sh service.sh uninstall.sh zs_compat.sh "
-                "post-mount-hook.sh verify.sh LICENSE META-INF/com/google/android/update-binary").split()
+                "webroot/index.html webroot/app.js webroot/styles.css webroot/diagnostics.sh post-mount-hook.sh verify.sh LICENSE META-INF/com/google/android/update-binary").split()
 
     def verify(extra=None):
         with warnings.catch_warnings():
@@ -3512,6 +3516,7 @@ int main() {
     for name in ("customize.sh", "post-fs-data.sh", "service.sh", "uninstall.sh",
                  "zs_compat.sh", "post-mount-hook.sh", "verify.sh", "LICENSE"):
         shutil.copy(Path(REPO_ROOT) / name, checkout / name)
+    shutil.copytree(Path(REPO_ROOT) / "webroot", checkout / "webroot")
     ndk = root / "ndk"
     (ndk / "build/cmake").mkdir(parents=True)
     (ndk / "build/cmake/android.toolchain.cmake").touch()
@@ -3591,7 +3596,7 @@ if sys.argv[1] == '-lW':
 
         with zipfile.ZipFile(fixture, "w") as z:
             for name in ("customize.sh post-fs-data.sh service.sh uninstall.sh zs_compat.sh "
-                         "post-mount-hook.sh verify.sh LICENSE "
+                         "webroot/index.html webroot/app.js webroot/styles.css webroot/diagnostics.sh post-mount-hook.sh verify.sh LICENSE "
                          "META-INF/com/google/android/update-binary").split():
                 z.writestr(member(name), "fixture")
             z.writestr("module.prop", "id=zygisk_study\nname=Study\nversion=1\n"
@@ -3687,7 +3692,7 @@ exit 0
     data = release_elf_fixture()
     names = ("libzygisk.so", "libpayload.so", "libzn_loader.so", "zygiskd")
     scripts = ("customize.sh post-fs-data.sh service.sh uninstall.sh zs_compat.sh "
-               "post-mount-hook.sh verify.sh LICENSE "
+               "webroot/index.html webroot/app.js webroot/styles.css webroot/diagnostics.sh post-mount-hook.sh verify.sh LICENSE "
                "META-INF/com/google/android/update-binary").split()
     prop = b"id=zygisk_study\nname=Study\nversion=1\nversionCode=1\nauthor=Test\ndescription=Fixture\n"
     archive = root / "fixture.zip"
@@ -3870,7 +3875,7 @@ def test_pr13_additional_forty_four(mk):
     archive = root / "release.zip"
     prop = b"id=zygisk_study\nname=Study\nversion=1\nversionCode=1\nauthor=Test\ndescription=Fixture\n"
     shell_names = ("customize.sh post-fs-data.sh service.sh uninstall.sh zs_compat.sh "
-                   "post-mount-hook.sh verify.sh META-INF/com/google/android/update-binary").split()
+                   "webroot/index.html webroot/app.js webroot/styles.css webroot/diagnostics.sh post-mount-hook.sh verify.sh META-INF/com/google/android/update-binary").split()
     base = {name: b"#!/system/bin/sh\n:\n" for name in shell_names}
     base.update({"module.prop": prop, "LICENSE": b"fixture license\n",
                  "META-INF/com/google/android/updater-script": b"#MAGISK\n"})
@@ -4003,7 +4008,7 @@ def test_pr13_symbol_and_segment_regressions(mk):
     env = mk.env({"REPO_ROOT": REPO_ROOT, "TOOLCHAIN": str(root), "MODULE_DIR": str(root)})
     base = {name: b"#!/system/bin/sh\n:\n" for name in (
         "customize.sh post-fs-data.sh service.sh uninstall.sh zs_compat.sh "
-        "post-mount-hook.sh verify.sh META-INF/com/google/android/update-binary").split()}
+        "webroot/index.html webroot/app.js webroot/styles.css webroot/diagnostics.sh post-mount-hook.sh verify.sh META-INF/com/google/android/update-binary").split()}
     base.update({"LICENSE": b"fixture\n", "module.prop":
                  b"id=zygisk_study\nname=Study\nversion=1\nversionCode=1\nauthor=Test\ndescription=Fixture\n",
                  "META-INF/com/google/android/updater-script": b"#MAGISK\n"})
