@@ -15,6 +15,7 @@
 # WHAT IT ASSEMBLES (the flashable zip layout):
 #   module.prop customize.sh post-fs-data.sh service.sh uninstall.sh
 #   zs_compat.sh post-mount-hook.sh verify.sh LICENSE
+#   webroot/{index.html,app.js,styles.css,diagnostics.sh}
 #   libs/<abi>/{libzygisk.so,libpayload.so,libzn_loader.so,zygiskd}
 #   META-INF/com/google/android/{update-binary,updater-script}
 #
@@ -405,6 +406,16 @@ assemble_module() {
         cp "$REPO_ROOT/$f" "$MODULE_DIR/$f"
     done
 
+    # Explicit offline asset allowlist: never ship fixtures, dependencies or reports.
+    mkdir -p "$MODULE_DIR/webroot"
+    for f in index.html app.js styles.css diagnostics.sh; do
+        [[ -s "$REPO_ROOT/webroot/$f" && ! -L "$REPO_ROOT/webroot/$f" ]] || {
+            echo "ERROR: missing, empty or linked WebUI asset: $f" >&2; exit 1;
+        }
+        cp "$REPO_ROOT/webroot/$f" "$MODULE_DIR/webroot/$f"
+        chmod 0644 "$MODULE_DIR/webroot/$f"
+    done
+
     # module.prop with per-commit version metadata (static fallback kept
     # in sync with the repo's module.prop).
     cat > "$MODULE_DIR/module.prop" <<EOF
@@ -760,7 +771,7 @@ def verify_archive(path, abis):
         prop = archive.read("module.prop")
         require(not any(c < 32 and c != 10 or c == 127 for c in prop), "control bytes in module.prop")
         scripts = ("customize.sh post-fs-data.sh service.sh uninstall.sh zs_compat.sh "
-                   "post-mount-hook.sh verify.sh META-INF/com/google/android/update-binary").split()
+                   "post-mount-hook.sh verify.sh webroot/diagnostics.sh META-INF/com/google/android/update-binary").split()
         for name in scripts:
             text = archive.read(name)
             require(b"\0" not in text and b"\r" not in text, "binary/CRLF shell file: " + name)
@@ -862,7 +873,7 @@ PY_VERIFY_RELEASE
     # 1. The files the installer needs. customize.sh is SOURCED by
     #    Magisk's install_module after extracting everything except
     #    META-INF; the boot scripts must be at the zip root.
-    local required="module.prop customize.sh post-fs-data.sh service.sh uninstall.sh zs_compat.sh post-mount-hook.sh verify.sh LICENSE META-INF/com/google/android/update-binary META-INF/com/google/android/updater-script"
+    local required="webroot/index.html webroot/app.js webroot/styles.css webroot/diagnostics.sh module.prop customize.sh post-fs-data.sh service.sh uninstall.sh zs_compat.sh post-mount-hook.sh verify.sh LICENSE META-INF/com/google/android/update-binary META-INF/com/google/android/updater-script"
     local f
     for f in $required; do
         if ! grep -Fxq -- "$f" <<< "$listing"; then
