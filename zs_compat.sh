@@ -69,6 +69,16 @@ zs_log() {
   return 0
 }
 
+# Small boot outcome record for read-only diagnostics. Never contains paths.
+zs_mount_state() {
+  local tmp
+  tmp="$(mktemp "$WORKDIR/.mount_status.XXXXXX" 2>/dev/null)" || return 0
+  if printf '%s\n' "$1" > "$tmp" && chmod 0600 "$tmp" &&
+     mv -f "$tmp" "$WORKDIR/.mount_status"; then return 0; fi
+  rm -f "$tmp" 2>/dev/null
+  return 0
+}
+
 # --- property write chain -------------------------------------------------
 
 # zs_prop_get NAME -> prints value (empty if absent), nonzero if all
@@ -148,7 +158,8 @@ zs_lib_dirs() {
 # Both libraries are required: the bridge dlopens its sibling payload.
 # File presence is necessary, not proof that linker/SELinux will allow loading.
 zs_loader_dir_visible() {
-  [ -f "$1/$ZS_BRIDGE_NAME" ] && [ -f "$1/$ZS_PAYLOAD_NAME" ]
+  [ -f "$1/$ZS_BRIDGE_NAME" ] && [ -r "$1/$ZS_BRIDGE_NAME" ] &&
+    [ -f "$1/$ZS_PAYLOAD_NAME" ] && [ -r "$1/$ZS_PAYLOAD_NAME" ]
 }
 
 # zs_loader_visible -> 0 if every needed dir has the complete pair
@@ -226,12 +237,21 @@ zs_copy_loader_file() {
   local tmp
   tmp="$(mktemp "$2.XXXXXX" 2>/dev/null)" || return 1
   if cp "$1" "$tmp" 2>/dev/null && chmod 0644 "$tmp" 2>/dev/null && \
-     mv -f "$tmp" "$2" 2>/dev/null; then
+     zs_label_loader_file "$tmp" && mv -f "$tmp" "$2" 2>/dev/null; then
     zs_uninstall_record copy "$2"
     return 0
   fi
   rm -f "$tmp" 2>/dev/null
   return 1
+}
+
+# A copy into an overlay upperdir can inherit system_data_file from /data.
+# Do not publish bytes that enforcing zygote cannot map as a system library.
+zs_label_loader_file() {
+  if command -v getenforce >/dev/null 2>&1 && [ "$(getenforce 2>/dev/null)" != Disabled ]; then
+    chcon u:object_r:system_file:s0 "$1" 2>/dev/null || return 1
+  fi
+  return 0
 }
 
 # zs_self_mount_dir DIR -> 0 if OUR overlay over DIR is (now) active.
@@ -268,9 +288,27 @@ zs_self_mount_dir() {
   if [ "$_owned" != "1" ]; then
     zs_have_overlayfs || return 1
     mkdir -p "$_tag/upper" "$_tag/work" 2>/dev/null || return 1
-    mount -t overlay overlay \
+    if ! mount -t overlay overlay \
       -o "lowerdir=$_dir,upperdir=$_tag/upper,workdir=$_tag/work" \
-      "$_dir" 2>/dev/null || return 1
+      "$_dir" 2>/dev/null; then
+      # Some Android /data filesystems cannot be overlay upperdirs.
+      # A read-only, lower-only overlay needs neither upperdir nor workdir,
+      # and retains the installer's system_file labels on the complete pair.
+      # Never cover stock filenames: the upper-priority layer must contain
+      # ONLY our pair, with no pre-existing destination of either name.
+      [ ! -e "$_dir/$ZS_BRIDGE_NAME" ] && [ ! -e "$_dir/$ZS_PAYLOAD_NAME" ] || return 1
+      for _file in "$_src"/* "$_src"/.[!.]* "$_src"/..?*; do
+        [ -e "$_file" ] || [ -L "$_file" ] || continue
+        case "${_file##*/}" in
+          "$ZS_BRIDGE_NAME"|"$ZS_PAYLOAD_NAME") [ ! -L "$_file" ] || return 1 ;;
+          *) return 1 ;;
+        esac
+      done
+      mount -t overlay overlay -o "ro,lowerdir=$_src:$_dir" "$_dir" 2>/dev/null || return 1
+      zs_uninstall_record overlay "$_dir $_tag"
+      zs_loader_dir_visible "$_dir"
+      return $?
+    fi
     zs_uninstall_record overlay "$_dir $_tag"
   fi
   # Also repair a partial previous attempt on our already-mounted overlay.

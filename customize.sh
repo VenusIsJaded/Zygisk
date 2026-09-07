@@ -315,13 +315,20 @@ ui_print "- No conflicting zygisk implementation detected"
 # pending loader mount gets resolved. Magisk ignores the directory
 # (harmless dead file; on Magisk magic mount already handles us).
 # ReZygisk uses the same mechanism for the same reason.
+# Keep the module-local entry point as well: manager forks can dispatch
+# post-mount.sh without running common post-mount.d scripts. Both paths are
+# idempotent via .mount_pending and obey disable/remove markers.
+cp "$MODPATH/post-mount-hook.sh" "$MODPATH/post-mount.sh" &&
+  chmod 0755 "$MODPATH/post-mount.sh" || {
+    abort "! Cannot install the module post-mount entry point."; exit 1;
+  }
 POSTMOUNT_DIR="$ZS_ADB_ROOT/post-mount.d"
 if mkdir -p "$POSTMOUNT_DIR" 2>/dev/null && \
    cp "$MODPATH/post-mount-hook.sh" "$POSTMOUNT_DIR/zygisk_study-mount.sh" 2>/dev/null; then
   chmod 0755 "$POSTMOUNT_DIR/zygisk_study-mount.sh" 2>/dev/null
   ui_print "- post-mount.d hook installed (KernelSU / APatch mount resolution)"
 else
-  ui_print "- NOTE: post-mount.d not writable; KernelSU mount resolution deferred to service.sh"
+  ui_print "- NOTE: post-mount.d not writable; common hook unavailable; module post-mount.sh is installed"
 fi
 # Root-manager messaging (detection is behavior-neutral; the boot
 # scripts work identically on all managers).

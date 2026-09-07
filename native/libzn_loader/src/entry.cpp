@@ -75,7 +75,7 @@ static constexpr uint32_t kApiMagic = 0x5A535354u; // "ZSST" (Zygisk STudy)
 // exercised the path).
 ZS_OBFS_PATH(kDaemonSocketLegacy, "/data/system/zygisk_study/sock/sock")
 
-// The session file the daemon writes before binding (root-only
+// The session file the daemon publishes after binding (root-only
 // directory; see module_dispatch.cpp for the full stealth rationale
 // for why the path is handed over in a file instead of a fixed name).
 ZS_OBFS_PATH(kSessionFileDefault, "/data/adb/modules/zygisk_study/session.sock")
@@ -177,39 +177,7 @@ static int resolve_daemon_socket(char* out, size_t outsz) {
 #endif
     if (!session) session = kSessionFileDefault();       // null -> default
     if (!session_alt) session_alt = kSessionFileAltDefault();
-    int fd = open(session, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) {
-        // Round 29: the module tree is unreadable from here — the
-        // daemon also writes its record into the /data/system workdir.
-        fd = open(session_alt, O_RDONLY | O_CLOEXEC);
-    }
-    if (fd >= 0) {
-        // 96 bytes read into a 97-byte buffer: a path that fills the
-        // full 96 is longer than any legitimate session path (the
-        // daemon's randomized paths are ~50 bytes) AND cannot fit the
-        // callers' 96-byte buffers — it would be silently truncated
-        // into a garbage path. Reject it outright (the earlier
-        // version accepted the first 95 bytes of a 120-byte file).
-        char path[97];
-        ssize_t n = read(fd, path, sizeof path - 1);
-        close(fd);
-        if (n > 0 && n <= (ssize_t)(sizeof path - 2)) {
-            path[n] = '\0';
-            // Trim trailing whitespace (the daemon writes a bare
-            // line; mirror the payload's parser exactly).
-            while (n > 0 && (path[n - 1] == '\n' || path[n - 1] == '\r' ||
-                             path[n - 1] == ' ')) {
-                path[--n] = '\0';
-            }
-            // Sanity: absolute path and it must fit both the output
-            // buffer and sockaddr_un::sun_path (108 on Linux).
-            if (path[0] == '/' && (size_t)n + 1 <= outsz &&
-                (size_t)n + 1 <= sizeof(((struct sockaddr_un*)0)->sun_path)) {
-                memcpy(out, path, (size_t)n + 1);
-                return 1;
-            }
-        }
-    }
+    if (zs_resolve_session_socket(session, session_alt, out, outsz)) return 1;
     snprintf(out, outsz, "%s", kDaemonSocketLegacy());
     return 0;
 }

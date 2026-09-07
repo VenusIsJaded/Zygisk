@@ -142,11 +142,19 @@ a simulated success.
 
 - **Modules:** disk inventory, ABI/layout notices, disable/remove markers,
   search, filters, and details. Discovery does not establish successful loading.
-  The current study daemon does not honor disable/remove markers and expects
-  `zygisk/<abi>/libzygisk-module.so`, not the standard upstream layout.
+  The study daemon excludes disable/remove markers from new registry snapshots
+  and expects `zygisk/<abi>/libzygisk-module.so`, not the upstream layout.
+  Already mapped modules require a reboot to fully unload. **Upstream Zygisk
+  binaries such as LSPosed and zygisk-detach are not supported by study API v2**;
+  renaming their libraries does not provide ABI compatibility. Use an
+  upstream-compatible provider instead, never two Zygisk loaders together.
 - **Diagnostics:** observed startup prerequisites plus an explicitly unverified
   native-function checklist. No injection, callback execution, property writes,
-  daemon commands, reboot, or module toggling is performed.
+  daemon commands, reboot, or module toggling is performed. Restored bridge
+  properties with matching records are reported for review, not as proof of
+  injection. Library visibility checks include the payload and installed
+  secondary ABI, and distinguish collector/init namespace differences.
+  Rollback and late mount outcomes remain visible after pending-marker cleanup.
 - **Logs:** on-demand, tag-filtered last 150 lines. `.debug` enables shell logs
   only; native logs require a Debug build. Empty logs are not proof of health.
 - **Export:** local JSON, with logs excluded by default. Review module names,

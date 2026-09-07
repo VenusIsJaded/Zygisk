@@ -186,6 +186,29 @@ ZS_TEST(resolver_rejects_overlong_content_in_the_workdir_record) {
     zs_test_zn_set_session_file_alt(nullptr);
 }
 
+ZS_TEST(resolver_uses_valid_alternate_after_malformed_or_stale_primary) {
+    std::string endpoint = g_zn_tmpdir + "/current.sock";
+    int sock = socket(AF_UNIX, SOCK_STREAM, 0);
+    ZS_CHECK(sock >= 0);
+    struct sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    snprintf(addr.sun_path, sizeof addr.sun_path, "%s", endpoint.c_str());
+    ZS_CHECK(bind(sock, (struct sockaddr*)&addr, sizeof addr) == 0);
+    std::string alt = session_file_with(endpoint.c_str());
+    zs_test_zn_set_session_file_alt(alt.c_str());
+    const char* invalid[] = {"", "relative", "/tmp/stale.sock", "/tmp/../bad", "/tmp/x\n/bad"};
+    for (const char* value : invalid) {
+        std::string primary = session_file_with(value);
+        zs_test_zn_set_session_file(primary.c_str());
+        char out[96];
+        ZS_CHECK_EQ(zs_test_zn_resolve_socket(out, sizeof out), 1);
+        ZS_CHECK_STR_EQ(out, endpoint.c_str());
+    }
+    zs_test_zn_set_session_file(nullptr);
+    zs_test_zn_set_session_file_alt(nullptr);
+    close(sock); unlink(endpoint.c_str());
+}
+
 // ---------------------------------------------------------------------------
 // End-to-end: the real API table against a live unix socket
 // ---------------------------------------------------------------------------

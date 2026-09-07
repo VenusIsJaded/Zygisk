@@ -349,12 +349,8 @@ void zs_module_set_daemon_socket(const char* path) {
 // scanner, and the /proc/net/unix line filter. Returns 1 when a
 // session path was loaded.
 //
-// Round 29: the module-dir record is tried FIRST; only when its
-// open() fails does the workdir record (kSessionFileAlt) run. A
-// device that can read the primary never touches the alt path
-// (zero extra syscalls in the healthy case); a device where the
-// module tree is blocked falls back transparently. The parser
-// (96-byte cap, absolute-path check, trim) is shared by both.
+// Both records are validated; a malformed/stale primary must not suppress
+// a usable workdir endpoint. The shared parser also rejects non-regular files.
 //
 // ROUND 37: the function is IDEMPOTENT — when the parsed path is the
 // one already active, it returns without re-registering the path
@@ -366,30 +362,9 @@ void zs_module_set_daemon_socket(const char* path) {
 // per-boot path up. Without it the payload connected to a dead path
 // for the whole boot (no modules, no props file, no companions).
 int zs_module_load_session_socket() {
-    int fd = open(session_file(), O_RDONLY | O_CLOEXEC);
-    if (fd < 0) {
-        // Round 29: the module tree is unreadable from here — try
-        // the daemon's workdir record before giving up.
-        fd = open(session_file_alt(), O_RDONLY | O_CLOEXEC);
-    }
-    if (fd < 0) return 0;                  // pre-R13 daemon: fallback
-    // Round 28: read up to 96 bytes into a 97-byte buffer. A path
-    // that fills the full 96 is longer than any legitimate session
-    // path (the daemon's randomized paths are ~50 bytes) and would
-    // be silently TRUNCATED into a garbage socket path plus garbage
-    // filter prefixes — the earlier version accepted the first 95
-    // bytes of a 120-byte file and registered them. Reject instead.
-    char path[97];
-    ssize_t n = read(fd, path, sizeof path - 1);
-    close(fd);
-    if (n <= 0 || n > (ssize_t)(sizeof path - 2)) return 0;
-    path[n] = '\0';
-    // Trim trailing whitespace (the daemon writes a bare line).
-    while (n > 0 && (path[n - 1] == '\n' || path[n - 1] == '\r' ||
-                     path[n - 1] == ' ')) {
-        path[--n] = '\0';
-    }
-    if (path[0] != '/') return 0;          // sanity: absolute path
+    char path[96];
+    if (!zs_resolve_session_socket(session_file(), session_file_alt(), path, sizeof path)) return 0;
+    size_t n = strlen(path);
 
     // ROUND 37: same path as the one already active? Nothing to do —
     // and no prefix re-registration (bounded, non-deduped tables).

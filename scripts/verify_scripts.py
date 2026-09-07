@@ -366,6 +366,9 @@ def run_customize(mk, arch="arm64", abi=None, api="30", is64="true",
     modpath = os.path.join(mk.root, "modpath")
     shutil.rmtree(modpath, ignore_errors=True)
     os.makedirs(modpath)
+    # Real release archives contain the hook source; the installer now also
+    # copies it to module-local post-mount.sh, not just post-mount.d.
+    shutil.copy(os.path.join(REPO_ROOT, "post-mount-hook.sh"), modpath)
     if make_libs:
         libs = os.path.join(modpath, "libs", abi)
         os.makedirs(libs)
@@ -507,6 +510,7 @@ def test_customize_no_getprop_on_path(mk):
         with open(os.path.join(libs, f), "wb") as fp:
             fp.write(b"\x7fELF" + b"\x00" * 64)
     write_exec(os.path.join(libs, "zygiskd"), STUB_DAEMON)
+    shutil.copy(os.path.join(mk.moddir, "post-mount-hook.sh"), modpath)
     proc = subprocess.run(
         ["sh", "-c",
          "ui_print() { echo \"$*\"; }\n"
@@ -549,6 +553,7 @@ def test_customize_buildprop_fallback(mk):
                 # ELF magic + EI_CLASS (offset 4): 2 = ELF64, 1 = ELF32
                 fp.write(b"\x7fELF" + bytes([elf_cls]) + b"\x00" * 59)
         write_exec(os.path.join(libs, "zygiskd"), STUB_DAEMON)
+    shutil.copy(os.path.join(mk.moddir, "post-mount-hook.sh"), modpath)
     propdir = os.path.join(mk.root, "props")
     os.makedirs(propdir, exist_ok=True)
     bp = os.path.join(propdir, "build.prop")
@@ -643,6 +648,35 @@ def test_service_starts_symlink_daemon(mk):
     # self-write), the file must simply be absent.
     check("no dead-pid file written by the script",
           not os.path.exists(os.path.join(mk.workdir, "zygiskd.pid")))
+
+
+def test_service_rereads_session_after_startup(mk):
+    """Real service body, delayed socket publication and a stale primary."""
+    import socket
+    import threading
+    os.makedirs(mk.workdir, exist_ok=True)
+    write_exec(os.path.join(mk.moddir, "zygiskd"), STUB_DAEMON)
+    open(os.path.join(mk.moddir, ".debug"), "w").close()
+    logfile = os.path.join(mk.root, "service.log")
+    write_exec(os.path.join(mk.bindir, "log"), '#!/bin/sh\nprintf "%s\n" "$*" >> "$ZS_SERVICE_LOG"\n')
+    with open(os.path.join(mk.moddir, "session.sock"), "w") as fp:
+        fp.write(os.path.join(mk.workdir, "stale"))
+    endpoint = os.path.join(mk.workdir, "s")
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    def publish():
+        sock.bind(endpoint)
+        with open(os.path.join(mk.workdir, "session.sock"), "w") as fp:
+            fp.write(endpoint)
+    timer = threading.Timer(0.3, publish)
+    timer.start()
+    try:
+        proc = mk.run_script("service.sh", {"ZS_SERVICE_LOG": logfile})
+        timer.join()
+        with open(logfile) as fp: logs = fp.read()
+        check("service re-reads a delayed alternate endpoint", proc.returncode == 0 and "daemon socket present" in logs, proc.stderr + logs)
+        check("service never claims IPC responsiveness", "IPC unverified" in logs)
+    finally:
+        timer.cancel(); timer.join(); sock.close()
 
 
 def test_service_finds_legacy_layout(mk):
@@ -1215,6 +1249,10 @@ def test_mount_pending_and_post_mount_hook(mk):
           "ro.dalvik.vm.native.bridge 0" in mk.resetprop_calls(),
           str(mk.resetprop_calls()))
     check("hook cleared the pending flag", not os.path.exists(pend))
+    with open(os.path.join(mk.workdir, ".mount_status")) as f:
+        check("rollback outcome survives pending marker cleanup", f.read().strip() == "rolled_back")
+    with open(os.path.join(mk.workdir, ".mount_status")) as fp:
+        check("hook preserves the rollback outcome", fp.read().strip() == "rolled_back")
     check("hook stood the guard down",
           not os.path.exists(os.path.join(mk.workdir, ".native_bridge_applied")))
 
@@ -1301,6 +1339,14 @@ def test_customize_installs_post_mount_hook(mk):
     check("post-mount.d hook installed", os.path.exists(hook))
     check("post-mount.d hook executable",
           os.path.exists(hook) and os.access(hook, os.X_OK))
+    local_hook = os.path.join(modpath, "post-mount.sh")
+    check("module-local post-mount entry point executable", os.access(local_hook, os.X_OK))
+    with open(local_hook) as f, open(hook) as g:
+        check("both post-mount entry points use the same implementation", f.read() == g.read())
+    local_hook = os.path.join(modpath, "post-mount.sh")
+    check("module-local post-mount.sh installed and executable", os.access(local_hook, os.X_OK))
+    with open(local_hook, "rb") as installed, open(hook, "rb") as common:
+        check("both post-mount entry points share the guarded implementation", installed.read() == common.read())
 
 
 def test_customize_conflict_detection(mk):
@@ -4499,6 +4545,12 @@ done
 zs_have_overlayfs() { [ "$OVERLAY" = 1 ]; }
 mount() {
   printf 'mount\n' >> "$WORKDIR/mount_calls"
+  case "$CASE:$5" in
+    overlay_readonly*:ro,*)
+      [ "$CASE" != overlay_readonly_failure ] || return 1
+      command cp "$MODDIR/system/lib64/"* "$SYSTEM/lib64/" ;;
+    overlay_readonly*) return 1 ;;
+  esac
   printf 'overlay %s overlay rw,%s 0 0\n' "$6" "$5" >> "$MOUNTS"
 }
 cp() {
@@ -4528,6 +4580,14 @@ case "$CASE" in
       visible_missing*) ! zs_loader_visible ;;
       *) zs_loader_visible ;;
     esac ;;
+  label_failure)
+    getenforce() { echo Enforcing; }
+    chcon() { return 1; }
+    ! zs_copy_loader_file "$MODDIR/system/lib64/$ZS_BRIDGE_NAME" "$SYSTEM/lib64/$ZS_BRIDGE_NAME"
+    test ! -e "$SYSTEM/lib64/$ZS_BRIDGE_NAME"
+    test -z "$(find "$SYSTEM" -name '*.so.*' -print)"
+    chcon() { test "$1" = u:object_r:system_file:s0; }
+    zs_copy_loader_file "$MODDIR/system/lib64/$ZS_BRIDGE_NAME" "$SYSTEM/lib64/$ZS_BRIDGE_NAME" ;;
   copy_failure|rename_failure)
     OVERLAY=0
     if [ "$CASE" = copy_failure ]; then FAIL_COPY="$ZS_PAYLOAD_NAME";
@@ -4558,6 +4618,21 @@ case "$CASE" in
       ! zs_self_mount_dir "$SYSTEM/lib64"
       test ! -e "$SYSTEM/lib64/$ZS_BRIDGE_NAME"
       test ! -e "$WORKDIR/mount_calls"
+    elif [ "$CASE" = overlay_readonly ]; then
+      zs_self_mount_dir "$SYSTEM/lib64"
+      test "$(wc -l < "$WORKDIR/mount_calls")" -eq 2
+      cmp "$MODDIR/system/lib64/$ZS_PAYLOAD_NAME" "$SYSTEM/lib64/$ZS_PAYLOAD_NAME"
+      grep -q '^overlay ' "$WORKDIR/.uninstall_manifest"
+      zs_self_mount_dir "$SYSTEM/lib64"
+      test "$(wc -l < "$WORKDIR/mount_calls")" -eq 2
+    elif [ "$CASE" = overlay_readonly_failure ]; then
+      ! zs_self_mount_dir "$SYSTEM/lib64"
+      test ! -e "$SYSTEM/lib64/$ZS_BRIDGE_NAME"
+      test ! -e "$WORKDIR/.uninstall_manifest"
+    elif [ "$CASE" = overlay_readonly_foreign_file ]; then
+      touch "$MODDIR/system/lib64/libstock.so"
+      ! zs_self_mount_dir "$SYSTEM/lib64"
+      test "$(wc -l < "$WORKDIR/mount_calls")" -eq 1
     elif [ "$CASE" = overlay_missing_source ]; then
       rm "$MODDIR/system/lib64/$ZS_PAYLOAD_NAME"
       ! zs_self_mount_dir "$SYSTEM/lib64"
@@ -4579,8 +4654,9 @@ esac
 '''
     cases = ("visible32", "visible64", "visible_dual", "visible_missing_bridge",
              "visible_missing_payload", "visible_missing_secondary", "copy_failure",
-             "rename_failure", "direct_bridge_missing", "direct_payload_missing",
-             "overlay_retry", "overlay_foreign", "overlay_missing_source")
+             "rename_failure", "label_failure", "direct_bridge_missing", "direct_payload_missing",
+             "overlay_retry", "overlay_foreign", "overlay_missing_source",
+             "overlay_readonly", "overlay_readonly_failure", "overlay_readonly_foreign_file")
     for shell in shells:
         for case in cases:
             for directory in (system, Path(mk.workdir), Path(mk.moddir) / "system"):
@@ -4659,8 +4735,39 @@ def test_customize_install_failures(mk):
             fixture.cleanup()
 
 
+def test_service_session_refresh(mk):
+    """Exercise publication during the wait, including the final wait boundary."""
+    import socket
+    from pathlib import Path
+    installed_layout(mk, with_symlink=True)
+    work = Path(mk.workdir); work.mkdir(parents=True)
+    endpoint = str(Path(mk.root) / "s")
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+        server.bind(endpoint); server.listen(1)
+        Path(mk.moddir, ".debug").touch()
+        Path(mk.moddir, "session.sock").write_text("/missing/stale/socket")
+        write_exec(os.path.join(mk.bindir, "log"), '#!/bin/sh\nprintf "%s\\n" "$*" >> "$ZS_SERVICE_LOG"\n')
+        write_exec(os.path.join(mk.bindir, "sleep"), r'''#!/bin/sh
+n=$(cat "$ZS_SLEEP_COUNT" 2>/dev/null); n=${n:-0}; n=$((n + 1))
+printf '%s' "$n" > "$ZS_SLEEP_COUNT"
+if [ "$n" = "$ZS_READY_AFTER" ]; then printf '%s' "$ZS_ENDPOINT" > "$ZS_SESSION_ALT"; fi
+''')
+        for ready_after in ("1", "5", "99"):
+            log = Path(mk.root, "service.log"); log.unlink(missing_ok=True)
+            count = Path(mk.root, "sleep.count"); count.unlink(missing_ok=True)
+            (work / "session.sock").unlink(missing_ok=True)
+            proc = mk.run_script("service.sh", {"ZS_SERVICE_LOG": str(log), "ZS_SLEEP_COUNT": str(count),
+                "ZS_READY_AFTER": ready_after, "ZS_ENDPOINT": endpoint, "ZS_SESSION_ALT": str(work / "session.sock")})
+            check(f"service refresh {ready_after}: exits successfully", proc.returncode == 0, proc.stderr)
+            text = log.read_text()
+            check(f"service refresh {ready_after}: honest readiness",
+                  ("socket present" in text) == (ready_after != "99"))
+            check(f"service refresh {ready_after}: bounded waits", int(count.read_text()) <= 5)
+
+
 def main():
     cases = [
+        ("PR #16: delayed session handoff", test_service_session_refresh),
         ("PR #14: installer labels and fatal write failures", test_customize_install_failures),
         ("PR #14: complete loader pairs and atomic copy failures", test_loader_mount_failures),
         ("PR #14: property read and swap failures", test_property_read_and_swap_failures),
@@ -4713,6 +4820,7 @@ def main():
          test_customize_refuses_missing_artifacts),
         ("service: starts the daemon via the symlink",
          test_service_starts_symlink_daemon),
+        ("service: delayed alternate socket handoff", test_service_rereads_session_after_startup),
         ("service: legacy libs/<abi> fallback",
          test_service_finds_legacy_layout),
         ("service: no daemon, no crash", test_service_survives_missing_daemon),

@@ -1,22 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // zygisk.hpp
 //
-// Public Zygisk module API surface — i.e. the C++ base class that third-
-// party Zygisk modules derive from. This is the documented public API
-// originally defined by Magisk's `zygisk/zygisk.hpp` and reused by every
-// downstream Zygisk implementation (including this study project).
+// Study API v2: this is NOT the upstream Magisk Zygisk ABI. Its classes,
+// entry point and specialize arguments differ. Existing upstream binaries
+// (including LSPosed and zygisk-detach) cannot be made compatible by renaming
+// their libraries or changing a version number.
 //
-// The interface contract is reproduced here from the public documentation
-// (https://topjohnwu.github.io/Magisk/guides.html#zygisk) so that
-// downstream modules written against that API can compile against this
-// project unchanged. The implementation behind it is original to this
-// repository.
-//
-// A Zygisk module is a .so file placed under
-//   /data/adb/modules/<module_id>/zygisk/<abi>.so
-// On boot the loader (libpayload in this project) enumerates those .so
-// files, dlopen-s each one, and looks up the symbol `zygisk_module`
-// which must be a function returning a `ZygiskModule*` factory.
+// A module built explicitly against this header is placed under
+//   /data/adb/modules/<module_id>/zygisk/<abi>/libzygisk-module.so
+// The daemon enumerates enabled study-layout modules. The payload dlopens
+// them and calls `zygisk_module`, a factory returning a `zygisk::Module*`.
 //
 // The module then receives the lifecycle callbacks below in
 // order. The loader's job is to feed them in at the right moment

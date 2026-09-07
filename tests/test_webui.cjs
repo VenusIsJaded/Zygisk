@@ -67,7 +67,7 @@ test('module records are unique, bounded and have known enums', () => {
 test('module status never equates discovery or disable markers with runtime state', () => {
   const modules=app.demoSnapshot().modules;
   assert.equal(app.moduleState(modules[0]).status,'unknown');
-  assert.equal(app.moduleState(modules[3]).label,'Layout mismatch');
+  assert.equal(app.moduleState(modules[3]).label,'Unsupported API');
   assert.equal(app.moduleState(modules[4]).label,'Disabled marker');
   assert.equal(app.moduleState({...modules[0],flags:'removing'}).label,'Pending removal');
   assert.equal(app.moduleState({...modules[0],layout:'none'}).label,'ABI unavailable');
@@ -147,6 +147,7 @@ printf '%s\\n' '09-07 12:00:00.000 1 1 W ZygiskStudy: fixture'
   write('data/adb/modules/zygisk_study/module.prop','id=zygisk_study\nversion=test\n');
   write('data/adb/modules/zygisk_study/.loader_names','bridge=libtest.so\n');
   write('system/lib64/libtest.so');
+  write('system/lib64/libpayload.so');
   write('data/system/zygisk_study/denylist','# comment\ncom.example.app\n');
   const run=(env={})=>spawnSync('sh',[path.join(repo,'webroot/diagnostics.sh')],{
     encoding:'utf8',timeout:30000,maxBuffer:6000000,
@@ -166,10 +167,11 @@ test('real shell collector discovers study, standard, disabled and wrong-ABI mod
   const snapshot=f.collect();
   assert.equal(snapshot.modules.length,3);
   assert.equal(snapshot.modules.find(m=>m.id==='study').flags,'disabled');
-  assert.equal(snapshot.modules.find(m=>m.id==='study').eligible,'yes');
+  assert.equal(snapshot.modules.find(m=>m.id==='study').eligible,'no');
   assert.equal(snapshot.modules.find(m=>m.id==='standard').layout,'standard');
   assert.equal(snapshot.modules.find(m=>m.id==='other').layout,'none');
-  for(const id of ['root','enabled','boot','bridge','mount','pending','denylist','inventory']) assert.equal(status(snapshot,id),'pass');
+  for(const id of ['root','enabled','boot','bridge','mount','denylist','inventory']) assert.equal(status(snapshot,id),'pass');
+  assert.equal(status(snapshot,'pending'),'unknown');
   assert.equal(status(snapshot,'daemon'),'unknown');assert.equal(status(snapshot,'socket'),'fail');
   assert.equal(snapshot.logs.length,1);
 });
@@ -199,14 +201,60 @@ test('daemon and socket evidence is constrained to installed paths',async t=>{
   const f=fixture(t);f.write('data/system/zygisk_study/zygiskd.pid','42\n');
   fs.mkdirSync(path.join(f.root,'proc/42'),{recursive:true});
   fs.symlinkSync(path.join(f.root,'data/adb/modules/zygisk_study/libs/arm64-v8a/zygiskd'),path.join(f.root,'proc/42/exe'));
-  const endpoint=path.join(f.root,'data/system/zygisk_study/sock');
+  const endpoint=path.join(f.root,'data/system/.1234abcd/s');
+  fs.mkdirSync(path.dirname(endpoint),{recursive:true});
   const server=net.createServer();await new Promise(resolve=>server.listen(endpoint,resolve));
   try {
-    f.write('data/adb/modules/zygisk_study/session.sock','/data/system/zygisk_study/sock\n');
+    f.write('data/adb/modules/zygisk_study/session.sock','/data/system/.1234abcd/s\n');
     let snapshot=f.collect();assert.equal(status(snapshot,'daemon'),'pass');assert.equal(status(snapshot,'socket'),'pass');
     assert.ok(!JSON.stringify(snapshot).includes(endpoint));
     f.write('data/adb/modules/zygisk_study/session.sock','/data/system/zygisk_study/../zygisk_study/sock');
     snapshot=f.collect();assert.equal(status(snapshot,'socket'),'fail');
+  } finally {await new Promise(resolve=>server.close(resolve));}
+});
+test('collector recognizes guard restoration without claiming injection',t=>{
+  const f=fixture(t);
+  f.write('data/system/zygisk_study/.native_bridge_applied','libtest.so');
+  f.write('data/system/zygisk_study/.native_bridge_backup','0');
+  assert.equal(status(f.collect({FAKE_BRIDGE:'0'}),'bridge'),'warn');
+  assert.equal(status(f.collect({FAKE_BRIDGE:'libforeign.so'}),'bridge'),'fail');
+  f.write('data/system/zygisk_study/.native_bridge_applied','libold.so');
+  assert.equal(status(f.collect({FAKE_BRIDGE:'0'}),'bridge'),'fail');
+});
+test('collector checks payload, secondary ABI, init namespace and rollback state',t=>{
+  const f=fixture(t);
+  fs.rmSync(path.join(f.root,'system/lib64/libpayload.so'));
+  assert.equal(status(f.collect(),'mount'),'fail');
+  f.write('proc/1/root/system/lib64/libtest.so');
+  f.write('proc/1/root/system/lib64/libpayload.so');
+  assert.equal(status(f.collect(),'mount'),'warn');
+  f.write('system/lib64/libpayload.so');
+  f.write('data/adb/modules/zygisk_study/system/lib/libtest.so');
+  assert.equal(status(f.collect(),'mount'),'fail');
+  f.write('system/lib/libtest.so');f.write('system/lib/libpayload.so');
+  assert.equal(status(f.collect(),'mount'),'pass');
+  for(const [state,want] of [['rolled_back','fail'],['late','warn']]) {
+    f.write('data/system/zygisk_study/.mount_status',state);
+    assert.equal(status(f.collect(),'pending'),want);
+  }
+  f.write('data/system/zygisk_study/.debug');
+  assert.equal(status(f.collect(),'debug'),'pass');
+});
+test('socket records fall back independently and reject malformed paths',async t=>{
+  const f=fixture(t),endpoint=path.join(f.root,'data/system/.abcdef12/s');
+  fs.mkdirSync(path.dirname(endpoint),{recursive:true});
+  const server=net.createServer();await new Promise(resolve=>server.listen(endpoint,resolve));
+  try {
+    f.write('data/adb/modules/zygisk_study/session.sock','/data/system/.deadbeef/s');
+    f.write('data/system/zygisk_study/session.sock','/data/system/.abcdef12/s');
+    assert.equal(status(f.collect(),'socket'),'pass');
+    fs.rmSync(path.join(f.root,'data/system/zygisk_study/session.sock'));
+    for(const bad of ['/data/system/.abcdef12/../.abcdef12/s','/data/system/.abcdef12//s',
+      '/data/system/.abcdef12/s/extra','/data/system/.ABCDEF12/s',' /data/system/.abcdef12/s',
+      '/data/system/.abcdef12/s\n/other']) {
+      f.write('data/adb/modules/zygisk_study/session.sock',bad);
+      assert.equal(status(f.collect(),'socket'),'fail',bad);
+    }
   } finally {await new Promise(resolve=>server.close(resolve));}
 });
 test('inventory cap is explicit and a maximal snapshot remains parseable',t=>{
