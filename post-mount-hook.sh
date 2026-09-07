@@ -7,8 +7,7 @@
 # run_stage("post-mount") -> exec_common_scripts("post-mount.d")),
 # AFTER metamodule mounting and still BEFORE zygote start. Magisk
 # ignores the directory (a dead file there is harmless), because on
-# Magisk the magic mount already made the loader visible before
-# post-fs-data.sh ran.
+# Magisk magic mount makes the loader visible after post-fs-data.
 #
 # What it does: if post-fs-data.sh left a .mount_pending flag (the
 # loader was not visible at /system/lib[64] yet), try to resolve it —
@@ -30,6 +29,7 @@ WORKDIR="$ZS_SYS_ROOT/zygisk_study"
 
 # Guard against a disabled or removed module.
 [ -f "$MODDIR_REAL/disable" ] && exit 0
+[ -f "$MODDIR_REAL/remove" ] && exit 0
 [ -d "$MODDIR_REAL" ] || exit 0
 
 . "$MODDIR_REAL/zs_compat.sh"
@@ -37,9 +37,11 @@ MODDIR="$MODDIR_REAL"
 zs_compat_init
 
 if zs_ensure_loader_mounted; then
+  zs_mount_state visible
   zs_log "post-mount: loader resolved at /system (name withheld)"
 else
   zs_rollback_bridge
+  zs_mount_state rolled_back
   rm -f "$WORKDIR/.mount_pending" 2>/dev/null
   zs_log "post-mount: loader could not be made visible; bridge rolled back"
 fi

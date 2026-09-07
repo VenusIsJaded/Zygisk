@@ -839,6 +839,26 @@ ZS_TEST(session_fallback_record_used_when_module_dir_is_unreadable) {
 // Round 29 — the fallback parser gets the SAME hygiene as the
 // primary (the R28 overlong/truncation fix applies to both records:
 // garbage in the workdir record must not register filter prefixes).
+ZS_TEST(session_alternate_survives_malformed_and_stale_primary) {
+    // Use the already-bound test daemon; resolving records must not connect
+    // or consume one of its finite protocol requests.
+    char primary[] = "./zs_primary_XXXXXX", alternate[] = "./zs_alternate_XXXXXX";
+    int pfd = mkstemp(primary), afd = mkstemp(alternate);
+    ZS_CHECK(pfd >= 0 && afd >= 0);
+    ZS_CHECK(write(afd, g_sock_path.data(), g_sock_path.size()) == (ssize_t)g_sock_path.size());
+    close(afd);
+    fn_set_session_file(primary); fn_set_session_file_alt(alternate);
+    for (const char* content : {"relative", "/tmp/stale.sock", "/tmp/../bad"}) {
+        ZS_CHECK(ftruncate(pfd, 0) == 0);
+        ZS_CHECK(lseek(pfd, 0, SEEK_SET) == 0);
+        ZS_CHECK(write(pfd, content, strlen(content)) == (ssize_t)strlen(content));
+        ZS_CHECK(fn_load_session() == 1);
+    }
+    close(pfd); unlink(primary); unlink(alternate);
+    fn_set_session_file(nullptr); fn_set_session_file_alt(nullptr);
+    fn_set_sock(g_sock_path.c_str());
+}
+
 ZS_TEST(session_fallback_record_rejects_overlong_content) {
     char alt_sess[] = "/tmp/zs_test_sess_alto_XXXXXX";
     int afd = mkstemp(alt_sess);

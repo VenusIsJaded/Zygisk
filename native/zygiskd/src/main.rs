@@ -587,12 +587,17 @@ impl DaemonState {
         if let Ok(entries) = std::fs::read_dir(remap_path(MODULES_ROOT)) {
             for entry in entries.flatten() {
                 let p = entry.path();
+                // Manager markers apply to new registry snapshots. Already
+                // mapped modules require a reboot to be fully unloaded.
+                if !p.is_dir() || p.join("disable").exists() || p.join("remove").exists() {
+                    continue;
+                }
                 let id = match p.file_name().and_then(|n| n.to_str()) {
                     Some(s) => s.to_string(),
                     None    => continue,
                 };
                 let so = p.join("zygisk").join(&abi).join("libzygisk-module.so");
-                if so.exists() {
+                if so.is_file() {
                     out.push(ModuleEntry { id, path: so });
                 }
             }
@@ -1923,15 +1928,41 @@ fn setup_random_socket() -> Option<String> {
             &dir, std::fs::Permissions::from_mode(0o700));
     }
     let path = format!("{}/s", dir);
-    // Hand the path to the payload BEFORE binding so a fast zygote
-    // never races a missing file (worst case it falls back to the
-    // fixed path and simply fails to fetch modules this boot).
-    // Round 29: write BOTH records — the module-dir file and the
-    // workdir fallback (see SESSION_FILE_ALT).
-    std::fs::write(remap_path(SESSION_FILE), &path).ok()?;
-    std::fs::create_dir_all(remap_path(WORKDIR)).ok()?;
-    std::fs::write(remap_path(SESSION_FILE_ALT), &path).ok()?;
     Some(path)
+}
+
+// Publish only the bound endpoint. A failure of ONE record must not change
+// the socket path or suppress the other handoff (e.g. module tree read-only).
+fn publish_session_record(record: &str, socket: &str) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let tmp = format!("{}.{}.tmp", record, std::process::id());
+    // Do not remove a pre-existing temporary path if create_new fails.
+    let mut file = std::fs::OpenOptions::new().write(true).create_new(true)
+        .mode(0o600).open(&tmp)?;
+    let result = (|| {
+        file.write_all(socket.as_bytes())?;
+        std::fs::rename(&tmp, record)
+    })();
+    if result.is_err() { let _ = std::fs::remove_file(&tmp); }
+    result
+}
+
+// Process-owned record lock, NOT flock: forked companion children must not
+// keep the daemon startup lock alive after their parent exits. Hold this File
+// until main returns; never unlink the lock inode during a normal restart.
+fn lock_instance(workdir: &str) -> std::io::Result<std::fs::File> {
+    use std::os::unix::io::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new().read(true).write(true).create(true)
+        .mode(0o600).custom_flags(libc::O_NOFOLLOW)
+        .open(format!("{}/daemon.lock", workdir))?;
+    let mut lock: libc::flock = unsafe { std::mem::zeroed() };
+    lock.l_type = libc::F_WRLCK as _;
+    lock.l_whence = libc::SEEK_SET as _;
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLK, &lock) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(file)
 }
 
 fn main() {
@@ -2017,7 +2048,14 @@ fn main() {
 
     // Make sure workdir and sockdir exist with the right perms.
     setup_dirs(&workdir);
+    // Re-running service.sh must not delete a live daemon's session directory.
+    let _instance_lock = match lock_instance(&workdir) {
+        Ok(file) => file,
+        Err(_) => { eprintln!("zygiskd: startup lock unavailable; refusing duplicate startup"); return; }
+    };
 
+    // Stale PID files must not claim readiness if this startup fails later.
+    let _ = std::fs::remove_file(format!("{}/zygiskd.pid", workdir));
     let state = Arc::new(DaemonState::new());
     state.reload_modules();
     state.reload_denylist();
@@ -2082,6 +2120,14 @@ fn main() {
     use std::os::unix::fs::PermissionsExt;
     let _ = std::fs::set_permissions(&sock_path,
         std::fs::Permissions::from_mode(0o600));
+
+    let primary = publish_session_record(&remap_path(SESSION_FILE), &sock_path);
+    let alternate = publish_session_record(&remap_path(SESSION_FILE_ALT), &sock_path);
+    if primary.is_err() && alternate.is_err() {
+        eprintln!("zygiskd: neither session record could be published");
+        let _ = std::fs::remove_file(&sock_path);
+        process::exit(1);
+    }
 
     // Round 33 — write the pid file OURSELVES. service.sh previously
     // recorded $! after `setsid ... &`, but the setsid wrapper may

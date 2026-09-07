@@ -41,9 +41,55 @@
 #include <poll.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/un.h>
 #include <unistd.h>
+
+// Both native clients use the same bounded session parser. Publication can
+// fail for just one record, leaving a readable but stale/malformed primary.
+// Prefer a candidate whose socket inode exists; if neither is visible yet,
+// preserve a valid primary for the existing bounded-connect/retry behavior.
+// Socket existence is NOT proof that a daemon is listening or SELinux allows IPC.
+static inline int zs_read_session_path(const char* record, char* out, size_t cap) {
+    int fd = open(record, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+    if (fd < 0) return 0;
+    struct stat st{};
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) { close(fd); return 0; }
+    char path[97];
+    ssize_t n;
+    do { n = read(fd, path, sizeof path - 1); } while (n < 0 && errno == EINTR);
+    close(fd);
+    if (n <= 0 || n >= 96 || memchr(path, '\0', (size_t)n)) return 0;
+    while (n > 0 && (path[n - 1] == '\n' || path[n - 1] == '\r' || path[n - 1] == ' ')) --n;
+    path[n] = '\0';
+    if (n < 2 || path[0] != '/' || (size_t)n + 1 > cap ||
+        strchr(path, '\n') || strchr(path, '\r') || strstr(path, "/../") ||
+        strstr(path, "/./") || strstr(path, "//") ||
+        (n >= 3 && strcmp(path + n - 3, "/..") == 0) ||
+        (n >= 2 && strcmp(path + n - 2, "/.") == 0)) return 0;
+    memcpy(out, path, (size_t)n + 1);
+    return 1;
+}
+
+static inline int zs_resolve_session_socket(const char* primary, const char* alternate,
+                                             char* out, size_t cap) {
+    if (!out || !cap) return 0;
+    char first[96] = {}, path[96];
+    const char* records[] = {primary, alternate};
+    for (const char* record : records) {
+        if (!record || !zs_read_session_path(record, path, sizeof path) || strlen(path) >= cap) continue;
+        struct stat st{};
+        if (stat(path, &st) == 0 && S_ISSOCK(st.st_mode)) {
+            memcpy(out, path, strlen(path) + 1);
+            return 1;
+        }
+        if (!first[0]) memcpy(first, path, strlen(path) + 1);
+    }
+    if (!first[0]) return 0;
+    memcpy(out, first, strlen(first) + 1);
+    return 1;
+}
 
 static inline int zs_daemon_connect_bounded(const char* path,
                                             int connect_ms, int io_ms) {

@@ -103,6 +103,7 @@ fi
 # itself; zs_compat_init reads .loader_names and sets ZS_* state.
 . "$MODDIR/zs_compat.sh"
 zs_compat_init
+zs_mount_state not_attempted
 
 if [ -n "$RESETPROP" ] || [ -x "$ZS_DAEMON" ]; then
   if ! CURRENT="$(zs_prop_get ro.dalvik.vm.native.bridge)"; then
@@ -173,6 +174,7 @@ if [ -n "$RESETPROP" ] || [ -x "$ZS_DAEMON" ]; then
     # AFTER their metamodule mounting, still before zygote) and
     # service.sh (last resort) resolve it or roll the swap back.
     if zs_loader_visible; then
+      zs_mount_state visible
       rm -f "$WORKDIR/.mount_pending" 2>/dev/null
     else
       # Use a regular builtin, not ':' (a special builtin): a redirection
@@ -182,6 +184,7 @@ if [ -n "$RESETPROP" ] || [ -x "$ZS_DAEMON" ]; then
         zs_rollback_bridge
         return 0 2>/dev/null || exit 0
       fi
+      zs_mount_state pending
       zs_log "loader not visible at /system yet; mount check deferred"
     fi
   else

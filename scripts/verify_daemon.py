@@ -516,6 +516,54 @@ def run_checks(binary, tree, env, proc):
     run_inert_backoff_checks(binary, env)
     run_orphan_sweep_checks(binary, env)
     run_live_uninstall_checks(binary, env)
+    run_startup_handoff_checks(binary, env)
+
+
+def run_startup_handoff_checks(binary, env):
+    """Publication failures must not strand a listening daemon or its clients."""
+    from pathlib import Path
+    for blocked in ("primary", "alternate", "both", "none"):
+        with tempfile.TemporaryDirectory(prefix="zs_handoff_") as root:
+            tree = Tree(root)
+            for name in ("disabledmod", "removingmod", "directorymod", "standardmod"):
+                mod = Path(tree.modules_root) / name
+                so = mod / "zygisk/arm64-v8a/libzygisk-module.so"
+                so.parent.mkdir(parents=True)
+                if name == "directorymod": so.mkdir()
+                else: so.touch()
+                if name == "disabledmod": (mod / "disable").touch()
+                if name == "removingmod": (mod / "remove").touch()
+                if name == "standardmod":
+                    so.unlink(); (mod / "zygisk/arm64-v8a.so").touch()
+            # Directories force rename failure even when the harness is root.
+            if blocked in ("primary", "both"): Path(tree.session_file).mkdir()
+            if blocked in ("alternate", "both"): Path(tree.session_file_alt).mkdir()
+            proc = subprocess.Popen([binary, "--workdir", tree.workdir],
+                env={**env, "ZS_TEST_ROOT": root}, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            try:
+                if blocked == "both":
+                    check("both session records unavailable fails closed", proc.wait(timeout=5) != 0)
+                    check("failed publication does not claim ready PID", not Path(tree.workdir, "zygiskd.pid").exists())
+                    continue
+                record = Path(tree.session_file_alt if blocked == "primary" else tree.session_file)
+                deadline = time.monotonic() + 5
+                while not record.is_file() and proc.poll() is None and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                check(f"{blocked}: independent session publication", record.is_file())
+                if not record.is_file(): continue
+                endpoint = record.read_text()
+                reply = ask(endpoint, b"L")
+                check(f"{blocked}: published endpoint is bound and responsive", b"testmod" in reply)
+                check(f"{blocked}: registry excludes disabled/removing/non-file/upstream entries",
+                      not any(name in reply for name in (b"disabledmod", b"removingmod", b"directorymod", b"standardmod")))
+                check(f"{blocked}: session record is private", record.stat().st_mode & 0o777 == 0o600)
+                # A duplicate service invocation must leave the endpoint/PID alone.
+                second = subprocess.run([binary, "--workdir", tree.workdir],
+                    env={**env, "ZS_TEST_ROOT": root}, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+                check(f"{blocked}: duplicate startup leaves live socket intact",
+                      second.returncode == 0 and record.read_text() == endpoint and b"testmod" in ask(endpoint, b"L"))
+            finally:
+                stop_daemon(proc)
 
 
 def start_fake_zygote(bridge_file):

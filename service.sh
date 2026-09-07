@@ -88,9 +88,11 @@ if [ -f "$WORKDIR/.mount_pending" ]; then
   . "$MODDIR/zs_compat.sh"
   zs_compat_init
   if zs_ensure_loader_mounted; then
+    zs_mount_state late
     zs_log "service: loader resolved late; armed for next zygote start"
   else
     zs_rollback_bridge
+    zs_mount_state rolled_back
     rm -f "$WORKDIR/.mount_pending" 2>/dev/null
     zs_log "service: loader unresolvable; bridge rolled back (module inert this boot)"
   fi
@@ -116,26 +118,23 @@ else
   "$DAEMON" --workdir "$WORKDIR" >/dev/null 2>&1 &
 fi
 
-# Give it a moment to come up, then sanity-check the socket. Round 13:
-# the socket path is randomized per boot — the daemon hands it to the
-# payload via the session file inside our module dir, so the check
-# reads that file (falling back to the legacy fixed path). Round 29:
-# the daemon also writes the same record into its /data/system workdir
-# (session.sock there) — a second source for exactly the same path.
-SESSION=$MODDIR/session.sock
-SOCK=""
-if [ -f "$SESSION" ]; then
-  SOCK=$(cat "$SESSION" 2>/dev/null | tr -d ' \r\n')
-fi
-if [ -z "$SOCK" ] && [ -f "$WORKDIR/session.sock" ]; then
-  SOCK=$(cat "$WORKDIR/session.sock" 2>/dev/null | tr -d ' \r\n')
-fi
-if [ -z "$SOCK" ]; then
-  SOCK=$WORKDIR/sock/sock
-fi
-sleep 1
-if [ -S "$SOCK" ]; then
-  zs_log "daemon ready"
+# Re-read session records AFTER each wait. Reading once before sleep picked
+# yesterday's path even when the daemon published a fresh endpoint in time.
+# This is only a bounded presence check, not proof of companion IPC.
+READY=0
+ATTEMPT=0
+while [ "$ATTEMPT" -le 5 ]; do
+  for SESSION in "$MODDIR/session.sock" "$WORKDIR/session.sock"; do
+    SOCK="$(cat "$SESSION" 2>/dev/null)"
+    if [ -n "$SOCK" ] && [ -S "$SOCK" ]; then READY=1; break; fi
+  done
+  if [ "$READY" = 1 ] || [ -S "$WORKDIR/sock/sock" ]; then READY=1; break; fi
+  [ "$ATTEMPT" -lt 5 ] || break
+  ATTEMPT=$((ATTEMPT + 1))
+  sleep 1
+done
+if [ "$READY" = 1 ]; then
+  zs_log "daemon socket present (IPC unverified)"
 else
-  zs_log "daemon did not open socket; check logcat for errors"
+  zs_log "daemon did not publish a usable socket within startup timeout"
 fi
